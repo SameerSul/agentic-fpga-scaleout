@@ -1,0 +1,166 @@
+{
+  "spec": {
+    "name": "mac8",
+    "description": "8-bit pipelined multiply-accumulate unit with synchronous clear and valid handshake",
+    "top_module": "mac",
+    "parameters": {
+      "data_width": 8,
+      "acc_width": 24,
+      "pipeline_stages": 2,
+      "target_clock_mhz": 100
+    },
+    "ports": [
+      {
+        "name": "clk",
+        "dir": "input",
+        "width": 1,
+        "desc": "clock, rising edge"
+      },
+      {
+        "name": "rst_n",
+        "dir": "input",
+        "width": 1,
+        "desc": "active-low synchronous reset"
+      },
+      {
+        "name": "clear",
+        "dir": "input",
+        "width": 1,
+        "desc": "synchronous accumulator clear"
+      },
+      {
+        "name": "a",
+        "dir": "input",
+        "width": 8,
+        "desc": "multiplicand"
+      },
+      {
+        "name": "b",
+        "dir": "input",
+        "width": 8,
+        "desc": "multiplier"
+      },
+      {
+        "name": "valid_in",
+        "dir": "input",
+        "width": 1,
+        "desc": "input operands valid"
+      },
+      {
+        "name": "acc",
+        "dir": "output",
+        "width": 24,
+        "desc": "accumulator value"
+      },
+      {
+        "name": "valid_out",
+        "dir": "output",
+        "width": 1,
+        "desc": "acc updated this cycle"
+      }
+    ],
+    "behavior": [
+      "Stage 1 registers the full 16-bit product a*b and the valid flag.",
+      "Stage 2 adds the registered product into the 24-bit accumulator when the piped valid is set.",
+      "clear synchronously zeroes acc and valid_out, taking priority over accumulation.",
+      "Latency from valid_in to valid_out is 2 cycles."
+    ]
+  },
+  "tools": {
+    "iverilog": "/opt/homebrew/bin/iverilog",
+    "vvp": "/opt/homebrew/bin/vvp",
+    "yosys": "/opt/homebrew/bin/yosys",
+    "sta": "/Users/ssuleman/.local/bin/sta"
+  },
+  "converged": true,
+  "iterations_used": 3,
+  "history": [
+    {
+      "iteration": 1,
+      "fixes_applied": [],
+      "sim": {
+        "stage": "sim",
+        "status": "fail",
+        "checks": null,
+        "mismatches": [
+          {
+            "test": "wide_product",
+            "expected_acc": 65328,
+            "got_acc": 304,
+            "expected_vout": "1",
+            "got_vout": "1"
+          }
+        ]
+      },
+      "synth": null,
+      "timing": null
+    },
+    {
+      "iteration": 2,
+      "fixes_applied": [
+        "widen_product_register"
+      ],
+      "sim": {
+        "stage": "sim",
+        "status": "fail",
+        "checks": null,
+        "mismatches": [
+          {
+            "test": "sync_clear",
+            "expected_acc": 0,
+            "got_acc": 101583,
+            "expected_vout": "0",
+            "got_vout": "0"
+          }
+        ]
+      },
+      "synth": null,
+      "timing": null
+    },
+    {
+      "iteration": 3,
+      "fixes_applied": [
+        "implement_sync_clear",
+        "widen_product_register"
+      ],
+      "sim": {
+        "stage": "sim",
+        "status": "pass",
+        "checks": 594,
+        "mismatches": [],
+        "throughput": {
+          "macs": 256,
+          "span_cycles": 256,
+          "latency_cycles": 4,
+          "cycles_per_mac": 1.0
+        }
+      },
+      "synth": {
+        "stage": "synth",
+        "status": "pass",
+        "cell_count": 1044,
+        "area": 2066.0
+      },
+      "timing": {
+        "stage": "timing",
+        "status": "pass",
+        "method": "opensta",
+        "clock_period_ns": 10.0,
+        "worst_slack_ns": 4.7
+      }
+    }
+  ],
+  "final_metrics": {
+    "sim_pass": true,
+    "sim_checks": 594,
+    "cell_count": 1044,
+    "area": 2066.0,
+    "timing": {
+      "stage": "timing",
+      "status": "pass",
+      "method": "opensta",
+      "clock_period_ns": 10.0,
+      "worst_slack_ns": 4.7
+    }
+  }
+}

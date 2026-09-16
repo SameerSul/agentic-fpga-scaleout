@@ -1,0 +1,27 @@
+{
+  "name": "mac8",
+  "description": "8-bit pipelined multiply-accumulate unit with synchronous clear and valid handshake",
+  "top_module": "mac",
+  "parameters": {
+    "data_width": 8,
+    "acc_width": 24,
+    "pipeline_stages": 2,
+    "target_clock_mhz": 100
+  },
+  "ports": [
+    {"name": "clk", "dir": "input", "width": 1, "desc": "clock, rising edge"},
+    {"name": "rst_n", "dir": "input", "width": 1, "desc": "active-low synchronous reset"},
+    {"name": "clear", "dir": "input", "width": 1, "desc": "synchronous accumulator clear"},
+    {"name": "a", "dir": "input", "width": 8, "desc": "multiplicand"},
+    {"name": "b", "dir": "input", "width": 8, "desc": "multiplier"},
+    {"name": "valid_in", "dir": "input", "width": 1, "desc": "input operands valid"},
+    {"name": "acc", "dir": "output", "width": 24, "desc": "accumulator value"},
+    {"name": "valid_out", "dir": "output", "width": 1, "desc": "acc updated this cycle"}
+  ],
+  "behavior": [
+    "Stage 1 registers the full 16-bit product a*b and the valid flag.",
+    "Stage 2 adds the registered product into the 24-bit accumulator when the piped valid is set.",
+    "clear synchronously zeroes acc and valid_out, taking priority over accumulation.",
+    "Latency from valid_in to valid_out is 2 cycles."
+  ]
+}

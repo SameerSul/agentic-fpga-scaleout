@@ -1,0 +1,124 @@
+{
+  "flow": {
+    "converged": true,
+    "iterations": 3
+  },
+  "chiplet_profile": {
+    "chiplet": "mac8",
+    "top_module": "mac",
+    "cycles_per_mac": 1.0,
+    "latency_cycles": 4,
+    "cell_count": 1044,
+    "area": 2066.0,
+    "fmax_estimate_mhz": 188.67924528301887,
+    "fmax_method": "opensta_slack",
+    "target_clock_mhz": 100,
+    "sim_checks_passed": 594,
+    "data_width": 8,
+    "acc_width": 24
+  },
+  "fit": [
+    {
+      "board": "artix7_small",
+      "board_class": "small (Artix-7 class)",
+      "instances": 13,
+      "clock_mhz": 150.0,
+      "cycles_per_mac": 1.0,
+      "macs_per_s": 1950000000.0,
+      "utilization": 0.6786,
+      "link_gbps": 6.6,
+      "link_prop_ns": 500.0,
+      "num_links": 4
+    },
+    {
+      "board": "zynq_us_mid",
+      "board_class": "mid (Kintex/Zynq UltraScale class)",
+      "instances": 80,
+      "clock_mhz": 188.67924528301887,
+      "cycles_per_mac": 1.0,
+      "macs_per_s": 15094339622.64151,
+      "utilization": 0.696,
+      "link_gbps": 16.3,
+      "link_prop_ns": 400.0,
+      "num_links": 8
+    },
+    {
+      "board": "versal_large",
+      "board_class": "large (Versal/Alveo class)",
+      "instances": 301,
+      "clock_mhz": 188.67924528301887,
+      "cycles_per_mac": 1.0,
+      "macs_per_s": 56792452830.18868,
+      "utilization": 0.69832,
+      "link_gbps": 32.0,
+      "link_prop_ns": 300.0,
+      "num_links": 16
+    }
+  ],
+  "scaleout": [
+    {
+      "boards": 1,
+      "time_ns": 282473.04,
+      "gflops": 29.697021705151048,
+      "speedup": 1.0,
+      "max_err": 0.0
+    },
+    {
+      "boards": 2,
+      "time_ns": 163389.2844171778,
+      "gflops": 51.34123715592985,
+      "speedup": 1.728834549998815,
+      "max_err": 1.2434497875801753e-14
+    },
+    {
+      "boards": 4,
+      "time_ns": 105431.40662576671,
+      "gflops": 79.56460288702894,
+      "speedup": 2.6792115275730892,
+      "max_err": 8.881784197001252e-15
+    },
+    {
+      "boards": 8,
+      "time_ns": 79620.46773006117,
+      "gflops": 105.357431815649,
+      "speedup": 3.5477440418671473,
+      "max_err": 9.769962616701378e-15
+    }
+  ],
+  "hetero": {
+    "boards": [
+      "artix7_small",
+      "artix7_small",
+      "versal_large",
+      "versal_large"
+    ],
+    "equal_split": {
+      "time_ns": 604230.4335664357,
+      "max_err": 8.881784197001252e-15,
+      "utilization": [
+        0.8940043158637452,
+        0.8940043158637452,
+        0.03427582787683814,
+        0.03427582787683814
+      ]
+    },
+    "proportional_split": {
+      "time_ns": 104512.65871337957,
+      "max_err": 1.0658141036401503e-14,
+      "columns": [
+        8,
+        8,
+        248,
+        248
+      ],
+      "utilization": [
+        0.3354764761816354,
+        0.3354764761816354,
+        0.3713888921150604,
+        0.3713888921150604
+      ]
+    },
+    "recovery_factor": 5.7814090752729355,
+    "mid_homogeneous_4b_time_ns": 105431.40662576671
+  }
+}
