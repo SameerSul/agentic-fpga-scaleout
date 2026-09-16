@@ -1,9 +1,13 @@
-"""Orchestrator: agent proposes chiplet RTL, then simulate (iverilog/vvp),
-synthesize (yosys + generic liberty), and time (OpenSTA, with a yosys
-gate-depth proxy fallback). Parsed failures feed back to the agent. Stops on
-full pass or 5 iterations, then writes chiplet_profile.json: the measured
-contract (cycles_per_mac, cell_count, area, fmax_estimate_mhz, checks) that
-the scaleout fabric consumes. Run: python3 chiplet_flow.py"""
+"""Orchestrator: agent proposes RTL, then simulate (iverilog/vvp), synthesize
+(yosys + generic liberty), and time (OpenSTA, with a yosys gate-depth proxy
+fallback). Parsed failures feed back to the agent. Stops on full pass or 5
+iterations, then writes a measured profile JSON: the contract the scaleout
+fabric consumes.
+
+Two generated blocks share this one flow, defined as jobs: the compute
+chiplet (spec.json + tb_mac.v -> chiplet_profile.json, cycles_per_mac) and
+the fabric endpoint (spec_crc.json + tb_crc.v -> fabric_profile.json,
+cycles_per_byte). Run: python3 chiplet_flow.py"""
 import json, os, re, shutil, subprocess, sys
 
 from agent import RuleBasedAgent
@@ -16,6 +20,15 @@ MAX_ITERS = 5
 # one INV (0.06 ns) plus wire/load margin in the toy liberty.
 PROXY_GATE_NS = 0.12
 
+CHIPLET_JOB = {
+    "spec_file": "spec.json", "tb_file": "tb_mac.v", "rtl_file": "mac.v",
+    "profile_file": "chiplet_profile.json", "report_file": "report.json",
+}
+FABRIC_JOB = {
+    "spec_file": "spec_crc.json", "tb_file": "tb_crc.v", "rtl_file": "crc.v",
+    "profile_file": "fabric_profile.json", "report_file": "report_crc.json",
+}
+
 
 def run(cmd, timeout=120):
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, cwd=BUILD)
@@ -26,41 +39,48 @@ def tool(name):
     return shutil.which(name)
 
 
-def stage_sim(rtl_path):
+def _parse_kv(line):
+    """Parse a machine line like 'test=foo expected_crc=1 got_crc=2' into a
+    dict of strings, so one parser serves every testbench."""
+    d = {}
+    for kv in line.split():
+        if "=" in kv:
+            k, v = kv.split("=", 1)
+            d[k] = v
+    return d
+
+
+def stage_sim(job, rtl_path):
     sim = os.path.join(BUILD, "sim.out")
-    rc, out = run(["iverilog", "-g2005", "-o", sim, os.path.join(ROOT, "tb_mac.v"), rtl_path])
+    rc, out = run(["iverilog", "-g2005", "-o", sim,
+                   os.path.join(ROOT, job["tb_file"]), rtl_path])
     if rc != 0:
         return {"stage": "sim", "status": "fail", "phase": "compile",
                 "errors": out.strip().splitlines()[:10], "mismatches": []}
     rc, out = run(["vvp", sim])
-    mismatches = [
-        {"test": m[0], "expected_acc": int(m[1]), "got_acc": int(m[2]),
-         "expected_vout": m[3], "got_vout": m[4]}
-        for m in re.findall(
-            r"TB_FAIL test=(\S+) expected_acc=(\d+) got_acc=(\d+) "
-            r"expected_vout=(\w) got_vout=(\w)", out)
-    ]
+    mismatches = [_parse_kv(l) for l in re.findall(r"TB_FAIL (.*)", out)]
     passed = "TB_RESULT: PASS" in out and rc == 0
     checks = re.search(r"TB_PASS checks=(\d+)", out)
-    prof = re.search(r"TB_PROFILE macs=(\d+) span_cycles=(\d+) latency_cycles=(\d+)", out)
     res = {"stage": "sim", "status": "pass" if passed else "fail",
            "checks": int(checks.group(1)) if checks else None,
            "mismatches": mismatches}
+    prof = re.search(r"TB_PROFILE (.*)", out)
     if prof:
-        macs, span, lat = (int(g) for g in prof.groups())
-        res["throughput"] = {"macs": macs, "span_cycles": span,
-                             "latency_cycles": lat,
-                             "cycles_per_mac": span / macs}
+        p = {k: int(v) for k, v in _parse_kv(prof.group(1)).items()}
+        units = p.get("macs") or p.get("bytes")
+        res["throughput"] = dict(p, units=units,
+                                 cycles_per_unit=p["span_cycles"] / units)
     return res
 
 
-def stage_synth(rtl_path):
+def stage_synth(job, spec, rtl_path):
     # Relative names only: all stages run with cwd=BUILD and the project path
     # contains a space, which yosys script parsing does not tolerate unquoted.
-    script = ("read_verilog {rtl}; synth -top mac; dfflibmap -liberty {lib}; "
+    script = ("read_verilog {rtl}; synth -top {top}; dfflibmap -liberty {lib}; "
               "abc -liberty {lib}; opt_clean; stat -liberty {lib}; "
               "write_verilog -noattr netlist.v").format(
-                  rtl=os.path.basename(rtl_path), lib="cells.lib")
+                  rtl=os.path.basename(rtl_path), top=spec["top_module"],
+                  lib="cells.lib")
     rc, out = run(["yosys", "-p", script])
     if rc != 0:
         return {"stage": "synth", "status": "fail",
@@ -74,7 +94,7 @@ def stage_synth(rtl_path):
             "area": float(area.group(1)) if area else None}
 
 
-def stage_timing(spec):
+def stage_timing(job, spec):
     period_ns = 1000.0 / spec["parameters"]["target_clock_mhz"]
     if tool("sta"):
         data_inputs = " ".join(p["name"] for p in spec["ports"]
@@ -83,14 +103,14 @@ def stage_timing(spec):
         with open(tcl, "w") as f:
             f.write("""read_liberty cells.lib
 read_verilog netlist.v
-link_design mac
+link_design {top}
 create_clock -name clk -period {per} [get_ports clk]
 set_input_delay 0.5 -clock clk [get_ports {{{ins}}}]
 set_output_delay 0.5 -clock clk [all_outputs]
 report_checks -path_delay max
 report_worst_slack -max
 exit
-""".format(per=period_ns, ins=data_inputs))
+""".format(top=spec["top_module"], per=period_ns, ins=data_inputs))
         try:
             # Relative script name: OpenSTA splits the path on spaces internally
             rc, out = run(["sta", "-no_init", "-exit", os.path.basename(tcl)])
@@ -104,7 +124,9 @@ exit
                     "worst_slack_ns": slack}
     # Proxy fallback: yosys longest topological path in AND-mapped netlist.
     rc, out = run(["yosys", "-p",
-                   "read_verilog mac.v; synth -top mac -flatten; abc -g AND; ltp -noff"])
+                   "read_verilog {rtl}; synth -top {top} -flatten; "
+                   "abc -g AND; ltp -noff".format(
+                       rtl=job["rtl_file"], top=spec["top_module"])])
     m = re.search(r"length=(\d+)", out)
     if rc == 0 and m:
         return {"stage": "timing", "status": "pass", "method": "proxy_gate_depth",
@@ -123,8 +145,9 @@ def summarize(res):
         if res.get("phase") == "compile":
             return "FAIL compile"
         m = res["mismatches"][0] if res["mismatches"] else {}
-        return "FAIL {}: exp {} got {}".format(
-            m.get("test", "?"), m.get("expected_acc"), m.get("got_acc"))
+        exp = m.get("expected_acc", m.get("expected_crc"))
+        got = m.get("got_acc", m.get("got_crc"))
+        return "FAIL {}: exp {} got {}".format(m.get("test", "?"), exp, got)
     if res["stage"] == "synth":
         return "pass ({} cells)".format(res["cell_count"]) if res["status"] == "pass" else "FAIL"
     if res["stage"] == "timing":
@@ -137,8 +160,8 @@ def summarize(res):
 
 
 def derive_profile(spec, final):
-    """Build the machine-readable chiplet profile from measured results only.
-    This JSON is the contract between the RTL half and the scaleout half."""
+    """Build the machine-readable profile from measured results only. These
+    JSONs are the contract between the RTL half and the scaleout half."""
     sim, synth, tim = final["sim"], final["synth"] or {}, final["timing"]
     thr = sim.get("throughput") or {}
     target_mhz = spec["parameters"]["target_clock_mhz"]
@@ -154,10 +177,12 @@ def derive_profile(spec, final):
     elif tim is None or tim.get("status") == "skipped":
         fmax = float(target_mhz)
         method = "target_assumed_no_timing_tool"
-    return {
-        "chiplet": spec["name"],
+    unit = spec.get("unit", "mac")
+    prof = {
+        "block": spec["name"],
         "top_module": spec["top_module"],
-        "cycles_per_mac": thr.get("cycles_per_mac"),
+        "unit": unit,
+        "cycles_per_" + unit: thr.get("cycles_per_unit"),
         "latency_cycles": thr.get("latency_cycles"),
         "cell_count": synth.get("cell_count"),
         "area": synth.get("area"),
@@ -165,18 +190,28 @@ def derive_profile(spec, final):
         "fmax_method": method,
         "target_clock_mhz": target_mhz,
         "sim_checks_passed": sim.get("checks"),
-        "data_width": spec["parameters"]["data_width"],
-        "acc_width": spec["parameters"]["acc_width"],
     }
+    if unit == "mac":
+        prof["chiplet"] = spec["name"]
+        prof["data_width"] = spec["parameters"]["data_width"]
+        prof["acc_width"] = spec["parameters"]["acc_width"]
+    else:
+        prof["bytes_per_cycle"] = spec["parameters"]["bytes_per_cycle"]
+        # The link rate the synthesized endpoint can actually sustain:
+        # bytes_per_cycle * fmax. Boards cap their transceiver rate at this.
+        prof["endpoint_gbps"] = (spec["parameters"]["bytes_per_cycle"] * 8
+                                 * fmax / 1000.0)
+    return prof
 
 
-def run_flow(verbose=True):
-    """Run the agentic loop to convergence. Returns (report, profile);
-    profile is None if the loop did not converge."""
+def run_flow(job=None, verbose=True):
+    """Run the agentic loop to convergence for one job (default: the compute
+    chiplet). Returns (report, profile); profile is None without convergence."""
+    job = job or CHIPLET_JOB
     say = print if verbose else (lambda *a, **k: None)
     os.makedirs(BUILD, exist_ok=True)
     shutil.copy(LIB, BUILD)
-    spec = json.load(open(os.path.join(ROOT, "spec.json")))
+    spec = json.load(open(os.path.join(ROOT, job["spec_file"])))
     tools = {t: tool(t) for t in ("iverilog", "vvp", "yosys", "sta")}
     say("Tools:", ", ".join("{}={}".format(k, v or "MISSING") for k, v in tools.items()))
     if not (tools["iverilog"] and tools["vvp"]):
@@ -190,16 +225,16 @@ def run_flow(verbose=True):
 
     for it in range(1, MAX_ITERS + 1):
         rtl, fixes = agent.propose(spec, history)
-        rtl_path = os.path.join(BUILD, "mac.v")
+        rtl_path = os.path.join(BUILD, job["rtl_file"])
         with open(rtl_path, "w") as f:
             f.write(rtl)
 
-        sim = stage_sim(rtl_path)
+        sim = stage_sim(job, rtl_path)
         synth = tim = None
         if sim["status"] == "pass" and tools["yosys"]:
-            synth = stage_synth(rtl_path)
+            synth = stage_synth(job, spec, rtl_path)
             if synth["status"] == "pass":
-                tim = stage_timing(spec)
+                tim = stage_timing(job, spec)
         elif sim["status"] == "pass":
             synth = {"stage": "synth", "status": "skipped", "note": "yosys missing"}
 
@@ -236,19 +271,19 @@ def run_flow(verbose=True):
             "timing": final["timing"],
         },
     }
-    rpath = os.path.join(ROOT, "report.json")
+    rpath = os.path.join(ROOT, job["report_file"])
     with open(rpath, "w") as f:
         json.dump(report, f, indent=2)
 
     profile = None
     if converged:
         profile = derive_profile(spec, final)
-        ppath = os.path.join(ROOT, "chiplet_profile.json")
+        ppath = os.path.join(ROOT, job["profile_file"])
         with open(ppath, "w") as f:
             json.dump(profile, f, indent=2)
         say("\nCONVERGED in {} iteration(s), report written to {}".format(
             len(iterations), rpath))
-        say("chiplet profile written to {}".format(ppath))
+        say("profile written to {}".format(ppath))
     else:
         say("\nDID NOT CONVERGE in {} iteration(s), report written to {}".format(
             len(iterations), rpath))
@@ -256,8 +291,10 @@ def run_flow(verbose=True):
 
 
 def main():
-    report, profile = run_flow(verbose=True)
-    sys.exit(0 if report["converged"] else 2)
+    r1, _ = run_flow(CHIPLET_JOB, verbose=True)
+    print()
+    r2, _ = run_flow(FABRIC_JOB, verbose=True)
+    sys.exit(0 if r1["converged"] and r2["converged"] else 2)
 
 
 if __name__ == "__main__":

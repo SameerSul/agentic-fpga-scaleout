@@ -1,0 +1,138 @@
+{
+  "spec": {
+    "name": "crc32_endpoint",
+    "description": "Fabric endpoint CRC32 datapath: 32 bits per cycle, zlib/Ethernet compatible (reflected polynomial 0xEDB88320), synchronous clear between frames, valid handshake",
+    "top_module": "crc32",
+    "unit": "byte",
+    "parameters": {
+      "data_width": 32,
+      "crc_width": 32,
+      "bytes_per_cycle": 4,
+      "target_clock_mhz": 100,
+      "polynomial": "0xEDB88320 reflected form of 0x04C11DB7"
+    },
+    "ports": [
+      {
+        "name": "clk",
+        "dir": "input",
+        "width": 1,
+        "desc": "clock, rising edge"
+      },
+      {
+        "name": "rst_n",
+        "dir": "input",
+        "width": 1,
+        "desc": "active-low synchronous reset"
+      },
+      {
+        "name": "clear",
+        "dir": "input",
+        "width": 1,
+        "desc": "synchronous state clear, start of a new frame"
+      },
+      {
+        "name": "data",
+        "dir": "input",
+        "width": 32,
+        "desc": "one 32-bit word per cycle, bytes LSB-first (little-endian packing)"
+      },
+      {
+        "name": "valid_in",
+        "dir": "input",
+        "width": 1,
+        "desc": "data word valid"
+      },
+      {
+        "name": "crc_out",
+        "dir": "output",
+        "width": 32,
+        "desc": "CRC32 of all words since clear, valid one cycle after the last word"
+      },
+      {
+        "name": "valid_out",
+        "dir": "output",
+        "width": 1,
+        "desc": "crc_out updated this cycle"
+      }
+    ],
+    "behavior": [
+      "State initializes to 0xFFFFFFFF on reset and on synchronous clear.",
+      "Each valid word w updates state s to 32 iterations of s = (s >> 1) ^ (0xEDB88320 & {32{s[0]}}) starting from s ^ w.",
+      "crc_out registers the updated state XOR 0xFFFFFFFF (the standard final inversion), matching zlib.crc32 of the byte stream.",
+      "Latency from valid_in to valid_out is 1 cycle; throughput is one word (4 bytes) per cycle."
+    ]
+  },
+  "tools": {
+    "iverilog": "/opt/homebrew/bin/iverilog",
+    "vvp": "/opt/homebrew/bin/vvp",
+    "yosys": "/opt/homebrew/bin/yosys",
+    "sta": "/Users/ssuleman/.local/bin/sta"
+  },
+  "converged": true,
+  "iterations_used": 2,
+  "history": [
+    {
+      "iteration": 1,
+      "fixes_applied": [],
+      "sim": {
+        "stage": "sim",
+        "status": "fail",
+        "checks": null,
+        "mismatches": [
+          {
+            "test": "zero_word",
+            "expected_crc": "558161692",
+            "got_crc": "3736805603"
+          }
+        ]
+      },
+      "synth": null,
+      "timing": null
+    },
+    {
+      "iteration": 2,
+      "fixes_applied": [
+        "apply_final_inversion"
+      ],
+      "sim": {
+        "stage": "sim",
+        "status": "pass",
+        "checks": 5,
+        "mismatches": [],
+        "throughput": {
+          "bytes": 1024,
+          "span_cycles": 256,
+          "latency_cycles": 3,
+          "units": 1024,
+          "cycles_per_unit": 0.25
+        }
+      },
+      "synth": {
+        "stage": "synth",
+        "status": "pass",
+        "cell_count": 2016,
+        "area": 4193.0
+      },
+      "timing": {
+        "stage": "timing",
+        "status": "pass",
+        "method": "opensta",
+        "clock_period_ns": 10.0,
+        "worst_slack_ns": 6.02
+      }
+    }
+  ],
+  "final_metrics": {
+    "sim_pass": true,
+    "sim_checks": 5,
+    "cell_count": 2016,
+    "area": 4193.0,
+    "timing": {
+      "stage": "timing",
+      "status": "pass",
+      "method": "opensta",
+      "clock_period_ns": 10.0,
+      "worst_slack_ns": 6.02
+    }
+  }
+}

@@ -1,13 +1,16 @@
 """Correctness tests. Run: python3 tests.py
-Runs the agentic flow once (needs iverilog/vvp), then exercises the fit layer
-and the fabric against exact references. Pure Python 3 stdlib."""
+Runs both agentic flows once (needs iverilog/vvp), then exercises the fit
+layer, the fabric, and the model sizing against exact references. Pure
+Python 3 stdlib."""
 import random
+import zlib
 
-from chiplet_flow import run_flow
+from chiplet_flow import run_flow, FABRIC_JOB
 from boards import BOARDS, fit
 from fabric import make_cluster, fabric_stats, mm, relu, RX_CAP
 from collectives import ring_allreduce, run_workers
 from demo import mlp_run
+from sizing import load_model_spec, size_fabric, simulate_decode
 
 PASSED = [0]
 
@@ -89,6 +92,68 @@ def test_hetero_bit_identical(profile):
           t_x > t_h)
 
 
+def crc32_word_serial(data):
+    """Python mirror of the generated RTL: 32-bit word-serial, bytes packed
+    little-endian, reflected poly 0xEDB88320, init and final XOR all-ones.
+    Defined for payloads that are a multiple of 4 bytes, like the fabric's
+    packet payloads."""
+    c = 0xFFFFFFFF
+    for i in range(0, len(data), 4):
+        x = c ^ int.from_bytes(data[i:i + 4], 'little')
+        for _ in range(32):
+            x = (x >> 1) ^ (0xEDB88320 if x & 1 else 0)
+        c = x
+    return c ^ 0xFFFFFFFF
+
+
+def test_fabric_flow():
+    report, fp = run_flow(FABRIC_JOB, verbose=False)
+    check('fabric endpoint flow converges', report['converged'])
+    check('fabric endpoint flow converges in 2 iterations',
+          report['iterations_used'] == 2)
+    fields = ('cycles_per_byte', 'latency_cycles', 'cell_count', 'area',
+              'fmax_estimate_mhz', 'sim_checks_passed', 'endpoint_gbps')
+    ok = fp is not None and all(
+        fp.get(k) is not None and fp[k] > 0 for k in fields)
+    check('fabric profile fields all present and positive', ok)
+    rng = random.Random(9)
+    ok = all(crc32_word_serial(p) == zlib.crc32(p)
+             for p in (bytes(rng.randrange(256) for _ in range(4 * k))
+                       for k in (1, 2, 7, 33, 256)))
+    check('word-serial CRC32 reference matches zlib on random payloads', ok)
+    return fp
+
+
+def test_sizing(profile, fp):
+    ms = load_model_spec()
+    mid = fit('zynq_us_mid', profile, fp)
+
+    def boards_needed(m):
+        ch = size_fabric(m, mid)['chosen']
+        return ch['boards'] if ch else float('inf')
+
+    targets = [100, 300, 500, 1000, 2000]
+    need = [boards_needed(dict(ms, target_tokens_per_s=t)) for t in targets]
+    check('sizing monotonic: higher target rate needs more boards',
+          all(a <= b for a, b in zip(need, need[1:])))
+    need = [boards_needed(dict(ms, d_model=d)) for d in (384, 768, 1536)]
+    check('sizing monotonic: bigger model needs more boards',
+          all(a <= b for a, b in zip(need, need[1:])))
+
+    ch = size_fabric(ms, mid)['chosen']
+    check('sizing finds a config that meets the target on the mid class',
+          ch is not None
+          and ch['predicted_tok_per_s'] >= ms['target_tokens_per_s'])
+    r = simulate_decode([mid] * ch['boards'], ms, tokens=8)
+    ratio = r['tok_per_s'] / ch['predicted_tok_per_s']
+    check('analytic prediction within 15%% of fabric simulation '
+          '(ratio %.2f)' % ratio, 0.85 <= ratio <= 1.15)
+    check('decode issues n_layer * 2 all-reduces per token',
+          r['collectives_per_token'] == ms['n_layer'] * 2)
+    check('decode activations identical on every board',
+          r['vecs_equal_across_boards'])
+
+
 def test_link_reliability(profile):
     mid = fit('zynq_us_mid', profile)
     sim, boards = make_cluster([mid, mid], ber=1e-5)
@@ -114,5 +179,7 @@ if __name__ == '__main__':
     test_fit_monotonic(profile)
     test_allreduce(profile)
     test_hetero_bit_identical(profile)
+    fp = test_fabric_flow()
+    test_sizing(profile, fp)
     test_link_reliability(profile)
     print('all %d tests passed' % PASSED[0])

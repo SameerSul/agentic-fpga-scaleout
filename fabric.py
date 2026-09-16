@@ -414,6 +414,17 @@ class Board:
         vals = yield self.nic.recv_event(src, tag)
         return vals
 
+    def compute(self, macs):
+        """Process: charge time for `macs` MAC operations from the measured
+        cycle model without materializing matrices. Used for full-dimension
+        LLM decode where the weights would be too large for pure Python; the
+        numerics of the sharded math are validated separately at reduced
+        dimensions by matmul()."""
+        cycles = macs * self.cpm / self.instances
+        dur = cycles * self.clk_ns
+        self.busy_ns += dur
+        yield dur
+
     def matmul(self, A, B):
         """Process: MAC-array cycle model, then the real product.
         cycles = M*N*K*cycles_per_mac / instances + fill/drain."""

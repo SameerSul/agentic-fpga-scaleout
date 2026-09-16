@@ -1,18 +1,23 @@
-"""End-to-end demo: an agent generates chiplet RTL, the flow signs it off and
-measures a chiplet profile, the profile deploys onto simulated FPGA boards of
-three classes, and the interconnect fabric scales the workload out across
-homogeneous and heterogeneous clusters.
+"""End-to-end demo: the LLM is the input workload. Agents generate and sign
+off two pieces of RTL (the compute chiplet and the fabric endpoint), the
+measured profiles deploy onto simulated FPGA board classes, sizing derives
+the right fabric configuration to host the model at its target token rate,
+and the chosen cluster hosts decode on the discrete-event fabric. Scaling is
+adding more boards running the same synthesized fabric.
 
 Run: python3 demo.py    (writes results.json)"""
 import json
 import random
 
-from chiplet_flow import run_flow
-from boards import BOARDS, fit, FIT_FRACTION
-from fabric import make_cluster, fabric_stats, start, mm, relu
+from chiplet_flow import run_flow, CHIPLET_JOB, FABRIC_JOB
+from boards import fit, FIT_FRACTION
+from fabric import make_cluster, fabric_stats, mm, relu
 from collectives import ring_allreduce, run_workers
+from sizing import (load_model_spec, model_summary, size_fabric,
+                    simulate_decode)
 
-M, D, F = 64, 64, 512  # MLP shapes: x is MxD, W1 is DxF, W2 is FxD
+M, D, F = 64, 64, 512  # reduced-dim MLP shapes for the numerics check
+BOARD_ORDER = ('artix7_small', 'zynq_us_mid', 'versal_large')
 
 
 def table(title, headers, rows):
@@ -34,59 +39,195 @@ def fmt_ns(ns):
     return '%.0f ns' % ns
 
 
-def stage1_flow(results):
+def banner(n, text):
+    print('\n' + '=' * 72)
+    print('Stage %d: %s' % (n, text))
     print('=' * 72)
-    print('Stage 1: agentic RTL generation and signoff (iverilog, yosys, OpenSTA)')
-    print('=' * 72)
-    report, profile = run_flow(verbose=True)
-    assert report['converged'] and profile is not None, 'flow did not converge'
-    results['flow'] = {'converged': True,
-                       'iterations': report['iterations_used']}
+
+
+def stage1_model(results):
+    banner(1, 'the input LLM (model_spec.json drives everything downstream)')
+    ms = load_model_spec()
+    s = model_summary(ms)
+    rows = [
+        ['model', ms['name'], ms['description']],
+        ['layers x d_model x d_ff',
+         '%d x %d x %d' % (ms['n_layer'], ms['d_model'], ms['d_ff']),
+         'decoder-only transformer'],
+        ['MACs per decode token', '%.1fM' % (s['per_token_macs'] / 1e6),
+         'n_layer * (4*d^2 attn + 2*d*d_ff MLP)'],
+        ['all-reduces per token', s['allreduces_per_token'],
+         'Megatron TP: one per attn block, one per MLP block'],
+        ['bytes per all-reduce', s['allreduce_bytes'],
+         '[1, d_model] activation, %d-byte elements' % ms['dtype_bytes']],
+        ['comm bytes per token', s['comm_bytes_per_token'],
+         'what the fabric must carry per token'],
+        ['target', '%d tok/s' % ms['target_tokens_per_s'],
+         'the rate the fabric is sized to'],
+    ]
+    table('the workload the agents must build hardware for',
+          ['quantity', 'value', 'meaning'], rows)
+    results['model'] = {'spec': ms, 'summary': s}
+    return ms, s
+
+
+def stage2_chiplet(results):
+    banner(2, 'agents generate the compute chiplet '
+              '(iverilog, yosys, OpenSTA)')
+    report, profile = run_flow(CHIPLET_JOB, verbose=True)
+    assert report['converged'] and profile is not None
+    results['chiplet_flow'] = {'converged': True,
+                               'iterations': report['iterations_used']}
+    results['chiplet_profile'] = profile
     return profile
 
 
-def stage2_profile(profile, results):
-    print('\n' + '=' * 72)
-    print('Stage 2: measured chiplet profile (the contract between the halves)')
-    print('=' * 72)
-    rows = [
-        ['cycles_per_mac', '%.3f' % profile['cycles_per_mac'],
-         'measured by testbench burst (span cycles / MACs)'],
-        ['latency_cycles', profile['latency_cycles'], 'measured by testbench'],
-        ['cell_count', profile['cell_count'], 'yosys stat, generic liberty'],
-        ['area', profile['area'], 'yosys stat, generic liberty'],
-        ['fmax_estimate_mhz', '%.1f' % profile['fmax_estimate_mhz'],
-         'OpenSTA: 1000 / (period - worst slack)'],
-        ['sim_checks_passed', profile['sim_checks_passed'],
-         'self-checking testbench vs golden model'],
-    ]
-    table('chiplet_profile.json (method: %s)' % profile['fmax_method'],
-          ['field', 'value', 'provenance'], rows)
-    results['chiplet_profile'] = profile
+def stage3_endpoint(results):
+    banner(3, 'agents generate the fabric endpoint (CRC32 datapath, '
+              'same signoff)')
+    report, profile = run_flow(FABRIC_JOB, verbose=True)
+    assert report['converged'] and profile is not None
+    print('\n   the fabric is synthesized, not assumed: the endpoint that '
+          'checks every')
+    print('   packet in stage 6 is this RTL, and its measured rate caps the '
+          'link below')
+    results['fabric_flow'] = {'converged': True,
+                              'iterations': report['iterations_used']}
+    results['fabric_profile'] = profile
+    return profile
 
 
-def stage3_fit(profile, results):
-    print('\n' + '=' * 72)
-    print('Stage 3: the same profile deploys on any board class (boards.py)')
-    print('=' * 72)
-    rows, out = [], []
-    for name in ('artix7_small', 'zynq_us_mid', 'versal_large'):
-        f = fit(name, profile)
+def stage4_fit(cp, fp, results):
+    banner(4, 'both profiles deploy on any board class (boards.py)')
+    rows, out = [], {}
+    for name in BOARD_ORDER:
+        f = fit(name, cp, fp)
         rows.append([f['board_class'], f['instances'],
                      '%.1f' % f['clock_mhz'],
-                     '%.0f%%' % (100 * f['utilization']),
                      '%.2f' % (f['macs_per_s'] / 1e9),
-                     '%g / %d' % (f['link_gbps'], f['num_links'])])
-        out.append(f)
-    table('fit(board, chiplet_profile), usable fabric fraction = %.0f%%'
-          % (100 * FIT_FRACTION),
-          ['board class', 'instances', 'clock MHz', 'util',
-           'GMAC/s', 'link Gbps / lanes'], rows)
-    print('   no upstream change: instances and clock derive from the one '
-          'measured profile')
-    results['fit'] = out
-    return {name: fit(name, profile)
-            for name in ('artix7_small', 'zynq_us_mid', 'versal_large')}
+                     '%.1f' % f['transceiver_gbps'],
+                     '%.2f' % f['endpoint_gbps'],
+                     '%.2f' % f['link_gbps']])
+        out[name] = f
+    table('fit(board, chiplet_profile, fabric_profile), usable fabric '
+          'fraction = %.0f%%' % (100 * FIT_FRACTION),
+          ['board class', 'instances', 'clock MHz', 'GMAC/s',
+           'xcvr Gbps', 'endpoint Gbps', 'link Gbps'], rows)
+    print('   link rate = min(transceiver, synthesized endpoint): the '
+          'endpoint gates')
+    print('   the mid and large boards, an honest measured limit, not a '
+          'datasheet number')
+    results['fit'] = list(out.values())
+    return out
+
+
+def stage5_sizing(ms, fits_by_name, results):
+    banner(5, 'the right fabric: smallest cluster per board class that '
+              'hosts the model')
+    sizings, rows = {}, []
+    for name in BOARD_ORDER:
+        sz = size_fabric(ms, fits_by_name[name])
+        sizings[name] = sz
+        ch = sz['chosen']
+        if ch is None:
+            best = max(sz['sweep'], key=lambda p: p['predicted_tok_per_s'])
+            rows.append([name, 'unreachable',
+                         '%.0f @ n=%d' % (best['predicted_tok_per_s'],
+                                          best['boards']), ''])
+        else:
+            rows.append([name, ch['boards'],
+                         '%.0f' % ch['predicted_tok_per_s'],
+                         '%.0f%%' % (100 * ch['comm_fraction'])])
+    table('analytic sizing vs the %d tok/s target'
+          % ms['target_tokens_per_s'],
+          ['board class', 'boards needed', 'predicted tok/s',
+           'comm fraction'], rows)
+
+    mid = sizings['zynq_us_mid']
+    rows = [[p['boards'], '%.0f' % p['predicted_tok_per_s'],
+             fmt_ns(p['compute_ns_per_token']),
+             fmt_ns(p['comm_ns_per_token']),
+             'chosen' if mid['chosen'] and p['boards'] ==
+             mid['chosen']['boards'] else '']
+            for p in mid['sweep']]
+    table('candidate sweep on the mid class (compute shrinks with n, '
+          'all-reduce grows)',
+          ['boards', 'pred tok/s', 'compute/token', 'comm/token', ''], rows)
+    results['sizing'] = sizings
+    return sizings
+
+
+def stage6_host(ms, fits_by_name, sizings, results):
+    banner(6, 'host the model: decode on the chosen fabric, every '
+              'all-reduce real traffic')
+    name = 'zynq_us_mid'
+    ch = sizings[name]['chosen']
+    n = ch['boards']
+    r = simulate_decode([fits_by_name[name]] * n, ms, tokens=8)
+    ratio = r['tok_per_s'] / ch['predicted_tok_per_s']
+    rows = [
+        ['boards', n, 'chosen by sizing in stage 5'],
+        ['tokens decoded', r['tokens'], 'full n_layer loop per token'],
+        ['measured tok/s', '%.0f' % r['tok_per_s'],
+         'discrete-event fabric, packetized + CRC + credits'],
+        ['predicted tok/s', '%.0f' % ch['predicted_tok_per_s'],
+         'analytic model from stage 5'],
+        ['prediction ratio', '%.2f' % ratio, 'measured / predicted'],
+        ['collectives per token', '%.0f' % r['collectives_per_token'],
+         'n_layer * 2 = %d expected' % (ms['n_layer'] * 2)],
+        ['wire bytes', r['fabric']['wire_bytes'],
+         'headers and CRC included'],
+        ['activations identical', r['vecs_equal_across_boards'],
+         'every board holds the same reduced vector'],
+    ]
+    table('%d x %s hosting %s' % (n, name, ms['name']),
+          ['quantity', 'value', 'provenance'], rows)
+    ok = r['tok_per_s'] >= ms['target_tokens_per_s']
+    print('   target %s: %.0f tok/s measured vs %d required'
+          % ('met' if ok else 'MISSED', r['tok_per_s'],
+             ms['target_tokens_per_s']))
+    results['host'] = {'board': name, 'boards': n,
+                       'measured_tok_per_s': r['tok_per_s'],
+                       'predicted_tok_per_s': ch['predicted_tok_per_s'],
+                       'prediction_ratio': ratio,
+                       'target_met': ok, 'fabric': r['fabric']}
+    return r
+
+
+def stage7_scale(ms, fits_by_name, results):
+    banner(7, 'scale by adding boards, and survive a lossy fabric')
+    name = 'zynq_us_mid'
+    f = fits_by_name[name]
+    rows, out = [], []
+    for n in (2, 4, 8, 16):
+        r = simulate_decode([f] * n, ms, tokens=4)
+        rows.append([n, '%.0f' % r['tok_per_s'],
+                     fmt_ns(r['token_ns']),
+                     r['vecs_equal_across_boards']])
+        out.append({'boards': n, 'tok_per_s': r['tok_per_s'],
+                    'token_ns': r['token_ns']})
+    table('same synthesized fabric, more %s boards' % name,
+          ['boards', 'tok/s', 'time/token', 'activations identical'], rows)
+    print('   throughput scales until the ring all-reduce term (2*(n-1) '
+          'steps) pushes back')
+
+    n = 8
+    clean = next(o for o in out if o['boards'] == n)
+    r = simulate_decode([f] * n, ms, tokens=4, ber=1e-6)
+    st = r['fabric']
+    print('\n   BER 1e-6 on every link, %d boards: %d CRC drops, %d '
+          'retransmits,' % (n, st['crc_drops'], st['retransmits']))
+    print('   activations still identical on every board = %s, throughput '
+          '%.0f tok/s' % (r['vecs_equal_across_boards'], r['tok_per_s']))
+    print('   (%.1fx slower than the clean fabric: reliability costs '
+          'latency, never bits)' % (clean['tok_per_s'] / r['tok_per_s']))
+    assert r['vecs_equal_across_boards']
+    results['scaling'] = out
+    results['ber'] = {'ber': 1e-6, 'boards': n,
+                      'tok_per_s': r['tok_per_s'],
+                      'crc_drops': st['crc_drops'],
+                      'retransmits': st['retransmits'],
+                      'bit_exact': r['vecs_equal_across_boards']}
 
 
 def make_shards(x, W1, W2, cols):
@@ -108,7 +249,7 @@ def mlp_run(fits, cols=None, seed=7):
     n = len(fits)
     rng = random.Random(seed)
     rm = lambda r, c: [[rng.uniform(-0.5, 0.5) for _ in range(c)]
-                       for _ in range(r)]
+                      for _ in range(r)]
     x, W1, W2 = rm(M, D), rm(D, F), rm(F, D)
     ref = mm([[relu(v) for v in r] for r in mm(x, W1)], W2)
     flat_ref = [v for row in ref for v in row]
@@ -136,76 +277,48 @@ def mlp_run(fits, cols=None, seed=7):
     return t, err, util, outs[0]
 
 
-def stage4_scaleout(fits_by_name, results):
-    print('\n' + '=' * 72)
-    print('Stage 4: tensor-parallel MLP scaleout on the mid board class')
-    print('=' * 72)
+def stage8_numerics(fits_by_name, results):
+    banner(8, 'numerics check at reduced dimensions (real arithmetic '
+              'through the fabric)')
     mid = fits_by_name['zynq_us_mid']
-    macs = 2 * M * D * F  # two matmuls
-    rows, out, t1 = [], [], None
-    for n in (1, 2, 4, 8):
-        t, err, _, _ = mlp_run([mid] * n)
-        if n == 1:
-            t1 = t
-        rows.append([n, fmt_ns(t), '%.1f' % (2 * macs / t),
-                     '%.2fx' % (t1 / t), '%.1e' % err])
-        out.append({'boards': n, 'time_ns': t, 'gflops': 2 * macs / t,
-                    'speedup': t1 / t, 'max_err': err})
-    table('MLP x:%dx%d W1:%dx%d W2:%dx%d, fused ring all-reduce, '
-          'zynq_us_mid boards' % (M, D, D, F, F, D),
-          ['boards', 'time', 'GFLOP/s', 'speedup', 'max err vs ref'], rows)
-    print('   sharded output matches the single-board reference on every run')
-    results['scaleout'] = out
+    t_h, err_h, _, out_h = mlp_run([mid] * 4)
+    print('   homogeneous 4-board MLP %dx%d W1 %dx%d W2 %dx%d: time %s, '
+          'max err vs single-board reference %.1e'
+          % (M, D, D, F, F, D, fmt_ns(t_h), err_h))
 
-
-def stage5_hetero(fits_by_name, results):
-    print('\n' + '=' * 72)
-    print('Stage 5: heterogeneous cluster, same chiplet, mixed board classes')
-    print('=' * 72)
-    small, large = fits_by_name['artix7_small'], fits_by_name['versal_large']
-    fits = [small, small, large, large]
-
-    t_eq, err_eq, util_eq, _ = mlp_run(fits)
-    rows = [[f['board'], F // len(fits), '%.0f%%' % (100 * u)]
-            for f, u in zip(fits, util_eq)]
-    table('equal shard split (2 small + 2 large), time %s, max err %.1e'
-          % (fmt_ns(t_eq), err_eq),
-          ['board', 'columns', 'compute utilization'], rows)
-
-    # Work-proportional split: columns proportional to each board's MACs/s.
+    fits = [fits_by_name['artix7_small'], fits_by_name['artix7_small'],
+            fits_by_name['versal_large'], fits_by_name['versal_large']]
+    t_eq, err_eq, _, out_eq = mlp_run(fits)
     wsum = sum(f['macs_per_s'] for f in fits)
     cols = [max(1, round(F * f['macs_per_s'] / wsum)) for f in fits]
-    cols[-1] += F - sum(cols)  # largest board absorbs rounding
-    t_pr, err_pr, util_pr, _ = mlp_run(fits, cols=cols)
-    rows = [[f['board'], c, '%.0f%%' % (100 * u)]
-            for f, c, u in zip(fits, cols, util_pr)]
-    table('work-proportional split, time %s, max err %.1e'
-          % (fmt_ns(t_pr), err_pr),
-          ['board', 'columns', 'compute utilization'], rows)
-
-    t_ref, _, _, _ = mlp_run([fits_by_name['zynq_us_mid']] * 4)
-    print('   proportional split is %.2fx faster than equal split on the '
-          'mixed cluster (slow boards no longer gate the ring)'
-          % (t_eq / t_pr))
-    results['hetero'] = {
-        'boards': [f['board'] for f in fits],
-        'equal_split': {'time_ns': t_eq, 'max_err': err_eq,
-                        'utilization': util_eq},
-        'proportional_split': {'time_ns': t_pr, 'max_err': err_pr,
-                               'columns': cols, 'utilization': util_pr},
+    cols[-1] += F - sum(cols)
+    t_pr, err_pr, _, _ = mlp_run(fits, cols=cols)
+    print('   heterogeneous 2 small + 2 large: bit-identical output to '
+          'homogeneous = %s' % (out_eq == out_h))
+    print('   work-proportional shards (%s) recover %.2fx over the equal '
+          'split' % (cols, t_eq / t_pr))
+    results['numerics'] = {
+        'homogeneous': {'time_ns': t_h, 'max_err': err_h},
+        'hetero_equal': {'time_ns': t_eq, 'max_err': err_eq},
+        'hetero_proportional': {'time_ns': t_pr, 'max_err': err_pr,
+                                'columns': cols},
+        'bit_identical_across_clusters': out_eq == out_h,
         'recovery_factor': t_eq / t_pr,
-        'mid_homogeneous_4b_time_ns': t_ref,
     }
 
 
 def main():
-    print('Agentic FPGA scaleout: chiplet RTL to multi-board fabric, one run')
+    print('Agentic FPGA scaleout: given an LLM, generate and synthesize '
+          'the fabric to host it')
     results = {}
-    profile = stage1_flow(results)
-    stage2_profile(profile, results)
-    fits_by_name = stage3_fit(profile, results)
-    stage4_scaleout(fits_by_name, results)
-    stage5_hetero(fits_by_name, results)
+    ms, _ = stage1_model(results)
+    cp = stage2_chiplet(results)
+    fp = stage3_endpoint(results)
+    fits_by_name = stage4_fit(cp, fp, results)
+    sizings = stage5_sizing(ms, fits_by_name, results)
+    stage6_host(ms, fits_by_name, sizings, results)
+    stage7_scale(ms, fits_by_name, results)
+    stage8_numerics(fits_by_name, results)
     with open('results.json', 'w') as f:
         json.dump(results, f, indent=2)
     print('\nresults written to results.json')

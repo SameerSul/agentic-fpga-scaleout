@@ -1,11 +1,40 @@
 {
-  "flow": {
+  "model": {
+    "spec": {
+      "name": "gpt2_124m",
+      "description": "GPT-2 124M decoder-only transformer, the LLM the fabric is sized to host",
+      "n_layer": 12,
+      "d_model": 768,
+      "n_head": 12,
+      "d_ff": 3072,
+      "vocab": 50257,
+      "dtype_bytes": 8,
+      "target_tokens_per_s": 500,
+      "allreduces_per_token_per_layer": 2,
+      "notes": [
+        "Megatron tensor parallelism: QKV and c_fc column-parallel, out-proj and c_proj row-parallel.",
+        "Each layer ends its attention and MLP blocks with one all-reduce of a [1, d_model] activation, so decode pays n_layer * 2 all-reduces per token.",
+        "Activations travel as 8-byte IEEE doubles end to end, matching the fabric simulator, so every all-reduce check is exact; a real deployment would use fp16 or fp32 and halve or quarter the traffic."
+      ]
+    },
+    "summary": {
+      "attn_macs_per_layer": 2359296,
+      "mlp_macs_per_layer": 4718592,
+      "per_layer_macs": 7077888,
+      "per_token_macs": 84934656,
+      "allreduces_per_token": 24,
+      "allreduce_bytes": 6144,
+      "comm_bytes_per_token": 147456
+    }
+  },
+  "chiplet_flow": {
     "converged": true,
     "iterations": 3
   },
   "chiplet_profile": {
-    "chiplet": "mac8",
+    "block": "mac8",
     "top_module": "mac",
+    "unit": "mac",
     "cycles_per_mac": 1.0,
     "latency_cycles": 4,
     "cell_count": 1044,
@@ -14,111 +43,298 @@
     "fmax_method": "opensta_slack",
     "target_clock_mhz": 100,
     "sim_checks_passed": 594,
+    "chiplet": "mac8",
     "data_width": 8,
     "acc_width": 24
+  },
+  "fabric_flow": {
+    "converged": true,
+    "iterations": 2
+  },
+  "fabric_profile": {
+    "block": "crc32_endpoint",
+    "top_module": "crc32",
+    "unit": "byte",
+    "cycles_per_byte": 0.25,
+    "latency_cycles": 3,
+    "cell_count": 2016,
+    "area": 4193.0,
+    "fmax_estimate_mhz": 251.25628140703515,
+    "fmax_method": "opensta_slack",
+    "target_clock_mhz": 100,
+    "sim_checks_passed": 5,
+    "bytes_per_cycle": 4,
+    "endpoint_gbps": 8.040201005025125
   },
   "fit": [
     {
       "board": "artix7_small",
       "board_class": "small (Artix-7 class)",
-      "instances": 13,
+      "instances": 5,
       "clock_mhz": 150.0,
       "cycles_per_mac": 1.0,
-      "macs_per_s": 1950000000.0,
-      "utilization": 0.6786,
-      "link_gbps": 6.6,
+      "macs_per_s": 750000000.0,
+      "utilization": 0.261,
+      "link_gbps": 4.8,
+      "transceiver_gbps": 6.6,
+      "endpoint_gbps": 4.8,
       "link_prop_ns": 500.0,
       "num_links": 4
     },
     {
       "board": "zynq_us_mid",
       "board_class": "mid (Kintex/Zynq UltraScale class)",
-      "instances": 80,
+      "instances": 65,
       "clock_mhz": 188.67924528301887,
       "cycles_per_mac": 1.0,
-      "macs_per_s": 15094339622.64151,
-      "utilization": 0.696,
-      "link_gbps": 16.3,
+      "macs_per_s": 12264150943.396227,
+      "utilization": 0.5655,
+      "link_gbps": 8.040201005025125,
+      "transceiver_gbps": 16.3,
+      "endpoint_gbps": 8.040201005025125,
       "link_prop_ns": 400.0,
       "num_links": 8
     },
     {
       "board": "versal_large",
       "board_class": "large (Versal/Alveo class)",
-      "instances": 301,
+      "instances": 270,
       "clock_mhz": 188.67924528301887,
       "cycles_per_mac": 1.0,
-      "macs_per_s": 56792452830.18868,
-      "utilization": 0.69832,
-      "link_gbps": 32.0,
+      "macs_per_s": 50943396226.4151,
+      "utilization": 0.6264,
+      "link_gbps": 8.040201005025125,
+      "transceiver_gbps": 32.0,
+      "endpoint_gbps": 8.040201005025125,
       "link_prop_ns": 300.0,
       "num_links": 16
     }
   ],
-  "scaleout": [
-    {
-      "boards": 1,
-      "time_ns": 282473.04,
-      "gflops": 29.697021705151048,
-      "speedup": 1.0,
-      "max_err": 0.0
+  "sizing": {
+    "artix7_small": {
+      "board": "artix7_small",
+      "target_tok_per_s": 500,
+      "sweep": [
+        {
+          "boards": 1,
+          "compute_ns_per_token": 113246208.0,
+          "comm_ns_per_token": 0.0,
+          "token_ns": 113246208.0,
+          "predicted_tok_per_s": 8.830317744502315,
+          "comm_fraction": 0.0
+        },
+        {
+          "boards": 2,
+          "compute_ns_per_token": 56623104.0,
+          "comm_ns_per_token": 271360.0,
+          "token_ns": 56894464.0,
+          "predicted_tok_per_s": 17.57640251255377,
+          "comm_fraction": 0.004769532585806591
+        },
+        {
+          "boards": 4,
+          "compute_ns_per_token": 28311552.0,
+          "comm_ns_per_token": 445440.0,
+          "token_ns": 28756992.0,
+          "predicted_tok_per_s": 34.77415162197771,
+          "comm_fraction": 0.01548979809849375
+        },
+        {
+          "boards": 8,
+          "compute_ns_per_token": 14155776.0,
+          "comm_ns_per_token": 609280.0,
+          "token_ns": 14765056.0,
+          "predicted_tok_per_s": 67.7274776336778,
+          "comm_fraction": 0.0412649975726472
+        },
+        {
+          "boards": 16,
+          "compute_ns_per_token": 7077888.0,
+          "comm_ns_per_token": 844800.0000000001,
+          "token_ns": 7922688.0,
+          "predicted_tok_per_s": 126.21978803153677,
+          "comm_fraction": 0.10663047692904228
+        }
+      ],
+      "chosen": null
     },
+    "zynq_us_mid": {
+      "board": "zynq_us_mid",
+      "target_tok_per_s": 500,
+      "sweep": [
+        {
+          "boards": 1,
+          "compute_ns_per_token": 6925441.181538462,
+          "comm_ns_per_token": 0.0,
+          "token_ns": 6925441.181538462,
+          "predicted_tok_per_s": 144.39513292896868,
+          "comm_fraction": 0.0
+        },
+        {
+          "boards": 2,
+          "compute_ns_per_token": 3462720.590769231,
+          "comm_ns_per_token": 166873.92,
+          "token_ns": 3629594.510769231,
+          "predicted_tok_per_s": 275.51286983516707,
+          "comm_fraction": 0.045975912599844085
+        },
+        {
+          "boards": 4,
+          "compute_ns_per_token": 1731360.2953846154,
+          "comm_ns_per_token": 280543.68,
+          "token_ns": 2011903.9753846154,
+          "predicted_tok_per_s": 497.04161442835766,
+          "comm_fraction": 0.13944188362487256
+        },
+        {
+          "boards": 8,
+          "compute_ns_per_token": 865680.1476923077,
+          "comm_ns_per_token": 397844.16,
+          "token_ns": 1263524.3076923077,
+          "predicted_tok_per_s": 791.4370890310715,
+          "comm_fraction": 0.31486862387841186
+        },
+        {
+          "boards": 16,
+          "compute_ns_per_token": 432840.07384615386,
+          "comm_ns_per_token": 577425.6,
+          "token_ns": 1010265.6738461538,
+          "predicted_tok_per_s": 989.8386393679282,
+          "comm_fraction": 0.5715581702402095
+        }
+      ],
+      "chosen": {
+        "boards": 8,
+        "compute_ns_per_token": 865680.1476923077,
+        "comm_ns_per_token": 397844.16,
+        "token_ns": 1263524.3076923077,
+        "predicted_tok_per_s": 791.4370890310715,
+        "comm_fraction": 0.31486862387841186
+      }
+    },
+    "versal_large": {
+      "board": "versal_large",
+      "target_tok_per_s": 500,
+      "sweep": [
+        {
+          "boards": 1,
+          "compute_ns_per_token": 1667235.8399999999,
+          "comm_ns_per_token": 0.0,
+          "token_ns": 1667235.8399999999,
+          "predicted_tok_per_s": 599.7951675511007,
+          "comm_fraction": 0.0
+        },
+        {
+          "boards": 2,
+          "compute_ns_per_token": 833617.9199999999,
+          "comm_ns_per_token": 162073.92,
+          "token_ns": 995691.84,
+          "predicted_tok_per_s": 1004.3268005490535,
+          "comm_fraction": 0.16277518152604326
+        },
+        {
+          "boards": 4,
+          "compute_ns_per_token": 416808.95999999996,
+          "comm_ns_per_token": 266143.68,
+          "token_ns": 682952.6399999999,
+          "predicted_tok_per_s": 1464.2303747445799,
+          "comm_fraction": 0.3896956603023015
+        },
+        {
+          "boards": 8,
+          "compute_ns_per_token": 208404.47999999998,
+          "comm_ns_per_token": 364244.16,
+          "token_ns": 572648.6399999999,
+          "predicted_tok_per_s": 1746.2715007932268,
+          "comm_fraction": 0.6360691959383682
+        },
+        {
+          "boards": 16,
+          "compute_ns_per_token": 104202.23999999999,
+          "comm_ns_per_token": 505425.60000000003,
+          "token_ns": 609627.8400000001,
+          "predicted_tok_per_s": 1640.3450341113028,
+          "comm_fraction": 0.8290723730727257
+        }
+      ],
+      "chosen": {
+        "boards": 1,
+        "compute_ns_per_token": 1667235.8399999999,
+        "comm_ns_per_token": 0.0,
+        "token_ns": 1667235.8399999999,
+        "predicted_tok_per_s": 599.7951675511007,
+        "comm_fraction": 0.0
+      }
+    }
+  },
+  "host": {
+    "board": "zynq_us_mid",
+    "boards": 8,
+    "measured_tok_per_s": 752.9914613085242,
+    "predicted_tok_per_s": 791.4370890310715,
+    "prediction_ratio": 0.9514230148480722,
+    "target_met": true,
+    "fabric": {
+      "retransmits": 0,
+      "crc_drops": 0,
+      "seq_drops": 0,
+      "overflow_drops": 0,
+      "max_rx_occupancy": 1,
+      "credit_stalls": 0,
+      "stall_ns": 0.0,
+      "wire_bytes": 17461248
+    }
+  },
+  "scaling": [
     {
       "boards": 2,
-      "time_ns": 163389.2844171778,
-      "gflops": 51.34123715592985,
-      "speedup": 1.728834549998815,
-      "max_err": 1.2434497875801753e-14
+      "tok_per_s": 273.51692273944,
+      "token_ns": 3656080.910769197
     },
     {
       "boards": 4,
-      "time_ns": 105431.40662576671,
-      "gflops": 79.56460288702894,
-      "speedup": 2.6792115275730892,
-      "max_err": 8.881784197001252e-15
+      "tok_per_s": 487.41647241395606,
+      "token_ns": 2051633.5753846124
     },
     {
       "boards": 8,
-      "time_ns": 79620.46773006117,
-      "gflops": 105.357431815649,
-      "speedup": 3.5477440418671473,
-      "max_err": 9.769962616701378e-15
+      "tok_per_s": 752.9914613085277,
+      "token_ns": 1328036.3076922912
+    },
+    {
+      "boards": 16,
+      "tok_per_s": 926.4529113460636,
+      "token_ns": 1079385.673846152
     }
   ],
-  "hetero": {
-    "boards": [
-      "artix7_small",
-      "artix7_small",
-      "versal_large",
-      "versal_large"
-    ],
-    "equal_split": {
-      "time_ns": 604230.4335664357,
-      "max_err": 8.881784197001252e-15,
-      "utilization": [
-        0.8940043158637452,
-        0.8940043158637452,
-        0.03427582787683814,
-        0.03427582787683814
-      ]
+  "ber": {
+    "ber": 1e-06,
+    "boards": 8,
+    "tok_per_s": 315.00617477708437,
+    "crc_drops": 64,
+    "retransmits": 464,
+    "bit_exact": true
+  },
+  "numerics": {
+    "homogeneous": {
+      "time_ns": 146729.1138461538,
+      "max_err": 8.881784197001252e-15
     },
-    "proportional_split": {
-      "time_ns": 104512.65871337957,
+    "hetero_equal": {
+      "time_ns": 1488150.2400000005,
+      "max_err": 8.881784197001252e-15
+    },
+    "hetero_proportional": {
+      "time_ns": 132706.24,
       "max_err": 1.0658141036401503e-14,
       "columns": [
-        8,
-        8,
-        248,
-        248
-      ],
-      "utilization": [
-        0.3354764761816354,
-        0.3354764761816354,
-        0.3713888921150604,
-        0.3713888921150604
+        4,
+        4,
+        252,
+        252
       ]
     },
-    "recovery_factor": 5.7814090752729355,
-    "mid_homogeneous_4b_time_ns": 105431.40662576671
+    "bit_identical_across_clusters": true,
+    "recovery_factor": 11.21386786333484
   }
 }

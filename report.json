@@ -85,8 +85,8 @@
         "mismatches": [
           {
             "test": "wide_product",
-            "expected_acc": 65328,
-            "got_acc": 304,
+            "expected_acc": "65328",
+            "got_acc": "304",
             "expected_vout": "1",
             "got_vout": "1"
           }
@@ -107,8 +107,8 @@
         "mismatches": [
           {
             "test": "sync_clear",
-            "expected_acc": 0,
-            "got_acc": 101583,
+            "expected_acc": "0",
+            "got_acc": "101583",
             "expected_vout": "0",
             "got_vout": "0"
           }
@@ -132,7 +132,8 @@
           "macs": 256,
           "span_cycles": 256,
           "latency_cycles": 4,
-          "cycles_per_mac": 1.0
+          "units": 256,
+          "cycles_per_unit": 1.0
         }
       },
       "synth": {

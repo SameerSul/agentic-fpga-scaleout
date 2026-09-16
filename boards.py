@@ -47,18 +47,30 @@ BOARDS = {
 }
 
 
-def fit(board, chiplet_profile):
+def fit(board, chiplet_profile, fabric_profile=None):
     """Compute how the measured chiplet deploys on one board class.
 
     instances = floor(usable capacity / chiplet cell count)
     clock     = min(measured fmax, board clock cap)
     MACs/s    = instances * clock_mhz * 1e6 / cycles_per_mac
-    """
+
+    When a fabric_profile (the synthesized endpoint, fabric_profile.json) is
+    given, the usable link rate becomes min(board transceiver rate, endpoint
+    rate): the endpoint clock caps its own datapath at min(fmax, board clock
+    cap), and endpoint cells are reserved off the capacity proxy per link."""
     if isinstance(board, str):
         board = BOARDS[board]
     cells = chiplet_profile["cell_count"]
     cpm = chiplet_profile["cycles_per_mac"]
     usable = board["lut_capacity_proxy"] * FIT_FRACTION
+    link_gbps = board["link_gbps"]
+    endpoint_gbps = None
+    if fabric_profile is not None:
+        usable -= fabric_profile["cell_count"] * board["num_links"]
+        ep_clock = min(fabric_profile["fmax_estimate_mhz"],
+                       board["max_chiplet_clock_mhz"])
+        endpoint_gbps = fabric_profile["bytes_per_cycle"] * 8 * ep_clock / 1000.0
+        link_gbps = min(link_gbps, endpoint_gbps)
     instances = max(0, math.floor(usable / cells))
     clock_mhz = min(chiplet_profile["fmax_estimate_mhz"],
                     board["max_chiplet_clock_mhz"])
@@ -71,7 +83,9 @@ def fit(board, chiplet_profile):
         "cycles_per_mac": cpm,
         "macs_per_s": macs_per_s,
         "utilization": instances * cells / board["lut_capacity_proxy"],
-        "link_gbps": board["link_gbps"],
+        "link_gbps": link_gbps,
+        "transceiver_gbps": board["link_gbps"],
+        "endpoint_gbps": endpoint_gbps,
         "link_prop_ns": board["link_prop_ns"],
         "num_links": board["num_links"],
     }
