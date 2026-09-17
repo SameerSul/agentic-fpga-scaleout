@@ -9,12 +9,15 @@
       "d_ff": 3072,
       "vocab": 50257,
       "dtype_bytes": 8,
+      "weight_bits": 8,
+      "activation_bits": 8,
       "target_tokens_per_s": 500,
       "allreduces_per_token_per_layer": 2,
       "notes": [
         "Megatron tensor parallelism: QKV and c_fc column-parallel, out-proj and c_proj row-parallel.",
         "Each layer ends its attention and MLP blocks with one all-reduce of a [1, d_model] activation, so decode pays n_layer * 2 all-reduces per token.",
-        "Activations travel as 8-byte IEEE doubles end to end, matching the fabric simulator, so every all-reduce check is exact; a real deployment would use fp16 or fp32 and halve or quarter the traffic."
+        "Activations travel as 8-byte IEEE doubles end to end, matching the fabric simulator, so every all-reduce check is exact; a real deployment would use fp16 or fp32 and halve or quarter the traffic.",
+        "weight_bits and activation_bits describe the int8 deployment quantization of the matmuls; specgen.py derives the MAC chiplet datapath from them and the accumulator width from the longest dot-product reduction."
       ]
     },
     "summary": {
@@ -27,25 +30,109 @@
       "comm_bytes_per_token": 147456
     }
   },
+  "chiplet_spec": {
+    "name": "mac8_gpt2_124m",
+    "description": "8-bit pipelined multiply-accumulate unit derived from gpt2_124m: datapath from the model quantization, accumulator sized for its longest reduction",
+    "top_module": "mac",
+    "parameters": {
+      "data_width": 8,
+      "acc_width": 28,
+      "pipeline_stages": 2,
+      "target_clock_mhz": 100
+    },
+    "derivation": {
+      "model": "gpt2_124m",
+      "weight_bits": 8,
+      "activation_bits": 8,
+      "reduction_depth": 3072,
+      "guard_bits": 12,
+      "rule": "acc_width = weight_bits + activation_bits + ceil(log2(max(d_model, d_ff)))"
+    },
+    "ports": [
+      {
+        "name": "clk",
+        "dir": "input",
+        "width": 1,
+        "desc": "clock, rising edge"
+      },
+      {
+        "name": "rst_n",
+        "dir": "input",
+        "width": 1,
+        "desc": "active-low synchronous reset"
+      },
+      {
+        "name": "clear",
+        "dir": "input",
+        "width": 1,
+        "desc": "synchronous accumulator clear"
+      },
+      {
+        "name": "a",
+        "dir": "input",
+        "width": 8,
+        "desc": "multiplicand (activation)"
+      },
+      {
+        "name": "b",
+        "dir": "input",
+        "width": 8,
+        "desc": "multiplier (weight)"
+      },
+      {
+        "name": "valid_in",
+        "dir": "input",
+        "width": 1,
+        "desc": "input operands valid"
+      },
+      {
+        "name": "acc",
+        "dir": "output",
+        "width": 28,
+        "desc": "accumulator value"
+      },
+      {
+        "name": "valid_out",
+        "dir": "output",
+        "width": 1,
+        "desc": "acc updated this cycle"
+      }
+    ],
+    "behavior": [
+      "Stage 1 registers the full 16-bit product a*b and the valid flag.",
+      "Stage 2 adds the registered product into the 28-bit accumulator when the piped valid is set.",
+      "clear synchronously zeroes acc and valid_out, taking priority over accumulation.",
+      "Latency from valid_in to valid_out is 2 cycles.",
+      "28 accumulator bits = 16 product bits + 12 guard bits, enough for a 3072-deep dot product with no overflow."
+    ]
+  },
   "chiplet_flow": {
     "converged": true,
     "iterations": 3
   },
   "chiplet_profile": {
-    "block": "mac8",
+    "block": "mac8_gpt2_124m",
     "top_module": "mac",
     "unit": "mac",
     "cycles_per_mac": 1.0,
     "latency_cycles": 4,
-    "cell_count": 1044,
-    "area": 2066.0,
-    "fmax_estimate_mhz": 188.67924528301887,
+    "cell_count": 1052,
+    "area": 2098.0,
+    "fmax_estimate_mhz": 179.8561151079137,
     "fmax_method": "opensta_slack",
     "target_clock_mhz": 100,
     "sim_checks_passed": 594,
-    "chiplet": "mac8",
+    "chiplet": "mac8_gpt2_124m",
     "data_width": 8,
-    "acc_width": 24
+    "acc_width": 28,
+    "derivation": {
+      "model": "gpt2_124m",
+      "weight_bits": 8,
+      "activation_bits": 8,
+      "reduction_depth": 3072,
+      "guard_bits": 12,
+      "rule": "acc_width = weight_bits + activation_bits + ceil(log2(max(d_model, d_ff)))"
+    }
   },
   "fabric_flow": {
     "converged": true,
@@ -74,7 +161,7 @@
       "clock_mhz": 150.0,
       "cycles_per_mac": 1.0,
       "macs_per_s": 750000000.0,
-      "utilization": 0.261,
+      "utilization": 0.263,
       "link_gbps": 4.8,
       "transceiver_gbps": 6.6,
       "endpoint_gbps": 4.8,
@@ -84,11 +171,11 @@
     {
       "board": "zynq_us_mid",
       "board_class": "mid (Kintex/Zynq UltraScale class)",
-      "instances": 65,
-      "clock_mhz": 188.67924528301887,
+      "instances": 64,
+      "clock_mhz": 179.8561151079137,
       "cycles_per_mac": 1.0,
-      "macs_per_s": 12264150943.396227,
-      "utilization": 0.5655,
+      "macs_per_s": 11510791366.906477,
+      "utilization": 0.5610666666666667,
       "link_gbps": 8.040201005025125,
       "transceiver_gbps": 16.3,
       "endpoint_gbps": 8.040201005025125,
@@ -98,11 +185,11 @@
     {
       "board": "versal_large",
       "board_class": "large (Versal/Alveo class)",
-      "instances": 270,
-      "clock_mhz": 188.67924528301887,
+      "instances": 268,
+      "clock_mhz": 179.8561151079137,
       "cycles_per_mac": 1.0,
-      "macs_per_s": 50943396226.4151,
-      "utilization": 0.6264,
+      "macs_per_s": 48201438848.920876,
+      "utilization": 0.6265244444444444,
       "link_gbps": 8.040201005025125,
       "transceiver_gbps": 32.0,
       "endpoint_gbps": 8.040201005025125,
@@ -164,52 +251,52 @@
       "sweep": [
         {
           "boards": 1,
-          "compute_ns_per_token": 6925441.181538462,
+          "compute_ns_per_token": 7378698.239999998,
           "comm_ns_per_token": 0.0,
-          "token_ns": 6925441.181538462,
-          "predicted_tok_per_s": 144.39513292896868,
+          "token_ns": 7378698.239999998,
+          "predicted_tok_per_s": 135.52526034727777,
           "comm_fraction": 0.0
         },
         {
           "boards": 2,
-          "compute_ns_per_token": 3462720.590769231,
+          "compute_ns_per_token": 3689349.119999999,
           "comm_ns_per_token": 166873.92,
-          "token_ns": 3629594.510769231,
-          "predicted_tok_per_s": 275.51286983516707,
-          "comm_fraction": 0.045975912599844085
+          "token_ns": 3856223.039999999,
+          "predicted_tok_per_s": 259.32109985007514,
+          "comm_fraction": 0.04327392847069345
         },
         {
           "boards": 4,
-          "compute_ns_per_token": 1731360.2953846154,
+          "compute_ns_per_token": 1844674.5599999996,
           "comm_ns_per_token": 280543.68,
-          "token_ns": 2011903.9753846154,
-          "predicted_tok_per_s": 497.04161442835766,
-          "comm_fraction": 0.13944188362487256
+          "token_ns": 2125218.2399999998,
+          "predicted_tok_per_s": 470.5399102917544,
+          "comm_fraction": 0.13200699802011864
         },
         {
           "boards": 8,
-          "compute_ns_per_token": 865680.1476923077,
+          "compute_ns_per_token": 922337.2799999998,
           "comm_ns_per_token": 397844.16,
-          "token_ns": 1263524.3076923077,
-          "predicted_tok_per_s": 791.4370890310715,
-          "comm_fraction": 0.31486862387841186
+          "token_ns": 1320181.4399999997,
+          "predicted_tok_per_s": 757.4716396558341,
+          "comm_fraction": 0.301355668202698
         },
         {
           "boards": 16,
-          "compute_ns_per_token": 432840.07384615386,
+          "compute_ns_per_token": 461168.6399999999,
           "comm_ns_per_token": 577425.6,
-          "token_ns": 1010265.6738461538,
-          "predicted_tok_per_s": 989.8386393679282,
-          "comm_fraction": 0.5715581702402095
+          "token_ns": 1038594.2399999999,
+          "predicted_tok_per_s": 962.8399248584318,
+          "comm_fraction": 0.5559684213153349
         }
       ],
       "chosen": {
         "boards": 8,
-        "compute_ns_per_token": 865680.1476923077,
+        "compute_ns_per_token": 922337.2799999998,
         "comm_ns_per_token": 397844.16,
-        "token_ns": 1263524.3076923077,
-        "predicted_tok_per_s": 791.4370890310715,
-        "comm_fraction": 0.31486862387841186
+        "token_ns": 1320181.4399999997,
+        "predicted_tok_per_s": 757.4716396558341,
+        "comm_fraction": 0.301355668202698
       }
     },
     "versal_large": {
@@ -218,51 +305,51 @@
       "sweep": [
         {
           "boards": 1,
-          "compute_ns_per_token": 1667235.8399999999,
+          "compute_ns_per_token": 1762077.1916417906,
           "comm_ns_per_token": 0.0,
-          "token_ns": 1667235.8399999999,
-          "predicted_tok_per_s": 599.7951675511007,
+          "token_ns": 1762077.1916417906,
+          "predicted_tok_per_s": 567.5120277042257,
           "comm_fraction": 0.0
         },
         {
           "boards": 2,
-          "compute_ns_per_token": 833617.9199999999,
+          "compute_ns_per_token": 881038.5958208953,
           "comm_ns_per_token": 162073.92,
-          "token_ns": 995691.84,
-          "predicted_tok_per_s": 1004.3268005490535,
-          "comm_fraction": 0.16277518152604326
+          "token_ns": 1043112.5158208953,
+          "predicted_tok_per_s": 958.6693523785714,
+          "comm_fraction": 0.1553752999238564
         },
         {
           "boards": 4,
-          "compute_ns_per_token": 416808.95999999996,
+          "compute_ns_per_token": 440519.29791044764,
           "comm_ns_per_token": 266143.68,
-          "token_ns": 682952.6399999999,
-          "predicted_tok_per_s": 1464.2303747445799,
-          "comm_fraction": 0.3896956603023015
+          "token_ns": 706662.9779104476,
+          "predicted_tok_per_s": 1415.1017263659817,
+          "comm_fraction": 0.3766203810293954
         },
         {
           "boards": 8,
-          "compute_ns_per_token": 208404.47999999998,
+          "compute_ns_per_token": 220259.64895522382,
           "comm_ns_per_token": 364244.16,
-          "token_ns": 572648.6399999999,
-          "predicted_tok_per_s": 1746.2715007932268,
-          "comm_fraction": 0.6360691959383682
+          "token_ns": 584503.8089552238,
+          "predicted_tok_per_s": 1710.852837362101,
+          "comm_fraction": 0.623168154628575
         },
         {
           "boards": 16,
-          "compute_ns_per_token": 104202.23999999999,
+          "compute_ns_per_token": 110129.82447761191,
           "comm_ns_per_token": 505425.60000000003,
-          "token_ns": 609627.8400000001,
-          "predicted_tok_per_s": 1640.3450341113028,
-          "comm_fraction": 0.8290723730727257
+          "token_ns": 615555.4244776119,
+          "predicted_tok_per_s": 1624.5490823976495,
+          "comm_fraction": 0.8210886947002815
         }
       ],
       "chosen": {
         "boards": 1,
-        "compute_ns_per_token": 1667235.8399999999,
+        "compute_ns_per_token": 1762077.1916417906,
         "comm_ns_per_token": 0.0,
-        "token_ns": 1667235.8399999999,
-        "predicted_tok_per_s": 599.7951675511007,
+        "token_ns": 1762077.1916417906,
+        "predicted_tok_per_s": 567.5120277042257,
         "comm_fraction": 0.0
       }
     }
@@ -270,9 +357,9 @@
   "host": {
     "board": "zynq_us_mid",
     "boards": 8,
-    "measured_tok_per_s": 752.9914613085242,
-    "predicted_tok_per_s": 791.4370890310715,
-    "prediction_ratio": 0.9514230148480722,
+    "measured_tok_per_s": 722.1815104432054,
+    "predicted_tok_per_s": 757.4716396558341,
+    "prediction_ratio": 0.9534106263982858,
     "target_met": true,
     "fabric": {
       "retransmits": 0,
@@ -288,36 +375,36 @@
   "scaling": [
     {
       "boards": 2,
-      "tok_per_s": 273.51692273944,
-      "token_ns": 3656080.910769197
+      "tok_per_s": 257.5521077363982,
+      "token_ns": 3882709.4399999594
     },
     {
       "boards": 4,
-      "tok_per_s": 487.41647241395606,
-      "token_ns": 2051633.5753846124
+      "tok_per_s": 461.90489282180727,
+      "token_ns": 2164947.8399999933
     },
     {
       "boards": 8,
-      "tok_per_s": 752.9914613085277,
-      "token_ns": 1328036.3076922912
+      "tok_per_s": 722.1815104432175,
+      "token_ns": 1384693.4399999797
     },
     {
       "boards": 16,
-      "tok_per_s": 926.4529113460636,
-      "token_ns": 1079385.673846152
+      "tok_per_s": 902.7599031316905,
+      "token_ns": 1107714.2400000065
     }
   ],
   "ber": {
     "ber": 1e-06,
     "boards": 8,
-    "tok_per_s": 315.00617477708437,
+    "tok_per_s": 307.90802568657693,
     "crc_drops": 64,
     "retransmits": 464,
     "bit_exact": true
   },
   "numerics": {
     "homogeneous": {
-      "time_ns": 146729.1138461538,
+      "time_ns": 152403.51999999993,
       "max_err": 8.881784197001252e-15
     },
     "hetero_equal": {
@@ -325,7 +412,7 @@
       "max_err": 8.881784197001252e-15
     },
     "hetero_proportional": {
-      "time_ns": 132706.24,
+      "time_ns": 134501.26507462686,
       "max_err": 1.0658141036401503e-14,
       "columns": [
         4,
@@ -335,6 +422,6 @@
       ]
     },
     "bit_identical_across_clusters": true,
-    "recovery_factor": 11.21386786333484
+    "recovery_factor": 11.064209984748569
   }
 }

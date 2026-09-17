@@ -1,13 +1,21 @@
 {
   "spec": {
-    "name": "mac8",
-    "description": "8-bit pipelined multiply-accumulate unit with synchronous clear and valid handshake",
+    "name": "mac8_gpt2_124m",
+    "description": "8-bit pipelined multiply-accumulate unit derived from gpt2_124m: datapath from the model quantization, accumulator sized for its longest reduction",
     "top_module": "mac",
     "parameters": {
       "data_width": 8,
-      "acc_width": 24,
+      "acc_width": 28,
       "pipeline_stages": 2,
       "target_clock_mhz": 100
+    },
+    "derivation": {
+      "model": "gpt2_124m",
+      "weight_bits": 8,
+      "activation_bits": 8,
+      "reduction_depth": 3072,
+      "guard_bits": 12,
+      "rule": "acc_width = weight_bits + activation_bits + ceil(log2(max(d_model, d_ff)))"
     },
     "ports": [
       {
@@ -32,13 +40,13 @@
         "name": "a",
         "dir": "input",
         "width": 8,
-        "desc": "multiplicand"
+        "desc": "multiplicand (activation)"
       },
       {
         "name": "b",
         "dir": "input",
         "width": 8,
-        "desc": "multiplier"
+        "desc": "multiplier (weight)"
       },
       {
         "name": "valid_in",
@@ -49,7 +57,7 @@
       {
         "name": "acc",
         "dir": "output",
-        "width": 24,
+        "width": 28,
         "desc": "accumulator value"
       },
       {
@@ -61,9 +69,10 @@
     ],
     "behavior": [
       "Stage 1 registers the full 16-bit product a*b and the valid flag.",
-      "Stage 2 adds the registered product into the 24-bit accumulator when the piped valid is set.",
+      "Stage 2 adds the registered product into the 28-bit accumulator when the piped valid is set.",
       "clear synchronously zeroes acc and valid_out, taking priority over accumulation.",
-      "Latency from valid_in to valid_out is 2 cycles."
+      "Latency from valid_in to valid_out is 2 cycles.",
+      "28 accumulator bits = 16 product bits + 12 guard bits, enough for a 3072-deep dot product with no overflow."
     ]
   },
   "tools": {
@@ -108,7 +117,7 @@
           {
             "test": "sync_clear",
             "expected_acc": "0",
-            "got_acc": "101583",
+            "got_acc": "129845",
             "expected_vout": "0",
             "got_vout": "0"
           }
@@ -139,29 +148,29 @@
       "synth": {
         "stage": "synth",
         "status": "pass",
-        "cell_count": 1044,
-        "area": 2066.0
+        "cell_count": 1052,
+        "area": 2098.0
       },
       "timing": {
         "stage": "timing",
         "status": "pass",
         "method": "opensta",
         "clock_period_ns": 10.0,
-        "worst_slack_ns": 4.7
+        "worst_slack_ns": 4.44
       }
     }
   ],
   "final_metrics": {
     "sim_pass": true,
     "sim_checks": 594,
-    "cell_count": 1044,
-    "area": 2066.0,
+    "cell_count": 1052,
+    "area": 2098.0,
     "timing": {
       "stage": "timing",
       "status": "pass",
       "method": "opensta",
       "clock_period_ns": 10.0,
-      "worst_slack_ns": 4.7
+      "worst_slack_ns": 4.44
     }
   }
 }

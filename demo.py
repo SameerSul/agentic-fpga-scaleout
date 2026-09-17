@@ -10,6 +10,7 @@ import json
 import random
 
 from chiplet_flow import run_flow, CHIPLET_JOB, FABRIC_JOB
+from specgen import generate
 from boards import fit, FIT_FRACTION
 from fabric import make_cluster, fabric_stats, mm, relu
 from collectives import ring_allreduce, run_workers
@@ -71,11 +72,28 @@ def stage1_model(results):
     return ms, s
 
 
-def stage2_chiplet(results):
-    banner(2, 'agents generate the compute chiplet '
-              '(iverilog, yosys, OpenSTA)')
+def stage2_chiplet(ms, results):
+    banner(2, 'derive the chiplet spec from the model, then agents '
+              'generate it')
+    spec = generate(ms)
+    p, dv = spec['parameters'], spec['derivation']
+    rows = [
+        ['MAC datapath', '%d x %d bits' % (p['data_width'], p['data_width']),
+         'the model quantization: weight_bits=%d, activation_bits=%d'
+         % (dv['weight_bits'], dv['activation_bits'])],
+        ['accumulator', '%d bits' % p['acc_width'],
+         '%d product bits + %d guard bits, overflow-free by construction'
+         % (dv['weight_bits'] + dv['activation_bits'], dv['guard_bits'])],
+        ['guard bits', dv['guard_bits'],
+         'ceil(log2(%d)), the longest dot-product reduction (d_ff)'
+         % dv['reduction_depth']],
+    ]
+    table('%s: spec_mac.json and tb_mac.v both generated from the model'
+          % spec['name'], ['quantity', 'value', 'derivation'], rows)
+    print()
     report, profile = run_flow(CHIPLET_JOB, verbose=True)
     assert report['converged'] and profile is not None
+    results['chiplet_spec'] = spec
     results['chiplet_flow'] = {'converged': True,
                                'iterations': report['iterations_used']}
     results['chiplet_profile'] = profile
@@ -312,7 +330,7 @@ def main():
           'the fabric to host it')
     results = {}
     ms, _ = stage1_model(results)
-    cp = stage2_chiplet(results)
+    cp = stage2_chiplet(ms, results)
     fp = stage3_endpoint(results)
     fits_by_name = stage4_fit(cp, fp, results)
     sizings = stage5_sizing(ms, fits_by_name, results)

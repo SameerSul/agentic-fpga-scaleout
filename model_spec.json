@@ -7,11 +7,14 @@
   "d_ff": 3072,
   "vocab": 50257,
   "dtype_bytes": 8,
+  "weight_bits": 8,
+  "activation_bits": 8,
   "target_tokens_per_s": 500,
   "allreduces_per_token_per_layer": 2,
   "notes": [
     "Megatron tensor parallelism: QKV and c_fc column-parallel, out-proj and c_proj row-parallel.",
     "Each layer ends its attention and MLP blocks with one all-reduce of a [1, d_model] activation, so decode pays n_layer * 2 all-reduces per token.",
-    "Activations travel as 8-byte IEEE doubles end to end, matching the fabric simulator, so every all-reduce check is exact; a real deployment would use fp16 or fp32 and halve or quarter the traffic."
+    "Activations travel as 8-byte IEEE doubles end to end, matching the fabric simulator, so every all-reduce check is exact; a real deployment would use fp16 or fp32 and halve or quarter the traffic.",
+    "weight_bits and activation_bits describe the int8 deployment quantization of the matmuls; specgen.py derives the MAC chiplet datapath from them and the accumulator width from the longest dot-product reduction."
   ]
 }

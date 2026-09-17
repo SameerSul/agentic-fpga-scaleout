@@ -3,9 +3,11 @@ returns Verilog source derived from parsed tool feedback, never from an
 iteration counter. To upgrade, replace RuleBasedAgent with a class whose
 propose() sends spec plus feedback to an LLM and returns its Verilog.
 
-Two block types are handled, dispatched on spec name: the compute chiplet
-(mac8) and the fabric endpoint (crc32_endpoint). Each carries its own seeded
-first-cut bugs so the demo shows the feedback loop converging on both."""
+Two block types are handled, dispatched on spec name: the fabric endpoint
+(crc32_endpoint) and the compute chiplet (any MAC spec, including the ones
+specgen.py derives from the model, at whatever data and accumulator widths
+the derivation chose). Each carries its own seeded first-cut bugs so the demo
+shows the feedback loop converging on both."""
 
 FIX_WIDTH = "widen_product_register"
 FIX_CLEAR = "implement_sync_clear"

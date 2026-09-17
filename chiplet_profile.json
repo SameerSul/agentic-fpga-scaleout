@@ -1,16 +1,24 @@
 {
-  "block": "mac8",
+  "block": "mac8_gpt2_124m",
   "top_module": "mac",
   "unit": "mac",
   "cycles_per_mac": 1.0,
   "latency_cycles": 4,
-  "cell_count": 1044,
-  "area": 2066.0,
-  "fmax_estimate_mhz": 188.67924528301887,
+  "cell_count": 1052,
+  "area": 2098.0,
+  "fmax_estimate_mhz": 179.8561151079137,
   "fmax_method": "opensta_slack",
   "target_clock_mhz": 100,
   "sim_checks_passed": 594,
-  "chiplet": "mac8",
+  "chiplet": "mac8_gpt2_124m",
   "data_width": 8,
-  "acc_width": 24
+  "acc_width": 28,
+  "derivation": {
+    "model": "gpt2_124m",
+    "weight_bits": 8,
+    "activation_bits": 8,
+    "reduction_depth": 3072,
+    "guard_bits": 12,
+    "rule": "acc_width = weight_bits + activation_bits + ceil(log2(max(d_model, d_ff)))"
+  }
 }

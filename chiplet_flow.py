@@ -5,12 +5,16 @@ iterations, then writes a measured profile JSON: the contract the scaleout
 fabric consumes.
 
 Two generated blocks share this one flow, defined as jobs: the compute
-chiplet (spec.json + tb_mac.v -> chiplet_profile.json, cycles_per_mac) and
-the fabric endpoint (spec_crc.json + tb_crc.v -> fabric_profile.json,
-cycles_per_byte). Run: python3 chiplet_flow.py"""
+chiplet (spec_mac.json + tb_mac.v -> chiplet_profile.json, cycles_per_mac)
+and the fabric endpoint (spec_crc.json + tb_crc.v -> fabric_profile.json,
+cycles_per_byte). The chiplet spec and testbench are not checked-in inputs:
+jobs marked derive_from_model regenerate them from model_spec.json via
+specgen.py before every run, so the hardware always tracks the model.
+Run: python3 chiplet_flow.py"""
 import json, os, re, shutil, subprocess, sys
 
 from agent import RuleBasedAgent
+import specgen
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 BUILD = os.path.join(ROOT, "build")
@@ -21,8 +25,9 @@ MAX_ITERS = 5
 PROXY_GATE_NS = 0.12
 
 CHIPLET_JOB = {
-    "spec_file": "spec.json", "tb_file": "tb_mac.v", "rtl_file": "mac.v",
+    "spec_file": "spec_mac.json", "tb_file": "tb_mac.v", "rtl_file": "mac.v",
     "profile_file": "chiplet_profile.json", "report_file": "report.json",
+    "derive_from_model": True,
 }
 FABRIC_JOB = {
     "spec_file": "spec_crc.json", "tb_file": "tb_crc.v", "rtl_file": "crc.v",
@@ -195,6 +200,8 @@ def derive_profile(spec, final):
         prof["chiplet"] = spec["name"]
         prof["data_width"] = spec["parameters"]["data_width"]
         prof["acc_width"] = spec["parameters"]["acc_width"]
+        if "derivation" in spec:
+            prof["derivation"] = spec["derivation"]
     else:
         prof["bytes_per_cycle"] = spec["parameters"]["bytes_per_cycle"]
         # The link rate the synthesized endpoint can actually sustain:
@@ -211,6 +218,8 @@ def run_flow(job=None, verbose=True):
     say = print if verbose else (lambda *a, **k: None)
     os.makedirs(BUILD, exist_ok=True)
     shutil.copy(LIB, BUILD)
+    if job.get("derive_from_model"):
+        specgen.generate(spec_file=job["spec_file"], tb_file=job["tb_file"])
     spec = json.load(open(os.path.join(ROOT, job["spec_file"])))
     tools = {t: tool(t) for t in ("iverilog", "vvp", "yosys", "sta")}
     say("Tools:", ", ".join("{}={}".format(k, v or "MISSING") for k, v in tools.items()))

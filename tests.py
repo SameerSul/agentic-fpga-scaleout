@@ -1,11 +1,14 @@
 """Correctness tests. Run: python3 tests.py
-Runs both agentic flows once (needs iverilog/vvp), then exercises the fit
-layer, the fabric, and the model sizing against exact references. Pure
-Python 3 stdlib."""
+Runs both agentic flows once (needs iverilog/vvp), then exercises the spec
+derivation, the fit layer, the fabric, and the model sizing against exact
+references. Pure Python 3 stdlib."""
+import math
+import os
 import random
 import zlib
 
-from chiplet_flow import run_flow, FABRIC_JOB
+from chiplet_flow import run_flow, FABRIC_JOB, ROOT
+from specgen import derive_chiplet_spec, generate
 from boards import BOARDS, fit
 from fabric import make_cluster, fabric_stats, mm, relu, RX_CAP
 from collectives import ring_allreduce, run_workers
@@ -92,6 +95,45 @@ def test_hetero_bit_identical(profile):
           t_x > t_h)
 
 
+def test_specgen(profile):
+    ms = load_model_spec()
+    spec = derive_chiplet_spec(ms)
+    p = spec['parameters']
+    aw = (ms['weight_bits'] + ms['activation_bits']
+          + math.ceil(math.log2(max(ms['d_model'], ms['d_ff']))))
+    check('chiplet datapath width follows the model quantization',
+          p['data_width'] == max(ms['weight_bits'], ms['activation_bits']))
+    check('accumulator width covers the longest reduction exactly',
+          p['acc_width'] == aw)
+    check('signed-off profile carries the derived widths',
+          profile['data_width'] == p['data_width']
+          and profile['acc_width'] == p['acc_width'])
+    wide = derive_chiplet_spec(dict(ms, d_ff=4 * ms['d_ff']))
+    check('deeper reduction derives a wider accumulator',
+          wide['parameters']['acc_width'] == p['acc_width'] + 2)
+
+
+def test_model_driven_flow(profile):
+    """A different model must yield different signed-off hardware through the
+    identical loop: re-quantize to 4 bits and run the full flow again."""
+    ms = load_model_spec()
+    q4 = dict(ms, name='gpt2_q4', weight_bits=4, activation_bits=4)
+    job = {'spec_file': 'spec_q4.json', 'tb_file': 'tb_q4.v',
+           'rtl_file': 'mac_q4.v', 'profile_file': 'profile_q4.json',
+           'report_file': 'report_q4.json'}
+    generate(q4, spec_file=job['spec_file'], tb_file=job['tb_file'])
+    report, prof = run_flow(job, verbose=False)
+    check('4-bit quantized model: flow converges on the derived spec',
+          report['converged'] and report['iterations_used'] == 3)
+    check('4-bit quantized model: profile has 4-bit datapath, 20-bit acc',
+          prof['data_width'] == 4 and prof['acc_width'] == 4 + 4 + 12)
+    check('4-bit chiplet is smaller than the 8-bit chiplet',
+          prof['cell_count'] < profile['cell_count'])
+    for f in job.values():
+        if f != 'mac_q4.v':
+            os.remove(os.path.join(ROOT, f))
+
+
 def crc32_word_serial(data):
     """Python mirror of the generated RTL: 32-bit word-serial, bytes packed
     little-endian, reflected poly 0xEDB88320, init and final XOR all-ones.
@@ -176,6 +218,8 @@ def test_link_reliability(profile):
 if __name__ == '__main__':
     report, profile = get_profile()
     test_flow_and_profile(report, profile)
+    test_specgen(profile)
+    test_model_driven_flow(profile)
     test_fit_monotonic(profile)
     test_allreduce(profile)
     test_hetero_bit_identical(profile)

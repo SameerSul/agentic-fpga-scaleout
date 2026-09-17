@@ -1,0 +1,76 @@
+{
+  "name": "mac8_gpt2_124m",
+  "description": "8-bit pipelined multiply-accumulate unit derived from gpt2_124m: datapath from the model quantization, accumulator sized for its longest reduction",
+  "top_module": "mac",
+  "parameters": {
+    "data_width": 8,
+    "acc_width": 28,
+    "pipeline_stages": 2,
+    "target_clock_mhz": 100
+  },
+  "derivation": {
+    "model": "gpt2_124m",
+    "weight_bits": 8,
+    "activation_bits": 8,
+    "reduction_depth": 3072,
+    "guard_bits": 12,
+    "rule": "acc_width = weight_bits + activation_bits + ceil(log2(max(d_model, d_ff)))"
+  },
+  "ports": [
+    {
+      "name": "clk",
+      "dir": "input",
+      "width": 1,
+      "desc": "clock, rising edge"
+    },
+    {
+      "name": "rst_n",
+      "dir": "input",
+      "width": 1,
+      "desc": "active-low synchronous reset"
+    },
+    {
+      "name": "clear",
+      "dir": "input",
+      "width": 1,
+      "desc": "synchronous accumulator clear"
+    },
+    {
+      "name": "a",
+      "dir": "input",
+      "width": 8,
+      "desc": "multiplicand (activation)"
+    },
+    {
+      "name": "b",
+      "dir": "input",
+      "width": 8,
+      "desc": "multiplier (weight)"
+    },
+    {
+      "name": "valid_in",
+      "dir": "input",
+      "width": 1,
+      "desc": "input operands valid"
+    },
+    {
+      "name": "acc",
+      "dir": "output",
+      "width": 28,
+      "desc": "accumulator value"
+    },
+    {
+      "name": "valid_out",
+      "dir": "output",
+      "width": 1,
+      "desc": "acc updated this cycle"
+    }
+  ],
+  "behavior": [
+    "Stage 1 registers the full 16-bit product a*b and the valid flag.",
+    "Stage 2 adds the registered product into the 28-bit accumulator when the piped valid is set.",
+    "clear synchronously zeroes acc and valid_out, taking priority over accumulation.",
+    "Latency from valid_in to valid_out is 2 cycles.",
+    "28 accumulator bits = 16 product bits + 12 guard bits, enough for a 3072-deep dot product with no overflow."
+  ]
+}
