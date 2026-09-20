@@ -57,6 +57,12 @@ def stage1_model(results):
          'decoder-only transformer'],
         ['MACs per decode token', '%.1fM' % (s['per_token_macs'] / 1e6),
          'n_layer * (4*d^2 attn + 2*d*d_ff MLP)'],
+        ['KV-attention MACs', '%.1fM' % (s['kv_macs_per_token'] / 1e6),
+         'n_layer * 2 * seq_len * d_model at seq_len %d' % ms['seq_len']],
+        ['weight bytes per token', '%.1f MB' % (s['weight_bytes'] / 1e6),
+         'batch-1 identity: every block weight read once per token'],
+        ['KV cache', '%.1f MB' % (s['kv_cache_bytes'] / 1e6),
+         'read fully from DDR every token; sharded with the heads'],
         ['all-reduces per token', s['allreduces_per_token'],
          'Megatron TP: one per attn block, one per MLP block'],
         ['bytes per all-reduce', s['allreduce_bytes'],
@@ -125,12 +131,15 @@ def stage4_fit(cp, fp, results):
                      '%.2f' % (f['macs_per_s'] / 1e9),
                      '%.1f' % f['transceiver_gbps'],
                      '%.2f' % f['endpoint_gbps'],
-                     '%.2f' % f['link_gbps']])
+                     '%.2f' % f['link_gbps'],
+                     '%.1f' % f['mem_bytes_per_ns'],
+                     '%.1f' % (f['sram_bytes'] / 1e6)])
         out[name] = f
     table('fit(board, chiplet_profile, fabric_profile), usable fabric '
           'fraction = %.0f%%' % (100 * FIT_FRACTION),
           ['board class', 'instances', 'clock MHz', 'GMAC/s',
-           'xcvr Gbps', 'endpoint Gbps', 'link Gbps'], rows)
+           'xcvr Gbps', 'endpoint Gbps', 'link Gbps', 'DDR GB/s',
+           'SRAM MB'], rows)
     print('   link rate = min(transceiver, synthesized endpoint): the '
           'endpoint gates')
     print('   the mid and large boards, an honest measured limit, not a '
@@ -151,26 +160,35 @@ def stage5_sizing(ms, fits_by_name, results):
             best = max(sz['sweep'], key=lambda p: p['predicted_tok_per_s'])
             rows.append([name, 'unreachable',
                          '%.0f @ n=%d' % (best['predicted_tok_per_s'],
-                                          best['boards']), ''])
+                                          best['boards']),
+                         best['bound'], ''])
         else:
             rows.append([name, ch['boards'],
-                         '%.0f' % ch['predicted_tok_per_s'],
-                         '%.0f%%' % (100 * ch['comm_fraction'])])
+                         '%.0f' % ch['predicted_tok_per_s'], ch['bound'],
+                         'yes' if ch['sram_resident'] else 'no'])
     table('analytic sizing vs the %d tok/s target'
           % ms['target_tokens_per_s'],
-          ['board class', 'boards needed', 'predicted tok/s',
-           'comm fraction'], rows)
+          ['board class', 'boards needed', 'predicted tok/s', 'bound',
+           'weights in SRAM'], rows)
+    print('   decode is memory-bound until the weight shard fits on-chip '
+          'SRAM: the small')
+    print('   and mid classes never get there, so only the large class '
+          'can host the target')
 
-    mid = sizings['zynq_us_mid']
+    lg = sizings['versal_large']
     rows = [[p['boards'], '%.0f' % p['predicted_tok_per_s'],
              fmt_ns(p['compute_ns_per_token']),
+             fmt_ns(p['mem_ns_per_token']),
              fmt_ns(p['comm_ns_per_token']),
-             'chosen' if mid['chosen'] and p['boards'] ==
-             mid['chosen']['boards'] else '']
-            for p in mid['sweep']]
-    table('candidate sweep on the mid class (compute shrinks with n, '
-          'all-reduce grows)',
-          ['boards', 'pred tok/s', 'compute/token', 'comm/token', ''], rows)
+             p['bound'],
+             'yes' if p['sram_resident'] else 'no',
+             'chosen' if lg['chosen'] and p['boards'] ==
+             lg['chosen']['boards'] else '']
+            for p in lg['sweep']]
+    table('candidate sweep on the large class (the SRAM residency cliff '
+          'sits between 2 and 4 boards)',
+          ['boards', 'pred tok/s', 'compute/tok', 'mem/tok', 'comm/tok',
+           'bound', 'resident', ''], rows)
     results['sizing'] = sizings
     return sizings
 
@@ -178,7 +196,7 @@ def stage5_sizing(ms, fits_by_name, results):
 def stage6_host(ms, fits_by_name, sizings, results):
     banner(6, 'host the model: decode on the chosen fabric, every '
               'all-reduce real traffic')
-    name = 'zynq_us_mid'
+    name = next(nm for nm in BOARD_ORDER if sizings[nm]['chosen'])
     ch = sizings[name]['chosen']
     n = ch['boards']
     r = simulate_decode([fits_by_name[name]] * n, ms, tokens=8)
@@ -193,6 +211,10 @@ def stage6_host(ms, fits_by_name, sizings, results):
         ['prediction ratio', '%.2f' % ratio, 'measured / predicted'],
         ['collectives per token', '%.0f' % r['collectives_per_token'],
          'n_layer * 2 = %d expected' % (ms['n_layer'] * 2)],
+        ['weights SRAM-resident', r['sram_resident'],
+         '%.1f MB shard vs %.1f MB SRAM budget'
+         % (ch['weights_per_board_bytes'] / 1e6,
+            fits_by_name[name]['sram_bytes'] / 1e6)],
         ['wire bytes', r['fabric']['wire_bytes'],
          'headers and CRC included'],
         ['activations identical', r['vecs_equal_across_boards'],
@@ -208,26 +230,32 @@ def stage6_host(ms, fits_by_name, sizings, results):
                        'measured_tok_per_s': r['tok_per_s'],
                        'predicted_tok_per_s': ch['predicted_tok_per_s'],
                        'prediction_ratio': ratio,
+                       'sram_resident': r['sram_resident'],
                        'target_met': ok, 'fabric': r['fabric']}
-    return r
+    return name, r
 
 
-def stage7_scale(ms, fits_by_name, results):
+def stage7_scale(ms, fits_by_name, results, host_name):
     banner(7, 'scale by adding boards, and survive a lossy fabric')
-    name = 'zynq_us_mid'
+    name = host_name
     f = fits_by_name[name]
     rows, out = [], []
     for n in (2, 4, 8, 16):
         r = simulate_decode([f] * n, ms, tokens=4)
         rows.append([n, '%.0f' % r['tok_per_s'],
                      fmt_ns(r['token_ns']),
+                     'yes' if r['sram_resident'] else 'no',
                      r['vecs_equal_across_boards']])
         out.append({'boards': n, 'tok_per_s': r['tok_per_s'],
-                    'token_ns': r['token_ns']})
+                    'token_ns': r['token_ns'],
+                    'sram_resident': r['sram_resident']})
     table('same synthesized fabric, more %s boards' % name,
-          ['boards', 'tok/s', 'time/token', 'activations identical'], rows)
-    print('   throughput scales until the ring all-reduce term (2*(n-1) '
-          'steps) pushes back')
+          ['boards', 'tok/s', 'time/token', 'weights in SRAM',
+           'activations identical'], rows)
+    print('   the jump is the SRAM residency cliff: once the weight shard '
+          'fits on-chip,')
+    print('   decode stops streaming DDR; past that the ring all-reduce '
+          'term (2*(n-1)) pushes back')
 
     n = 8
     clean = next(o for o in out if o['boards'] == n)
@@ -334,8 +362,8 @@ def main():
     fp = stage3_endpoint(results)
     fits_by_name = stage4_fit(cp, fp, results)
     sizings = stage5_sizing(ms, fits_by_name, results)
-    stage6_host(ms, fits_by_name, sizings, results)
-    stage7_scale(ms, fits_by_name, results)
+    host_name, _ = stage6_host(ms, fits_by_name, sizings, results)
+    stage7_scale(ms, fits_by_name, results, host_name)
     stage8_numerics(fits_by_name, results)
     with open('results.json', 'w') as f:
         json.dump(results, f, indent=2)

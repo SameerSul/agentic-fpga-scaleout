@@ -20,5 +20,6 @@
     "reduction_depth": 3072,
     "guard_bits": 12,
     "rule": "acc_width = weight_bits + activation_bits + ceil(log2(max(d_model, d_ff)))"
-  }
+  },
+  "agent": "RuleBasedAgent"
 }

@@ -388,6 +388,7 @@ class Board:
         self.clk_ns = 1000.0 / fit_result["clock_mhz"]
         self.link_gbps = fit_result["link_gbps"]
         self.link_prop_ns = fit_result["link_prop_ns"]
+        self.mem_bpns = fit_result.get("mem_bytes_per_ns")
         self.busy_ns = 0.0
         self.nic = NIC(sim, self)
 
@@ -420,8 +421,18 @@ class Board:
         LLM decode where the weights would be too large for pure Python; the
         numerics of the sharded math are validated separately at reduced
         dimensions by matmul()."""
+        yield from self.compute_mem(macs, 0)
+
+    def compute_mem(self, macs, mem_bytes):
+        """Process: compute charged against both the MAC array and the local
+        memory system. Duration is the slower of the two, modeling double
+        buffered overlap of weight/KV streaming with the array; mem_bytes is
+        the DDR traffic this block must move (zero when the weight shard is
+        SRAM-resident)."""
         cycles = macs * self.cpm / self.instances
         dur = cycles * self.clk_ns
+        if self.mem_bpns and mem_bytes:
+            dur = max(dur, mem_bytes / self.mem_bpns)
         self.busy_ns += dur
         yield dur
 

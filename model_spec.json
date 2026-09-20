@@ -9,12 +9,15 @@
   "dtype_bytes": 8,
   "weight_bits": 8,
   "activation_bits": 8,
+  "seq_len": 1024,
   "target_tokens_per_s": 500,
   "allreduces_per_token_per_layer": 2,
   "notes": [
     "Megatron tensor parallelism: QKV and c_fc column-parallel, out-proj and c_proj row-parallel.",
     "Each layer ends its attention and MLP blocks with one all-reduce of a [1, d_model] activation, so decode pays n_layer * 2 all-reduces per token.",
     "Activations travel as 8-byte IEEE doubles end to end, matching the fabric simulator, so every all-reduce check is exact; a real deployment would use fp16 or fp32 and halve or quarter the traffic.",
-    "weight_bits and activation_bits describe the int8 deployment quantization of the matmuls; specgen.py derives the MAC chiplet datapath from them and the accumulator width from the longest dot-product reduction."
+    "weight_bits and activation_bits describe the int8 deployment quantization of the matmuls; specgen.py derives the MAC chiplet datapath from them and the accumulator width from the longest dot-product reduction.",
+    "seq_len is the modeled decode context: the KV cache holds n_layer * 2 * d_model * seq_len activation-width entries per replica, attention reads it fully per token, and attention-vs-cache MACs (2 * seq_len * d_model per layer) are charged on top of the projection MACs.",
+    "Batch-1 decode identity: every block weight is used exactly once per token, so per-token block MACs equal block parameter count, and weight traffic per token equals per_token_macs * weight_bits / 8 bytes. The LM head and embeddings are excluded from both compute and traffic (modeled as host-side)."
   ]
 }

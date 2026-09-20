@@ -10,7 +10,10 @@ and the fabric endpoint (spec_crc.json + tb_crc.v -> fabric_profile.json,
 cycles_per_byte). The chiplet spec and testbench are not checked-in inputs:
 jobs marked derive_from_model regenerate them from model_spec.json via
 specgen.py before every run, so the hardware always tracks the model.
-Run: python3 chiplet_flow.py"""
+
+The proposing agent is pluggable: the deterministic RuleBasedAgent by
+default, or a real LLM (llm_agent.py) with --agent llm or CHIPLET_AGENT=llm.
+Run: python3 chiplet_flow.py [--agent rules|llm]"""
 import json, os, re, shutil, subprocess, sys
 
 from agent import RuleBasedAgent
@@ -33,6 +36,18 @@ FABRIC_JOB = {
     "spec_file": "spec_crc.json", "tb_file": "tb_crc.v", "rtl_file": "crc.v",
     "profile_file": "fabric_profile.json", "report_file": "report_crc.json",
 }
+
+
+def make_agent(kind=None):
+    """Agent factory: 'rules' (default) or 'llm'. One fresh instance per
+    flow run so an LLM agent's attempt memory never leaks between blocks."""
+    kind = kind or os.environ.get("CHIPLET_AGENT", "rules")
+    if kind == "rules":
+        return RuleBasedAgent()
+    if kind == "llm":
+        from llm_agent import LLMAgent
+        return LLMAgent()
+    raise SystemExit("unknown agent %r, expected 'rules' or 'llm'" % kind)
 
 
 def run(cmd, timeout=120):
@@ -211,10 +226,11 @@ def derive_profile(spec, final):
     return prof
 
 
-def run_flow(job=None, verbose=True):
+def run_flow(job=None, verbose=True, agent=None, max_iters=None):
     """Run the agentic loop to convergence for one job (default: the compute
     chiplet). Returns (report, profile); profile is None without convergence."""
     job = job or CHIPLET_JOB
+    max_iters = max_iters or int(os.environ.get("CHIPLET_MAX_ITERS", MAX_ITERS))
     say = print if verbose else (lambda *a, **k: None)
     os.makedirs(BUILD, exist_ok=True)
     shutil.copy(LIB, BUILD)
@@ -227,12 +243,15 @@ def run_flow(job=None, verbose=True):
         say("iverilog/vvp required for the demo loop, aborting")
         sys.exit(1)
 
-    agent = RuleBasedAgent()
+    agent = agent or make_agent()
+    say("Agent:", type(agent).__name__ + (
+        " ({}@{})".format(agent.model, agent.backend)
+        if hasattr(agent, "backend") else ""))
     history, iterations = [], []
     rows = [("iter", "fixes applied", "sim", "synth", "timing")]
     converged = False
 
-    for it in range(1, MAX_ITERS + 1):
+    for it in range(1, max_iters + 1):
         rtl, fixes = agent.propose(spec, history)
         rtl_path = os.path.join(BUILD, job["rtl_file"])
         with open(rtl_path, "w") as f:
@@ -270,7 +289,8 @@ def run_flow(job=None, verbose=True):
 
     final = iterations[-1]
     report = {
-        "spec": spec, "tools": tools, "converged": converged,
+        "spec": spec, "tools": tools, "agent": type(agent).__name__,
+        "converged": converged,
         "iterations_used": len(iterations), "history": iterations,
         "final_metrics": {
             "sim_pass": final["sim"]["status"] == "pass",
@@ -287,6 +307,7 @@ def run_flow(job=None, verbose=True):
     profile = None
     if converged:
         profile = derive_profile(spec, final)
+        profile["agent"] = type(agent).__name__
         ppath = os.path.join(ROOT, job["profile_file"])
         with open(ppath, "w") as f:
             json.dump(profile, f, indent=2)
@@ -299,10 +320,17 @@ def run_flow(job=None, verbose=True):
     return report, profile
 
 
-def main():
-    r1, _ = run_flow(CHIPLET_JOB, verbose=True)
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    kind = argv[argv.index("--agent") + 1] if "--agent" in argv else None
+    # LLM first cuts are less predictable than the seeded bugs; allow more
+    # feedback iterations before giving up.
+    iters = 8 if (kind or os.environ.get("CHIPLET_AGENT")) == "llm" else None
+    r1, _ = run_flow(CHIPLET_JOB, verbose=True,
+                     agent=make_agent(kind), max_iters=iters)
     print()
-    r2, _ = run_flow(FABRIC_JOB, verbose=True)
+    r2, _ = run_flow(FABRIC_JOB, verbose=True,
+                     agent=make_agent(kind), max_iters=iters)
     sys.exit(0 if r1["converged"] and r2["converged"] else 2)
 
 

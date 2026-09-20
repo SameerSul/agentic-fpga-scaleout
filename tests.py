@@ -7,13 +7,16 @@ import os
 import random
 import zlib
 
-from chiplet_flow import run_flow, FABRIC_JOB, ROOT
+from chiplet_flow import run_flow, make_agent, FABRIC_JOB, ROOT
+from agent import RuleBasedAgent
+from llm_agent import build_prompt, extract_verilog, condense_feedback
 from specgen import derive_chiplet_spec, generate
 from boards import BOARDS, fit
 from fabric import make_cluster, fabric_stats, mm, relu, RX_CAP
 from collectives import ring_allreduce, run_workers
 from demo import mlp_run
-from sizing import load_model_spec, size_fabric, simulate_decode
+from sizing import (load_model_spec, model_summary, predict_config,
+                    size_fabric, simulate_decode)
 
 PASSED = [0]
 
@@ -134,6 +137,33 @@ def test_model_driven_flow(profile):
             os.remove(os.path.join(ROOT, f))
 
 
+def test_llm_agent_offline():
+    """The LLM agent's deterministic parts, no network: agent selection,
+    prompt assembly, and Verilog extraction from messy model output."""
+    check('default agent is the deterministic rule-based one',
+          isinstance(make_agent(), RuleBasedAgent))
+    ms = load_model_spec()
+    spec = derive_chiplet_spec(ms)
+    fb = [{'stage': 'sim', 'status': 'fail', 'iteration': 1,
+           'mismatches': [{'test': 'wide_product',
+                           'expected_acc': '65328', 'got_acc': '304'}]},
+          {'stage': 'synth', 'status': 'fail', 'iteration': 2,
+           'errors': ['ERROR: syntax error near always_ff']}]
+    p = build_prompt(spec, fb, 'module mac();\nendmodule')
+    check('prompt carries spec, previous attempt, and parsed feedback',
+          spec['top_module'] in p and 'PREVIOUS ATTEMPT' in p
+          and 'wide_product' in p and 'always_ff' in p
+          and 'Verilog-2005' in p)
+    check('feedback condenser keeps only the recent, trimmed records',
+          len(condense_feedback(fb)) == 2
+          and 'testbench_mismatches' in condense_feedback(fb)[0])
+    fenced = 'Sure!\n```verilog\nmodule mac (input clk);\nendmodule\n```\ndone'
+    bare = 'preamble text\nmodule mac (input clk);\nendmodule\ntrailing prose'
+    check('verilog extraction strips fences and surrounding prose',
+          extract_verilog(fenced) == 'module mac (input clk);\nendmodule\n'
+          and extract_verilog(bare) == 'module mac (input clk);\nendmodule\n')
+
+
 def crc32_word_serial(data):
     """Python mirror of the generated RTL: 32-bit word-serial, bytes packed
     little-endian, reflected poly 0xEDB88320, init and final XOR all-ones.
@@ -168,25 +198,44 @@ def test_fabric_flow():
 
 def test_sizing(profile, fp):
     ms = load_model_spec()
+    lg = fit('versal_large', profile, fp)
     mid = fit('zynq_us_mid', profile, fp)
+    s = model_summary(ms)
 
-    def boards_needed(m):
-        ch = size_fabric(m, mid)['chosen']
+    check('weight traffic identity: bytes/token = block MACs * wb/8',
+          s['weight_bytes'] == s['per_token_macs'] * ms['weight_bits'] / 8.0)
+    check('KV cache bytes follow n_layer * 2 * d_model * seq_len',
+          s['kv_cache_bytes'] == ms['n_layer'] * 2 * ms['d_model']
+          * ms['seq_len'] * ms['activation_bits'] / 8.0)
+
+    def boards_needed(m, f):
+        ch = size_fabric(m, f)['chosen']
         return ch['boards'] if ch else float('inf')
 
-    targets = [100, 300, 500, 1000, 2000]
-    need = [boards_needed(dict(ms, target_tokens_per_s=t)) for t in targets]
+    targets = [100, 300, 500, 1000]
+    need = [boards_needed(dict(ms, target_tokens_per_s=t), lg)
+            for t in targets]
     check('sizing monotonic: higher target rate needs more boards',
           all(a <= b for a, b in zip(need, need[1:])))
-    need = [boards_needed(dict(ms, d_model=d)) for d in (384, 768, 1536)]
+    need = [boards_needed(dict(ms, d_model=d), lg) for d in (384, 768, 1536)]
     check('sizing monotonic: bigger model needs more boards',
           all(a <= b for a, b in zip(need, need[1:])))
+    tok_ns = [predict_config(dict(ms, seq_len=q), lg, 4)['token_ns']
+              for q in (256, 1024, 4096)]
+    check('sizing monotonic: longer context costs token time',
+          all(a <= b for a, b in zip(tok_ns, tok_ns[1:])))
 
-    ch = size_fabric(ms, mid)['chosen']
-    check('sizing finds a config that meets the target on the mid class',
-          ch is not None
+    check('memory wall honest: mid class cannot host at seq_len %d'
+          % ms['seq_len'], size_fabric(ms, mid)['chosen'] is None)
+    ch = size_fabric(ms, lg)['chosen']
+    check('sizing meets target on the large class via SRAM residency',
+          ch is not None and ch['sram_resident']
           and ch['predicted_tok_per_s'] >= ms['target_tokens_per_s'])
-    r = simulate_decode([mid] * ch['boards'], ms, tokens=8)
+    below = predict_config(ms, lg, max(1, ch['boards'] // 2))
+    check('below the residency cliff decode is memory-bound',
+          not below['sram_resident'] and below['bound'] == 'memory')
+
+    r = simulate_decode([lg] * ch['boards'], ms, tokens=8)
     ratio = r['tok_per_s'] / ch['predicted_tok_per_s']
     check('analytic prediction within 15%% of fabric simulation '
           '(ratio %.2f)' % ratio, 0.85 <= ratio <= 1.15)
@@ -220,6 +269,7 @@ if __name__ == '__main__':
     test_flow_and_profile(report, profile)
     test_specgen(profile)
     test_model_driven_flow(profile)
+    test_llm_agent_offline()
     test_fit_monotonic(profile)
     test_allreduce(profile)
     test_hetero_bit_identical(profile)

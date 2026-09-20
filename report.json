@@ -81,6 +81,7 @@
     "yosys": "/opt/homebrew/bin/yosys",
     "sta": "/Users/ssuleman/.local/bin/sta"
   },
+  "agent": "RuleBasedAgent",
   "converged": true,
   "iterations_used": 3,
   "history": [

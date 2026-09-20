@@ -11,5 +11,6 @@
   "target_clock_mhz": 100,
   "sim_checks_passed": 5,
   "bytes_per_cycle": 4,
-  "endpoint_gbps": 8.040201005025125
+  "endpoint_gbps": 8.040201005025125,
+  "agent": "RuleBasedAgent"
 }

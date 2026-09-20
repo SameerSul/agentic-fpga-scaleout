@@ -16,6 +16,11 @@ FIT_FRACTION = 0.7  # fraction of the capacity proxy available to chiplets
 # Three board classes spanning small to large. link_gbps / link_prop_ns /
 # num_links describe the transceiver class; max_chiplet_clock_mhz caps the
 # chiplet clock by board fabric speed grade.
+# mem_gbytes_per_s is effective DDR bandwidth available to the fabric-side
+# datapath (bytes/ns numerically equals GB/s); sram_bytes is the on-chip
+# BRAM+URAM budget. Weights whose per-board shard fits in sram_bytes are
+# modeled as SRAM-resident (no DDR traffic per token); otherwise every token
+# streams the shard from DDR. Both are representative class parameters.
 BOARDS = {
     "artix7_small": {
         "name": "artix7_small",
@@ -25,6 +30,8 @@ BOARDS = {
         "link_gbps": 6.6,
         "link_prop_ns": 500.0,
         "num_links": 4,
+        "mem_gbytes_per_s": 1.6,
+        "sram_bytes": 600e3,
     },
     "zynq_us_mid": {
         "name": "zynq_us_mid",
@@ -34,6 +41,8 @@ BOARDS = {
         "link_gbps": 16.3,
         "link_prop_ns": 400.0,
         "num_links": 8,
+        "mem_gbytes_per_s": 3.2,
+        "sram_bytes": 4.5e6,
     },
     "versal_large": {
         "name": "versal_large",
@@ -43,6 +52,8 @@ BOARDS = {
         "link_gbps": 32.0,
         "link_prop_ns": 300.0,
         "num_links": 16,
+        "mem_gbytes_per_s": 12.0,
+        "sram_bytes": 24e6,
     },
 }
 
@@ -88,4 +99,6 @@ def fit(board, chiplet_profile, fabric_profile=None):
         "endpoint_gbps": endpoint_gbps,
         "link_prop_ns": board["link_prop_ns"],
         "num_links": board["num_links"],
+        "mem_bytes_per_ns": board["mem_gbytes_per_s"],
+        "sram_bytes": board["sram_bytes"],
     }
