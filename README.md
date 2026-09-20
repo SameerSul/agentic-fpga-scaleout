@@ -212,7 +212,27 @@ Reading the numbers: the chiplet the agents build is the one this model asked fo
 
 ## How an LLM agent slots in
 
-`agent.py` exposes one interface: `propose(spec, feedback_history) -> (verilog_source, notes)`, and `llm_agent.py` ships a real LLM behind it. The prompt serializes the spec, the agent's own previous attempt, and the parsed tool feedback (failing test, expected vs got, compile errors, negative slack); the response is fence-stripped and trimmed to the module, and anything malformed simply fails simulation and feeds back. Three backends, all stdlib urllib, autodetected or forced with `CHIPLET_LLM`: the Anthropic API (`ANTHROPIC_API_KEY`), a local Ollama server (lightweight local models such as qwen2.5-coder), or the Claude Code CLI in print mode. Select it with `--agent llm` or `CHIPLET_AGENT=llm`; the deterministic `RuleBasedAgent` stays the default so the demo and test suite are reproducible offline. Because the chiplet spec itself is generated from the model, pointing the pipeline at a different LLM workload is a one-file change to `model_spec.json`: the derivation produces a different spec and testbench, the agent produces different RTL, and the measured profile produces a different fit, link rate, and sizing answer with no code changes anywhere downstream. The derivation step (`specgen.py`) is likewise where an LLM architecture agent would slot in next, proposing datapath structure from the model rather than applying closed-form width rules.
+`agent.py` exposes one interface: `propose(spec, feedback_history) -> (verilog_source, notes)`, and `llm_agent.py` ships a real LLM behind it. The prompt serializes the spec, the agent's own previous attempt, and the parsed tool feedback (failing test, expected vs got, compile errors, negative slack); the response is fence-stripped and trimmed to the module, and anything malformed simply fails simulation and feeds back. Three backends, all stdlib urllib, autodetected or forced with `CHIPLET_LLM`: the Anthropic API (`ANTHROPIC_API_KEY`), a local Ollama server (lightweight local models such as qwen2.5-coder), or the Claude Code CLI in print mode. Select it with `--agent llm` or `CHIPLET_AGENT=llm`; the deterministic `RuleBasedAgent` stays the default so the demo and test suite are reproducible offline.
+
+A real run, Claude Haiku through the CLI backend, both blocks first try:
+
+```
+Agent: LLMAgent (haiku@claude-cli)
+
+iter  fixes applied           sim                synth              timing
+-----------------------------------------------------------------------------------------
+1     llm:haiku@claude-cli#1  pass (594 checks)  pass (1058 cells)  pass (slack +4.44 ns)
+
+CONVERGED in 1 iteration(s)
+
+iter  fixes applied           sim              synth              timing
+---------------------------------------------------------------------------------------
+1     llm:haiku@claude-cli#1  pass (5 checks)  pass (1756 cells)  pass (slack +6.26 ns)
+
+CONVERGED in 1 iteration(s)
+```
+
+The generated RTL is structurally its own: the MAC pipelines a combinational product wire with explicit valid handling, and the CRC unrolls the 32 iterations with a generate loop instead of a function, which synthesized 13% smaller than the rule-based render (1756 vs 2016 cells) and timed faster (267 vs 251 MHz, an 8.56 Gbps endpoint). Both cleared every golden-vector check, the seeded-bug traps included (full-width product, synchronous clear priority, CRC final inversion), on the first attempt. The committed profiles remain the rule-based ones so the repo is reproducible without a network; rerun with `--agent llm` to regenerate these. Because the chiplet spec itself is generated from the model, pointing the pipeline at a different LLM workload is a one-file change to `model_spec.json`: the derivation produces a different spec and testbench, the agent produces different RTL, and the measured profile produces a different fit, link rate, and sizing answer with no code changes anywhere downstream. The derivation step (`specgen.py`) is likewise where an LLM architecture agent would slot in next, proposing datapath structure from the model rather than applying closed-form width rules.
 
 ## Honest simplifications
 
