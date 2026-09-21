@@ -10,7 +10,7 @@
   "weight_bits": 8,
   "activation_bits": 8,
   "seq_len": 1024,
-  "target_tokens_per_s": 100,
+  "target_tokens_per_s": 320,
   "allreduces_per_token_per_layer": 2,
   "notes": [
     "Megatron tensor parallelism: QKV and c_fc column-parallel, out-proj and c_proj row-parallel.",
@@ -19,6 +19,7 @@
     "weight_bits and activation_bits describe the int8 deployment quantization of the matmuls; specgen.py derives the MAC chiplet datapath from them and the accumulator width from the longest dot-product reduction.",
     "seq_len is the modeled decode context: the KV cache holds n_layer * 2 * d_model * seq_len activation-width entries per replica, attention reads it fully per token, and attention-vs-cache MACs (2 * seq_len * d_model per layer) are charged on top of the projection MACs.",
     "Batch-1 decode identity: every block weight is used exactly once per token, so per-token block MACs equal block parameter count, and weight traffic per token equals per_token_macs * weight_bits / 8 bytes. The LM head and embeddings are excluded from both compute and traffic (modeled as host-side).",
-    "target_tokens_per_s is 100: roughly 15x human reading speed, reachable by two boards in the few-hundred-dollar class. The earlier 500 was arbitrary and admitted only datacenter cards."
-  ]
+    "batch_size 8 with target_tokens_per_s 320 encodes the requirement 'serve 8 concurrent users at 40 tokens/s each'. Batching is what breaks the memory wall: one decode step reads every weight once and serves the whole batch, so fixed weight traffic is amortised while compute, KV traffic, and all-reduce payload scale with the batch. It buys aggregate throughput, not per-sequence latency."
+  ],
+  "batch_size": 8
 }

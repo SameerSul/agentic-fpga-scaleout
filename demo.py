@@ -15,8 +15,8 @@ from specgen import generate
 from boards import fit, FIT_FRACTION, TRANSPORTS
 from fabric import make_cluster, fabric_stats, mm, relu
 from collectives import ring_allreduce, run_workers
-from sizing import (load_model_spec, model_summary, size_fabric,
-                    simulate_decode)
+from sizing import (load_model_spec, model_summary, predict_config,
+                    size_fabric, simulate_decode)
 
 M, D, F = 64, 64, 512  # reduced-dim MLP shapes for the numerics check
 BOARD_ORDER = ('arty_a7_100t', 'kc705', 'alveo_u250')
@@ -70,8 +70,12 @@ def stage1_model(results):
          '[1, d_model] activation, %d-byte elements' % ms['dtype_bytes']],
         ['comm bytes per token', s['comm_bytes_per_token'],
          'what the fabric must carry per token'],
+        ['batch size', ms.get('batch_size', 1),
+         'concurrent sequences per decode step; weights are read once for all'],
         ['target', '%d tok/s' % ms['target_tokens_per_s'],
-         'the rate the fabric is sized to'],
+         '%d concurrent users at %d tok/s each'
+         % (ms.get('batch_size', 1),
+            ms['target_tokens_per_s'] // max(1, ms.get('batch_size', 1)))],
     ]
     table('the workload the agents must build hardware for',
           ['quantity', 'value', 'meaning'], rows)
@@ -206,14 +210,22 @@ def stage4b_transport(cp, fp, ms, results):
           'boards versus Aurora,'
           % (100 * (1 - e['peak_tok_per_s'] / a['peak_tok_per_s']),
              100 * (1 - e['tok_per_s_at_16'] / a['tok_per_s_at_16'])))
-    print('   because latency matters more as chunks shrink. It buys '
-          'commodity cabling, real')
-    print('   switching, and vendor neutrality, which is what "any FPGA, '
-          'any count" requires.')
+    print('   because latency matters more as chunks shrink. Batching '
+          'works in Ethernet\'s')
+    print('   favour here: at batch %d each all-reduce carries %d bytes '
+          'instead of %d, so the'
+          % (ms.get('batch_size', 1),
+             ms.get('batch_size', 1) * model_summary(ms)['allreduce_bytes'],
+             model_summary(ms)['allreduce_bytes']))
+    print('   fixed per-hop delay is amortised over a much larger message. '
+          'It buys commodity')
+    print('   cabling, real switching, and vendor neutrality, which is '
+          'what "any FPGA, any')
+    print('   count" requires.')
     results['transports'] = out
 
 
-def stage5_sizing(ms, fits_by_name, results):
+def stage5_sizing(ms, s, fits_by_name, results):
     banner(6, 'the right fabric: smallest cluster per board class that '
               'hosts the model')
     sizings, rows = {}, []
@@ -235,14 +247,42 @@ def stage5_sizing(ms, fits_by_name, results):
           % ms['target_tokens_per_s'],
           ['board class', 'boards needed', 'predicted tok/s', 'bound',
            'weights in SRAM'], rows)
-    print('   batch-1 decode touches every weight once per token, so a '
-          'board streaming from')
-    print('   DDR is memory-bound no matter how many MACs it has: every '
-          'row above is')
-    print('   bound by memory, not by the %d to %d GMAC/s of compute on '
-          'offer'
+    print('   decode touches every weight once per step, so a board '
+          'streaming from DDR is')
+    print('   memory-bound no matter how many MACs it has. Even at batch '
+          '%d, every row above'
+          % ms.get('batch_size', 1))
+    print('   is bound by memory or the link, not by the %.0f to %.0f '
+          'GMAC/s of compute on offer.'
           % (fits_by_name[BOARD_ORDER[0]]['macs_per_s'] / 1e9,
              fits_by_name[BOARD_ORDER[-1]]['macs_per_s'] / 1e9))
+
+    # Batching is the lever that converts the idle compute above into
+    # throughput, so show the curve and where it stops paying.
+    host = next((nm for nm in BOARD_ORDER if sizings[nm]['chosen']),
+                BOARD_ORDER[-1])
+    f = fits_by_name[host]
+    rows = []
+    for bsz in (1, 2, 4, 8, 16, 32):
+        p1 = predict_config(dict(ms, batch_size=bsz), f, 1)
+        p2 = predict_config(dict(ms, batch_size=bsz), f, 2)
+        rows.append([bsz, '%.0f' % p1['predicted_tok_per_s'],
+                     '%.0f' % p2['predicted_tok_per_s'], p2['bound'],
+                     '%.1f' % (s['weight_bytes'] / 1e6),
+                     '%.1f' % (bsz * s['kv_read_bytes_per_token'] / 1e6),
+                     'chosen' if bsz == ms['batch_size'] else ''])
+    table('batching on %s: one step reads the weights once and serves the '
+          'whole batch' % host,
+          ['batch', '1 board tok/s', '2 boards tok/s', 'bound',
+           'weight MB/step', 'KV MB/step', ''], rows)
+    print('   weight traffic per step is fixed, so batching converts idle '
+          'compute into tokens.')
+    print('   It stops paying once the KV cache read, which does scale '
+          'with the batch,')
+    print('   overtakes the weights. That is why real serving systems '
+          'fight over KV size.')
+    print('   Throughput, not latency: each sequence still waits a full '
+          'step for its token.')
 
     lg = sizings['alveo_u250']
     cliff = next((p['boards'] for p in lg['sweep'] if p['sram_resident']),
@@ -426,8 +466,12 @@ def stage8_numerics(fits_by_name, results):
     t_pr, err_pr, _, _ = mlp_run(fits, cols=cols)
     print('   heterogeneous 2 small + 2 large: bit-identical output to '
           'homogeneous = %s' % (out_eq == out_h))
-    print('   work-proportional shards (%s) recover %.2fx over the equal '
-          'split' % (cols, t_eq / t_pr))
+    print('   work-proportional shards (%s) change the time by %.2fx: with '
+          'the Arty limited to' % (cols, t_eq / t_pr))
+    print('   100 Mbit Ethernet this ring is link-bound, so rebalancing '
+          'compute barely helps.')
+    print('   The result that matters here is the first line: the answer '
+          'is identical either way.')
     results['numerics'] = {
         'homogeneous': {'time_ns': t_h, 'max_err': err_h},
         'hetero_equal': {'time_ns': t_eq, 'max_err': err_eq},
@@ -442,12 +486,12 @@ def main():
     print('Agentic FPGA scaleout: given an LLM, generate and synthesize '
           'the fabric to host it')
     results = {}
-    ms, _ = stage1_model(results)
+    ms, msum = stage1_model(results)
     cp = stage2_chiplet(ms, results)
     fp = stage3_endpoint(results)
     fits_by_name = stage4_fit(cp, fp, results)
     stage4b_transport(cp, fp, ms, results)
-    sizings = stage5_sizing(ms, fits_by_name, results)
+    sizings = stage5_sizing(ms, msum, fits_by_name, results)
     host_name, _ = stage6_host(ms, fits_by_name, sizings, results)
     stage7_scale(ms, fits_by_name, results, host_name)
     stage8_numerics(fits_by_name, results)

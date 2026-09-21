@@ -78,12 +78,20 @@ def predict_config(ms, fit_result, n):
     [1, d_model] activation at the synthesized link rate, with ring step =
     propagation + serialization of the chunk and 2*(n-1) steps per all-reduce."""
     s = model_summary(ms)
-    compute_ns = s["macs_per_token_total"] / n / fit_result["macs_per_s"] * 1e9
+    # Batching is the lever that breaks the memory wall. One decode step
+    # reads every weight once and serves B sequences with them, so weight
+    # traffic is fixed per step while compute, KV traffic, and all-reduce
+    # payload all scale with B. Throughput is B tokens per step, so the
+    # idle compute the memory wall creates gets converted into tokens until
+    # the array saturates. It buys throughput, not per-sequence latency.
+    b = max(1, int(ms.get("batch_size", 1)))
+    compute_ns = (b * s["macs_per_token_total"] / n
+                  / fit_result["macs_per_s"] * 1e9)
     weights_per_board = s["weight_bytes"] / n
     sram = fit_result.get("sram_bytes")
     resident = sram is not None and weights_per_board <= sram
     mem_bytes = (0.0 if resident else weights_per_board) \
-        + s["kv_read_bytes_per_token"] / n
+        + b * s["kv_read_bytes_per_token"] / n
     bpns = fit_result.get("mem_bytes_per_ns")
     mem_ns = mem_bytes / bpns if bpns else 0.0
     if n == 1:
@@ -94,7 +102,7 @@ def predict_config(ms, fit_result, n):
         # takes (Ethernet preamble, header, FCS, and interframe gap, or
         # Aurora control words). Small chunks at high board counts pay that
         # latency term repeatedly, which is what caps tensor parallelism.
-        chunk = s["allreduce_bytes"] / n
+        chunk = b * s["allreduce_bytes"] / n
         frames = max(1, math.ceil(chunk / PAYLOAD))
         wire = chunk + frames * (HDR_BYTES
                                  + fit_result.get("frame_overhead_bytes", 0))
@@ -107,30 +115,32 @@ def predict_config(ms, fit_result, n):
     # per block is slower than max of sums; the simulator does the former, so
     # the analytic model must too or it predicts optimistically.
     rate = fit_result["macs_per_s"] / 1e9  # MACs per ns
-    attn_c = (s["attn_macs_per_layer"] + s["kv_macs_per_layer"]) / n / rate
-    mlp_c = s["mlp_macs_per_layer"] / n / rate
+    attn_c = b * (s["attn_macs_per_layer"] + s["kv_macs_per_layer"]) / n / rate
+    mlp_c = b * s["mlp_macs_per_layer"] / n / rate
     if bpns:
         attn_m = ((0.0 if resident else s["attn_weight_bytes_per_layer"] / n)
-                  + s["kv_read_bytes_per_layer"] / n) / bpns
+                  + b * s["kv_read_bytes_per_layer"] / n) / bpns
         mlp_m = (0.0 if resident else
                  s["mlp_weight_bytes_per_layer"] / n) / bpns
     else:
         attn_m = mlp_m = 0.0
     blocks_ns = ms["n_layer"] * (max(attn_c, attn_m) + max(mlp_c, mlp_m))
-    token_ns = blocks_ns + comm_ns
+    step_ns = blocks_ns + comm_ns
     bound = "comm" if comm_ns >= blocks_ns else (
         "memory" if mem_ns > compute_ns else "compute")
     return {
         "boards": n,
+        "batch": b,
         "compute_ns_per_token": compute_ns,
         "mem_ns_per_token": mem_ns,
         "comm_ns_per_token": comm_ns,
         "weights_per_board_bytes": weights_per_board,
         "sram_resident": resident,
         "bound": bound,
-        "token_ns": token_ns,
-        "predicted_tok_per_s": 1e9 / token_ns,
-        "comm_fraction": comm_ns / token_ns,
+        "step_ns": step_ns,
+        "token_ns": step_ns / b,
+        "predicted_tok_per_s": b * 1e9 / step_ns,
+        "comm_fraction": comm_ns / step_ns,
     }
 
 
@@ -163,16 +173,21 @@ def simulate_decode(fits, ms, tokens=8, ber=0.0, seed=11):
     s = model_summary(ms)
     L = ms["n_layer"]
     d = ms["d_model"]
+    b = max(1, int(ms.get("batch_size", 1)))
     sram = min((f.get("sram_bytes") or float("inf")) for f in fits)
     resident = s["weight_bytes"] / n <= sram
+    # Weights are read once per step whatever the batch; KV and compute are
+    # per sequence, so they scale with it. Matches predict_config exactly.
     attn_w = 0.0 if resident else s["attn_weight_bytes_per_layer"] / n
     mlp_w = 0.0 if resident else s["mlp_weight_bytes_per_layer"] / n
-    kv_rd = s["kv_read_bytes_per_layer"] / n
+    kv_rd = b * s["kv_read_bytes_per_layer"] / n
     sim, boards = make_cluster(fits, ber=ber, seed=seed)
     rng = random.Random(seed)
     # One persistent activation vector per board; values are arbitrary floats,
     # what matters is that they travel and reduce through the real link layer.
-    vecs = [[rng.uniform(-1.0, 1.0) for _ in range(d)] for _ in range(n)]
+    # The all-reduced activation is [batch, d_model], so its payload, and
+    # therefore the real traffic on the wire, scales with the batch.
+    vecs = [[rng.uniform(-1.0, 1.0) for _ in range(b * d)] for _ in range(n)]
 
     # Pre-build every collective so all boards agree on op ids: for each of
     # tokens * n_layer * 2 all-reduces there is one generator per board.
@@ -180,29 +195,35 @@ def simulate_decode(fits, ms, tokens=8, ber=0.0, seed=11):
            for _ in range(tokens * L * ms["allreduces_per_token_per_layer"])]
 
     def worker(i):
-        b = boards[i]
+        bd = boards[i]
         k = 0
         for _ in range(tokens):
             for _ in range(L):
-                yield from b.compute_mem(
-                    (s["attn_macs_per_layer"] + s["kv_macs_per_layer"]) / n,
+                yield from bd.compute_mem(
+                    b * (s["attn_macs_per_layer"]
+                         + s["kv_macs_per_layer"]) / n,
                     attn_w + kv_rd)
                 yield from ars[k][i]
                 k += 1
-                yield from b.compute_mem(s["mlp_macs_per_layer"] / n, mlp_w)
+                yield from bd.compute_mem(
+                    b * s["mlp_macs_per_layer"] / n, mlp_w)
                 yield from ars[k][i]
                 k += 1
 
     t = run_workers(sim, [worker(i) for i in range(n)])
     st = fabric_stats(boards)
     assert st["overflow_drops"] == 0
+    # `tokens` counts decode steps; each step emits one token for every
+    # sequence in the batch, so throughput is steps * batch per second.
     return {
         "boards": n,
-        "tokens": tokens,
+        "batch": b,
+        "steps": tokens,
+        "tokens": tokens * b,
         "sram_resident": resident,
         "total_ns": t,
-        "token_ns": t / tokens,
-        "tok_per_s": tokens / (t / 1e9),
+        "token_ns": t / (tokens * b),
+        "tok_per_s": tokens * b / (t / 1e9),
         "collectives": len(ars),
         "collectives_per_token": len(ars) / tokens,
         "fabric": st,

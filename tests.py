@@ -230,6 +230,38 @@ def test_transports(profile, fp):
           and rd['vecs_equal_across_boards'])
 
 
+def test_batching(profile, fp):
+    """Batching is the lever against the memory wall: one step reads every
+    weight once and serves the whole batch."""
+    ms = load_model_spec()
+    f = fit('kc705', profile, fp)
+    sweep = [predict_config(dict(ms, batch_size=b), f, 1) for b in
+             (1, 2, 4, 8, 16, 32)]
+    tps = [p['predicted_tok_per_s'] for p in sweep]
+    check('batching never reduces throughput',
+          all(a <= b * 1.0001 for a, b in zip(tps, tps[1:])))
+    check('batch 8 is worth more than 2x over batch 1',
+          tps[3] > 2 * tps[0])
+    check('per-sequence latency does not improve with batch',
+          all(a <= b * 1.0001 for a, b in
+              zip([p['step_ns'] for p in sweep],
+                  [p['step_ns'] for p in sweep][1:])))
+    # Weight traffic per step is batch-independent; KV traffic is not, which
+    # is exactly why the curve flattens.
+    s = model_summary(ms)
+    big = predict_config(dict(ms, batch_size=64), f, 1)
+    check('batching saturates once KV traffic overtakes the weights',
+          64 * s['kv_read_bytes_per_token'] > s['weight_bytes']
+          and tps[-1] < 2 * tps[3])
+    r = simulate_decode([f] * 2, dict(ms, batch_size=8), tokens=2)
+    p = predict_config(dict(ms, batch_size=8), f, 2)
+    ratio = r['tok_per_s'] / p['predicted_tok_per_s']
+    check('batched prediction matches the fabric simulation (ratio %.2f)'
+          % ratio, 0.85 <= ratio <= 1.15)
+    check('a batched step emits one token per sequence',
+          r['tokens'] == r['steps'] * 8)
+
+
 def crc32_word_serial(data):
     """Python mirror of the generated RTL: 32-bit word-serial, bytes packed
     little-endian, reflected poly 0xEDB88320, init and final XOR all-ones.
@@ -300,10 +332,14 @@ def test_sizing(profile, fp):
     one = predict_config(ms, lg, 1)
     check('streaming weights from DDR is memory-bound',
           not one['sram_resident'] and one['bound'] == 'memory')
-    resident = [p for p in size_fabric(ms, lg)['sweep'] if p['sram_resident']]
-    check('SRAM residency jumps throughput by more than 3x',
+    # Isolate the weight-streaming effect at batch 1: with a large batch the
+    # weights are already amortised, so residency matters proportionally less.
+    b1 = dict(ms, batch_size=1)
+    one_b1 = predict_config(b1, lg, 1)
+    resident = [p for p in size_fabric(b1, lg)['sweep'] if p['sram_resident']]
+    check('at batch 1, SRAM residency jumps throughput by more than 3x',
           resident and resident[0]['predicted_tok_per_s']
-          > 3 * one['predicted_tok_per_s'])
+          > 3 * one_b1['predicted_tok_per_s'])
     sweep = size_fabric(ms, lg)['sweep']
     peak = max(range(len(sweep)), key=lambda i: sweep[i]['predicted_tok_per_s'])
     check('throughput peaks then falls as the ring term takes over',
@@ -352,6 +388,7 @@ if __name__ == '__main__':
     test_fpga_backend(profile, fp)
     test_endpoint_derivation(fp)
     test_transports(profile, fp)
+    test_batching(profile, fp)
     test_sizing(profile, fp)
     test_link_reliability(profile)
     print('all %d tests passed' % PASSED[0])

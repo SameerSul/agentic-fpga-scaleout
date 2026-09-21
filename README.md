@@ -81,7 +81,7 @@ One convenient alignment: Ethernet's frame check sequence is CRC-32 with polynom
 
 ```
 python3 demo.py                    # end-to-end, all nine stages, writes results.json (about 30 s)
-python3 tests.py                   # 60-check suite (both flows, a 4-bit model variant, FPGA mapping, transports, sizing physics)
+python3 tests.py                   # 66-check suite (both flows, a 4-bit model variant, FPGA mapping, transports, sizing physics)
 python3 chiplet_flow.py            # just the two agentic RTL loops, writes both profiles
 python3 chiplet_flow.py --agent llm  # same loops with a real LLM writing the RTL (Ollama, API, or Claude CLI)
 python3 specgen.py                 # just the model-to-chiplet derivation
@@ -112,7 +112,8 @@ layers x d_model x d_ff  12 x 768 x 3072                                        
   all-reduces per token               24                        Megatron TP: one per attn block, one per MLP block
    bytes per all-reduce             6144                                  [1, d_model] activation, 8-byte elements
    comm bytes per token           147456                                      what the fabric must carry per token
-                 target        500 tok/s                                           the rate the fabric is sized to
+             batch size                8       concurrent sequences per decode step; weights are read once for all
+                 target        320 tok/s                                       8 concurrent users at 40 tok/s each
 
 ========================================================================
 Stage 2: derive the chiplet spec from the model, then agents generate it
@@ -180,15 +181,17 @@ Stage 4: both profiles deploy on any board class (boards.py)
    endpoint 1004 LUT / 65 FF / 0 DSP
 
 fit(board, chiplet_profile, fabric_profile) over Ethernet, direct attach (no switch), usable device fraction = 70%
-board class                     instances  bound by  clock MHz  GMAC/s  wire Gbps  endpoint Gbps  link Gbps  DDR GB/s  SRAM MB
-------------------------------  ---------  --------  ---------  ------  ---------  -------------  ---------  --------  -------
-      small (Artix-7 XC7A100T)        168      dsps      150.0    25.2       1.21          10.94       1.21         1      0.6
-mid (Zynq UltraScale+ XCZU9EG)       1764      dsps      179.9   317.3      10.00          10.94      10.00        12      4.2
-    large (Alveo U250, XCU250)       8601      dsps      179.9  1546.9      25.00          10.94      10.94        64     56.4
+board                                price  instances  bound by  GMAC/s  DDR GB/s  SRAM MB  link Gbps  ports
+-----------------------------------  -----  ---------  --------  ------  --------  -------  ---------  -----
+    Arty A7-100T (Artix-7 XC7A100T)   $250        168      dsps    25.2         1      0.6       0.12      1
+    KC705, used (Kintex-7 XC7K325T)   $350        588      dsps   105.8         9      2.0      10.00      1
+Alveo U250 datacenter card (XCU250)  $3000       8601      dsps  1546.9        64     56.4      10.94      2
    the MAC infers a DSP slice, so compute is DSP-bound on every class: a single
    capacity number cannot express that, because the endpoint is pure LUT logic
-   link rate = min(wire, synthesized endpoint): the endpoint now only gates the
-   25G board, since it was derived for a 10G target
+   link rate = min(wire, synthesized endpoint), so the endpoint only gates boards
+   whose wire is faster than the 10G target it was derived for
+   one high-speed port on arty_a7_100t, kc705: those can be cabled to exactly one peer, so any
+   cluster past two boards needs a switch, which is a physical argument for Ethernet
 
 ========================================================================
 Stage 5: how the boards are wired: transport choice, measured
@@ -197,36 +200,53 @@ Stage 5: how the boards are wired: transport choice, measured
 same cluster (alveo_u250), three ways to wire it
 transport                              link Gbps  hop ns  frame B  MAC cost  switchable  peak tok/s  tok/s @16
 -------------------------------------  ---------  ------  -------  --------  ----------  ----------  ---------
-        Aurora 64B/66B, direct attach      10.94     215        8  1500 LUT          no        3553       2548
-  Ethernet, direct attach (no switch)      10.94     565       38  5000 LUT         yes        3259       1515
-Ethernet through a cut-through switch      10.94    1015       38  5000 LUT         yes        3045       1016
-   Ethernet costs 8% of peak throughput and 41% at 16 boards versus Aurora,
-   because latency matters more as chunks shrink. It buys commodity cabling, real
-   switching, and vendor neutrality, which is what "any FPGA, any count" requires.
+        Aurora 64B/66B, direct attach      10.94     215        8  1500 LUT          no        4093       4036
+  Ethernet, direct attach (no switch)      10.94     565       38  5000 LUT         yes        3789       3506
+Ethernet through a cut-through switch      10.94    1015       38  5000 LUT         yes        3676       3070
+   Ethernet costs 7% of peak throughput and 13% at 16 boards versus Aurora,
+   because latency matters more as chunks shrink. Batching works in Ethernet's
+   favour here: at batch 8 each all-reduce carries 49152 bytes instead of 6144, so the
+   fixed per-hop delay is amortised over a much larger message. It buys commodity
+   cabling, real switching, and vendor neutrality, which is what "any FPGA, any
+   count" requires.
 
 ========================================================================
 Stage 6: the right fabric: smallest cluster per board class that hosts the model
 ========================================================================
 
-analytic sizing vs the 500 tok/s target
+analytic sizing vs the 320 tok/s target
 board class   boards needed  predicted tok/s  bound   weights in SRAM
 ------------  -------------  ---------------  ------  ---------------
-arty_a7_100t    unreachable       111 @ n=16  memory
-      zcu102              8              670  memory               no
-  alveo_u250              1              617  memory               no
-   batch-1 decode touches every weight once per token, so a board streaming from
-   DDR is memory-bound no matter how many MACs it has: every row above is
-   bound by memory, not by the 25 to 1546 GMAC/s of compute on offer
+arty_a7_100t    unreachable        48 @ n=16    comm
+       kc705              2              566  memory               no
+  alveo_u250              1             2170  memory               no
+   decode touches every weight once per step, so a board streaming from DDR is
+   memory-bound no matter how many MACs it has. Even at batch 8, every row above
+   is bound by memory or the link, not by the 25 to 1547 GMAC/s of compute on offer.
+
+batching on kc705: one step reads the weights once and serves the whole batch
+batch  1 board tok/s  2 boards tok/s  bound   weight MB/step  KV MB/step
+-----  -------------  --------------  ------  --------------  ----------  ------
+    1             87             169  memory            84.9        18.9
+    2            147             282  memory            84.9        37.7
+    4            224             424  memory            84.9        75.5
+    8            305             566  memory            84.9       151.0  chosen
+   16            353             649  memory            84.9       302.0
+   32            366             671  memory            84.9       604.0
+   weight traffic per step is fixed, so batching converts idle compute into tokens.
+   It stops paying once the KV cache read, which does scale with the batch,
+   overtakes the weights. That is why real serving systems fight over KV size.
+   Throughput, not latency: each sequence still waits a full step for its token.
 
 candidate sweep on the large class (weight shards become SRAM-resident at 2 boards)
 boards  pred tok/s  compute/tok  mem/tok   comm/tok  bound   resident
 ------  ----------  -----------  --------  --------  ------  --------  ------
-     1         617      67.1 us   1.62 ms      0 ns  memory        no  chosen
-     2        3259      33.6 us  147.5 us  141.1 us  memory       yes
-     4        2957      16.8 us   73.7 us  255.3 us    comm       yes
-     8        2303       8.4 us   36.9 us  392.8 us    comm       yes
-    16        1515       4.2 us   18.4 us  639.5 us    comm       yes
-   throughput peaks at 2 boards (3259 tok/s) and then falls: past residency the
+     1        2170     536.8 us   3.69 ms      0 ns  memory        no  chosen
+     2        3533     268.4 us   1.18 ms  938.6 us  memory       yes
+     4        3789     134.2 us  589.8 us   1.45 ms    comm       yes
+     8        3780      67.1 us  294.9 us   1.78 ms    comm       yes
+    16        3506      33.6 us  147.5 us   2.12 ms    comm       yes
+   throughput peaks at 4 boards (3789 tok/s) and then falls: past residency the
    ring all-reduce grows as 2*(n-1) while there is no memory traffic left to save,
    so more boards is actively worse. That is the number the sizing layer exists to find.
 
@@ -234,44 +254,46 @@ boards  pred tok/s  compute/tok  mem/tok   comm/tok  bound   resident
 Stage 7: host the model: decode on the chosen fabric, every all-reduce real traffic
 ========================================================================
 
-8 x zcu102 hosting gpt2_124m
+2 x kc705 hosting gpt2_124m
 quantity               value     provenance
 ---------------------  --------  -------------------------------------------------
-               boards         8                        chosen by sizing in stage 6
-       tokens decoded         8                        full n_layer loop per token
-       measured tok/s       642  discrete-event fabric, packetized + CRC + credits
-      predicted tok/s       670                        analytic model from stage 6
-     prediction ratio      0.96                               measured / predicted
+               boards         2                        chosen by sizing in stage 6
+       tokens decoded        64                        full n_layer loop per token
+       measured tok/s       562  discrete-event fabric, packetized + CRC + credits
+      predicted tok/s       566                        analytic model from stage 6
+     prediction ratio      0.99                               measured / predicted
 collectives per token        24                          n_layer * 2 = 24 expected
-weights SRAM-resident     False                10.6 MB shard vs 4.2 MB SRAM budget
-           wire bytes  17461248                           headers and CRC included
+weights SRAM-resident     False                42.5 MB shard vs 2.0 MB SRAM budget
+           wire bytes  19685376                           headers and CRC included
 activations identical      True          every board holds the same reduced vector
-   target met: 642 tok/s measured vs 500 required
+   target met: 562 tok/s measured vs 320 required
 
 ========================================================================
 Stage 8: scale by adding boards, and survive a lossy fabric
 ========================================================================
 
-same synthesized fabric, more zcu102 boards
+same synthesized fabric, more kc705 boards
 boards  tok/s  time/token  weights in SRAM  activations identical
 ------  -----  ----------  ---------------  ---------------------
-     2    222     4.50 ms               no                   True
-     4    405     2.47 ms               no                   True
-     8    642     1.56 ms               no                   True
-    16    787     1.27 ms               no                   True
-   the jump is the SRAM residency cliff: once the weight shard fits on-chip,
-   decode stops streaming DDR; past that the ring all-reduce term (2*(n-1)) pushes back
+     2    562     1.78 ms               no                   True
+     4    956     1.05 ms               no                   True
+     8   1451    689.1 us               no                   True
+    16   1868    535.4 us               no                   True
+   no residency cliff on this class: the shard never fits on-chip, so every
+   added board only divides the DDR traffic, and the ring term (2*(n-1)) erodes it
 
-   BER 1e-6 on every link, 8 boards: 68 CRC drops, 456 retransmits,
-   activations still identical on every board = True, throughput 314 tok/s
-   (2.0x slower than the clean fabric: reliability costs latency, never bits)
+   BER 1e-6 on every link, 8 boards: 589 CRC drops, 9633 retransmits,
+   activations still identical on every board = True, throughput 591 tok/s
+   (2.5x slower than the clean fabric: reliability costs latency, never bits)
 
 ========================================================================
 Stage 9: numerics check at reduced dimensions (real arithmetic through the fabric)
 ========================================================================
-   homogeneous 4-board MLP 64x64 W1 64x512 W2 512x64: time 58.0 us, max err vs single-board reference 8.9e-15
+   homogeneous 4-board MLP 64x64 W1 64x512 W2 512x64: time 64.3 us, max err vs single-board reference 8.9e-15
    heterogeneous 2 small + 2 large: bit-identical output to homogeneous = True
-   work-proportional shards ([4, 4, 252, 252]) recover 1.10x over the equal split
+   work-proportional shards ([4, 4, 252, 252]) change the time by 1.01x: with the Arty limited to
+   100 Mbit Ethernet this ring is link-bound, so rebalancing compute barely helps.
+   The result that matters here is the first line: the answer is identical either way.
 
 results written to results.json
 ```
