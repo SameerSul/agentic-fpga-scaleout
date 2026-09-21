@@ -61,7 +61,7 @@ def test_fit_monotonic(profile):
 
 
 def test_allreduce(profile):
-    mid = fit('zcu102', profile)
+    mid = fit('kc705', profile)
     for n in (2, 3, 5, 8):
         sim, boards = make_cluster([mid] * n)
         L = 1000
@@ -76,7 +76,7 @@ def test_allreduce(profile):
               err < 1e-9 and st['overflow_drops'] == 0)
     # Heterogeneous ring: mixed link rates, still exact.
     fits = [fit('arty_a7_100t', profile), fit('alveo_u250', profile),
-            fit('zcu102', profile)]
+            fit('kc705', profile)]
     sim, boards = make_cluster(fits)
     L = 777
     for i, b in enumerate(boards):
@@ -91,7 +91,7 @@ def test_hetero_bit_identical(profile):
     """Same n, same shard split: the heterogeneous cluster must produce
     bit-identical MLP output to the homogeneous one (only timing differs)."""
     small, mid, large = (fit(n, profile) for n in
-                         ('arty_a7_100t', 'zcu102', 'alveo_u250'))
+                         ('arty_a7_100t', 'kc705', 'alveo_u250'))
     t_h, err_h, _, out_h = mlp_run([mid] * 4)
     t_x, err_x, _, out_x = mlp_run([small, small, large, large])
     check('heterogeneous MLP output bit-identical to homogeneous',
@@ -265,7 +265,7 @@ def test_fabric_flow():
 def test_sizing(profile, fp):
     ms = load_model_spec()
     lg = fit('alveo_u250', profile, fp)
-    mid = fit('zcu102', profile, fp)
+    mid = fit('kc705', profile, fp)
     s = model_summary(ms)
 
     check('weight traffic identity: bytes/token = block MACs * wb/8',
@@ -321,7 +321,7 @@ def test_sizing(profile, fp):
 
 
 def test_link_reliability(profile):
-    mid = fit('zcu102', profile)
+    mid = fit('kc705', profile)
     sim, boards = make_cluster([mid, mid], ber=1e-5)
     vals = [random.Random(3).uniform(-1, 1) for _ in range(8192)]  # 64 KB
     out = {}

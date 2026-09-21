@@ -24,41 +24,57 @@ LINE_CODE = 64.0 / 66.0   # 64b/66b encoding, both Aurora and 10/25GBASE-R
 CABLE_NS_PER_M = 5.0
 CABLE_M = 3.0        # a rack-local direct-attach copper cable
 
+# Boards we could actually put on a purchase order, plus one datacenter card
+# for contrast. price_usd is what one costs today (used where noted), and
+# link_ports is the number of physical high-speed ports: a board with one
+# port can only be cabled to one peer, so any cluster larger than two boards
+# needs a switch. Decode is memory-bound (see sizing.py), so the figure that
+# decides throughput is mem_gbytes_per_s, not the logic capacity.
 BOARDS = {
     "arty_a7_100t": {
         "name": "arty_a7_100t",
-        "class": "small (Artix-7 XC7A100T)",
+        "class": "Arty A7-100T (Artix-7 XC7A100T)",
         "family": "xc7",
+        "price_usd": 250,
         "luts": 63400, "ffs": 126800, "dsps": 240,
-        "sram_bytes": 622080,          # 135 BRAM36
+        "sram_bytes": 607500,          # 135 BRAM36
         "max_chiplet_clock_mhz": 150.0,
-        "mem_gbytes_per_s": 1.0,       # 16-bit DDR3L-1333, effective
-        "serdes_line_gbps": 6.25,      # GTP
-        "eth_line_gbps": 1.25,         # 1000BASE-X on the available cage
-        "num_links": 2,
+        "mem_gbytes_per_s": 1.1,       # 16-bit DDR3L-1333, effective
+        # The XC7A100T in the CSG324 package this board uses has no GTP
+        # transceivers at all: its only link is a 10/100 PHY on RJ45.
+        "serdes_line_gbps": 0.125,
+        "eth_line_gbps": 0.125,
+        "link_ports": 1,
+        "num_links": 1,
     },
-    "zcu102": {
-        "name": "zcu102",
-        "class": "mid (Zynq UltraScale+ XCZU9EG)",
-        "family": "xcup",
-        "luts": 274080, "ffs": 548160, "dsps": 2520,
-        "sram_bytes": 4202496,         # 912 BRAM36, no URAM on this part
-        "max_chiplet_clock_mhz": 300.0,
-        "mem_gbytes_per_s": 12.0,      # 64-bit DDR4-2133, effective
-        "serdes_line_gbps": 16.375,    # GTH
-        "eth_line_gbps": 10.3125,      # 10GBASE-R over the SFP+ cages
-        "num_links": 4,
+    "kc705": {
+        "name": "kc705",
+        "class": "KC705, used (Kintex-7 XC7K325T)",
+        "family": "xc7",
+        "price_usd": 350,
+        "luts": 203800, "ffs": 407600, "dsps": 840,
+        "sram_bytes": 2002500,         # 445 BRAM36
+        "max_chiplet_clock_mhz": 250.0,
+        # 1 GB DDR3-1600 SODIMM on a 64-bit bus: the widest memory in this
+        # price class, and the reason this board outruns costlier ones.
+        "mem_gbytes_per_s": 9.0,
+        "serdes_line_gbps": 10.3125,   # GTX
+        "eth_line_gbps": 10.3125,      # 10GBASE-R over the SFP+ cage
+        "link_ports": 1,               # one cage; a ring would need an FMC card
+        "num_links": 1,
     },
     "alveo_u250": {
         "name": "alveo_u250",
-        "class": "large (Alveo U250, XCU250)",
+        "class": "Alveo U250 datacenter card (XCU250)",
         "family": "xcup",
+        "price_usd": 3000,             # used; also needs a host with PCIe
         "luts": 1728000, "ffs": 3456000, "dsps": 12288,
         "sram_bytes": 56401920,        # 2000 BRAM36 + 1280 URAM288
         "max_chiplet_clock_mhz": 500.0,
         "mem_gbytes_per_s": 64.0,      # 4 channels of DDR4-2400, effective
         "serdes_line_gbps": 25.78125,  # GTY
         "eth_line_gbps": 25.78125,     # 25GBASE-R lanes of the QSFP28 cages
+        "link_ports": 2,               # two QSFP28 cages
         "num_links": 8,
     },
 }
@@ -186,6 +202,8 @@ def fit(board, chiplet_profile, fabric_profile=None,
         "frame_overhead_bytes": tr["frame_overhead_bytes"],
         "mtu_bytes": tr["mtu_bytes"],
         "num_links": board["num_links"],
+        "link_ports": board.get("link_ports", board["num_links"]),
+        "price_usd": board.get("price_usd"),
         "mem_bytes_per_ns": board["mem_gbytes_per_s"],
         "sram_bytes": board["sram_bytes"],
     }

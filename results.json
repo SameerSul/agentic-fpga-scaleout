@@ -12,7 +12,7 @@
       "weight_bits": 8,
       "activation_bits": 8,
       "seq_len": 1024,
-      "target_tokens_per_s": 500,
+      "target_tokens_per_s": 100,
       "allreduces_per_token_per_layer": 2,
       "notes": [
         "Megatron tensor parallelism: QKV and c_fc column-parallel, out-proj and c_proj row-parallel.",
@@ -20,7 +20,8 @@
         "Activations travel as 8-byte IEEE doubles end to end, matching the fabric simulator, so every all-reduce check is exact; a real deployment would use fp16 or fp32 and halve or quarter the traffic.",
         "weight_bits and activation_bits describe the int8 deployment quantization of the matmuls; specgen.py derives the MAC chiplet datapath from them and the accumulator width from the longest dot-product reduction.",
         "seq_len is the modeled decode context: the KV cache holds n_layer * 2 * d_model * seq_len activation-width entries per replica, attention reads it fully per token, and attention-vs-cache MACs (2 * seq_len * d_model per layer) are charged on top of the projection MACs.",
-        "Batch-1 decode identity: every block weight is used exactly once per token, so per-token block MACs equal block parameter count, and weight traffic per token equals per_token_macs * weight_bits / 8 bytes. The LM head and embeddings are excluded from both compute and traffic (modeled as host-side)."
+        "Batch-1 decode identity: every block weight is used exactly once per token, so per-token block MACs equal block parameter count, and weight traffic per token equals per_token_macs * weight_bits / 8 bytes. The LM head and embeddings are excluded from both compute and traffic (modeled as host-side).",
+        "target_tokens_per_s is 100: roughly 15x human reading speed, reachable by two boards in the few-hundred-dollar class. The earlier 500 was arbitrary and admitted only datacenter cards."
       ]
     },
     "summary": {
@@ -204,7 +205,7 @@
   "fit": [
     {
       "board": "arty_a7_100t",
-      "board_class": "small (Artix-7 XC7A100T)",
+      "board_class": "Arty A7-100T (Artix-7 XC7A100T)",
       "family": "xc7",
       "instances": 168,
       "bound_by": "dsps",
@@ -212,31 +213,33 @@
       "cycles_per_mac": 1.0,
       "macs_per_s": 25200000000.0,
       "dsp_utilization": 0.7,
-      "lut_utilization": 0.27949526813880127,
+      "lut_utilization": 0.18479495268138801,
       "transport": "Ethernet, direct attach (no switch)",
       "transport_key": "ethernet_direct",
-      "link_gbps": 1.2121212121212122,
-      "wire_gbps": 1.2121212121212122,
+      "link_gbps": 0.12121212121212122,
+      "wire_gbps": 0.12121212121212122,
       "endpoint_gbps": 10.94017094017094,
       "link_prop_ns": 565.0,
-      "pkt_overhead_ns": 250.79999999999998,
+      "pkt_overhead_ns": 2508.0,
       "frame_overhead_bytes": 38,
       "mtu_bytes": 9000,
-      "num_links": 2,
-      "mem_bytes_per_ns": 1.0,
-      "sram_bytes": 622080
+      "num_links": 1,
+      "link_ports": 1,
+      "price_usd": 250,
+      "mem_bytes_per_ns": 1.1,
+      "sram_bytes": 607500
     },
     {
-      "board": "zcu102",
-      "board_class": "mid (Zynq UltraScale+ XCZU9EG)",
-      "family": "xcup",
-      "instances": 1764,
+      "board": "kc705",
+      "board_class": "KC705, used (Kintex-7 XC7K325T)",
+      "family": "xc7",
+      "instances": 588,
       "bound_by": "dsps",
       "clock_mhz": 179.8561151079137,
       "cycles_per_mac": 1.0,
-      "macs_per_s": 317266187050.35974,
+      "macs_per_s": 105755395683.45326,
       "dsp_utilization": 0.7,
-      "lut_utilization": 0.30645067133683596,
+      "lut_utilization": 0.12755642787046123,
       "transport": "Ethernet, direct attach (no switch)",
       "transport_key": "ethernet_direct",
       "link_gbps": 10.0,
@@ -246,13 +249,15 @@
       "pkt_overhead_ns": 30.4,
       "frame_overhead_bytes": 38,
       "mtu_bytes": 9000,
-      "num_links": 4,
-      "mem_bytes_per_ns": 12.0,
-      "sram_bytes": 4202496
+      "num_links": 1,
+      "link_ports": 1,
+      "price_usd": 350,
+      "mem_bytes_per_ns": 9.0,
+      "sram_bytes": 2002500
     },
     {
       "board": "alveo_u250",
-      "board_class": "large (Alveo U250, XCU250)",
+      "board_class": "Alveo U250 datacenter card (XCU250)",
       "family": "xcup",
       "instances": 8601,
       "bound_by": "dsps",
@@ -271,6 +276,8 @@
       "frame_overhead_bytes": 38,
       "mtu_bytes": 9000,
       "num_links": 8,
+      "link_ports": 2,
+      "price_usd": 3000,
       "mem_bytes_per_ns": 64.0,
       "sram_bytes": 56401920
     }
@@ -298,152 +305,152 @@
   "sizing": {
     "arty_a7_100t": {
       "board": "arty_a7_100t",
-      "target_tok_per_s": 500,
+      "target_tok_per_s": 100,
       "sweep": [
         {
           "boards": 1,
           "compute_ns_per_token": 4119405.7142857146,
-          "mem_ns_per_token": 103809024.0,
+          "mem_ns_per_token": 94371839.99999999,
           "comm_ns_per_token": 0.0,
           "weights_per_board_bytes": 84934656.0,
           "sram_resident": false,
           "bound": "memory",
-          "token_ns": 103809024.0,
-          "predicted_tok_per_s": 9.633073903093434,
+          "token_ns": 94371840.0,
+          "predicted_tok_per_s": 10.596381293402779,
           "comm_fraction": 0.0
         },
         {
           "boards": 2,
           "compute_ns_per_token": 2059702.8571428573,
-          "mem_ns_per_token": 51904512.0,
-          "comm_ns_per_token": 1055452.7999999998,
+          "mem_ns_per_token": 47185919.99999999,
+          "comm_ns_per_token": 10310448.0,
           "weights_per_board_bytes": 42467328.0,
           "sram_resident": false,
           "bound": "memory",
-          "token_ns": 52959964.8,
-          "predicted_tok_per_s": 18.8821877766807,
-          "comm_fraction": 0.019929257959023415
+          "token_ns": 57496368.0,
+          "predicted_tok_per_s": 17.392402942738922,
+          "comm_fraction": 0.17932346613615663
         },
         {
           "boards": 4,
           "compute_ns_per_token": 1029851.4285714286,
-          "mem_ns_per_token": 25952256.0,
-          "comm_ns_per_token": 1651420.7999999998,
+          "mem_ns_per_token": 23592959.999999996,
+          "comm_ns_per_token": 15781968.0,
           "weights_per_board_bytes": 21233664.0,
           "sram_resident": false,
           "bound": "memory",
-          "token_ns": 27603676.8,
-          "predicted_tok_per_s": 36.227057983811775,
-          "comm_fraction": 0.059826117077272825
+          "token_ns": 39374928.0,
+          "predicted_tok_per_s": 25.396871836819614,
+          "comm_fraction": 0.40081261862878836
         },
         {
           "boards": 8,
           "compute_ns_per_token": 514925.7142857143,
-          "mem_ns_per_token": 12976128.0,
-          "comm_ns_per_token": 2021577.5999999999,
+          "mem_ns_per_token": 11796479.999999998,
+          "comm_ns_per_token": 18507216.0,
           "weights_per_board_bytes": 10616832.0,
           "sram_resident": false,
-          "bound": "memory",
-          "token_ns": 14997705.6,
-          "predicted_tok_per_s": 66.67686556002273,
-          "comm_fraction": 0.1347924578543534
+          "bound": "comm",
+          "token_ns": 30303696.0,
+          "predicted_tok_per_s": 32.99927507192522,
+          "comm_fraction": 0.6107247115995356
         },
         {
           "boards": 16,
           "compute_ns_per_token": 257462.85714285716,
-          "mem_ns_per_token": 6488064.0,
-          "comm_ns_per_token": 2507184.0,
+          "mem_ns_per_token": 5898239.999999999,
+          "comm_ns_per_token": 21410640.0,
           "weights_per_board_bytes": 5308416.0,
           "sram_resident": false,
-          "bound": "memory",
-          "token_ns": 8995248.0,
-          "predicted_tok_per_s": 111.16980877014174,
-          "comm_fraction": 0.27872316583155904
+          "bound": "comm",
+          "token_ns": 27308880.0,
+          "predicted_tok_per_s": 36.61812567926623,
+          "comm_fraction": 0.7840175063935247
         }
       ],
       "chosen": null
     },
-    "zcu102": {
-      "board": "zcu102",
-      "target_tok_per_s": 500,
+    "kc705": {
+      "board": "kc705",
+      "target_tok_per_s": 100,
       "sweep": [
         {
           "boards": 1,
-          "compute_ns_per_token": 327198.5110204081,
-          "mem_ns_per_token": 8650752.0,
+          "compute_ns_per_token": 981595.5330612243,
+          "mem_ns_per_token": 11534336.0,
           "comm_ns_per_token": 0.0,
           "weights_per_board_bytes": 84934656.0,
           "sram_resident": false,
           "bound": "memory",
-          "token_ns": 8650752.0,
-          "predicted_tok_per_s": 115.59688683712122,
+          "token_ns": 11534336.0,
+          "predicted_tok_per_s": 86.6976651278409,
           "comm_fraction": 0.0
         },
         {
           "boards": 2,
-          "compute_ns_per_token": 163599.25551020406,
-          "mem_ns_per_token": 4325376.0,
+          "compute_ns_per_token": 490797.76653061213,
+          "mem_ns_per_token": 5767168.0,
           "comm_ns_per_token": 151766.40000000002,
           "weights_per_board_bytes": 42467328.0,
           "sram_resident": false,
           "bound": "memory",
-          "token_ns": 4477142.4,
-          "predicted_tok_per_s": 223.35675541613327,
-          "comm_fraction": 0.03389805068518705
+          "token_ns": 5918934.4,
+          "predicted_tok_per_s": 168.9493297982826,
+          "comm_fraction": 0.02564083156589808
         },
         {
           "boards": 4,
-          "compute_ns_per_token": 81799.62775510203,
-          "mem_ns_per_token": 2162688.0,
+          "compute_ns_per_token": 245398.88326530607,
+          "mem_ns_per_token": 2883584.0,
           "comm_ns_per_token": 271670.39999999997,
           "weights_per_board_bytes": 21233664.0,
           "sram_resident": false,
           "bound": "memory",
-          "token_ns": 2434358.4,
-          "predicted_tok_per_s": 410.78585634720014,
-          "comm_fraction": 0.1115983579081864
+          "token_ns": 3155254.4,
+          "predicted_tok_per_s": 316.9316553365713,
+          "comm_fraction": 0.08610094957794845
         },
         {
           "boards": 8,
-          "compute_ns_per_token": 40899.813877551016,
-          "mem_ns_per_token": 1081344.0,
+          "compute_ns_per_token": 122699.44163265303,
+          "mem_ns_per_token": 1441792.0,
           "comm_ns_per_token": 411868.8,
           "weights_per_board_bytes": 10616832.0,
           "sram_resident": false,
           "bound": "memory",
-          "token_ns": 1493212.8,
-          "predicted_tok_per_s": 669.6969112506938,
-          "comm_fraction": 0.27582726320052975
+          "token_ns": 1853660.8,
+          "predicted_tok_per_s": 539.4730254855689,
+          "comm_fraction": 0.22219210763911065
         },
         {
           "boards": 16,
-          "compute_ns_per_token": 20449.906938775508,
-          "mem_ns_per_token": 540672.0,
+          "compute_ns_per_token": 61349.72081632652,
+          "mem_ns_per_token": 720896.0,
           "comm_ns_per_token": 661392.0,
           "weights_per_board_bytes": 5308416.0,
           "sram_resident": false,
-          "bound": "comm",
-          "token_ns": 1202064.0,
-          "predicted_tok_per_s": 831.9024611002409,
-          "comm_fraction": 0.5502136325520105
+          "bound": "memory",
+          "token_ns": 1382288.0,
+          "predicted_tok_per_s": 723.4382415241976,
+          "comm_fraction": 0.47847626543817207
         }
       ],
       "chosen": {
-        "boards": 8,
-        "compute_ns_per_token": 40899.813877551016,
-        "mem_ns_per_token": 1081344.0,
-        "comm_ns_per_token": 411868.8,
-        "weights_per_board_bytes": 10616832.0,
+        "boards": 2,
+        "compute_ns_per_token": 490797.76653061213,
+        "mem_ns_per_token": 5767168.0,
+        "comm_ns_per_token": 151766.40000000002,
+        "weights_per_board_bytes": 42467328.0,
         "sram_resident": false,
         "bound": "memory",
-        "token_ns": 1493212.8,
-        "predicted_tok_per_s": 669.6969112506938,
-        "comm_fraction": 0.27582726320052975
+        "token_ns": 5918934.4,
+        "predicted_tok_per_s": 168.9493297982826,
+        "comm_fraction": 0.02564083156589808
       }
     },
     "alveo_u250": {
       "board": "alveo_u250",
-      "target_tok_per_s": 500,
+      "target_tok_per_s": 100,
       "sweep": [
         {
           "boards": 1,
@@ -521,11 +528,11 @@
     }
   },
   "host": {
-    "board": "zcu102",
-    "boards": 8,
-    "measured_tok_per_s": 641.9619177918348,
-    "predicted_tok_per_s": 669.6969112506938,
-    "prediction_ratio": 0.9585857527593155,
+    "board": "kc705",
+    "boards": 2,
+    "measured_tok_per_s": 168.25073613062207,
+    "predicted_tok_per_s": 168.9493297982826,
+    "prediction_ratio": 0.9958650699088619,
     "sram_resident": false,
     "target_met": true,
     "fabric": {
@@ -536,54 +543,54 @@
       "max_rx_occupancy": 1,
       "credit_stalls": 0,
       "stall_ns": 0.0,
-      "wire_bytes": 17461248
+      "wire_bytes": 2460672
     }
   },
   "scaling": [
     {
       "boards": 2,
-      "tok_per_s": 222.13739535551724,
-      "token_ns": 4501718.399999971,
+      "tok_per_s": 168.25073613062366,
+      "token_ns": 5943510.399999896,
       "sram_resident": false
     },
     {
       "boards": 4,
-      "tok_per_s": 404.6580348251899,
-      "token_ns": 2471222.4000000264,
+      "tok_per_s": 313.2715879210488,
+      "token_ns": 3192118.4000000074,
       "sram_resident": false
     },
     {
       "boards": 8,
-      "tok_per_s": 641.9619177918753,
-      "token_ns": 1557724.800000054,
+      "tok_per_s": 521.3294652076983,
+      "token_ns": 1918172.8000000897,
       "sram_resident": false
     },
     {
       "boards": 16,
-      "tok_per_s": 786.6681770695184,
-      "token_ns": 1271184.000000078,
+      "tok_per_s": 688.9861431106333,
+      "token_ns": 1451408.000000119,
       "sram_resident": false
     }
   ],
   "ber": {
     "ber": 1e-06,
     "boards": 8,
-    "tok_per_s": 314.4405304284538,
+    "tok_per_s": 274.80049758674136,
     "crc_drops": 68,
     "retransmits": 456,
     "bit_exact": true
   },
   "numerics": {
     "homogeneous": {
-      "time_ns": 58047.035464852604,
+      "time_ns": 64279.02639455781,
       "max_err": 8.881784197001252e-15
     },
     "hetero_equal": {
-      "time_ns": 390515.09206349193,
+      "time_ns": 3475513.492063492,
       "max_err": 8.881784197001252e-15
     },
     "hetero_proportional": {
-      "time_ns": 354150.3330868502,
+      "time_ns": 3439148.7330868505,
       "max_err": 1.0658141036401503e-14,
       "columns": [
         4,
@@ -593,6 +600,6 @@
       ]
     },
     "bit_identical_across_clusters": true,
-    "recovery_factor": 1.102681702032238
+    "recovery_factor": 1.0105737674636717
   }
 }

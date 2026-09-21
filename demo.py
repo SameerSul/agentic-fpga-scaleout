@@ -19,7 +19,7 @@ from sizing import (load_model_spec, model_summary, size_fabric,
                     simulate_decode)
 
 M, D, F = 64, 64, 512  # reduced-dim MLP shapes for the numerics check
-BOARD_ORDER = ('arty_a7_100t', 'zcu102', 'alveo_u250')
+BOARD_ORDER = ('arty_a7_100t', 'kc705', 'alveo_u250')
 
 
 def table(title, headers, rows):
@@ -148,28 +148,32 @@ def stage4_fit(cp, fp, results):
     rows, out = [], {}
     for name in BOARD_ORDER:
         f = fit(name, cp, fp)
-        rows.append([f['board_class'], f['instances'], f['bound_by'],
-                     '%.1f' % f['clock_mhz'],
+        rows.append([f['board_class'], '$%d' % f['price_usd'],
+                     f['instances'], f['bound_by'],
                      '%.1f' % (f['macs_per_s'] / 1e9),
-                     '%.2f' % f['wire_gbps'],
-                     '%.2f' % f['endpoint_gbps'],
-                     '%.2f' % f['link_gbps'],
                      '%.0f' % f['mem_bytes_per_ns'],
-                     '%.1f' % (f['sram_bytes'] / 1e6)])
+                     '%.1f' % (f['sram_bytes'] / 1e6),
+                     '%.2f' % f['link_gbps'],
+                     f['link_ports']])
         out[name] = f
     table('fit(board, chiplet_profile, fabric_profile) over %s, usable '
           'device fraction = %.0f%%'
           % (out[BOARD_ORDER[0]]['transport'], 100 * FIT_FRACTION),
-          ['board class', 'instances', 'bound by', 'clock MHz', 'GMAC/s',
-           'wire Gbps', 'endpoint Gbps', 'link Gbps', 'DDR GB/s',
-           'SRAM MB'], rows)
+          ['board', 'price', 'instances', 'bound by', 'GMAC/s',
+           'DDR GB/s', 'SRAM MB', 'link Gbps', 'ports'], rows)
     print('   the MAC infers a DSP slice, so compute is DSP-bound on every '
           'class: a single')
     print('   capacity number cannot express that, because the endpoint is '
           'pure LUT logic')
-    print('   link rate = min(wire, synthesized endpoint): the endpoint now '
-          'only gates the')
-    print('   25G board, since it was derived for a 10G target')
+    print('   link rate = min(wire, synthesized endpoint), so the endpoint '
+          'only gates boards')
+    print('   whose wire is faster than the 10G target it was derived for')
+    single = [f['board'] for f in out.values() if f['link_ports'] < 2]
+    if single:
+        print('   one high-speed port on %s: those can be cabled to exactly '
+              'one peer, so any' % ', '.join(single))
+        print('   cluster past two boards needs a switch, which is a '
+              'physical argument for Ethernet')
     results['fit'] = list(out.values())
     return out
 
@@ -327,10 +331,16 @@ def stage7_scale(ms, fits_by_name, results, host_name):
     table('same synthesized fabric, more %s boards' % name,
           ['boards', 'tok/s', 'time/token', 'weights in SRAM',
            'activations identical'], rows)
-    print('   the jump is the SRAM residency cliff: once the weight shard '
-          'fits on-chip,')
-    print('   decode stops streaming DDR; past that the ring all-reduce '
-          'term (2*(n-1)) pushes back')
+    if len({o['sram_resident'] for o in out}) > 1:
+        print('   the jump is the SRAM residency cliff: once the weight '
+              'shard fits on-chip,')
+        print('   decode stops streaming DDR; past that the ring '
+              'all-reduce term (2*(n-1)) pushes back')
+    else:
+        print('   no residency cliff on this class: the shard never fits '
+              'on-chip, so every')
+        print('   added board only divides the DDR traffic, and the ring '
+              'term (2*(n-1)) erodes it')
 
     n = 8
     clean = next(o for o in out if o['boards'] == n)
@@ -401,7 +411,7 @@ def mlp_run(fits, cols=None, seed=7):
 def stage8_numerics(fits_by_name, results):
     banner(9, 'numerics check at reduced dimensions (real arithmetic '
               'through the fabric)')
-    mid = fits_by_name['zcu102']
+    mid = fits_by_name['kc705']
     t_h, err_h, _, out_h = mlp_run([mid] * 4)
     print('   homogeneous 4-board MLP %dx%d W1 %dx%d W2 %dx%d: time %s, '
           'max err vs single-board reference %.1e'
