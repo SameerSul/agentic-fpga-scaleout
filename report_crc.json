@@ -1,15 +1,32 @@
 {
   "spec": {
-    "name": "crc32_endpoint",
-    "description": "Fabric endpoint CRC32 datapath: 32 bits per cycle, zlib/Ethernet compatible (reflected polynomial 0xEDB88320), synchronous clear between frames, valid handshake",
+    "name": "crc32_endpoint_16B",
+    "description": "Fabric endpoint CRC32 datapath, 16 byte(s) per cycle, zlib/Ethernet compatible (reflected polynomial 0xEDB88320), sized for a 10 Gbps link",
     "top_module": "crc32",
     "unit": "byte",
     "parameters": {
-      "data_width": 32,
+      "data_width": 128,
       "crc_width": 32,
-      "bytes_per_cycle": 4,
-      "target_clock_mhz": 100,
+      "bytes_per_cycle": 16,
+      "target_clock_mhz": 78.125,
       "polynomial": "0xEDB88320 reflected form of 0x04C11DB7"
+    },
+    "derivation": {
+      "target_link_gbps": 10.0,
+      "standard_rate_gbps": 10.0,
+      "datapath_option": 1,
+      "options_for_rate": [
+        [
+          8,
+          156.25
+        ],
+        [
+          16,
+          78.125
+        ]
+      ],
+      "rule": "standard Ethernet MAC datapath whose bytes_per_cycle * 8 * core_clock sustains the link rate; wider and slower options are tried when timing does not close",
+      "sustains_gbps": 10.0
     },
     "ports": [
       {
@@ -33,8 +50,8 @@
       {
         "name": "data",
         "dir": "input",
-        "width": 32,
-        "desc": "one 32-bit word per cycle, bytes LSB-first (little-endian packing)"
+        "width": 128,
+        "desc": "one 16-byte word per cycle, bytes LSB-first (little-endian packing)"
       },
       {
         "name": "valid_in",
@@ -46,7 +63,7 @@
         "name": "crc_out",
         "dir": "output",
         "width": 32,
-        "desc": "CRC32 of all words since clear, valid one cycle after the last word"
+        "desc": "CRC32 of all words since clear"
       },
       {
         "name": "valid_out",
@@ -57,9 +74,9 @@
     ],
     "behavior": [
       "State initializes to 0xFFFFFFFF on reset and on synchronous clear.",
-      "Each valid word w updates state s to 32 iterations of s = (s >> 1) ^ (0xEDB88320 & {32{s[0]}}) starting from s ^ w.",
+      "Each valid word consumes its 16 bytes LSB-first; per byte b, state s becomes 8 iterations of s = (s >> 1) ^ (0xEDB88320 & -(s & 1)) starting from s ^ b.",
       "crc_out registers the updated state XOR 0xFFFFFFFF (the standard final inversion), matching zlib.crc32 of the byte stream.",
-      "Latency from valid_in to valid_out is 1 cycle; throughput is one word (4 bytes) per cycle."
+      "Latency from valid_in to valid_out is 1 cycle; throughput is one 16-byte word per cycle."
     ]
   },
   "tools": {
@@ -82,13 +99,14 @@
         "mismatches": [
           {
             "test": "zero_word",
-            "expected_crc": "558161692",
-            "got_crc": "3736805603"
+            "expected_crc": "3971697493",
+            "got_crc": "323269802"
           }
         ]
       },
       "synth": null,
-      "timing": null
+      "timing": null,
+      "fpga": null
     },
     {
       "iteration": 2,
@@ -101,39 +119,53 @@
         "checks": 5,
         "mismatches": [],
         "throughput": {
-          "bytes": 1024,
+          "bytes": 4096,
           "span_cycles": 256,
           "latency_cycles": 3,
-          "units": 1024,
-          "cycles_per_unit": 0.25
+          "units": 4096,
+          "cycles_per_unit": 0.0625
         }
       },
       "synth": {
         "stage": "synth",
         "status": "pass",
-        "cell_count": 2016,
-        "area": 4193.0
+        "cell_count": 7333,
+        "area": 14728.0
       },
       "timing": {
         "stage": "timing",
         "status": "pass",
         "method": "opensta",
-        "clock_period_ns": 10.0,
-        "worst_slack_ns": 6.02
+        "clock_period_ns": 12.8,
+        "worst_slack_ns": 1.1
+      },
+      "fpga": {
+        "luts": 1004,
+        "ffs": 65,
+        "dsps": 0,
+        "brams": 0,
+        "urams": 0,
+        "carry": 0,
+        "muxf": 422,
+        "status": "pass",
+        "family": "xcup",
+        "top": "crc32",
+        "lint": [],
+        "stage": "fpga"
       }
     }
   ],
   "final_metrics": {
     "sim_pass": true,
     "sim_checks": 5,
-    "cell_count": 2016,
-    "area": 4193.0,
+    "cell_count": 7333,
+    "area": 14728.0,
     "timing": {
       "stage": "timing",
       "status": "pass",
       "method": "opensta",
-      "clock_period_ns": 10.0,
-      "worst_slack_ns": 6.02
+      "clock_period_ns": 12.8,
+      "worst_slack_ns": 1.1
     }
   }
 }

@@ -9,16 +9,17 @@ Run: python3 demo.py    (writes results.json)"""
 import json
 import random
 
-from chiplet_flow import run_flow, CHIPLET_JOB, FABRIC_JOB
+from chiplet_flow import (run_flow, run_endpoint_flow, CHIPLET_JOB,
+                          TARGET_LINK_GBPS)
 from specgen import generate
-from boards import fit, FIT_FRACTION
+from boards import fit, FIT_FRACTION, TRANSPORTS
 from fabric import make_cluster, fabric_stats, mm, relu
 from collectives import ring_allreduce, run_workers
 from sizing import (load_model_spec, model_summary, size_fabric,
                     simulate_decode)
 
 M, D, F = 64, 64, 512  # reduced-dim MLP shapes for the numerics check
-BOARD_ORDER = ('artix7_small', 'zynq_us_mid', 'versal_large')
+BOARD_ORDER = ('arty_a7_100t', 'zcu102', 'alveo_u250')
 
 
 def table(title, headers, rows):
@@ -107,49 +108,109 @@ def stage2_chiplet(ms, results):
 
 
 def stage3_endpoint(results):
-    banner(3, 'agents generate the fabric endpoint (CRC32 datapath, '
-              'same signoff)')
-    report, profile = run_flow(FABRIC_JOB, verbose=True)
+    banner(3, 'derive the fabric endpoint from the link rate, then '
+              'generate it')
+    print('   target link: %g Gbps. The endpoint datapath has to sustain it '
+          'or it' % TARGET_LINK_GBPS)
+    print('   throttles the wire, so width and clock are derived, not '
+          'chosen by hand.')
+    report, profile = run_endpoint_flow(verbose=True)
     assert report['converged'] and profile is not None
+    att = report.get('datapath_attempts', [])
+    if len(att) > 1:
+        table('datapath search: timing rejected the narrow option',
+              ['bytes/cycle', 'clock MHz', 'sustains Gbps', 'signed off'],
+              [[a['bytes_per_cycle'], '%g' % a['clock_mhz'],
+                '%.1f' % (a['bytes_per_cycle'] * 8 * a['clock_mhz'] / 1000),
+                'yes' if a['converged'] else 'no'] for a in att])
+        print('   this is architecture-level feedback: a datapath that '
+              'cannot close timing')
+        print('   is not an RTL bug, so the flow widened it and halved the '
+              'clock and retried')
     print('\n   the fabric is synthesized, not assumed: the endpoint that '
           'checks every')
-    print('   packet in stage 6 is this RTL, and its measured rate caps the '
-          'link below')
+    print('   packet in stage 7 is this RTL, at %.2f Gbps measured'
+          % profile['endpoint_gbps'])
     results['fabric_flow'] = {'converged': True,
-                              'iterations': report['iterations_used']}
+                              'iterations': report['iterations_used'],
+                              'datapath_attempts': att}
     results['fabric_profile'] = profile
     return profile
 
 
 def stage4_fit(cp, fp, results):
     banner(4, 'both profiles deploy on any board class (boards.py)')
+    print('   per-instance cost from real yosys synth_xilinx runs: chiplet '
+          '%d LUT / %d FF / %d DSP,' % (cp['fpga']['luts'], cp['fpga']['ffs'],
+                                        cp['fpga']['dsps']))
+    print('   endpoint %d LUT / %d FF / %d DSP'
+          % (fp['fpga']['luts'], fp['fpga']['ffs'], fp['fpga']['dsps']))
     rows, out = [], {}
     for name in BOARD_ORDER:
         f = fit(name, cp, fp)
-        rows.append([f['board_class'], f['instances'],
+        rows.append([f['board_class'], f['instances'], f['bound_by'],
                      '%.1f' % f['clock_mhz'],
-                     '%.2f' % (f['macs_per_s'] / 1e9),
-                     '%.1f' % f['transceiver_gbps'],
+                     '%.1f' % (f['macs_per_s'] / 1e9),
+                     '%.2f' % f['wire_gbps'],
                      '%.2f' % f['endpoint_gbps'],
                      '%.2f' % f['link_gbps'],
-                     '%.1f' % f['mem_bytes_per_ns'],
+                     '%.0f' % f['mem_bytes_per_ns'],
                      '%.1f' % (f['sram_bytes'] / 1e6)])
         out[name] = f
-    table('fit(board, chiplet_profile, fabric_profile), usable fabric '
-          'fraction = %.0f%%' % (100 * FIT_FRACTION),
-          ['board class', 'instances', 'clock MHz', 'GMAC/s',
-           'xcvr Gbps', 'endpoint Gbps', 'link Gbps', 'DDR GB/s',
+    table('fit(board, chiplet_profile, fabric_profile) over %s, usable '
+          'device fraction = %.0f%%'
+          % (out[BOARD_ORDER[0]]['transport'], 100 * FIT_FRACTION),
+          ['board class', 'instances', 'bound by', 'clock MHz', 'GMAC/s',
+           'wire Gbps', 'endpoint Gbps', 'link Gbps', 'DDR GB/s',
            'SRAM MB'], rows)
-    print('   link rate = min(transceiver, synthesized endpoint): the '
-          'endpoint gates')
-    print('   the mid and large boards, an honest measured limit, not a '
-          'datasheet number')
+    print('   the MAC infers a DSP slice, so compute is DSP-bound on every '
+          'class: a single')
+    print('   capacity number cannot express that, because the endpoint is '
+          'pure LUT logic')
+    print('   link rate = min(wire, synthesized endpoint): the endpoint now '
+          'only gates the')
+    print('   25G board, since it was derived for a 10G target')
     results['fit'] = list(out.values())
     return out
 
 
+def stage4b_transport(cp, fp, ms, results):
+    banner(5, 'how the boards are wired: transport choice, measured')
+    rows, out = [], {}
+    for key in ('aurora', 'ethernet_direct', 'ethernet_switched'):
+        f = fit('alveo_u250', cp, fp, transport=key)
+        sz = size_fabric(dict(ms, target_tokens_per_s=0), f)
+        peak = max(sz['sweep'], key=lambda p: p['predicted_tok_per_s'])
+        at16 = next(p for p in sz['sweep'] if p['boards'] == 16)
+        tr = TRANSPORTS[key]
+        rows.append([tr['name'], '%.2f' % f['link_gbps'],
+                     '%.0f' % f['link_prop_ns'],
+                     f['frame_overhead_bytes'],
+                     '%d LUT' % tr['luts_per_port'],
+                     'yes' if tr['switchable'] else 'no',
+                     '%.0f' % peak['predicted_tok_per_s'],
+                     '%.0f' % at16['predicted_tok_per_s']])
+        out[key] = {'link_gbps': f['link_gbps'],
+                    'prop_ns': f['link_prop_ns'],
+                    'peak_tok_per_s': peak['predicted_tok_per_s'],
+                    'tok_per_s_at_16': at16['predicted_tok_per_s']}
+    table('same cluster (alveo_u250), three ways to wire it',
+          ['transport', 'link Gbps', 'hop ns', 'frame B', 'MAC cost',
+           'switchable', 'peak tok/s', 'tok/s @16'], rows)
+    a, e = out['aurora'], out['ethernet_direct']
+    print('   Ethernet costs %.0f%% of peak throughput and %.0f%% at 16 '
+          'boards versus Aurora,'
+          % (100 * (1 - e['peak_tok_per_s'] / a['peak_tok_per_s']),
+             100 * (1 - e['tok_per_s_at_16'] / a['tok_per_s_at_16'])))
+    print('   because latency matters more as chunks shrink. It buys '
+          'commodity cabling, real')
+    print('   switching, and vendor neutrality, which is what "any FPGA, '
+          'any count" requires.')
+    results['transports'] = out
+
+
 def stage5_sizing(ms, fits_by_name, results):
-    banner(5, 'the right fabric: smallest cluster per board class that '
+    banner(6, 'the right fabric: smallest cluster per board class that '
               'hosts the model')
     sizings, rows = {}, []
     for name in BOARD_ORDER:
@@ -170,12 +231,18 @@ def stage5_sizing(ms, fits_by_name, results):
           % ms['target_tokens_per_s'],
           ['board class', 'boards needed', 'predicted tok/s', 'bound',
            'weights in SRAM'], rows)
-    print('   decode is memory-bound until the weight shard fits on-chip '
-          'SRAM: the small')
-    print('   and mid classes never get there, so only the large class '
-          'can host the target')
+    print('   batch-1 decode touches every weight once per token, so a '
+          'board streaming from')
+    print('   DDR is memory-bound no matter how many MACs it has: every '
+          'row above is')
+    print('   bound by memory, not by the %d to %d GMAC/s of compute on '
+          'offer'
+          % (fits_by_name[BOARD_ORDER[0]]['macs_per_s'] / 1e9,
+             fits_by_name[BOARD_ORDER[-1]]['macs_per_s'] / 1e9))
 
-    lg = sizings['versal_large']
+    lg = sizings['alveo_u250']
+    cliff = next((p['boards'] for p in lg['sweep'] if p['sram_resident']),
+                 None)
     rows = [[p['boards'], '%.0f' % p['predicted_tok_per_s'],
              fmt_ns(p['compute_ns_per_token']),
              fmt_ns(p['mem_ns_per_token']),
@@ -185,16 +252,24 @@ def stage5_sizing(ms, fits_by_name, results):
              'chosen' if lg['chosen'] and p['boards'] ==
              lg['chosen']['boards'] else '']
             for p in lg['sweep']]
-    table('candidate sweep on the large class (the SRAM residency cliff '
-          'sits between 2 and 4 boards)',
+    table('candidate sweep on the large class (weight shards become '
+          'SRAM-resident at %s boards)' % cliff,
           ['boards', 'pred tok/s', 'compute/tok', 'mem/tok', 'comm/tok',
            'bound', 'resident', ''], rows)
+    best = max(lg['sweep'], key=lambda p: p['predicted_tok_per_s'])
+    print('   throughput peaks at %d boards (%.0f tok/s) and then falls: '
+          'past residency the'
+          % (best['boards'], best['predicted_tok_per_s']))
+    print('   ring all-reduce grows as 2*(n-1) while there is no memory '
+          'traffic left to save,')
+    print('   so more boards is actively worse. That is the number the '
+          'sizing layer exists to find.')
     results['sizing'] = sizings
     return sizings
 
 
 def stage6_host(ms, fits_by_name, sizings, results):
-    banner(6, 'host the model: decode on the chosen fabric, every '
+    banner(7, 'host the model: decode on the chosen fabric, every '
               'all-reduce real traffic')
     name = next(nm for nm in BOARD_ORDER if sizings[nm]['chosen'])
     ch = sizings[name]['chosen']
@@ -202,12 +277,12 @@ def stage6_host(ms, fits_by_name, sizings, results):
     r = simulate_decode([fits_by_name[name]] * n, ms, tokens=8)
     ratio = r['tok_per_s'] / ch['predicted_tok_per_s']
     rows = [
-        ['boards', n, 'chosen by sizing in stage 5'],
+        ['boards', n, 'chosen by sizing in stage 6'],
         ['tokens decoded', r['tokens'], 'full n_layer loop per token'],
         ['measured tok/s', '%.0f' % r['tok_per_s'],
          'discrete-event fabric, packetized + CRC + credits'],
         ['predicted tok/s', '%.0f' % ch['predicted_tok_per_s'],
-         'analytic model from stage 5'],
+         'analytic model from stage 6'],
         ['prediction ratio', '%.2f' % ratio, 'measured / predicted'],
         ['collectives per token', '%.0f' % r['collectives_per_token'],
          'n_layer * 2 = %d expected' % (ms['n_layer'] * 2)],
@@ -236,7 +311,7 @@ def stage6_host(ms, fits_by_name, sizings, results):
 
 
 def stage7_scale(ms, fits_by_name, results, host_name):
-    banner(7, 'scale by adding boards, and survive a lossy fabric')
+    banner(8, 'scale by adding boards, and survive a lossy fabric')
     name = host_name
     f = fits_by_name[name]
     rows, out = [], []
@@ -324,16 +399,16 @@ def mlp_run(fits, cols=None, seed=7):
 
 
 def stage8_numerics(fits_by_name, results):
-    banner(8, 'numerics check at reduced dimensions (real arithmetic '
+    banner(9, 'numerics check at reduced dimensions (real arithmetic '
               'through the fabric)')
-    mid = fits_by_name['zynq_us_mid']
+    mid = fits_by_name['zcu102']
     t_h, err_h, _, out_h = mlp_run([mid] * 4)
     print('   homogeneous 4-board MLP %dx%d W1 %dx%d W2 %dx%d: time %s, '
           'max err vs single-board reference %.1e'
           % (M, D, D, F, F, D, fmt_ns(t_h), err_h))
 
-    fits = [fits_by_name['artix7_small'], fits_by_name['artix7_small'],
-            fits_by_name['versal_large'], fits_by_name['versal_large']]
+    fits = [fits_by_name['arty_a7_100t'], fits_by_name['arty_a7_100t'],
+            fits_by_name['alveo_u250'], fits_by_name['alveo_u250']]
     t_eq, err_eq, _, out_eq = mlp_run(fits)
     wsum = sum(f['macs_per_s'] for f in fits)
     cols = [max(1, round(F * f['macs_per_s'] / wsum)) for f in fits]
@@ -361,6 +436,7 @@ def main():
     cp = stage2_chiplet(ms, results)
     fp = stage3_endpoint(results)
     fits_by_name = stage4_fit(cp, fp, results)
+    stage4b_transport(cp, fp, ms, results)
     sizings = stage5_sizing(ms, fits_by_name, results)
     host_name, _ = stage6_host(ms, fits_by_name, sizings, results)
     stage7_scale(ms, fits_by_name, results, host_name)

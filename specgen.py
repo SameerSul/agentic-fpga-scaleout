@@ -18,6 +18,8 @@ derived widths. Pure Python 3 stdlib."""
 import json
 import math
 import os
+import random
+import zlib
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 
@@ -231,6 +233,240 @@ def render_testbench(spec):
     return TB_TEMPLATE.format(
         dw=dw, aw=aw, dwm=dw - 1, awm=aw - 1, pwm=2 * dw - 1, pw=2 * dw,
         maxv=maxv, v1=maxv - 1, v2=maxv - 2, c1=12 & maxv, c2=34 & maxv)
+
+
+# Standard Ethernet rates and the MAC datapaths that carry them, ordered
+# narrowest first. Every option for a rate sustains it (bytes_per_cycle * 8
+# * clock >= rate), but they trade combinational depth against clock period:
+# doubling the width halves the clock and roughly doubles the XOR tree, and
+# because CRC trees collapse sub-linearly the wider/slower option often
+# closes timing when the narrow/fast one does not. The flow tries them in
+# order and keeps the first that signs off, which is the same call a human
+# designer makes when the first datapath misses.
+ETH_DATAPATHS = {
+    1.0: ((1, 125.0), (2, 62.5)),
+    10.0: ((8, 156.25), (16, 78.125)),
+    25.0: ((16, 195.3125), (32, 97.65625)),
+    100.0: ((64, 195.3125), (128, 97.65625)),
+}
+ETH_RATES = tuple(sorted(ETH_DATAPATHS))
+
+
+def endpoint_options(link_gbps):
+    """Standard rate at or above the target, and its datapath options."""
+    rate = next((r for r in ETH_RATES if r >= link_gbps - 1e-9), ETH_RATES[-1])
+    return rate, ETH_DATAPATHS[rate]
+
+
+def derive_endpoint_spec(link_gbps, option=0):
+    """Size the fabric endpoint to the link it has to keep up with.
+
+    An endpoint narrower than the wire throttles it: a 4-byte datapath at
+    250 MHz carries 8 Gbps no matter what transceiver sits behind it. This
+    picks a standard datapath that sustains the target rate; `option`
+    selects among the width/clock trades for that rate, which the flow
+    advances when timing does not close."""
+    rate, opts = endpoint_options(link_gbps)
+    w, clk = opts[min(option, len(opts) - 1)]
+    return {
+        "name": "crc32_endpoint_%dB" % w,
+        "description": "Fabric endpoint CRC32 datapath, %d byte(s) per cycle, "
+                       "zlib/Ethernet compatible (reflected polynomial "
+                       "0xEDB88320), sized for a %g Gbps link" % (w, rate),
+        "top_module": "crc32",
+        "unit": "byte",
+        "parameters": {
+            "data_width": 8 * w,
+            "crc_width": 32,
+            "bytes_per_cycle": w,
+            "target_clock_mhz": clk,
+            "polynomial": "0xEDB88320 reflected form of 0x04C11DB7",
+        },
+        "derivation": {
+            "target_link_gbps": link_gbps,
+            "standard_rate_gbps": rate,
+            "datapath_option": option,
+            "options_for_rate": [list(o) for o in opts],
+            "rule": "standard Ethernet MAC datapath whose bytes_per_cycle * "
+                    "8 * core_clock sustains the link rate; wider and slower "
+                    "options are tried when timing does not close",
+            "sustains_gbps": w * 8 * clk / 1000.0,
+        },
+        "ports": [
+            {"name": "clk", "dir": "input", "width": 1,
+             "desc": "clock, rising edge"},
+            {"name": "rst_n", "dir": "input", "width": 1,
+             "desc": "active-low synchronous reset"},
+            {"name": "clear", "dir": "input", "width": 1,
+             "desc": "synchronous state clear, start of a new frame"},
+            {"name": "data", "dir": "input", "width": 8 * w,
+             "desc": "one %d-byte word per cycle, bytes LSB-first "
+                     "(little-endian packing)" % w},
+            {"name": "valid_in", "dir": "input", "width": 1,
+             "desc": "data word valid"},
+            {"name": "crc_out", "dir": "output", "width": 32,
+             "desc": "CRC32 of all words since clear"},
+            {"name": "valid_out", "dir": "output", "width": 1,
+             "desc": "crc_out updated this cycle"},
+        ],
+        "behavior": [
+            "State initializes to 0xFFFFFFFF on reset and on synchronous "
+            "clear.",
+            "Each valid word consumes its %d bytes LSB-first; per byte b, "
+            "state s becomes 8 iterations of s = (s >> 1) ^ (0xEDB88320 & "
+            "-(s & 1)) starting from s ^ b." % w,
+            "crc_out registers the updated state XOR 0xFFFFFFFF (the "
+            "standard final inversion), matching zlib.crc32 of the byte "
+            "stream.",
+            "Latency from valid_in to valid_out is 1 cycle; throughput is "
+            "one %d-byte word per cycle." % w,
+        ],
+    }
+
+
+def crc32_bytes(data):
+    """Reference CRC32 (zlib compatible), used to bake golden vectors into
+    the generated testbench so the checks are independent of the RTL."""
+    return zlib.crc32(data) & 0xFFFFFFFF
+
+
+def _word_literal(chunk, w):
+    """Pack w bytes LSB-first into a Verilog sized literal."""
+    v = int.from_bytes(chunk, "little")
+    return "%d'h%0*x" % (8 * w, 2 * w, v)
+
+
+def render_crc_testbench(spec):
+    """Generate the endpoint testbench at the derived width, with golden
+    CRC values computed by zlib rather than by the design under test."""
+    w = spec["parameters"]["bytes_per_cycle"]
+    rng = random.Random(42)
+    ascii_src = b"123456789abcdefghijklmnopqrstuvwxyz"
+    cases = [
+        ("zero_word", bytes(w)),
+        # Exactly w bytes: a short literal would leave the high bytes of the
+        # word zero while the golden value covered only the literal, so the
+        # vector has to be padded to the full datapath width.
+        ("ascii_word", (ascii_src * (w // len(ascii_src) + 1))[:w]),
+        ("two_words", bytes(rng.randrange(256) for _ in range(2 * w))),
+        ("eight_words", bytes(rng.randrange(256) for _ in range(8 * w))),
+    ]
+    body = []
+    for name, payload in cases:
+        body.append('    testname = "%s";' % name)
+        body.append("    start_frame;")
+        for off in range(0, len(payload), w):
+            body.append("    word(%s);"
+                        % _word_literal(payload[off:off + w], w))
+        body.append("    expect_crc(32'h%08x);" % crc32_bytes(payload))
+        body.append("")
+    # Re-check the first vector after a clear, proving state reinitializes.
+    body.append('    testname = "clear_reinit";')
+    body.append("    start_frame;")
+    for off in range(0, len(cases[0][1]), w):
+        body.append("    word(%s);" % _word_literal(cases[0][1][off:off + w], w))
+    body.append("    expect_crc(32'h%08x);" % crc32_bytes(cases[0][1]))
+    return CRC_TB_TEMPLATE.format(w=w, dm=8 * w - 1, cases="\n".join(body))
+
+
+CRC_TB_TEMPLATE = """`timescale 1ns/1ps
+// GENERATED by specgen.py: do not edit by hand.
+// Self-checking testbench for the {w}-byte-per-cycle CRC32 fabric endpoint.
+// Golden values are computed by Python's zlib.crc32, so a design that
+// matches them is wire-compatible with the Ethernet FCS it has to produce.
+// Prints machine-parseable TB_FAIL / TB_PROFILE / TB_RESULT lines.
+module tb_crc;
+  reg clk = 0, rst_n = 0, clear = 0, valid_in = 0;
+  reg [{dm}:0] data = 0;
+  wire [31:0] crc_out;
+  wire valid_out;
+  integer checks = 0, i;
+  reg [127:0] testname;
+
+  integer cyc = 0;
+  integer first_vin_cyc = 0, first_vout_cyc = 0, last_vout_cyc = 0;
+  integer vout_count = 0;
+  reg profiling = 0;
+
+  crc32 dut (.clk(clk), .rst_n(rst_n), .clear(clear), .data(data),
+             .valid_in(valid_in), .crc_out(crc_out), .valid_out(valid_out));
+
+  always #5 clk = ~clk;
+
+  always @(posedge clk) begin
+    cyc = cyc + 1;
+    if (profiling && valid_out) begin
+      if (vout_count == 0) first_vout_cyc = cyc;
+      last_vout_cyc = cyc;
+      vout_count = vout_count + 1;
+    end
+  end
+
+  task start_frame;
+    begin
+      @(negedge clk); clear = 1; valid_in = 0;
+      @(negedge clk); clear = 0;
+    end
+  endtask
+
+  task word(input [{dm}:0] d);
+    begin
+      @(negedge clk); data = d; valid_in = 1;
+    end
+  endtask
+
+  task expect_crc(input [31:0] want);
+    begin
+      @(negedge clk); valid_in = 0;
+      checks = checks + 1;
+      if (crc_out !== want) begin
+        $display("TB_FAIL test=%0s expected_crc=%0d got_crc=%0d",
+                 testname, want, crc_out);
+        $display("TB_RESULT: FAIL");
+        $finish;
+      end
+    end
+  endtask
+
+  initial begin
+    repeat (3) @(negedge clk);
+    rst_n = 1;
+    @(negedge clk);
+
+{cases}
+
+    // Throughput burst: 256 back-to-back words, measuring the steady-state
+    // initiation interval in cycles per byte.
+    testname = "throughput_burst";
+    start_frame;
+    profiling = 1;
+    vout_count = 0;
+    first_vin_cyc = cyc;
+    for (i = 0; i < 256; i = i + 1) word(i);
+    @(negedge clk); valid_in = 0;
+    repeat (4) @(negedge clk);
+    profiling = 0;
+    $display("TB_PROFILE bytes=%0d span_cycles=%0d latency_cycles=%0d",
+             vout_count * {w}, last_vout_cyc - first_vout_cyc + 1,
+             first_vout_cyc - first_vin_cyc);
+
+    $display("TB_PASS checks=%0d", checks);
+    $display("TB_RESULT: PASS");
+    $finish;
+  end
+endmodule
+"""
+
+
+def generate_endpoint(link_gbps, spec_file="spec_crc.json",
+                      tb_file="tb_crc.v", option=0):
+    """Write the derived endpoint spec and its testbench, return the spec."""
+    spec = derive_endpoint_spec(link_gbps, option)
+    with open(os.path.join(ROOT, spec_file), "w") as f:
+        json.dump(spec, f, indent=2)
+    with open(os.path.join(ROOT, tb_file), "w") as f:
+        f.write(render_crc_testbench(spec))
+    return spec
 
 
 def load_model_spec(path=None):

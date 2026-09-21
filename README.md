@@ -11,8 +11,8 @@ Everything downstream is driven by three machine-readable files:
 | file | role |
 |---|---|
 | `model_spec.json` | the input workload: layer count, d_model, d_ff, quantization (weight_bits, activation_bits), seq_len, dtype, and the target tokens/s. Per-token MACs, weight and KV cache traffic, all-reduce bytes, and the chiplet architecture all derive from it |
-| `chiplet_profile.json` | written by the agentic flow only after the compute chiplet passes sim, synth, and timing: measured cycles/MAC, cell count, fmax, and the derivation record |
-| `fabric_profile.json` | same flow, same signoff, for the fabric endpoint (a word-serial CRC32 datapath): measured cycles/byte and the endpoint's achievable Gbps |
+| `chiplet_profile.json` | written by the agentic flow only after the compute chiplet passes simulation, synthesis, timing, and FPGA mapping: measured cycles/MAC, cell count, fmax, real LUT/FF/DSP counts, and the derivation record |
+| `fabric_profile.json` | same flow, same signoff, for the fabric endpoint (a CRC32 datapath whose width is derived from the link rate): measured cycles/byte, FPGA resources, and the endpoint's achievable Gbps |
 
 The chiplet spec is not a checked-in input. `specgen.py` derives it from the model before every run:
 
@@ -23,6 +23,8 @@ acc_width  = weight_bits + activation_bits + ceil(log2(max(d_model, d_ff)))
 
 The accumulator gets exactly the guard bits its longest dot-product reduction needs (12 for GPT-2's 3072-deep c_proj), so it can never overflow and is never wider than the model requires. The self-checking testbench is generated alongside the spec at the same widths, golden model and max-value stimulus included. A different model yields different signed-off hardware through the identical loop with no code changes: re-quantize the model to 4 bits and the flow converges on a 4x4-bit datapath with a 20-bit accumulator that synthesizes measurably smaller (the test suite does exactly this).
 
+The fabric endpoint is derived the same way, from the link it has to keep up with rather than from the model. An endpoint narrower than the wire throttles it, so `specgen.derive_endpoint_spec` picks a standard Ethernet MAC datapath (bytes per cycle and core clock) that sustains the target rate, and generates the matching testbench with golden values computed by `zlib.crc32`. That closes a loop the RTL agent cannot: when a datapath misses timing, widening it is not an RTL fix, it is a different architecture, so `run_endpoint_flow` advances to the next standard width/clock pair and reruns the whole agent loop. At a 10 Gbps target the 8-byte datapath at 156.25 MHz misses by 0.02 ns and the 16-byte datapath at 78.125 MHz signs off at +1.10 ns, which is exactly the call a human designer makes at that point.
+
 Profile provenance, identical for both generated blocks:
 
 | field | where it comes from |
@@ -32,10 +34,27 @@ Profile provenance, identical for both generated blocks:
 | `cell_count`, `area` | yosys `stat` against the generic liberty |
 | `fmax_estimate_mhz` | OpenSTA worst slack at the target clock: fmax = 1000 / (period - slack); falls back to a yosys gate-depth proxy if OpenSTA is absent |
 | `endpoint_gbps` (fabric only) | bytes/cycle times the measured fmax: what the synthesized endpoint can actually carry |
+| `fpga` | real device primitives from yosys `synth_xilinx`: LUTs, flip-flops, DSP slices, block RAM. The MAC infers one DSP; the endpoint is pure LUT logic |
 | `derivation` (chiplet only) | the record of how the model produced this architecture: quantization, reduction depth, guard bits |
 | `sim_checks_passed` | self-checking testbench vs golden vectors (the CRC testbench checks against zlib-computed CRC32 values) |
 
-`boards.py` consumes both with `fit(board, chiplet_profile, fabric_profile)`: endpoint cells are reserved off the capacity proxy per link, chiplet instances fill what remains, and the usable link rate is min(board transceiver, synthesized endpoint). On the mid and large board classes the endpoint is the limit, so the fabric the cluster actually gets is the one the agents built, not a datasheet number. Nothing upstream changes when the board class changes, and a cluster may mix classes.
+`boards.py` consumes both with `fit(board, chiplet_profile, fabric_profile, transport)` against real device budgets (Artix-7 XC7A100T, Zynq UltraScale+ ZU9EG, Alveo U250). The fit is multi-resource and that matters: because the MAC infers a DSP slice and the endpoint is LUT logic, the two blocks compete for different things, and a single capacity number cannot express it. Compute comes out DSP-bound on all three parts (168, 1764, and 8601 instances), while the transport cores and endpoints are charged against LUTs and flip-flops per link. The usable link rate is min(wire rate after 64b/66b coding, synthesized endpoint rate). Nothing upstream changes when the board class changes, and a cluster may mix classes.
+
+## Connecting the boards
+
+Three transports are modeled, and the choice is a measurable trade rather than a preference:
+
+| transport | hop latency | wire overhead | core cost | switchable |
+|---|---|---|---|---|
+| Aurora 64B/66B, direct attach | 215 ns | 8 B/frame | ~1500 LUT/port | no |
+| Ethernet, direct attach | 565 ns | 38 B/frame | ~5000 LUT/port | yes |
+| Ethernet through a cut-through switch | 1015 ns | 38 B/frame | ~5000 LUT/port | yes |
+
+On the same 8-board Alveo cluster, Ethernet direct-attach costs about 8% of peak throughput against Aurora and about 41% at 16 boards. The gap widens with board count because the ring's chunk size shrinks as 1/n while the per-hop latency stays fixed, so latency dominates exactly where Aurora is strongest.
+
+**Ethernet is still the right default here, and the prototype uses it.** The project's claim is scaling across any FPGA of any class in any count, and Aurora is point-to-point and vendor-locked: it cannot express a topology that is not directly cabled, and it does not cross vendors. Ethernet buys commodity DAC cables, real switching (so the topology is not limited to a physical ring), vendor neutrality, and the same substrate the industry is standardizing scaleout on. The measured cost of that flexibility is 8% at the board counts sizing actually recommends, which is cheap.
+
+One convenient alignment: Ethernet's frame check sequence is CRC-32 with polynomial 0x04C11DB7, the reflected form of which is the 0xEDB88320 the generated endpoint already implements. The agent-generated block is therefore the FCS engine, not a layer bolted above it. Note that the FCS protects a single hop; the sequence numbers, go-back-N retransmission, and credit flow control in `fabric.py` are what make the end-to-end ring reliable, and those remain necessary above any transport.
 
 ## Model assumptions and hardware mapping
 
@@ -45,9 +64,11 @@ Profile provenance, identical for both generated blocks:
 | `specgen.py` | derives the chiplet spec and its testbench from the model: datapath width from the quantization, accumulator width from the longest reduction | the architecture step: choosing the datapath the model actually needs before any RTL is written |
 | `chiplet_flow.py` + `agent.py` / `llm_agent.py` | agent proposes RTL, tools verify, parsed failures feed back until signoff; the same loop runs both the derived chiplet and the fabric endpoint, with a deterministic rule-based agent by default and a real LLM behind the same interface (`--agent llm`) | the LLM-driven RTL generation loop on production verification and synthesis flows |
 | generated `tb_mac.v` / `tb_crc.v` | golden-model checking plus a throughput burst that measures cycles per unit, at whatever widths the derivation chose | a full UVM environment plus performance characterization on the real testbench |
-| yosys + `cells.lib` | mapping to a tiny generic liberty, cell count as the footprint metric | FPGA synthesis to LUTs/FFs/DSPs with a place-and-route utilization report |
+| yosys + `cells.lib` | mapping to a tiny generic liberty, cell count as the footprint metric | ASIC synthesis against a standard-cell library |
+| `fpga.py`, yosys `synth_xilinx` | real device mapping: LUT, FF, DSP, and BRAM counts per block, plus a lint gate that fails the iteration on inferred latches, multiple drivers, and combinational loops | Vivado synthesis and implementation, with utilization and post-route timing reports |
 | OpenSTA slack to fmax | achievable clock from static timing at the target period | vendor STA after place-and-route, speed-grade specific |
-| `boards.py` profiles | capacity proxy, clock cap, transceiver class, effective DDR bandwidth, and SRAM budget per board family; endpoint cells reserved per link; weight shards that fit SRAM are modeled resident (no per-token DDR traffic) | Artix-7, Kintex/Zynq UltraScale, and Versal/Alveo class parts with GTP/GTH/GTY-class serial links, DDR controllers, and BRAM/URAM |
+| `boards.py` devices | datasheet LUT/FF/DSP/BRAM budgets, clock caps, transceiver rates, effective DDR bandwidth; transport cores and endpoints reserved per link; weight shards that fit SRAM are modeled resident | the actual named parts: Artix-7 XC7A100T, Zynq UltraScale+ ZU9EG (ZCU102), Alveo U250 |
+| `boards.TRANSPORTS` | Aurora and Ethernet (direct and switched): per-hop latency, per-frame wire overhead, MTU, and the LUT/FF cost of the core itself | Xilinx Aurora 64B/66B IP, or a 10/25G Ethernet MAC plus PCS over SFP+/QSFP28 |
 | generated `crc.v` endpoint | word-serial CRC32 datapath, measured Gbps caps the usable link rate | the framing/CRC stage of an Aurora-style or Ethernet-style link endpoint |
 | `Link` (rate, prop delay, BER knob) | serialization delay, flight time, random corruption | one transceiver lane running a framed stream |
 | `_Tx` / `_Rx` in `fabric.py` | seq numbers, CRC32, go-back-N retransmit, cumulative ACKs | the reliable link-layer RTL block: replay buffer in BRAM, ACK sideband |
@@ -59,11 +80,13 @@ Profile provenance, identical for both generated blocks:
 ## How to run
 
 ```
-python3 demo.py                    # end-to-end, all eight stages, writes results.json (about 6 s)
-python3 tests.py                   # 43-check correctness suite (both flows, a 4-bit model variant, sizing physics)
+python3 demo.py                    # end-to-end, all nine stages, writes results.json (about 30 s)
+python3 tests.py                   # 60-check suite (both flows, a 4-bit model variant, FPGA mapping, transports, sizing physics)
 python3 chiplet_flow.py            # just the two agentic RTL loops, writes both profiles
 python3 chiplet_flow.py --agent llm  # same loops with a real LLM writing the RTL (Ollama, API, or Claude CLI)
 python3 specgen.py                 # just the model-to-chiplet derivation
+CHIPLET_LINK_GBPS=25 python3 chiplet_flow.py   # derive the endpoint for a different link rate
+CHIPLET_FPGA_FAMILY=xc7 python3 chiplet_flow.py  # map to 7-series instead of UltraScale+
 ```
 
 Python 3 stdlib only. Requires `iverilog` and `vvp` on PATH; `yosys` and `sta` (OpenSTA) are used when present and skipped gracefully when not (timing then falls back to the gate-depth proxy, clearly labeled). Build artifacts go to `build/`; `spec_mac.json` and `tb_mac.v` are regenerated from the model spec on every run.
@@ -102,113 +125,160 @@ MAC datapath  8 x 8 bits        the model quantization: weight_bits=8, activatio
  accumulator     28 bits  16 product bits + 12 guard bits, overflow-free by construction
   guard bits          12      ceil(log2(3072)), the longest dot-product reduction (d_ff)
 
-Agent: RuleBasedAgent
 
-iter  fixes applied                                sim                                   synth              timing
----------------------------------------------------------------------------------------------------------------------------------
-1     none                                         FAIL wide_product: exp 65328 got 304  -                  -
-2     widen_product_register                       FAIL sync_clear: exp 0 got 129845     -                  -
-3     implement_sync_clear,widen_product_register  pass (594 checks)                     pass (1052 cells)  pass (slack +4.44 ns)
+iter  fixes applied                                sim                                   synth              timing                 fpga
+--------------------------------------------------------------------------------------------------------------------------------------------------------------
+1     none                                         FAIL wide_product: exp 65328 got 304  -                  -                      -
+2     widen_product_register                       FAIL sync_clear: exp 0 got 129845     -                  -                      -
+3     implement_sync_clear,widen_product_register  pass (594 checks)                     pass (1052 cells)  pass (slack +4.44 ns)  pass (34 LUT, 46 FF, 1 DSP)
 
 CONVERGED in 3 iteration(s)
 
 ========================================================================
-Stage 3: agents generate the fabric endpoint (CRC32 datapath, same signoff)
+Stage 3: derive the fabric endpoint from the link rate, then generate it
 ========================================================================
-Agent: RuleBasedAgent
+   target link: 10 Gbps. The endpoint datapath has to sustain it or it
+   throttles the wire, so width and clock are derived, not chosen by hand.
 
-iter  fixes applied          sim                                           synth              timing
--------------------------------------------------------------------------------------------------------------------
-1     none                   FAIL zero_word: exp 558161692 got 3736805603  -                  -
-2     apply_final_inversion  pass (5 checks)                               pass (2016 cells)  pass (slack +6.02 ns)
+Endpoint datapath option 1/2 for 10 Gbps: 8 bytes/cycle at 156.25 MHz
+
+iter  fixes applied          sim                                            synth              timing                 fpga
+--------------------------------------------------------------------------------------------------------------------------------------------------
+1     none                   FAIL zero_word: exp 1696784233 got 2598183062  -                  -                      -
+2     apply_final_inversion  pass (5 checks)                                pass (3815 cells)  fail (slack -0.02 ns)  pass (522 LUT, 65 FF, 0 DSP)
+3     apply_final_inversion  pass (5 checks)                                pass (3815 cells)  fail (slack -0.02 ns)  pass (522 LUT, 65 FF, 0 DSP)
+4     apply_final_inversion  pass (5 checks)                                pass (3815 cells)  fail (slack -0.02 ns)  pass (522 LUT, 65 FF, 0 DSP)
+5     apply_final_inversion  pass (5 checks)                                pass (3815 cells)  fail (slack -0.02 ns)  pass (522 LUT, 65 FF, 0 DSP)
+
+DID NOT CONVERGE in 5 iteration(s)
+   timing missed by -0.02 ns at 156.25 MHz, widening the datapath and slowing the clock
+
+Endpoint datapath option 2/2 for 10 Gbps: 16 bytes/cycle at 78.125 MHz
+
+iter  fixes applied          sim                                           synth              timing                 fpga
+--------------------------------------------------------------------------------------------------------------------------------------------------
+1     none                   FAIL zero_word: exp 3971697493 got 323269802  -                  -                      -
+2     apply_final_inversion  pass (5 checks)                               pass (7333 cells)  pass (slack +1.10 ns)  pass (1004 LUT, 65 FF, 0 DSP)
 
 CONVERGED in 2 iteration(s)
 
+datapath search: timing rejected the narrow option
+bytes/cycle  clock MHz  sustains Gbps  signed off
+-----------  ---------  -------------  ----------
+          8     156.25           10.0          no
+         16     78.125           10.0         yes
+   this is architecture-level feedback: a datapath that cannot close timing
+   is not an RTL bug, so the flow widened it and halved the clock and retried
+
    the fabric is synthesized, not assumed: the endpoint that checks every
-   packet in stage 6 is this RTL, and its measured rate caps the link below
+   packet in stage 7 is this RTL, at 10.94 Gbps measured
 
 ========================================================================
 Stage 4: both profiles deploy on any board class (boards.py)
 ========================================================================
+   per-instance cost from real yosys synth_xilinx runs: chiplet 34 LUT / 46 FF / 1 DSP,
+   endpoint 1004 LUT / 65 FF / 0 DSP
 
-fit(board, chiplet_profile, fabric_profile), usable fabric fraction = 70%
-board class                         instances  clock MHz  GMAC/s  xcvr Gbps  endpoint Gbps  link Gbps  DDR GB/s  SRAM MB
-----------------------------------  ---------  ---------  ------  ---------  -------------  ---------  --------  -------
-             small (Artix-7 class)          5      150.0    0.75        6.6           4.80       4.80       1.6      0.6
-mid (Kintex/Zynq UltraScale class)         64      179.9   11.51       16.3           8.04       8.04       3.2      4.5
-        large (Versal/Alveo class)        268      179.9   48.20       32.0           8.04       8.04      12.0     24.0
-   link rate = min(transceiver, synthesized endpoint): the endpoint gates
-   the mid and large boards, an honest measured limit, not a datasheet number
+fit(board, chiplet_profile, fabric_profile) over Ethernet, direct attach (no switch), usable device fraction = 70%
+board class                     instances  bound by  clock MHz  GMAC/s  wire Gbps  endpoint Gbps  link Gbps  DDR GB/s  SRAM MB
+------------------------------  ---------  --------  ---------  ------  ---------  -------------  ---------  --------  -------
+      small (Artix-7 XC7A100T)        168      dsps      150.0    25.2       1.21          10.94       1.21         1      0.6
+mid (Zynq UltraScale+ XCZU9EG)       1764      dsps      179.9   317.3      10.00          10.94      10.00        12      4.2
+    large (Alveo U250, XCU250)       8601      dsps      179.9  1546.9      25.00          10.94      10.94        64     56.4
+   the MAC infers a DSP slice, so compute is DSP-bound on every class: a single
+   capacity number cannot express that, because the endpoint is pure LUT logic
+   link rate = min(wire, synthesized endpoint): the endpoint now only gates the
+   25G board, since it was derived for a 10G target
 
 ========================================================================
-Stage 5: the right fabric: smallest cluster per board class that hosts the model
+Stage 5: how the boards are wired: transport choice, measured
+========================================================================
+
+same cluster (alveo_u250), three ways to wire it
+transport                              link Gbps  hop ns  frame B  MAC cost  switchable  peak tok/s  tok/s @16
+-------------------------------------  ---------  ------  -------  --------  ----------  ----------  ---------
+        Aurora 64B/66B, direct attach      10.94     215        8  1500 LUT          no        3553       2548
+  Ethernet, direct attach (no switch)      10.94     565       38  5000 LUT         yes        3259       1515
+Ethernet through a cut-through switch      10.94    1015       38  5000 LUT         yes        3045       1016
+   Ethernet costs 8% of peak throughput and 41% at 16 boards versus Aurora,
+   because latency matters more as chunks shrink. It buys commodity cabling, real
+   switching, and vendor neutrality, which is what "any FPGA, any count" requires.
+
+========================================================================
+Stage 6: the right fabric: smallest cluster per board class that hosts the model
 ========================================================================
 
 analytic sizing vs the 500 tok/s target
-board class   boards needed  predicted tok/s  bound    weights in SRAM
-------------  -------------  ---------------  -------  ---------------
-artix7_small    unreachable       105 @ n=16  compute
- zynq_us_mid    unreachable       384 @ n=16   memory
-versal_large              4             1049  compute              yes
-   decode is memory-bound until the weight shard fits on-chip SRAM: the small
-   and mid classes never get there, so only the large class can host the target
+board class   boards needed  predicted tok/s  bound   weights in SRAM
+------------  -------------  ---------------  ------  ---------------
+arty_a7_100t    unreachable       111 @ n=16  memory
+      zcu102              8              670  memory               no
+  alveo_u250              1              617  memory               no
+   batch-1 decode touches every weight once per token, so a board streaming from
+   DDR is memory-bound no matter how many MACs it has: every row above is
+   bound by memory, not by the 25 to 1546 GMAC/s of compute on offer
 
-candidate sweep on the large class (the SRAM residency cliff sits between 2 and 4 boards)
-boards  pred tok/s  compute/tok  mem/tok   comm/tok  bound    resident
-------  ----------  -----------  --------  --------  -------  --------  ------
-     1         116      2.15 ms   8.65 ms      0 ns   memory        no
-     2         223      1.08 ms   4.33 ms  162.1 us   memory        no
-     4        1049     538.4 us  393.2 us  266.1 us  compute       yes  chosen
-     8        1413     269.2 us  196.6 us  364.2 us     comm       yes
-    16        1477     134.6 us   98.3 us  505.4 us     comm       yes
-
-========================================================================
-Stage 6: host the model: decode on the chosen fabric, every all-reduce real traffic
-========================================================================
-
-4 x versal_large hosting gpt2_124m
-quantity               value    provenance
----------------------  -------  -------------------------------------------------
-               boards        4                        chosen by sizing in stage 5
-       tokens decoded        8                        full n_layer loop per token
-       measured tok/s     1007  discrete-event fabric, packetized + CRC + credits
-      predicted tok/s     1049                        analytic model from stage 5
-     prediction ratio     0.96                               measured / predicted
-collectives per token       24                          n_layer * 2 = 24 expected
-weights SRAM-resident     True               21.2 MB shard vs 24.0 MB SRAM budget
-           wire bytes  7483392                           headers and CRC included
-activations identical     True          every board holds the same reduced vector
-   target met: 1007 tok/s measured vs 500 required
+candidate sweep on the large class (weight shards become SRAM-resident at 2 boards)
+boards  pred tok/s  compute/tok  mem/tok   comm/tok  bound   resident
+------  ----------  -----------  --------  --------  ------  --------  ------
+     1         617      67.1 us   1.62 ms      0 ns  memory        no  chosen
+     2        3259      33.6 us  147.5 us  141.1 us  memory       yes
+     4        2957      16.8 us   73.7 us  255.3 us    comm       yes
+     8        2303       8.4 us   36.9 us  392.8 us    comm       yes
+    16        1515       4.2 us   18.4 us  639.5 us    comm       yes
+   throughput peaks at 2 boards (3259 tok/s) and then falls: past residency the
+   ring all-reduce grows as 2*(n-1) while there is no memory traffic left to save,
+   so more boards is actively worse. That is the number the sizing layer exists to find.
 
 ========================================================================
-Stage 7: scale by adding boards, and survive a lossy fabric
+Stage 7: host the model: decode on the chosen fabric, every all-reduce real traffic
 ========================================================================
 
-same synthesized fabric, more versal_large boards
+8 x zcu102 hosting gpt2_124m
+quantity               value     provenance
+---------------------  --------  -------------------------------------------------
+               boards         8                        chosen by sizing in stage 6
+       tokens decoded         8                        full n_layer loop per token
+       measured tok/s       642  discrete-event fabric, packetized + CRC + credits
+      predicted tok/s       670                        analytic model from stage 6
+     prediction ratio      0.96                               measured / predicted
+collectives per token        24                          n_layer * 2 = 24 expected
+weights SRAM-resident     False                10.6 MB shard vs 4.2 MB SRAM budget
+           wire bytes  17461248                           headers and CRC included
+activations identical      True          every board holds the same reduced vector
+   target met: 642 tok/s measured vs 500 required
+
+========================================================================
+Stage 8: scale by adding boards, and survive a lossy fabric
+========================================================================
+
+same synthesized fabric, more zcu102 boards
 boards  tok/s  time/token  weights in SRAM  activations identical
 ------  -----  ----------  ---------------  ---------------------
-     2    222     4.51 ms               no                   True
-     4   1007    992.8 us              yes                   True
-     8   1295    772.2 us              yes                   True
-    16   1340    746.3 us              yes                   True
+     2    222     4.50 ms               no                   True
+     4    405     2.47 ms               no                   True
+     8    642     1.56 ms               no                   True
+    16    787     1.27 ms               no                   True
    the jump is the SRAM residency cliff: once the weight shard fits on-chip,
    decode stops streaming DDR; past that the ring all-reduce term (2*(n-1)) pushes back
 
-   BER 1e-6 on every link, 8 boards: 63 CRC drops, 446 retransmits,
-   activations still identical on every board = True, throughput 420 tok/s
-   (3.1x slower than the clean fabric: reliability costs latency, never bits)
+   BER 1e-6 on every link, 8 boards: 68 CRC drops, 456 retransmits,
+   activations still identical on every board = True, throughput 314 tok/s
+   (2.0x slower than the clean fabric: reliability costs latency, never bits)
 
 ========================================================================
-Stage 8: numerics check at reduced dimensions (real arithmetic through the fabric)
+Stage 9: numerics check at reduced dimensions (real arithmetic through the fabric)
 ========================================================================
-   homogeneous 4-board MLP 64x64 W1 64x512 W2 512x64: time 152.4 us, max err vs single-board reference 8.9e-15
+   homogeneous 4-board MLP 64x64 W1 64x512 W2 512x64: time 58.0 us, max err vs single-board reference 8.9e-15
    heterogeneous 2 small + 2 large: bit-identical output to homogeneous = True
-   work-proportional shards ([4, 4, 252, 252]) recover 11.06x over the equal split
+   work-proportional shards ([4, 4, 252, 252]) recover 1.10x over the equal split
 
 results written to results.json
 ```
 
-Reading the numbers: the chiplet the agents build is the one this model asked for, an 8x8-bit MAC from the int8 quantization with a 28-bit accumulator (16 product bits plus 12 guard bits for the 3072-deep c_proj reduction), and both seeded first-cut bugs (a truncated product register, a missing CRC final inversion) are caught by the generated testbenches and fixed from parsed feedback. The measured endpoint (4 bytes/cycle at 251 MHz = 8.04 Gbps) becomes the usable link rate on the mid and large boards, gating their 16.3 and 32 Gbps transceivers, so the sizing answers reflect the fabric the agents actually built. Sizing then runs into the real wall of batch-1 decode: every token must touch all 84.9 MB of block weights, so a board streaming from DDR is memory-bound no matter how many MACs it has. The small class is compute-starved, the mid class is memory-bound at every board count (its 16-way shard of 5.3 MB still misses the 4.5 MB SRAM budget, peaking at 384 tok/s), and the large class crosses the SRAM residency cliff at 4 boards: 223 tok/s streaming at n=2 jumps to 1049 predicted once the 21.2 MB shard fits the 24 MB budget. The chosen 4-board configuration hosts decode with every all-reduce as real link traffic and lands at 1007 tok/s, within 5% of the prediction. Past residency the ring's 2\*(n-1) serialization term takes over as the bound (comm at n=8 and 16), and at BER 1e-6 the fabric retransmits its way to the same bit-exact activations at 3.1x the latency. This is the quantitative version of why the fabric exists at all: tensor parallelism is not primarily buying FLOPs here, it is buying enough aggregate SRAM to stop streaming weights.
+Reading the numbers: the chiplet the agents build is the one this model asked for, an 8x8-bit MAC from the int8 quantization with a 28-bit accumulator (16 product bits plus 12 guard bits for the 3072-deep c_proj reduction), and the endpoint is the one the link asked for, a 16-byte datapath reached only after timing rejected the narrower 8-byte option. Both seeded first-cut bugs (a truncated product register, a missing CRC final inversion) are caught by the generated testbenches and fixed from parsed feedback, and both blocks now also clear a real FPGA mapping stage: 34 LUT / 46 FF / 1 DSP for the MAC, 1004 LUT / 65 FF / 0 DSP for the endpoint. That split is why the fit is multi-resource, and it makes compute DSP-bound on every part, 168 instances on the Artix-7 up to 8601 on the U250.
+
+Sizing then runs into the real wall of batch-1 decode: every token touches all 84.9 MB of block weights, so a board streaming from DDR is memory-bound no matter how much compute it has, and every row of the sizing table is bound by memory rather than by the 25 to 1547 GMAC/s on offer. The small class never reaches the target, the mid class needs 8 boards, and the large class reaches it on one. The large-class sweep is the interesting one: weight shards become SRAM-resident at 2 boards, throughput jumps from 617 to 3259 tok/s, and then *falls* at 4, 8, and 16 as the ring's 2*(n-1) term grows with no memory traffic left to save. More boards is actively worse past the peak, which is precisely the number the sizing layer exists to find. The chosen 8x ZCU102 configuration hosts decode with every all-reduce as real link traffic and measures 642 tok/s against 670 predicted, and at BER 1e-6 the fabric retransmits its way to the same bit-exact activations. Tensor parallelism here is not primarily buying FLOPs, it is buying enough aggregate on-chip SRAM to stop streaming weights.
 
 ## How an LLM agent slots in
 
@@ -236,7 +306,10 @@ The generated RTL is structurally its own: the MAC pipelines a combinational pro
 
 ## Honest simplifications
 
-- Generic liberty cells are not FPGA LUTs: `lut_capacity_proxy` is in generic-cell units so the yosys cell count maps onto it directly. Real capacity fit needs LUT/FF/DSP utilization from vendor place-and-route.
+- FPGA resources come from yosys `synth_xilinx`, which is real technology mapping but not place-and-route: there is no routing congestion, no floorplan, and no post-route timing. Vivado would give different and more pessimistic numbers, and yosys's own DSP inference varies by family (the 7-series mapping absorbs the accumulator into the DSP48E1, the UltraScale+ one does not).
+- fmax still comes from OpenSTA against the toy generic liberty, so it is an ASIC-flavored number used as an FPGA clock estimate. A real FPGA fmax needs Vivado timing; the endpoint datapath search is therefore honest about *relative* timing pressure rather than absolute megahertz.
+- Feeding 8601 MAC instances would need on-chip operand bandwidth the model does not check. DSP count is the right first-order capacity ceiling, not a claim that the array is routable at that size.
+- A 25 Gbps endpoint does not close timing in this flow at either standard datapath. Reaching it needs a pipelined or matrix-form CRC that the rule-based agent does not write, so the default target is 10 Gbps, which is also what the mid board class actually exposes.
 - There is no place-and-route anywhere; timing is real OpenSTA static timing but against a toy illustrative liberty, so fmax is an estimate of an estimate.
 - The derivation covers the matmul datapath only: MAC and accumulator widths from closed-form rules. Softmax, layernorm, and nonlinearity hardware are not generated and their cost is not modeled; a fuller version derives those blocks the same way.
 - Boards are simulated, not real: link rates, propagation delays, clock caps, and capacities are representative class parameters, not measured silicon.

@@ -103,7 +103,8 @@
         ]
       },
       "synth": null,
-      "timing": null
+      "timing": null,
+      "fpga": null
     },
     {
       "iteration": 2,
@@ -125,7 +126,8 @@
         ]
       },
       "synth": null,
-      "timing": null
+      "timing": null,
+      "fpga": null
     },
     {
       "iteration": 3,
@@ -158,6 +160,20 @@
         "method": "opensta",
         "clock_period_ns": 10.0,
         "worst_slack_ns": 4.44
+      },
+      "fpga": {
+        "luts": 34,
+        "ffs": 46,
+        "dsps": 1,
+        "brams": 0,
+        "urams": 0,
+        "carry": 7,
+        "muxf": 0,
+        "status": "pass",
+        "family": "xcup",
+        "top": "mac",
+        "lint": [],
+        "stage": "fpga"
       }
     }
   ],

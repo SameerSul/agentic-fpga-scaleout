@@ -7,11 +7,13 @@ import os
 import random
 import zlib
 
-from chiplet_flow import run_flow, make_agent, FABRIC_JOB, ROOT
+from chiplet_flow import (run_flow, run_endpoint_flow, make_agent, ROOT)
 from agent import RuleBasedAgent
 from llm_agent import build_prompt, extract_verilog, condense_feedback
-from specgen import derive_chiplet_spec, generate
-from boards import BOARDS, fit
+from specgen import (derive_chiplet_spec, derive_endpoint_spec,
+                     endpoint_options, generate)
+from boards import BOARDS, fit, TRANSPORTS
+from fpga import synth_fpga
 from fabric import make_cluster, fabric_stats, mm, relu, RX_CAP
 from collectives import ring_allreduce, run_workers
 from demo import mlp_run
@@ -45,7 +47,7 @@ def test_flow_and_profile(report, profile):
 
 
 def test_fit_monotonic(profile):
-    names = sorted(BOARDS, key=lambda n: BOARDS[n]['lut_capacity_proxy'])
+    names = sorted(BOARDS, key=lambda n: BOARDS[n]['dsps'])
     fits = [fit(n, profile) for n in names]
     inst = [f['instances'] for f in fits]
     thr = [f['macs_per_s'] for f in fits]
@@ -59,7 +61,7 @@ def test_fit_monotonic(profile):
 
 
 def test_allreduce(profile):
-    mid = fit('zynq_us_mid', profile)
+    mid = fit('zcu102', profile)
     for n in (2, 3, 5, 8):
         sim, boards = make_cluster([mid] * n)
         L = 1000
@@ -73,8 +75,8 @@ def test_allreduce(profile):
         check('ring allreduce n=%d exact vs reference sum' % n,
               err < 1e-9 and st['overflow_drops'] == 0)
     # Heterogeneous ring: mixed link rates, still exact.
-    fits = [fit('artix7_small', profile), fit('versal_large', profile),
-            fit('zynq_us_mid', profile)]
+    fits = [fit('arty_a7_100t', profile), fit('alveo_u250', profile),
+            fit('zcu102', profile)]
     sim, boards = make_cluster(fits)
     L = 777
     for i, b in enumerate(boards):
@@ -89,7 +91,7 @@ def test_hetero_bit_identical(profile):
     """Same n, same shard split: the heterogeneous cluster must produce
     bit-identical MLP output to the homogeneous one (only timing differs)."""
     small, mid, large = (fit(n, profile) for n in
-                         ('artix7_small', 'zynq_us_mid', 'versal_large'))
+                         ('arty_a7_100t', 'zcu102', 'alveo_u250'))
     t_h, err_h, _, out_h = mlp_run([mid] * 4)
     t_x, err_x, _, out_x = mlp_run([small, small, large, large])
     check('heterogeneous MLP output bit-identical to homogeneous',
@@ -164,6 +166,70 @@ def test_llm_agent_offline():
           and extract_verilog(bare) == 'module mac (input clk);\nendmodule\n')
 
 
+def test_fpga_backend(profile, fp):
+    """Real device mapping, not generic cells: the two generated blocks land
+    on different resources, which is what makes a single capacity proxy
+    wrong and multi-resource fit necessary."""
+    c, e = profile.get('fpga'), fp.get('fpga')
+    check('chiplet profile carries real FPGA resources',
+          c is not None and c['luts'] > 0 and c['ffs'] > 0)
+    check('the MAC infers exactly one DSP slice', c['dsps'] == 1)
+    check('the endpoint is pure LUT logic, no DSP',
+          e is not None and e['luts'] > 0 and e['dsps'] == 0)
+    bad = os.path.join(ROOT, 'build', 'lint_probe.v')
+    with open(bad, 'w') as f:
+        f.write('module lint_probe(input clk, input en, input [3:0] d,\n'
+                '  output reg [3:0] q, output reg [3:0] l);\n'
+                '  always @(posedge clk) q <= d;\n'
+                '  always @(*) if (en) l = d;\n'
+                'endmodule\n')
+    res = synth_fpga('lint_probe.v', 'lint_probe',
+                     os.path.join(ROOT, 'build'))
+    kinds = [f['kind'] for f in res.get('lint', [])]
+    check('FPGA lint catches an inferred latch', 'inferred_latch' in kinds)
+    os.remove(bad)
+
+
+def test_endpoint_derivation(fp):
+    """The endpoint datapath is derived from the link rate it must sustain,
+    and the signed-off design actually sustains it."""
+    widths = [derive_endpoint_spec(g)['parameters']['bytes_per_cycle']
+              for g in (1.0, 10.0, 25.0, 100.0)]
+    check('endpoint width grows with the link rate',
+          all(a <= b for a, b in zip(widths, widths[1:])))
+    for g in (1.0, 10.0, 25.0):
+        rate, opts = endpoint_options(g)
+        ok = all(w * 8 * clk / 1000.0 >= rate - 1e-9 for w, clk in opts)
+        check('every %g Gbps datapath option sustains the rate' % g, ok)
+    d = fp.get('derivation', {})
+    check('signed-off endpoint sustains its target link rate',
+          fp['endpoint_gbps'] >= d.get('target_link_gbps', 0) - 1e-9)
+
+
+def test_transports(profile, fp):
+    """Wiring choice is a measurable trade, not a preference."""
+    a = fit('alveo_u250', profile, fp, transport='aurora')
+    d = fit('alveo_u250', profile, fp, transport='ethernet_direct')
+    s = fit('alveo_u250', profile, fp, transport='ethernet_switched')
+    check('Ethernet costs latency per hop versus Aurora',
+          d['link_prop_ns'] > a['link_prop_ns'])
+    check('a switch hop costs more latency than direct attach',
+          s['link_prop_ns'] > d['link_prop_ns'])
+    check('Ethernet framing costs more wire bytes per packet',
+          d['frame_overhead_bytes'] > a['frame_overhead_bytes'])
+    check('the Ethernet MAC costs real logic, so fewer chiplets fit',
+          d['instances'] <= a['instances'])
+    ms = load_model_spec()
+    ta, td = (predict_config(ms, f, 8)['predicted_tok_per_s'] for f in (a, d))
+    check('Aurora predicts higher throughput at 8 boards', ta > td)
+    # Transport must not change the arithmetic, only the timing.
+    ra = simulate_decode([a] * 4, ms, tokens=2)
+    rd = simulate_decode([d] * 4, ms, tokens=2)
+    check('every transport produces identical activations',
+          ra['final_vec'] == rd['final_vec']
+          and rd['vecs_equal_across_boards'])
+
+
 def crc32_word_serial(data):
     """Python mirror of the generated RTL: 32-bit word-serial, bytes packed
     little-endian, reflected poly 0xEDB88320, init and final XOR all-ones.
@@ -179,9 +245,9 @@ def crc32_word_serial(data):
 
 
 def test_fabric_flow():
-    report, fp = run_flow(FABRIC_JOB, verbose=False)
+    report, fp = run_endpoint_flow(verbose=False)
     check('fabric endpoint flow converges', report['converged'])
-    check('fabric endpoint flow converges in 2 iterations',
+    check('endpoint converges in 2 iterations once the datapath closes',
           report['iterations_used'] == 2)
     fields = ('cycles_per_byte', 'latency_cycles', 'cell_count', 'area',
               'fmax_estimate_mhz', 'sim_checks_passed', 'endpoint_gbps')
@@ -198,8 +264,8 @@ def test_fabric_flow():
 
 def test_sizing(profile, fp):
     ms = load_model_spec()
-    lg = fit('versal_large', profile, fp)
-    mid = fit('zynq_us_mid', profile, fp)
+    lg = fit('alveo_u250', profile, fp)
+    mid = fit('zcu102', profile, fp)
     s = model_summary(ms)
 
     check('weight traffic identity: bytes/token = block MACs * wb/8',
@@ -225,15 +291,24 @@ def test_sizing(profile, fp):
     check('sizing monotonic: longer context costs token time',
           all(a <= b for a, b in zip(tok_ns, tok_ns[1:])))
 
-    check('memory wall honest: mid class cannot host at seq_len %d'
-          % ms['seq_len'], size_fabric(ms, mid)['chosen'] is None)
+    check('small class cannot host this model at any board count',
+          size_fabric(ms, fit('arty_a7_100t', profile, fp))['chosen'] is None)
     ch = size_fabric(ms, lg)['chosen']
-    check('sizing meets target on the large class via SRAM residency',
-          ch is not None and ch['sram_resident']
+    check('sizing meets the target on the large class',
+          ch is not None
           and ch['predicted_tok_per_s'] >= ms['target_tokens_per_s'])
-    below = predict_config(ms, lg, max(1, ch['boards'] // 2))
-    check('below the residency cliff decode is memory-bound',
-          not below['sram_resident'] and below['bound'] == 'memory')
+    one = predict_config(ms, lg, 1)
+    check('streaming weights from DDR is memory-bound',
+          not one['sram_resident'] and one['bound'] == 'memory')
+    resident = [p for p in size_fabric(ms, lg)['sweep'] if p['sram_resident']]
+    check('SRAM residency jumps throughput by more than 3x',
+          resident and resident[0]['predicted_tok_per_s']
+          > 3 * one['predicted_tok_per_s'])
+    sweep = size_fabric(ms, lg)['sweep']
+    peak = max(range(len(sweep)), key=lambda i: sweep[i]['predicted_tok_per_s'])
+    check('throughput peaks then falls as the ring term takes over',
+          peak < len(sweep) - 1
+          and sweep[-1]['bound'] == 'comm')
 
     r = simulate_decode([lg] * ch['boards'], ms, tokens=8)
     ratio = r['tok_per_s'] / ch['predicted_tok_per_s']
@@ -246,7 +321,7 @@ def test_sizing(profile, fp):
 
 
 def test_link_reliability(profile):
-    mid = fit('zynq_us_mid', profile)
+    mid = fit('zcu102', profile)
     sim, boards = make_cluster([mid, mid], ber=1e-5)
     vals = [random.Random(3).uniform(-1, 1) for _ in range(8192)]  # 64 KB
     out = {}
@@ -274,6 +349,9 @@ if __name__ == '__main__':
     test_allreduce(profile)
     test_hetero_bit_identical(profile)
     fp = test_fabric_flow()
+    test_fpga_backend(profile, fp)
+    test_endpoint_derivation(fp)
+    test_transports(profile, fp)
     test_sizing(profile, fp)
     test_link_reliability(profile)
     print('all %d tests passed' % PASSED[0])

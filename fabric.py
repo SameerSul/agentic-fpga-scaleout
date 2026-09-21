@@ -352,15 +352,19 @@ class NIC:
         return ev
 
 
-def connect(a, b, ber=0.0, pkt_overhead_ns=0.0, gbps=None, prop_ns=None):
+def connect(a, b, ber=0.0, pkt_overhead_ns=None, gbps=None, prop_ns=None):
     """Full-duplex connection between two boards (two unidirectional links).
     Heterogeneous rule: the link runs at the min of the two endpoints'
     transceiver rates and the max of their propagation delays, unless the
-    caller overrides both explicitly."""
+    caller overrides both explicitly. Per-frame wire overhead (Ethernet
+    preamble, header, FCS, and interframe gap, or Aurora control words)
+    likewise takes the slower endpoint's cost."""
     if gbps is None:
         gbps = min(a.link_gbps, b.link_gbps)
     if prop_ns is None:
         prop_ns = max(a.link_prop_ns, b.link_prop_ns)
+    if pkt_overhead_ns is None:
+        pkt_overhead_ns = max(a.pkt_overhead_ns, b.pkt_overhead_ns)
     ab = Link(a.sim, gbps, prop_ns, ber, pkt_overhead_ns)
     ba = Link(a.sim, gbps, prop_ns, ber, pkt_overhead_ns)
     a.nic._peer(b.id, b.nic, ab)
@@ -389,6 +393,7 @@ class Board:
         self.link_gbps = fit_result["link_gbps"]
         self.link_prop_ns = fit_result["link_prop_ns"]
         self.mem_bpns = fit_result.get("mem_bytes_per_ns")
+        self.pkt_overhead_ns = fit_result.get("pkt_overhead_ns", 0.0)
         self.busy_ns = 0.0
         self.nic = NIC(sim, self)
 
@@ -465,7 +470,7 @@ def relu(v):
     return v if v > 0.0 else 0.0
 
 
-def make_cluster(fits, ber=0.0, pkt_overhead_ns=0.0,
+def make_cluster(fits, ber=0.0, pkt_overhead_ns=None,
                  dma_gbps=64.0, drain_gbps=None, seed=1):
     """Build a cluster from a list of fit() results, one per board (mixes
     allowed). Full mesh of links; the ring collective uses neighbor links.

@@ -134,6 +134,16 @@
     "fmax_method": "opensta_slack",
     "target_clock_mhz": 100,
     "sim_checks_passed": 594,
+    "fpga": {
+      "family": "xcup",
+      "luts": 34,
+      "ffs": 46,
+      "dsps": 1,
+      "brams": 0,
+      "urams": 0,
+      "carry": 7,
+      "muxf": 0
+    },
     "chiplet": "mac8_gpt2_124m",
     "data_width": 8,
     "acc_width": 28,
@@ -149,216 +159,217 @@
   },
   "fabric_flow": {
     "converged": true,
-    "iterations": 2
+    "iterations": 2,
+    "datapath_attempts": [
+      {
+        "option": 0,
+        "bytes_per_cycle": 8,
+        "clock_mhz": 156.25,
+        "converged": false
+      },
+      {
+        "option": 1,
+        "bytes_per_cycle": 16,
+        "clock_mhz": 78.125,
+        "converged": true
+      }
+    ]
   },
   "fabric_profile": {
-    "block": "crc32_endpoint",
+    "block": "crc32_endpoint_16B",
     "top_module": "crc32",
     "unit": "byte",
-    "cycles_per_byte": 0.25,
+    "cycles_per_byte": 0.0625,
     "latency_cycles": 3,
-    "cell_count": 2016,
-    "area": 4193.0,
-    "fmax_estimate_mhz": 251.25628140703515,
+    "cell_count": 7333,
+    "area": 14728.0,
+    "fmax_estimate_mhz": 85.47008547008546,
     "fmax_method": "opensta_slack",
-    "target_clock_mhz": 100,
+    "target_clock_mhz": 78.125,
     "sim_checks_passed": 5,
-    "bytes_per_cycle": 4,
-    "endpoint_gbps": 8.040201005025125,
+    "fpga": {
+      "family": "xcup",
+      "luts": 1004,
+      "ffs": 65,
+      "dsps": 0,
+      "brams": 0,
+      "urams": 0,
+      "carry": 0,
+      "muxf": 422
+    },
+    "bytes_per_cycle": 16,
+    "endpoint_gbps": 10.94017094017094,
     "agent": "RuleBasedAgent"
   },
   "fit": [
     {
-      "board": "artix7_small",
-      "board_class": "small (Artix-7 class)",
-      "instances": 5,
+      "board": "arty_a7_100t",
+      "board_class": "small (Artix-7 XC7A100T)",
+      "family": "xc7",
+      "instances": 168,
+      "bound_by": "dsps",
       "clock_mhz": 150.0,
       "cycles_per_mac": 1.0,
-      "macs_per_s": 750000000.0,
-      "utilization": 0.263,
-      "link_gbps": 4.8,
-      "transceiver_gbps": 6.6,
-      "endpoint_gbps": 4.8,
-      "link_prop_ns": 500.0,
+      "macs_per_s": 25200000000.0,
+      "dsp_utilization": 0.7,
+      "lut_utilization": 0.27949526813880127,
+      "transport": "Ethernet, direct attach (no switch)",
+      "transport_key": "ethernet_direct",
+      "link_gbps": 1.2121212121212122,
+      "wire_gbps": 1.2121212121212122,
+      "endpoint_gbps": 10.94017094017094,
+      "link_prop_ns": 565.0,
+      "pkt_overhead_ns": 250.79999999999998,
+      "frame_overhead_bytes": 38,
+      "mtu_bytes": 9000,
+      "num_links": 2,
+      "mem_bytes_per_ns": 1.0,
+      "sram_bytes": 622080
+    },
+    {
+      "board": "zcu102",
+      "board_class": "mid (Zynq UltraScale+ XCZU9EG)",
+      "family": "xcup",
+      "instances": 1764,
+      "bound_by": "dsps",
+      "clock_mhz": 179.8561151079137,
+      "cycles_per_mac": 1.0,
+      "macs_per_s": 317266187050.35974,
+      "dsp_utilization": 0.7,
+      "lut_utilization": 0.30645067133683596,
+      "transport": "Ethernet, direct attach (no switch)",
+      "transport_key": "ethernet_direct",
+      "link_gbps": 10.0,
+      "wire_gbps": 10.0,
+      "endpoint_gbps": 10.94017094017094,
+      "link_prop_ns": 565.0,
+      "pkt_overhead_ns": 30.4,
+      "frame_overhead_bytes": 38,
+      "mtu_bytes": 9000,
       "num_links": 4,
-      "mem_bytes_per_ns": 1.6,
-      "sram_bytes": 600000.0
-    },
-    {
-      "board": "zynq_us_mid",
-      "board_class": "mid (Kintex/Zynq UltraScale class)",
-      "instances": 64,
-      "clock_mhz": 179.8561151079137,
-      "cycles_per_mac": 1.0,
-      "macs_per_s": 11510791366.906477,
-      "utilization": 0.5610666666666667,
-      "link_gbps": 8.040201005025125,
-      "transceiver_gbps": 16.3,
-      "endpoint_gbps": 8.040201005025125,
-      "link_prop_ns": 400.0,
-      "num_links": 8,
-      "mem_bytes_per_ns": 3.2,
-      "sram_bytes": 4500000.0
-    },
-    {
-      "board": "versal_large",
-      "board_class": "large (Versal/Alveo class)",
-      "instances": 268,
-      "clock_mhz": 179.8561151079137,
-      "cycles_per_mac": 1.0,
-      "macs_per_s": 48201438848.920876,
-      "utilization": 0.6265244444444444,
-      "link_gbps": 8.040201005025125,
-      "transceiver_gbps": 32.0,
-      "endpoint_gbps": 8.040201005025125,
-      "link_prop_ns": 300.0,
-      "num_links": 16,
       "mem_bytes_per_ns": 12.0,
-      "sram_bytes": 24000000.0
+      "sram_bytes": 4202496
+    },
+    {
+      "board": "alveo_u250",
+      "board_class": "large (Alveo U250, XCU250)",
+      "family": "xcup",
+      "instances": 8601,
+      "bound_by": "dsps",
+      "clock_mhz": 179.8561151079137,
+      "cycles_per_mac": 1.0,
+      "macs_per_s": 1546942446043.1655,
+      "dsp_utilization": 0.699951171875,
+      "lut_utilization": 0.1970289351851852,
+      "transport": "Ethernet, direct attach (no switch)",
+      "transport_key": "ethernet_direct",
+      "link_gbps": 10.94017094017094,
+      "wire_gbps": 25.0,
+      "endpoint_gbps": 10.94017094017094,
+      "link_prop_ns": 565.0,
+      "pkt_overhead_ns": 27.787499999999998,
+      "frame_overhead_bytes": 38,
+      "mtu_bytes": 9000,
+      "num_links": 8,
+      "mem_bytes_per_ns": 64.0,
+      "sram_bytes": 56401920
     }
   ],
+  "transports": {
+    "aurora": {
+      "link_gbps": 10.94017094017094,
+      "prop_ns": 215.0,
+      "peak_tok_per_s": 3552.6955915395406,
+      "tok_per_s_at_16": 2548.1751467716053
+    },
+    "ethernet_direct": {
+      "link_gbps": 10.94017094017094,
+      "prop_ns": 565.0,
+      "peak_tok_per_s": 3259.3225970766784,
+      "tok_per_s_at_16": 1514.617492154677
+    },
+    "ethernet_switched": {
+      "link_gbps": 10.94017094017094,
+      "prop_ns": 1015.0,
+      "peak_tok_per_s": 3044.953691409852,
+      "tok_per_s_at_16": 1016.019887904961
+    }
+  },
   "sizing": {
-    "artix7_small": {
-      "board": "artix7_small",
+    "arty_a7_100t": {
+      "board": "arty_a7_100t",
       "target_tok_per_s": 500,
       "sweep": [
         {
           "boards": 1,
-          "compute_ns_per_token": 138412032.0,
-          "mem_ns_per_token": 64880640.0,
-          "comm_ns_per_token": 0.0,
-          "weights_per_board_bytes": 84934656.0,
-          "sram_resident": false,
-          "bound": "compute",
-          "token_ns": 138412032.0,
-          "predicted_tok_per_s": 7.224805427320076,
-          "comm_fraction": 0.0
-        },
-        {
-          "boards": 2,
-          "compute_ns_per_token": 69206016.0,
-          "mem_ns_per_token": 32440320.0,
-          "comm_ns_per_token": 271360.0,
-          "weights_per_board_bytes": 42467328.0,
-          "sram_resident": false,
-          "bound": "compute",
-          "token_ns": 69477376.0,
-          "predicted_tok_per_s": 14.393174549366977,
-          "comm_fraction": 0.0039057318457162227
-        },
-        {
-          "boards": 4,
-          "compute_ns_per_token": 34603008.0,
-          "mem_ns_per_token": 16220160.0,
-          "comm_ns_per_token": 445440.0,
-          "weights_per_board_bytes": 21233664.0,
-          "sram_resident": false,
-          "bound": "compute",
-          "token_ns": 35048448.0,
-          "predicted_tok_per_s": 28.531933853390598,
-          "comm_fraction": 0.012709264615654308
-        },
-        {
-          "boards": 8,
-          "compute_ns_per_token": 17301504.0,
-          "mem_ns_per_token": 8110080.0,
-          "comm_ns_per_token": 609280.0,
-          "weights_per_board_bytes": 10616832.0,
-          "sram_resident": false,
-          "bound": "compute",
-          "token_ns": 17910784.0,
-          "predicted_tok_per_s": 55.832285175232975,
-          "comm_fraction": 0.03401749471156595
-        },
-        {
-          "boards": 16,
-          "compute_ns_per_token": 8650752.0,
-          "mem_ns_per_token": 4055040.0,
-          "comm_ns_per_token": 844800.0000000001,
-          "weights_per_board_bytes": 5308416.0,
-          "sram_resident": false,
-          "bound": "compute",
-          "token_ns": 9495552.0,
-          "predicted_tok_per_s": 105.31246630001078,
-          "comm_fraction": 0.08896797153024913
-        }
-      ],
-      "chosen": null
-    },
-    "zynq_us_mid": {
-      "board": "zynq_us_mid",
-      "target_tok_per_s": 500,
-      "sweep": [
-        {
-          "boards": 1,
-          "compute_ns_per_token": 9018408.959999999,
-          "mem_ns_per_token": 32440320.0,
+          "compute_ns_per_token": 4119405.7142857146,
+          "mem_ns_per_token": 103809024.0,
           "comm_ns_per_token": 0.0,
           "weights_per_board_bytes": 84934656.0,
           "sram_resident": false,
           "bound": "memory",
-          "token_ns": 32440320.0,
-          "predicted_tok_per_s": 30.82583648989899,
+          "token_ns": 103809024.0,
+          "predicted_tok_per_s": 9.633073903093434,
           "comm_fraction": 0.0
         },
         {
           "boards": 2,
-          "compute_ns_per_token": 4509204.4799999995,
-          "mem_ns_per_token": 16220160.0,
-          "comm_ns_per_token": 166873.92,
+          "compute_ns_per_token": 2059702.8571428573,
+          "mem_ns_per_token": 51904512.0,
+          "comm_ns_per_token": 1055452.7999999998,
           "weights_per_board_bytes": 42467328.0,
           "sram_resident": false,
           "bound": "memory",
-          "token_ns": 16387033.92,
-          "predicted_tok_per_s": 61.02385610976999,
-          "comm_fraction": 0.010183290082553269
+          "token_ns": 52959964.8,
+          "predicted_tok_per_s": 18.8821877766807,
+          "comm_fraction": 0.019929257959023415
         },
         {
           "boards": 4,
-          "compute_ns_per_token": 2254602.2399999998,
-          "mem_ns_per_token": 8110080.0,
-          "comm_ns_per_token": 280543.68,
+          "compute_ns_per_token": 1029851.4285714286,
+          "mem_ns_per_token": 25952256.0,
+          "comm_ns_per_token": 1651420.7999999998,
           "weights_per_board_bytes": 21233664.0,
           "sram_resident": false,
           "bound": "memory",
-          "token_ns": 8390623.68,
-          "predicted_tok_per_s": 119.18065189642732,
-          "comm_fraction": 0.0334353786678227
+          "token_ns": 27603676.8,
+          "predicted_tok_per_s": 36.227057983811775,
+          "comm_fraction": 0.059826117077272825
         },
         {
           "boards": 8,
-          "compute_ns_per_token": 1127301.1199999999,
-          "mem_ns_per_token": 4055040.0,
-          "comm_ns_per_token": 397844.16,
+          "compute_ns_per_token": 514925.7142857143,
+          "mem_ns_per_token": 12976128.0,
+          "comm_ns_per_token": 2021577.5999999999,
           "weights_per_board_bytes": 10616832.0,
           "sram_resident": false,
           "bound": "memory",
-          "token_ns": 4452884.16,
-          "predicted_tok_per_s": 224.5735492027711,
-          "comm_fraction": 0.08934527504079512
+          "token_ns": 14997705.6,
+          "predicted_tok_per_s": 66.67686556002273,
+          "comm_fraction": 0.1347924578543534
         },
         {
           "boards": 16,
-          "compute_ns_per_token": 563650.5599999999,
-          "mem_ns_per_token": 2027520.0,
-          "comm_ns_per_token": 577425.6,
+          "compute_ns_per_token": 257462.85714285716,
+          "mem_ns_per_token": 6488064.0,
+          "comm_ns_per_token": 2507184.0,
           "weights_per_board_bytes": 5308416.0,
           "sram_resident": false,
           "bound": "memory",
-          "token_ns": 2604945.6,
-          "predicted_tok_per_s": 383.8851759514671,
-          "comm_fraction": 0.22166512805488145
+          "token_ns": 8995248.0,
+          "predicted_tok_per_s": 111.16980877014174,
+          "comm_fraction": 0.27872316583155904
         }
       ],
       "chosen": null
     },
-    "versal_large": {
-      "board": "versal_large",
+    "zcu102": {
+      "board": "zcu102",
       "target_tok_per_s": 500,
       "sweep": [
         {
           "boards": 1,
-          "compute_ns_per_token": 2153649.900895522,
+          "compute_ns_per_token": 327198.5110204081,
           "mem_ns_per_token": 8650752.0,
           "comm_ns_per_token": 0.0,
           "weights_per_board_bytes": 84934656.0,
@@ -370,74 +381,152 @@
         },
         {
           "boards": 2,
-          "compute_ns_per_token": 1076824.950447761,
+          "compute_ns_per_token": 163599.25551020406,
           "mem_ns_per_token": 4325376.0,
-          "comm_ns_per_token": 162073.92,
+          "comm_ns_per_token": 151766.40000000002,
           "weights_per_board_bytes": 42467328.0,
           "sram_resident": false,
           "bound": "memory",
-          "token_ns": 4487449.92,
-          "predicted_tok_per_s": 222.8437125377435,
-          "comm_fraction": 0.036117154038345235
+          "token_ns": 4477142.4,
+          "predicted_tok_per_s": 223.35675541613327,
+          "comm_fraction": 0.03389805068518705
         },
         {
           "boards": 4,
-          "compute_ns_per_token": 538412.4752238805,
-          "mem_ns_per_token": 393216.0,
-          "comm_ns_per_token": 266143.68,
+          "compute_ns_per_token": 81799.62775510203,
+          "mem_ns_per_token": 2162688.0,
+          "comm_ns_per_token": 271670.39999999997,
           "weights_per_board_bytes": 21233664.0,
-          "sram_resident": true,
-          "bound": "compute",
-          "token_ns": 953039.2119402983,
-          "predicted_tok_per_s": 1049.2747700948148,
-          "comm_fraction": 0.27925784864418796
+          "sram_resident": false,
+          "bound": "memory",
+          "token_ns": 2434358.4,
+          "predicted_tok_per_s": 410.78585634720014,
+          "comm_fraction": 0.1115983579081864
         },
         {
           "boards": 8,
-          "compute_ns_per_token": 269206.23761194025,
-          "mem_ns_per_token": 196608.0,
-          "comm_ns_per_token": 364244.16,
+          "compute_ns_per_token": 40899.813877551016,
+          "mem_ns_per_token": 1081344.0,
+          "comm_ns_per_token": 411868.8,
           "weights_per_board_bytes": 10616832.0,
-          "sram_resident": true,
-          "bound": "comm",
-          "token_ns": 707691.9259701492,
-          "predicted_tok_per_s": 1413.0442404428115,
-          "comm_fraction": 0.5146931124029299
+          "sram_resident": false,
+          "bound": "memory",
+          "token_ns": 1493212.8,
+          "predicted_tok_per_s": 669.6969112506938,
+          "comm_fraction": 0.27582726320052975
         },
         {
           "boards": 16,
-          "compute_ns_per_token": 134603.11880597012,
-          "mem_ns_per_token": 98304.0,
-          "comm_ns_per_token": 505425.60000000003,
+          "compute_ns_per_token": 20449.906938775508,
+          "mem_ns_per_token": 540672.0,
+          "comm_ns_per_token": 661392.0,
           "weights_per_board_bytes": 5308416.0,
-          "sram_resident": true,
+          "sram_resident": false,
           "bound": "comm",
-          "token_ns": 677149.4829850746,
-          "predicted_tok_per_s": 1476.7787986659978,
-          "comm_fraction": 0.7464018103830412
+          "token_ns": 1202064.0,
+          "predicted_tok_per_s": 831.9024611002409,
+          "comm_fraction": 0.5502136325520105
         }
       ],
       "chosen": {
-        "boards": 4,
-        "compute_ns_per_token": 538412.4752238805,
-        "mem_ns_per_token": 393216.0,
-        "comm_ns_per_token": 266143.68,
-        "weights_per_board_bytes": 21233664.0,
-        "sram_resident": true,
-        "bound": "compute",
-        "token_ns": 953039.2119402983,
-        "predicted_tok_per_s": 1049.2747700948148,
-        "comm_fraction": 0.27925784864418796
+        "boards": 8,
+        "compute_ns_per_token": 40899.813877551016,
+        "mem_ns_per_token": 1081344.0,
+        "comm_ns_per_token": 411868.8,
+        "weights_per_board_bytes": 10616832.0,
+        "sram_resident": false,
+        "bound": "memory",
+        "token_ns": 1493212.8,
+        "predicted_tok_per_s": 669.6969112506938,
+        "comm_fraction": 0.27582726320052975
+      }
+    },
+    "alveo_u250": {
+      "board": "alveo_u250",
+      "target_tok_per_s": 500,
+      "sweep": [
+        {
+          "boards": 1,
+          "compute_ns_per_token": 67105.93808161841,
+          "mem_ns_per_token": 1622016.0,
+          "comm_ns_per_token": 0.0,
+          "weights_per_board_bytes": 84934656.0,
+          "sram_resident": false,
+          "bound": "memory",
+          "token_ns": 1622016.0,
+          "predicted_tok_per_s": 616.5167297979798,
+          "comm_fraction": 0.0
+        },
+        {
+          "boards": 2,
+          "compute_ns_per_token": 33552.96904080921,
+          "mem_ns_per_token": 147456.0,
+          "comm_ns_per_token": 141054.59999999998,
+          "weights_per_board_bytes": 42467328.0,
+          "sram_resident": true,
+          "bound": "memory",
+          "token_ns": 306812.219476805,
+          "predicted_tok_per_s": 3259.3225970766784,
+          "comm_fraction": 0.459742445201612
+        },
+        {
+          "boards": 4,
+          "compute_ns_per_token": 16776.484520404603,
+          "mem_ns_per_token": 73728.0,
+          "comm_ns_per_token": 255315.59999999998,
+          "weights_per_board_bytes": 21233664.0,
+          "sram_resident": true,
+          "bound": "comm",
+          "token_ns": 338194.40973840246,
+          "predicted_tok_per_s": 2956.879153542225,
+          "comm_fraction": 0.7549373752141253
+        },
+        {
+          "boards": 8,
+          "compute_ns_per_token": 8388.242260202302,
+          "mem_ns_per_token": 36864.0,
+          "comm_ns_per_token": 392788.19999999995,
+          "weights_per_board_bytes": 10616832.0,
+          "sram_resident": true,
+          "bound": "comm",
+          "token_ns": 434227.6048692012,
+          "predicted_tok_per_s": 2302.9397228239827,
+          "comm_fraction": 0.9045675484365309
+        },
+        {
+          "boards": 16,
+          "compute_ns_per_token": 4194.121130101151,
+          "mem_ns_per_token": 18432.0,
+          "comm_ns_per_token": 639513.0,
+          "weights_per_board_bytes": 5308416.0,
+          "sram_resident": true,
+          "bound": "comm",
+          "token_ns": 660232.7024346007,
+          "predicted_tok_per_s": 1514.617492154677,
+          "comm_fraction": 0.968617576260314
+        }
+      ],
+      "chosen": {
+        "boards": 1,
+        "compute_ns_per_token": 67105.93808161841,
+        "mem_ns_per_token": 1622016.0,
+        "comm_ns_per_token": 0.0,
+        "weights_per_board_bytes": 84934656.0,
+        "sram_resident": false,
+        "bound": "memory",
+        "token_ns": 1622016.0,
+        "predicted_tok_per_s": 616.5167297979798,
+        "comm_fraction": 0.0
       }
     }
   },
   "host": {
-    "board": "versal_large",
-    "boards": 4,
-    "measured_tok_per_s": 1007.2838590140377,
-    "predicted_tok_per_s": 1049.2747700948148,
-    "prediction_ratio": 0.9599810151949211,
-    "sram_resident": true,
+    "board": "zcu102",
+    "boards": 8,
+    "measured_tok_per_s": 641.9619177918348,
+    "predicted_tok_per_s": 669.6969112506938,
+    "prediction_ratio": 0.9585857527593155,
+    "sram_resident": false,
     "target_met": true,
     "fabric": {
       "retransmits": 0,
@@ -447,54 +536,54 @@
       "max_rx_occupancy": 1,
       "credit_stalls": 0,
       "stall_ns": 0.0,
-      "wire_bytes": 7483392
+      "wire_bytes": 17461248
     }
   },
   "scaling": [
     {
       "boards": 2,
-      "tok_per_s": 221.5361336776692,
-      "token_ns": 4513936.319999972,
+      "tok_per_s": 222.13739535551724,
+      "token_ns": 4501718.399999971,
       "sram_resident": false
     },
     {
       "boards": 4,
-      "tok_per_s": 1007.2838590140535,
-      "token_ns": 992768.8119402777,
-      "sram_resident": true
+      "tok_per_s": 404.6580348251899,
+      "token_ns": 2471222.4000000264,
+      "sram_resident": false
     },
     {
       "boards": 8,
-      "tok_per_s": 1294.9947110714863,
-      "token_ns": 772203.9259701641,
-      "sram_resident": true
+      "tok_per_s": 641.9619177918753,
+      "token_ns": 1557724.800000054,
+      "sram_resident": false
     },
     {
       "boards": 16,
-      "tok_per_s": 1339.9985163536649,
-      "token_ns": 746269.4829850623,
-      "sram_resident": true
+      "tok_per_s": 786.6681770695184,
+      "token_ns": 1271184.000000078,
+      "sram_resident": false
     }
   ],
   "ber": {
     "ber": 1e-06,
     "boards": 8,
-    "tok_per_s": 419.59708419329064,
-    "crc_drops": 63,
-    "retransmits": 446,
+    "tok_per_s": 314.4405304284538,
+    "crc_drops": 68,
+    "retransmits": 456,
     "bit_exact": true
   },
   "numerics": {
     "homogeneous": {
-      "time_ns": 152403.51999999993,
+      "time_ns": 58047.035464852604,
       "max_err": 8.881784197001252e-15
     },
     "hetero_equal": {
-      "time_ns": 1488150.2400000005,
+      "time_ns": 390515.09206349193,
       "max_err": 8.881784197001252e-15
     },
     "hetero_proportional": {
-      "time_ns": 134501.26507462686,
+      "time_ns": 354150.3330868502,
       "max_err": 1.0658141036401503e-14,
       "columns": [
         4,
@@ -504,6 +593,6 @@
       ]
     },
     "bit_identical_across_clusters": true,
-    "recovery_factor": 11.064209984748569
+    "recovery_factor": 1.102681702032238
   }
 }

@@ -1,28 +1,80 @@
 {
-  "name": "crc32_endpoint",
-  "description": "Fabric endpoint CRC32 datapath: 32 bits per cycle, zlib/Ethernet compatible (reflected polynomial 0xEDB88320), synchronous clear between frames, valid handshake",
+  "name": "crc32_endpoint_16B",
+  "description": "Fabric endpoint CRC32 datapath, 16 byte(s) per cycle, zlib/Ethernet compatible (reflected polynomial 0xEDB88320), sized for a 10 Gbps link",
   "top_module": "crc32",
   "unit": "byte",
   "parameters": {
-    "data_width": 32,
+    "data_width": 128,
     "crc_width": 32,
-    "bytes_per_cycle": 4,
-    "target_clock_mhz": 100,
+    "bytes_per_cycle": 16,
+    "target_clock_mhz": 78.125,
     "polynomial": "0xEDB88320 reflected form of 0x04C11DB7"
   },
+  "derivation": {
+    "target_link_gbps": 10.0,
+    "standard_rate_gbps": 10.0,
+    "datapath_option": 1,
+    "options_for_rate": [
+      [
+        8,
+        156.25
+      ],
+      [
+        16,
+        78.125
+      ]
+    ],
+    "rule": "standard Ethernet MAC datapath whose bytes_per_cycle * 8 * core_clock sustains the link rate; wider and slower options are tried when timing does not close",
+    "sustains_gbps": 10.0
+  },
   "ports": [
-    {"name": "clk", "dir": "input", "width": 1, "desc": "clock, rising edge"},
-    {"name": "rst_n", "dir": "input", "width": 1, "desc": "active-low synchronous reset"},
-    {"name": "clear", "dir": "input", "width": 1, "desc": "synchronous state clear, start of a new frame"},
-    {"name": "data", "dir": "input", "width": 32, "desc": "one 32-bit word per cycle, bytes LSB-first (little-endian packing)"},
-    {"name": "valid_in", "dir": "input", "width": 1, "desc": "data word valid"},
-    {"name": "crc_out", "dir": "output", "width": 32, "desc": "CRC32 of all words since clear, valid one cycle after the last word"},
-    {"name": "valid_out", "dir": "output", "width": 1, "desc": "crc_out updated this cycle"}
+    {
+      "name": "clk",
+      "dir": "input",
+      "width": 1,
+      "desc": "clock, rising edge"
+    },
+    {
+      "name": "rst_n",
+      "dir": "input",
+      "width": 1,
+      "desc": "active-low synchronous reset"
+    },
+    {
+      "name": "clear",
+      "dir": "input",
+      "width": 1,
+      "desc": "synchronous state clear, start of a new frame"
+    },
+    {
+      "name": "data",
+      "dir": "input",
+      "width": 128,
+      "desc": "one 16-byte word per cycle, bytes LSB-first (little-endian packing)"
+    },
+    {
+      "name": "valid_in",
+      "dir": "input",
+      "width": 1,
+      "desc": "data word valid"
+    },
+    {
+      "name": "crc_out",
+      "dir": "output",
+      "width": 32,
+      "desc": "CRC32 of all words since clear"
+    },
+    {
+      "name": "valid_out",
+      "dir": "output",
+      "width": 1,
+      "desc": "crc_out updated this cycle"
+    }
   ],
   "behavior": [
     "State initializes to 0xFFFFFFFF on reset and on synchronous clear.",
-    "Each valid word w updates state s to 32 iterations of s = (s >> 1) ^ (0xEDB88320 & {32{s[0]}}) starting from s ^ w.",
+    "Each valid word consumes its 16 bytes LSB-first; per byte b, state s becomes 8 iterations of s = (s >> 1) ^ (0xEDB88320 & -(s & 1)) starting from s ^ b.",
     "crc_out registers the updated state XOR 0xFFFFFFFF (the standard final inversion), matching zlib.crc32 of the byte stream.",
-    "Latency from valid_in to valid_out is 1 cycle; throughput is one word (4 bytes) per cycle."
+    "Latency from valid_in to valid_out is 1 cycle; throughput is one 16-byte word per cycle."
   ]
 }

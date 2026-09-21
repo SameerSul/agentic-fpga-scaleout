@@ -17,6 +17,7 @@ Run: python3 chiplet_flow.py [--agent rules|llm]"""
 import json, os, re, shutil, subprocess, sys
 
 from agent import RuleBasedAgent
+import fpga
 import specgen
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -26,6 +27,8 @@ MAX_ITERS = 5
 # Fallback delay per logic level for the gate-depth timing proxy, ns. Roughly
 # one INV (0.06 ns) plus wire/load margin in the toy liberty.
 PROXY_GATE_NS = 0.12
+# Default FPGA family for the deployment-path synthesis stage.
+FPGA_FAMILY = os.environ.get("CHIPLET_FPGA_FAMILY", "xcup")
 
 CHIPLET_JOB = {
     "spec_file": "spec_mac.json", "tb_file": "tb_mac.v", "rtl_file": "mac.v",
@@ -35,7 +38,14 @@ CHIPLET_JOB = {
 FABRIC_JOB = {
     "spec_file": "spec_crc.json", "tb_file": "tb_crc.v", "rtl_file": "crc.v",
     "profile_file": "fabric_profile.json", "report_file": "report_crc.json",
+    "derive_from_link": True,
 }
+# Link rate the fabric endpoint is generated for. 10GbE is the default
+# because it is what the mid board class actually exposes (SFP+ cages) and
+# what a two-board bring-up would be cabled with. 25G is reachable by the
+# same derivation but needs a pipelined or matrix-form CRC the rule-based
+# agent does not write; see the README.
+TARGET_LINK_GBPS = float(os.environ.get("CHIPLET_LINK_GBPS", 10.0))
 
 
 def make_agent(kind=None):
@@ -156,6 +166,26 @@ exit
             "errors": out.strip().splitlines()[-5:]}
 
 
+def stage_fpga(job, spec, rtl_path, family=FPGA_FAMILY):
+    """Map the block onto real FPGA primitives and gate on FPGA-hostile RTL.
+
+    This is a hard stage, not a report: inferred latches, multiple drivers,
+    and combinational loops fail the iteration and go back to the agent as
+    structured feedback, because they are exactly the defects that pass
+    simulation and then misbehave on a real part."""
+    res = fpga.synth_fpga(os.path.basename(rtl_path), spec["top_module"],
+                          BUILD, family)
+    if res.get("status") != "pass":
+        return {"stage": "fpga", "status": "fail", "family": family,
+                "errors": res.get("errors", [])}
+    if res["lint"]:
+        return {"stage": "fpga", "status": "fail", "family": family,
+                "lint": res["lint"],
+                "errors": ["%s on %s: %s" % (f["kind"], f.get("signal", "?"),
+                                             f["hint"]) for f in res["lint"]]}
+    return dict(res, stage="fpga", status="pass")
+
+
 def summarize(res):
     if res is None:
         return "-"
@@ -176,6 +206,14 @@ def summarize(res):
         if res["method"] == "proxy_gate_depth":
             return "proxy (depth {})".format(res["gate_depth"])
         return "FAIL"
+    if res["stage"] == "fpga":
+        if res["status"] == "pass":
+            return "pass ({} LUT, {} FF, {} DSP)".format(
+                res["luts"], res["ffs"], res["dsps"])
+        if res.get("lint"):
+            f = res["lint"][0]
+            return "FAIL {} {}".format(f["kind"], f.get("signal", ""))
+        return "FAIL synth"
     return res["status"]
 
 
@@ -183,6 +221,7 @@ def derive_profile(spec, final):
     """Build the machine-readable profile from measured results only. These
     JSONs are the contract between the RTL half and the scaleout half."""
     sim, synth, tim = final["sim"], final["synth"] or {}, final["timing"]
+    fpg = final.get("fpga") or {}
     thr = sim.get("throughput") or {}
     target_mhz = spec["parameters"]["target_clock_mhz"]
     fmax, method = None, "none"
@@ -211,6 +250,13 @@ def derive_profile(spec, final):
         "target_clock_mhz": target_mhz,
         "sim_checks_passed": sim.get("checks"),
     }
+    if fpg.get("status") == "pass":
+        # Real device primitives: what boards.py budgets against. The MAC
+        # infers a DSP slice, the endpoint is pure LUT logic, and those are
+        # different resources, so a single capacity number cannot fit both.
+        prof["fpga"] = {k: fpg[k] for k in
+                        ("family", "luts", "ffs", "dsps", "brams", "urams",
+                         "carry", "muxf") if k in fpg}
     if unit == "mac":
         prof["chiplet"] = spec["name"]
         prof["data_width"] = spec["parameters"]["data_width"]
@@ -226,6 +272,43 @@ def derive_profile(spec, final):
     return prof
 
 
+def run_endpoint_flow(target_gbps=None, verbose=True, agent_kind=None):
+    """Generate and sign off the fabric endpoint for a link rate.
+
+    Architecture-level feedback: the agent loop fixes the RTL, but a
+    datapath that cannot close timing at its clock is not an RTL bug, it is
+    the wrong datapath. When a width and clock pair fails timing, this
+    advances to the next standard option for the same rate (wider datapath,
+    slower clock) and runs the whole loop again, which is the call a human
+    designer makes at exactly that point."""
+    target = TARGET_LINK_GBPS if target_gbps is None else target_gbps
+    rate, opts = specgen.endpoint_options(target)
+    say = print if verbose else (lambda *a, **k: None)
+    attempts = []
+    for opt in range(len(opts)):
+        w, clk = opts[opt]
+        say("\nEndpoint datapath option {}/{} for {:g} Gbps: {} bytes/cycle "
+            "at {:g} MHz".format(opt + 1, len(opts), rate, w, clk))
+        specgen.generate_endpoint(target, spec_file=FABRIC_JOB["spec_file"],
+                                  tb_file=FABRIC_JOB["tb_file"], option=opt)
+        job = dict(FABRIC_JOB)
+        job.pop("derive_from_link")   # already generated for this option
+        report, profile = run_flow(job, verbose=verbose,
+                                   agent=make_agent(agent_kind))
+        attempts.append({"option": opt, "bytes_per_cycle": w,
+                         "clock_mhz": clk, "converged": report["converged"]})
+        if report["converged"]:
+            report["datapath_attempts"] = attempts
+            return report, profile
+        t = report["final_metrics"]["timing"] or {}
+        if t.get("worst_slack_ns") is not None:
+            say("   timing missed by {:+.2f} ns at {:g} MHz, widening the "
+                "datapath and slowing the clock".format(
+                    t["worst_slack_ns"], clk))
+    report["datapath_attempts"] = attempts
+    return report, profile
+
+
 def run_flow(job=None, verbose=True, agent=None, max_iters=None):
     """Run the agentic loop to convergence for one job (default: the compute
     chiplet). Returns (report, profile); profile is None without convergence."""
@@ -236,6 +319,10 @@ def run_flow(job=None, verbose=True, agent=None, max_iters=None):
     shutil.copy(LIB, BUILD)
     if job.get("derive_from_model"):
         specgen.generate(spec_file=job["spec_file"], tb_file=job["tb_file"])
+    if job.get("derive_from_link"):
+        specgen.generate_endpoint(TARGET_LINK_GBPS,
+                                  spec_file=job["spec_file"],
+                                  tb_file=job["tb_file"])
     spec = json.load(open(os.path.join(ROOT, job["spec_file"])))
     tools = {t: tool(t) for t in ("iverilog", "vvp", "yosys", "sta")}
     say("Tools:", ", ".join("{}={}".format(k, v or "MISSING") for k, v in tools.items()))
@@ -248,7 +335,7 @@ def run_flow(job=None, verbose=True, agent=None, max_iters=None):
         " ({}@{})".format(agent.model, agent.backend)
         if hasattr(agent, "backend") else ""))
     history, iterations = [], []
-    rows = [("iter", "fixes applied", "sim", "synth", "timing")]
+    rows = [("iter", "fixes applied", "sim", "synth", "timing", "fpga")]
     converged = False
 
     for it in range(1, max_iters + 1):
@@ -258,25 +345,27 @@ def run_flow(job=None, verbose=True, agent=None, max_iters=None):
             f.write(rtl)
 
         sim = stage_sim(job, rtl_path)
-        synth = tim = None
+        synth = tim = fpg = None
         if sim["status"] == "pass" and tools["yosys"]:
             synth = stage_synth(job, spec, rtl_path)
             if synth["status"] == "pass":
                 tim = stage_timing(job, spec)
+                fpg = stage_fpga(job, spec, rtl_path)
         elif sim["status"] == "pass":
             synth = {"stage": "synth", "status": "skipped", "note": "yosys missing"}
 
         record = {"iteration": it, "fixes_applied": fixes,
-                  "sim": sim, "synth": synth, "timing": tim}
+                  "sim": sim, "synth": synth, "timing": tim, "fpga": fpg}
         iterations.append(record)
-        for r in (sim, synth, tim):
+        for r in (sim, synth, tim, fpg):
             if r and r["status"] == "fail":
                 history.append(dict(r, iteration=it))
-        rows.append((str(it), ",".join(fixes) or "none",
-                     summarize(sim), summarize(synth), summarize(tim)))
+        rows.append((str(it), ",".join(fixes) or "none", summarize(sim),
+                     summarize(synth), summarize(tim), summarize(fpg)))
 
         ok = lambda r: r is not None and r["status"] in ("pass", "skipped")
-        if ok(sim) and ok(synth) and (tim is None and synth["status"] == "skipped" or ok(tim)):
+        if ok(sim) and ok(synth) and (tim is None and synth["status"] == "skipped"
+                                      or (ok(tim) and ok(fpg))):
             converged = True
             break
 
@@ -329,8 +418,7 @@ def main(argv=None):
     r1, _ = run_flow(CHIPLET_JOB, verbose=True,
                      agent=make_agent(kind), max_iters=iters)
     print()
-    r2, _ = run_flow(FABRIC_JOB, verbose=True,
-                     agent=make_agent(kind), max_iters=iters)
+    r2, _ = run_endpoint_flow(verbose=True, agent_kind=kind)
     sys.exit(0 if r1["converged"] and r2["converged"] else 2)
 
 

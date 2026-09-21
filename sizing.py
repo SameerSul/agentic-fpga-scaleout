@@ -10,10 +10,11 @@ packetized, CRC-checked, credit-gated traffic.
 
 Pure Python 3 stdlib."""
 import json
+import math
 import os
 import random
 
-from fabric import make_cluster, fabric_stats, HDR_BYTES
+from fabric import make_cluster, fabric_stats, HDR_BYTES, PAYLOAD
 from collectives import ring_allreduce, run_workers
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -88,9 +89,17 @@ def predict_config(ms, fit_result, n):
     if n == 1:
         comm_ns = 0.0
     else:
+        # Ring step: flight and transport latency once, plus serialization
+        # of the chunk and of the per-frame wire overhead every frame it
+        # takes (Ethernet preamble, header, FCS, and interframe gap, or
+        # Aurora control words). Small chunks at high board counts pay that
+        # latency term repeatedly, which is what caps tensor parallelism.
         chunk = s["allreduce_bytes"] / n
+        frames = max(1, math.ceil(chunk / PAYLOAD))
+        wire = chunk + frames * (HDR_BYTES
+                                 + fit_result.get("frame_overhead_bytes", 0))
         Bpns = fit_result["link_gbps"] / 8.0
-        step_ns = fit_result["link_prop_ns"] + (chunk + HDR_BYTES) / Bpns
+        step_ns = fit_result["link_prop_ns"] + wire / Bpns
         comm_ns = s["allreduces_per_token"] * 2 * (n - 1) * step_ns
     # Block-granular overlap, matching the simulator: within each attention
     # and MLP block, compute overlaps that block's own memory traffic, so the
