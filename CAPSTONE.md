@@ -45,12 +45,12 @@ Not done: anything on a board.
 
 Each person owns a lane end to end so two people are never editing the same files. Yax and Sameer can work entirely in software, so nobody is blocked waiting for hardware.
 
-| Person | Discord | Lane | Scope |
-|---|---|---|---|
-| **Sameer** | sami | Lead, proposal, agents and sizing software | Owns spec derivation, the sizing model, the repo, and every written deliverable. Decides scope. |
-| **Yax** | Octane98 | Agent swarm and the fabric | Owns the multi-agent architecture and the literature behind it, plus the interconnect and collectives. All software, so not blocked on hardware. |
-| **Vaibhav** | wabbadedabbadi | Board bring-up and the physical flow | Has the only board. Owns Vivado, place and route, bitstreams, and everything that runs on real silicon. |
-| **Siddh** | original_heisenberg | Hardware sourcing, the link, and verification | Owns getting more boards, designing the board-to-board cable, and raising the verification bar to something we can defend. |
+| Person | Lane | Scope |
+|---|---|---|
+| **Sameer** | Lead, proposal, agents and sizing software | Owns spec derivation, the sizing model, the repo, and every written deliverable. Decides scope. |
+| **Yax** | Agent swarm and the fabric | Owns the multi-agent architecture and the literature behind it, plus the interconnect and collectives. All software, so not blocked on hardware. |
+| **Vaibhav** | Board bring-up and the physical flow | Has the only board. Owns Vivado, place and route, bitstreams, and everything that runs on real silicon. |
+| **Siddh** | Hardware sourcing, the link, and verification | Owns getting more boards, designing the board-to-board cable, and raising the verification bar to something we can defend. |
 
 ## Milestones
 
