@@ -98,12 +98,12 @@ Three of five rows say unconfirmed, which is our biggest planning gap. Hardware 
 
 Tasks live in the issues below. Tick items there as you go.
 
-- **A. Hardware: decide, source, bring up** (Vaibhav): 8 items
-- **B. The board-to-board link** (Siddh): 6 items
+- **A. Hardware: decide, source, bring up** (Vaibhav): 9 items
+- **B. The board-to-board link** (Siddh): 7 items
 - **C. Agent swarm** (Yax): 6 items
 - **D. Model and sizing** (Sameer): 7 items
 - **E. Physical implementation** (Vaibhav): 4 items
-- **F. Verification** (Siddh): 4 items
+- **F. Verification** (Siddh): 5 items
 - **G. Serving layer** (Sameer): 4 items
 - **H. Deliverables and the professor** (Sameer): 8 items
 
