@@ -291,7 +291,21 @@ _Something has to tokenize, batch, send, and stream results back._
 
 ---
 
-## 9. Milestones after the presentation
+## 9. Scope tiers: MVP, core, stretch
+
+Three tiers, same as the proposal. The point of the split is that **the MVP depends
+on neither a hardware purchase nor the unproven LLM iteration**, which are the two
+riskiest things in the project.
+
+| Tier | What must work | Modules | Needs |
+|---|---|---|---|
+| **Bronze, MVP** | Agents generate and sign off both blocks through all five gates. A bitstream from agent-written RTL runs on one board and passes self-test. Simulated cluster hosts Qwen3-0.6B within 15 percent of prediction. 100+ tests passing. | A, C, D | Nothing bought. Both boards already in hand |
+| **Silver, core result** | Two boards linked over the generated fabric. Ring all-reduce bit-exact across both, including under injected bit errors. Qwen3-0.6B at 40+ tok/s measured. One block fixed by an LLM from tool output, transcript published. | A, B, C, D | Second board, already owned |
+| **Gold, stretch** | Larger models by adding boards. Agent writes the verification as well as the RTL. Interconnect comparison including photonics. Optionally GDSII on a shuttle. | All | Third board, sponsorship |
+
+Cut order if the schedule slips: Gold first, then parts of Silver, never Bronze.
+
+## 9b. Milestones after the presentation
 
 Each is independently demonstrable, so we can stop at any point and still have a result.
 

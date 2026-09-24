@@ -159,26 +159,49 @@ data rate, and the bring-up and acceptance test plan. The verification half is
 software and the link analysis is paper work, so neither waits on hardware.
 
 \section{Deliverables}
-\subsection{Bronze (minimum viable product)}
-Agents generate and sign off both the compute datapath and the fabric endpoint
-through all five gates with no human intervention. A bitstream produced from
-agent-written RTL loads on one FPGA and passes its self-test. The simulated cluster
-hosts Qwen3-0.6B and reports throughput within 15\% of the analytic prediction.
-At least 100 automated tests pass from a single command.
+Three tiers. \textbf{Bronze is the minimum viable product} and is deliberately
+scoped so that it depends on neither a hardware purchase nor the unproven ability
+of an LLM to correct its own RTL, which are the two riskiest items in the project.
+\textbf{Silver is the core result} the project should be judged on. \textbf{Gold is
+stretch work}, pursued only once Silver is demonstrated and dropped first if the
+schedule slips.
 
-\subsection{Silver}
-Two boards are linked over the generated fabric. Ring all-reduce runs across real
-hardware and produces results bit-identical to a single board, including under
-injected bit errors. Measured end-to-end throughput reaches 40 tokens per second or
-more on Qwen3-0.6B and is compared against the prediction. At least one block is
-demonstrably fixed by an LLM reading tool output, with the transcript published.
+\subsection{Bronze: minimum viable product}
+\emph{Modules A, C and D. No purchase needed; both boards are already in hand.}
+\begin{itemize}\itemsep1pt \parskip0pt
+\item Agents generate and sign off the compute datapath and the fabric endpoint
+through all five gates with no human intervention.
+\item A bitstream built from agent-written RTL loads on one FPGA and passes its
+self-test, closing the specification-to-silicon path for a single block.
+\item The simulated cluster hosts Qwen3-0.6B and reports throughput within 15\% of
+the analytic prediction.
+\item At least 100 automated regression tests pass from one command.
+\end{itemize}
 
-\subsection{Gold}
-Larger models hosted by adding boards, demonstrating that throughput holds roughly
-constant as the model and the cluster grow together. A multi-agent swarm in which
-an agent writes the verification as well as the RTL. A quantified study of
-alternative interconnects, including photonic links. Optionally, the compute block
-hardened to GDSII on an open process and submitted to a shared shuttle.
+\subsection{Silver: core result}
+\emph{Adds Modules B and D. Needs the second board, already owned.}
+\begin{itemize}\itemsep1pt \parskip0pt
+\item Two boards linked over the generated fabric, with framing, checksums and
+flow control verified on real hardware.
+\item Ring all-reduce across both boards producing results bit-identical to a
+single board, including under injected bit errors at $10^{-6}$.
+\item Qwen3-0.6B running end to end at 40 or more tokens per second, measured and
+compared against the prediction.
+\item At least one block demonstrably corrected by an LLM reading tool output,
+with the transcript published.
+\end{itemize}
+
+\subsection{Gold: stretch}
+\emph{All modules. Pursued only after Silver; first to be cut.}
+\begin{itemize}\itemsep1pt \parskip0pt
+\item Larger models hosted by adding boards, showing throughput holds roughly
+constant as model and cluster grow together.
+\item A multi-agent swarm in which an agent writes the verification as well as the
+RTL, with coverage-driven and formal signoff.
+\item A quantified comparison of interconnect options, including photonic links.
+\item Optionally, the compute block hardened to GDSII on an open process and
+submitted to a shared shuttle.
+\end{itemize}
 
 \section{Resources}
 \subsection{People}
