@@ -185,7 +185,20 @@ Not done: anything on a board.
 
 ## 7. Who owns what
 
-Each person owns a lane end to end so two people are never editing the same files. Yax and Sameer can work entirely in software, so nobody is blocked waiting for hardware.
+Each person is accountable for one lane. **Ownership is not exclusivity**: the owner answers for the deliverable, but work that crosses a boundary, such as bringing the fabric up on real boards, is done jointly. Yax and Sameer can work entirely in software, so nobody is blocked waiting for hardware.
+
+Shared work, where two people are expected to pair:
+
+| Work | Owner | With |
+|---|---|---|
+| Multi-agent architecture | Sameer | Yax |
+| Agent-written testbenches | Sameer | Siddh |
+| Two-board bring-up and framing | Yax | Vaibhav |
+| Ring all-reduce on hardware | Yax | Vaibhav |
+| Post-route data into the profile | Vaibhav | Sameer |
+| Link fabrication and measurement | Siddh | Vaibhav |
+| Coverage instrumentation | Siddh | Sameer |
+| Report, slides, demo | Everyone | Everyone |
 
 | Person | Lane | Scope |
 |---|---|---|

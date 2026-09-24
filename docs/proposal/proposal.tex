@@ -124,14 +124,19 @@ Total component budget & $\leq$ \$800 CAD \\
 \end{table}
 
 \section{Technical Modules}\label{sec:modules}
-The system divides into four modules, one owned by each group member. They are
+The system divides into four modules, each with one member accountable for
+delivering it. Ownership is not exclusivity: every module names supporting members
+who contribute to it, and the tasks that cross a module boundary, such as bringing
+up the fabric on real boards, are jointly executed. The owner is the person who
+answers for the deliverable, not the only person who touches it. Modules remain
 separable because the interfaces between them are machine-readable files that
 already exist: a JSON performance profile emitted by Module~A and consumed by
 Module~B, a constraints-and-wrapper contract between Modules~A and~C, and a
 testbench contract between Modules~A and~D. Each module can therefore be developed
 and validated against a stub of its neighbours.
 
-\subsection{Module A: Agentic Generation and Signoff (Sameer)}
+\subsection{Module A: Agentic Generation and Signoff}
+\emph{Owner: Sameer. Support: Yax on the multi-agent architecture, Siddh on generated testbenches.}
 The orchestrator and the agents. Derives block specifications from the model
 (datapath width from the quantization, accumulator width from the deepest
 reduction so that overflow is impossible by construction), prompts an LLM for RTL,
@@ -139,20 +144,23 @@ parses tool failures into structured feedback, and iterates to signoff. Also own
 the sizing layer that models compute, memory bandwidth, on-chip residency, KV cache
 traffic and network cost. Validated in simulation, so it needs no hardware.
 
-\subsection{Module B: Interconnect Fabric and Collectives (Yax)}
+\subsection{Module B: Interconnect Fabric and Collectives}
+\emph{Owner: Yax. Support: Vaibhav on hardware bring-up of the link, Sameer on the profile interface.}
 The inter-board communication layer: framing, CRC, sequence numbers, go-back-N
 retransmission, credit-based flow control, and ring all-reduce for arbitrary board
 counts. Also owns the multi-agent architecture, defining the writer, verifier and
 reviewer roles and how tool output is routed between them. Entirely software, so
 it is never blocked waiting for hardware.
 
-\subsection{Module C: Physical Implementation (Vaibhav)}
+\subsection{Module C: Physical Implementation}
+\emph{Owner: Vaibhav. Support: Siddh on board acceptance testing, Sameer on feeding post-route data back to the agents.}
 Everything that runs on real silicon: the Vivado project, constraints, top-level
 wrapper, place-and-route, bitstream generation and board bring-up. Feeds real
 utilization and post-route timing back into the profile, replacing estimates. Uses
 the board already in hand, so it starts immediately.
 
-\subsection{Module D: Verification and Physical Link (Siddh)}
+\subsection{Module D: Verification and Physical Link}
+\emph{Owner: Siddh. Support: Vaibhav on link fabrication and measurement, Yax on fabric-level test cases.}
 Raising verification from golden-model checks to coverage-driven and formal
 methods, including a proof that the derived accumulator cannot overflow for any
 model. Also owns the physical board-to-board link: signalling, cabling, achievable
@@ -266,36 +274,36 @@ module be built against a stub of its neighbours.
   \ganttgroup{A. Agentic generation and signoff (Sameer)}{1}{26} \\
   \ganttbar{Agent loop, spec derivation}{1}{5} \\
   \ganttbar{Place-and-route as fifth gate}{4}{9} \\
-  \ganttbar{LLM iteration, multi-role agents}{8}{14} \\
-  \ganttbar{Agent-written testbenches}{13}{19} \\
+  \ganttbar[bar/.append style={fill=teal!60}]{LLM iteration, multi-role agents}{8}{14} \\
+  \ganttbar[bar/.append style={fill=teal!60}]{Agent-written testbenches}{13}{19} \\
   \ganttbar{Sizing calibrated to hardware}{15}{22} \\
   \ganttbar{Larger-model scaling study}{21}{26} \\
   \ganttgroup{B. Fabric and collectives (Yax)}{1}{26} \\
   \ganttbar{Multi-agent architecture, survey}{1}{6} \\
   \ganttbar{Endpoint re-derived for real link}{8}{12} \\
-  \ganttbar{Two-board framing bring-up}{11}{16} \\
-  \ganttbar{Ring all-reduce on hardware}{14}{19} \\
+  \ganttbar[bar/.append style={fill=teal!60}]{Two-board framing bring-up}{11}{16} \\
+  \ganttbar[bar/.append style={fill=teal!60}]{Ring all-reduce on hardware}{14}{19} \\
   \ganttbar{Heterogeneous, multi-board scaling}{18}{23} \\
   \ganttbar{Interconnect comparison study}{22}{26} \\
   \ganttgroup{C. Physical implementation (Vaibhav)}{1}{26} \\
   \ganttbar{Vivado flow, reference bitstream}{1}{4} \\
   \ganttbar{Constraints, wrapper, RTL on board}{3}{8} \\
-  \ganttbar{Post-route data into the profile}{7}{12} \\
+  \ganttbar[bar/.append style={fill=teal!60}]{Post-route data into the profile}{7}{12} \\
   \ganttbar{Second board bring-up}{11}{15} \\
-  \ganttbar{Multi-board deployment}{16}{21} \\
+  \ganttbar[bar/.append style={fill=teal!60}]{Multi-board deployment}{16}{21} \\
   \ganttbar{Optional GDSII hardening}{22}{26} \\
   \ganttgroup{D. Verification and physical link (Siddh)}{1}{26} \\
   \ganttbar{Bring-up, acceptance test plan}{1}{5} \\
   \ganttbar{Link electrical characterization}{6}{12} \\
-  \ganttbar{Link build and measurement}{10}{15} \\
-  \ganttbar{Coverage instrumentation}{14}{20} \\
+  \ganttbar[bar/.append style={fill=teal!60}]{Link build and measurement}{10}{15} \\
+  \ganttbar[bar/.append style={fill=teal!60}]{Coverage instrumentation}{14}{20} \\
   \ganttbar{Formal proofs}{18}{24} \\
   \ganttbar{Release verification}{23}{26} \\
   \ganttgroup{Continuous and shared}{1}{28} \\
-  \ganttbar{Bi-weekly reviews, documentation}{1}{28} \\
-  \ganttbar{Integration testing}{6}{27} \\
-  \ganttbar{Float and contingency}{24}{28} \\
-  \ganttbar{Final report and demonstration}{25}{28} \\
+  \ganttbar[bar/.append style={fill=teal!60}]{Bi-weekly reviews, documentation}{1}{28} \\
+  \ganttbar[bar/.append style={fill=teal!60}]{Integration testing}{6}{27} \\
+  \ganttbar[bar/.append style={fill=teal!60}]{Float and contingency}{24}{28} \\
+  \ganttbar[bar/.append style={fill=teal!60}]{Final report and demonstration}{25}{28} \\
   \ganttmilestone{Proposal}{2}
   \ganttmilestone{Bronze}{8}
   \ganttmilestone{Silver}{19}
@@ -305,7 +313,8 @@ module be built against a stub of its neighbours.
 module lanes run concurrently for the entire duration, and tasks overlap within
 each lane as well, so every member is designing at the same time rather than
 waiting on a predecessor. Integration testing and bi-weekly reviews run
-continuously from week~6. Diamonds mark the deliverable tiers.}
+continuously from week~6. Teal bars are jointly executed by two or more members, which is where the module
+interfaces meet. Diamonds mark the deliverable tiers.}
 \label{fig:gantt}
 \end{figure*}
 
