@@ -251,57 +251,70 @@ module be built against a stub of its neighbours.
 \centering
 \begin{ganttchart}[
   hgrid, vgrid,
-  x unit=0.56cm, y unit title=0.5cm, y unit chart=0.40cm,
+  x unit=0.455cm, y unit title=0.46cm, y unit chart=0.325cm,
   title height=1, title label font=\scriptsize,
-  bar height=0.6, bar label font=\scriptsize,
+  bar height=0.62, bar label font=\scriptsize,
   group label font=\scriptsize\bfseries,
   milestone label font=\scriptsize\itshape,
   bar/.append style={fill=blue!45, draw=none},
   group/.append style={draw=none, fill=black!60},
   milestone/.append style={fill=orange!85, draw=none}
-]{1}{24}
-  \gantttitle{Project week}{24} \\
-  \gantttitlelist{2,4,...,24}{2} \\
-  \ganttgroup{A. Agentic generation and signoff (Sameer)}{1}{18} \\
-  \ganttbar{Agent loop, spec derivation}{1}{4} \\
-  \ganttbar{Place-and-route as fifth gate}{3}{8} \\
-  \ganttbar{LLM iteration, multi-role agents}{7}{12} \\
-  \ganttbar{Sizing against measured hardware}{13}{18} \\
-  \ganttgroup{B. Fabric and collectives (Yax)}{1}{16} \\
+]{1}{28}
+  \gantttitle{Sep}{2}\gantttitle{Oct}{4}\gantttitle{Nov}{4}\gantttitle{Dec}{4}
+  \gantttitle{Jan}{4}\gantttitle{Feb}{4}\gantttitle{Mar}{4}\gantttitle{Apr}{2} \\
+  \gantttitlelist{2,4,...,28}{2} \\
+  \ganttgroup{A. Agentic generation and signoff (Sameer)}{1}{26} \\
+  \ganttbar{Agent loop, spec derivation}{1}{5} \\
+  \ganttbar{Place-and-route as fifth gate}{4}{9} \\
+  \ganttbar{LLM iteration, multi-role agents}{8}{14} \\
+  \ganttbar{Agent-written testbenches}{13}{19} \\
+  \ganttbar{Sizing calibrated to hardware}{15}{22} \\
+  \ganttbar{Larger-model scaling study}{21}{26} \\
+  \ganttgroup{B. Fabric and collectives (Yax)}{1}{26} \\
   \ganttbar{Multi-agent architecture, survey}{1}{6} \\
-  \ganttbar{Endpoint re-derived for real link}{9}{12} \\
-  \ganttbar{Two-board framing bring-up}{11}{14} \\
-  \ganttbar{Ring all-reduce on hardware}{13}{16} \\
-  \ganttgroup{C. Physical implementation (Vaibhav)}{1}{14} \\
+  \ganttbar{Endpoint re-derived for real link}{8}{12} \\
+  \ganttbar{Two-board framing bring-up}{11}{16} \\
+  \ganttbar{Ring all-reduce on hardware}{14}{19} \\
+  \ganttbar{Heterogeneous, multi-board scaling}{18}{23} \\
+  \ganttbar{Interconnect comparison study}{22}{26} \\
+  \ganttgroup{C. Physical implementation (Vaibhav)}{1}{26} \\
   \ganttbar{Vivado flow, reference bitstream}{1}{4} \\
-  \ganttbar{Constraints, wrapper, RTL on board}{3}{6} \\
-  \ganttbar{Post-route data into the profile}{7}{10} \\
-  \ganttbar{Second board bring-up}{11}{14} \\
-  \ganttgroup{D. Verification and physical link (Siddh)}{1}{20} \\
-  \ganttbar{Bring-up and acceptance test plan}{1}{4} \\
-  \ganttbar{Physical link characterization}{7}{12} \\
-  \ganttbar{Coverage instrumentation}{13}{18} \\
-  \ganttbar{Formal proofs}{17}{20} \\
-  \ganttgroup{Shared}{19}{24} \\
-  \ganttbar{Stretch objectives}{19}{22} \\
-  \ganttbar{Integration, final report, demonstration}{21}{24} \\
+  \ganttbar{Constraints, wrapper, RTL on board}{3}{8} \\
+  \ganttbar{Post-route data into the profile}{7}{12} \\
+  \ganttbar{Second board bring-up}{11}{15} \\
+  \ganttbar{Multi-board deployment}{16}{21} \\
+  \ganttbar{Optional GDSII hardening}{22}{26} \\
+  \ganttgroup{D. Verification and physical link (Siddh)}{1}{26} \\
+  \ganttbar{Bring-up, acceptance test plan}{1}{5} \\
+  \ganttbar{Link electrical characterization}{6}{12} \\
+  \ganttbar{Link build and measurement}{10}{15} \\
+  \ganttbar{Coverage instrumentation}{14}{20} \\
+  \ganttbar{Formal proofs}{18}{24} \\
+  \ganttbar{Release verification}{23}{26} \\
+  \ganttgroup{Continuous and shared}{1}{28} \\
+  \ganttbar{Bi-weekly reviews, documentation}{1}{28} \\
+  \ganttbar{Integration testing}{6}{27} \\
+  \ganttbar{Float and contingency}{24}{28} \\
+  \ganttbar{Final report and demonstration}{25}{28} \\
   \ganttmilestone{Proposal}{2}
-  \ganttmilestone{Bronze}{6}
-  \ganttmilestone{Silver}{16}
-  \ganttmilestone{Gold}{22}
+  \ganttmilestone{Bronze}{8}
+  \ganttmilestone{Silver}{19}
+  \ganttmilestone{Gold}{26}
 \end{ganttchart}
-\caption{Schedule across 24 weeks. The four module lanes run concurrently
-throughout, with integration checkpoints at each two-week boundary. Diamonds mark
-the deliverable tiers: Bronze at week 6, Silver at week 16, Gold at week 22.}
+\caption{Schedule across the full 28-week project, September to April. The four
+module lanes run concurrently for the entire duration, and tasks overlap within
+each lane as well, so every member is designing at the same time rather than
+waiting on a predecessor. Integration testing and bi-weekly reviews run
+continuously from week~6. Diamonds mark the deliverable tiers.}
 \label{fig:gantt}
 \end{figure*}
 
-The Bronze milestone lands at week 6, early enough that a working
-specification-to-bitstream result exists well before the midpoint. Silver completes
-at week 16, leaving roughly four weeks of float in the second half to absorb
-hardware delays, which historically dominate schedule risk on projects of this
-type. Gold work is scheduled last precisely so it can be dropped without
-jeopardising anything already demonstrated.
+Bronze lands at week~8, early enough that a working specification-to-bitstream
+result exists well before the midpoint and long before the final report depends on
+it. Silver completes at week~19, and Gold at week~26. Five weeks of float sit in
+the final stretch to absorb hardware delays, which historically dominate schedule
+risk on projects of this type, and Gold work is scheduled last precisely so it can
+be dropped without jeopardising anything already demonstrated.
 
 \section{Progress Monitoring and Control}\label{sec:monitor}
 Progress is tracked against artifacts rather than self-reported percentages. Every

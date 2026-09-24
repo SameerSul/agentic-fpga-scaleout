@@ -45,22 +45,30 @@ Due September 27. Presentation slot September 30.
 
 ## The Gantt chart
 
-`proposal.tex` uses the `pgfgantt` package, which Overleaf provides. The chart is a
-`figure*`, so it spans both columns and floats to the top of a page. Four module
-lanes run concurrently across it, which is the visual evidence for the "modules can
-be completed in parallel" criterion, so keep it full width rather than shrinking it
-into one column.
+`proposal.tex` uses `pgfgantt`, which Overleaf provides. The chart is a `figure*`,
+so it spans both columns and floats to the top of a page. Keep it full width: the
+four concurrent module lanes are the visual evidence for the "modules can be
+completed in parallel" criterion, and shrinking it into one column destroys that.
+
+It covers the **full 28 weeks, September to April**, with a month header above the
+week scale. Tasks overlap both across lanes and within each lane, so no member is
+ever shown waiting on a predecessor. Integration testing and bi-weekly reviews run
+continuously from week 6, and five weeks of float sit at the end.
 
 It replaced the milestone table. Do not re-add that table; the chart carries the
 same information and the page budget will not take both.
 
-**If pgfgantt misbehaves on Overleaf**, the quickest fixes in order:
+Approximate geometry: 34 rows at 12.0 cm tall and 17.5 cm wide, against an IEEE
+text width of 18.4 cm. It fits, but not with much to spare.
 
-1. Shrink it: reduce `x unit` to `0.48cm` and `y unit chart` to `0.36cm`
-2. If it still overflows the page, drop the `Shared` group and its two bars
-3. As a last resort, replace the whole `ganttchart` environment with a plain
-   `tabular` of week ranges per module. The parallelism is less obvious but the
-   schedule information survives
+**If it overflows**, in order:
 
-Estimated length with the chart is about 3.7 pages, so there is a little headroom
-under the 4-page limit, but check it first.
+1. Reduce `y unit chart` from `0.325cm` to `0.30cm`
+2. Reduce `x unit` from `0.455cm` to `0.42cm`
+3. Drop the `Continuous and shared` group and its four bars
+4. Drop one bar from each module lane, taking the last one in each
+5. Last resort, replace the `ganttchart` environment with a plain `tabular` of
+   week ranges per module. Schedule survives, parallelism becomes less obvious
+
+**Milestone weeks:** Proposal 2, Bronze 8, Silver 19, Gold 26. If the term calendar
+shifts these, every bar position is a plain integer and easy to move.
