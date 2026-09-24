@@ -16,13 +16,10 @@ words of body text plus four tables, which should land just under. If it runs ov
 cut in this order: the Background paragraph on AlphaChip and ChipNeMo, then the
 Resources software list, then shorten the module descriptions.
 
-## Before submitting, fill in
+## Title block
 
-- Group number, on the title line
-- Vaibhav and Siddh's surnames
-- Supervisor name
-- The project name if `fpgAI` is not what the team agrees on. Candidates raised so
-  far: fpgAI, fpgLLM, LLMArray, distLLM.
+Filled in: Group 9, Sameer Suleman, Yax Patel, Vaibhav Gopalakrishnan, Siddh Patel,
+Supervisor Dr. Shirani. Project name settled as `fpgAI`.
 
 ## Rubric coverage
 
