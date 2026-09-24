@@ -1,5 +1,6 @@
 \documentclass[conference,10pt]{IEEEtran}
 \usepackage{times,graphicx,amsmath,booktabs,url,balance}
+\usepackage{pgfgantt}
 \usepackage[hidelinks]{hyperref}
 \renewcommand{\arraystretch}{1.15}
 \begin{document}
@@ -241,33 +242,66 @@ the third board and extend the Gold objectives.
 
 \section{Schedule and Milestones}
 Milestones fall on two-week boundaries to align with the bi-weekly instructor
-meetings. Modules run in parallel throughout.
+meetings. Figure~\ref{fig:gantt} shows the schedule. The four module lanes overlap
+across nearly the whole project, which is the point: no member waits on another to
+begin, because the interfaces described in Section~\ref{sec:modules} let each
+module be built against a stub of its neighbours.
 
-\begin{table}[h]
+\begin{figure*}[t]
 \centering
-\caption{Bi-weekly milestones}
-\begin{tabular}{@{}cp{6.0cm}@{}}
-\toprule
-\textbf{Wk} & \textbf{Milestone} \\
-\midrule
-2 & Proposal delivered. Vivado toolchain installed and a reference bitstream builds on the board in hand. \\
-4 & Place-and-route added as the fifth signoff gate; utilization and post-route timing reach the profile. \\
-6 & Agent-written RTL placed, routed and loaded onto one board, self-test passing. \textbf{Bronze.} \\
-8 & LLM iteration demonstrated: a block fixed from tool feedback, transcript captured. Multi-role agent split implemented. \\
-10 & Physical board-to-board link characterized; measured data rate feeds the sizing model. \\
-12 & Two boards linked; framing and CRC verified on real hardware. \\
-14 & Ring all-reduce across two boards, bit-exact against a single board. \\
-16 & Qwen3-0.6B hosted end to end on two boards; measured against prediction. \textbf{Silver.} \\
-18 & Coverage instrumentation and formal accumulator proof complete. \\
-20 & Larger model hosted by adding a board; scaling behaviour characterized. \\
-22 & Agent-written testbenches; interconnect comparison study. \textbf{Gold.} \\
-24 & Final integration, full regression, report and demonstration. \\
-\bottomrule
-\end{tabular}
-\end{table}
+\begin{ganttchart}[
+  hgrid, vgrid,
+  x unit=0.56cm, y unit title=0.5cm, y unit chart=0.40cm,
+  title height=1, title label font=\scriptsize,
+  bar height=0.6, bar label font=\scriptsize,
+  group label font=\scriptsize\bfseries,
+  milestone label font=\scriptsize\itshape,
+  bar/.append style={fill=blue!45, draw=none},
+  group/.append style={draw=none, fill=black!60},
+  milestone/.append style={fill=orange!85, draw=none}
+]{1}{24}
+  \gantttitle{Project week}{24} \\
+  \gantttitlelist{2,4,...,24}{2} \\
+  \ganttgroup{A. Agentic generation and signoff (Sameer)}{1}{18} \\
+  \ganttbar{Agent loop, spec derivation}{1}{4} \\
+  \ganttbar{Place-and-route as fifth gate}{3}{8} \\
+  \ganttbar{LLM iteration, multi-role agents}{7}{12} \\
+  \ganttbar{Sizing against measured hardware}{13}{18} \\
+  \ganttgroup{B. Fabric and collectives (Yax)}{1}{16} \\
+  \ganttbar{Multi-agent architecture, survey}{1}{6} \\
+  \ganttbar{Endpoint re-derived for real link}{9}{12} \\
+  \ganttbar{Two-board framing bring-up}{11}{14} \\
+  \ganttbar{Ring all-reduce on hardware}{13}{16} \\
+  \ganttgroup{C. Physical implementation (Vaibhav)}{1}{14} \\
+  \ganttbar{Vivado flow, reference bitstream}{1}{4} \\
+  \ganttbar{Constraints, wrapper, RTL on board}{3}{6} \\
+  \ganttbar{Post-route data into the profile}{7}{10} \\
+  \ganttbar{Second board bring-up}{11}{14} \\
+  \ganttgroup{D. Verification and physical link (Siddh)}{1}{20} \\
+  \ganttbar{Bring-up and acceptance test plan}{1}{4} \\
+  \ganttbar{Physical link characterization}{7}{12} \\
+  \ganttbar{Coverage instrumentation}{13}{18} \\
+  \ganttbar{Formal proofs}{17}{20} \\
+  \ganttgroup{Shared}{19}{24} \\
+  \ganttbar{Stretch objectives}{19}{22} \\
+  \ganttbar{Integration, final report, demonstration}{21}{24} \\
+  \ganttmilestone{Proposal}{2}
+  \ganttmilestone{Bronze}{6}
+  \ganttmilestone{Silver}{16}
+  \ganttmilestone{Gold}{22}
+\end{ganttchart}
+\caption{Schedule across 24 weeks. The four module lanes run concurrently
+throughout, with integration checkpoints at each two-week boundary. Diamonds mark
+the deliverable tiers: Bronze at week 6, Silver at week 16, Gold at week 22.}
+\label{fig:gantt}
+\end{figure*}
 
-Roughly four weeks of float are held across the second half to absorb hardware
-delays, which historically dominate schedule risk on projects of this type.
+The Bronze milestone lands at week 6, early enough that a working
+specification-to-bitstream result exists well before the midpoint. Silver completes
+at week 16, leaving roughly four weeks of float in the second half to absorb
+hardware delays, which historically dominate schedule risk on projects of this
+type. Gold work is scheduled last precisely so it can be dropped without
+jeopardising anything already demonstrated.
 
 \section{Progress Monitoring and Control}\label{sec:monitor}
 Progress is tracked against artifacts rather than self-reported percentages. Every
