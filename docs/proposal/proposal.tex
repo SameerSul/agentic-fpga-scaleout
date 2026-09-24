@@ -1,0 +1,325 @@
+\documentclass[conference,10pt]{IEEEtran}
+\usepackage{times,graphicx,amsmath,booktabs,url,balance}
+\usepackage[hidelinks]{hyperref}
+\renewcommand{\arraystretch}{1.15}
+\begin{document}
+
+\title{fpgAI: Agent-Designed FPGA Scaleout for Local LLM Inference}
+\author{Group X\\
+Sameer Suleman, Yax Patel, Vaibhav [surname], Siddh [surname]\\
+Supervisor: Dr. [Supervisor]}
+\maketitle
+
+\section{Executive Summary}
+Running a large language model locally is limited less by arithmetic than by the
+hardware available to run it on. Purpose-built accelerators cost tens of thousands
+of dollars and take years to design, while the programmable hardware a student or
+small lab can afford is individually too small to hold a useful model. The design
+process itself is the bottleneck: a chip is specified years before the models it
+will run, and closing that loop currently takes teams of specialists months.
+
+We are building \textbf{fpgAI}, a system in which software agents take a language
+model's specification as input and generate the hardware required to run it. The
+agents derive the compute datapath and the inter-board communication fabric from
+the model's own properties, write the RTL, carry it through simulation, synthesis,
+static timing analysis, FPGA technology mapping and place-and-route without a human
+in the loop, and emit a measured performance profile. A sizing layer then determines
+how many FPGA boards the model needs and validates that answer packet by packet
+before any hardware is purchased. Capacity grows by adding boards rather than by
+buying a larger one.
+
+The end users are students, hobbyists, university research groups and small
+hardware teams who need local, private inference on hardware they can actually
+afford, and researchers studying automated chip design. Our target is
+Qwen3-0.6B running at 40 or more tokens per second across two FPGA boards costing
+roughly \$300 each. For comparison, Architect Labs measured 12.1 tokens per second
+on the same model using a \$17{,}995 AMD Versal board~\cite{redwood}.
+
+The principal risks are the runtime cost of place-and-route, which is roughly
+500 times slower than the rest of the loop and therefore constrains how agents may
+iterate, the unproven ability of a language model to correct its own RTL from tool
+feedback, and the platform dependency that vendor place-and-route tools do not run
+on all team machines. Each is addressed in Sections~\ref{sec:modules}
+and~\ref{sec:monitor}. The software half of the system is already implemented and
+covered by 66 automated tests, so the project begins from a working base rather
+than from zero.
+
+\section{Expression of Need}
+Verifying and deploying a new hardware design is slow and specialist work. A
+conventional flow runs from specification to RTL, through verification, synthesis
+and timing closure, and finally through physical implementation, with human
+engineers interpreting tool output and revising the design at every stage. For
+inference accelerators the problem compounds, because the chip must be specified
+years before the models it will eventually run, and by the time silicon exists the
+models have changed.
+
+At the other end of the scale, a student or small lab that wants to run a model
+locally faces a different wall. A single affordable FPGA board holds only a few
+hundred kilobytes of fast on-chip memory and a gigabyte of slower external memory,
+which is not enough for a useful model on its own. Commercial accelerators that are
+large enough cost more than the entire budget of a research group, and cloud
+inference means sending data off-premises, which is unacceptable for medical,
+legal and industrial users.
+
+The stakeholders are therefore twofold. First, users who need affordable, private,
+local inference: university labs, hardware startups, and anyone handling data that
+cannot leave the building. Second, the hardware design community, for whom
+automating the path from specification to working silicon shortens a cycle
+currently measured in engineer-months.
+
+What is missing is a system that closes both gaps at once: one that derives the
+hardware from the model instead of guessing years ahead, and that reaches useful
+capacity by combining cheap boards instead of requiring one expensive one.
+
+\section{Background}
+\textbf{Redwood} (Architect Labs, 2026) is the closest prior work. An autonomous AI
+system produced the RTL, UVM verification environment, formal properties, firmware
+and drivers for an inference accelerator in under two weeks, reaching over 95\%
+functional coverage, and deployed it on an AMD Versal VPK180 running Qwen3-0.6B at
+12.1 tokens per second~\cite{redwood}. Two things it did not do define our
+contribution: the architecture was specified by two human architects rather than
+derived from the model, and the result ran on a single chip with no inter-chip
+scaleout. Notably, its measured throughput was below that of a \$250 NVIDIA Jetson
+Orin Nano, confirming that the result was about the design process rather than
+performance.
+
+\textbf{MAGE}~\cite{mage} demonstrated that multi-agent LLM systems reach 95.7\% on
+the VerilogEval-Human benchmark, establishing that the underlying RTL generation
+capability exists. \textbf{AlphaChip}~\cite{alphachip} applied reinforcement
+learning to floorplanning, and \textbf{ChipNeMo}~\cite{chipnemo} built a
+domain-adapted LLM for chip designers. Commercially, Synopsys and Cadence both ship
+AI-driven optimization, but all of these automate a single stage rather than the
+path from specification to bitstream.
+
+On the scaleout side, tensor parallelism with ring all-reduce collectives is
+standard practice in GPU clusters~\cite{megatron}, and Ethernet-native multi-chip
+fabrics are an active commercial direction. No existing work generates that fabric
+as part of the same agentic loop that generates the compute.
+
+\section{Objectives}
+Objectives are quantifiable and measured on hardware unless stated otherwise.
+
+\begin{table}[h]
+\centering
+\caption{Technical objectives}
+\begin{tabular}{@{}p{4.9cm}p{2.9cm}@{}}
+\toprule
+\textbf{Metric} & \textbf{Target} \\
+\midrule
+Distinct hardware blocks generated and signed off autonomously & $\geq 4$ \\
+Automated signoff gates in the loop & 5 (simulate, synthesize, time, map, place-and-route) \\
+Specs reaching full signoff within 5 agent iterations & $\geq 90\%$ \\
+Blocks corrected by an LLM from parsed tool feedback alone & $\geq 1$, transcript captured \\
+Qwen3-0.6B throughput, two boards & $\geq 40$ tokens/s \\
+Analytic prediction versus measured throughput & within $15\%$ \\
+Numerical agreement across 1 to 8 boards & bit-exact, $100\%$ \\
+Inter-board link rate & $\geq 1$ Gbps sustained \\
+Data integrity at bit error rate $10^{-6}$ & zero corrupted results \\
+Automated regression tests & $\geq 100$ \\
+Functional coverage on generated blocks & $\geq 90\%$ \\
+Total component budget & $\leq$ \$800 CAD \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Technical Modules}\label{sec:modules}
+The system divides into four modules, one owned by each group member. They are
+separable because the interfaces between them are machine-readable files that
+already exist: a JSON performance profile emitted by Module~A and consumed by
+Module~B, a constraints-and-wrapper contract between Modules~A and~C, and a
+testbench contract between Modules~A and~D. Each module can therefore be developed
+and validated against a stub of its neighbours.
+
+\subsection{Module A: Agentic Generation and Signoff (Sameer)}
+The orchestrator and the agents. Derives block specifications from the model
+(datapath width from the quantization, accumulator width from the deepest
+reduction so that overflow is impossible by construction), prompts an LLM for RTL,
+parses tool failures into structured feedback, and iterates to signoff. Also owns
+the sizing layer that models compute, memory bandwidth, on-chip residency, KV cache
+traffic and network cost. Validated in simulation, so it needs no hardware.
+
+\subsection{Module B: Interconnect Fabric and Collectives (Yax)}
+The inter-board communication layer: framing, CRC, sequence numbers, go-back-N
+retransmission, credit-based flow control, and ring all-reduce for arbitrary board
+counts. Also owns the multi-agent architecture, defining the writer, verifier and
+reviewer roles and how tool output is routed between them. Entirely software, so
+it is never blocked waiting for hardware.
+
+\subsection{Module C: Physical Implementation (Vaibhav)}
+Everything that runs on real silicon: the Vivado project, constraints, top-level
+wrapper, place-and-route, bitstream generation and board bring-up. Feeds real
+utilization and post-route timing back into the profile, replacing estimates. Uses
+the board already in hand, so it starts immediately.
+
+\subsection{Module D: Verification and Physical Link (Siddh)}
+Raising verification from golden-model checks to coverage-driven and formal
+methods, including a proof that the derived accumulator cannot overflow for any
+model. Also owns the physical board-to-board link: signalling, cabling, achievable
+data rate, and the bring-up and acceptance test plan. The verification half is
+software and the link analysis is paper work, so neither waits on hardware.
+
+\section{Deliverables}
+\subsection{Bronze (minimum viable product)}
+Agents generate and sign off both the compute datapath and the fabric endpoint
+through all five gates with no human intervention. A bitstream produced from
+agent-written RTL loads on one FPGA and passes its self-test. The simulated cluster
+hosts Qwen3-0.6B and reports throughput within 15\% of the analytic prediction.
+At least 100 automated tests pass from a single command.
+
+\subsection{Silver}
+Two boards are linked over the generated fabric. Ring all-reduce runs across real
+hardware and produces results bit-identical to a single board, including under
+injected bit errors. Measured end-to-end throughput reaches 40 tokens per second or
+more on Qwen3-0.6B and is compared against the prediction. At least one block is
+demonstrably fixed by an LLM reading tool output, with the transcript published.
+
+\subsection{Gold}
+Larger models hosted by adding boards, demonstrating that throughput holds roughly
+constant as the model and the cluster grow together. A multi-agent swarm in which
+an agent writes the verification as well as the RTL. A quantified study of
+alternative interconnects, including photonic links. Optionally, the compute block
+hardened to GDSII on an open process and submitted to a shared shuttle.
+
+\section{Resources}
+\subsection{People}
+Four members, one technical module each, as above. Sameer and Yax work primarily in
+software; Vaibhav owns the physical flow; Siddh spans verification and link
+hardware.
+
+\subsection{Software}
+All tooling is free. Icarus Verilog and cocotb for simulation, Yosys for synthesis
+and FPGA technology mapping, OpenSTA for static timing, SymbiYosys for formal
+properties, AMD Vivado (free tier, which covers the Artix-7 and Zynq-7000 devices
+we target) for place-and-route and bitstream generation, and PyTorch for model
+quantization. Agent inference costs cents per converged run.
+
+\subsection{Components and budget}
+\begin{table}[h]
+\centering
+\caption{Budget, CAD}
+\begin{tabular}{@{}p{4.6cm}rr@{}}
+\toprule
+\textbf{Item} & \textbf{Qty} & \textbf{Cost} \\
+\midrule
+Zynq-7000 class FPGA boards (already owned) & 2 & 0 \\
+Additional FPGA board & 1 & 520 \\
+Ethernet and ribbon cabling, connectors & -- & 60 \\
+Pmod adapters and passives & -- & 40 \\
+Contingency & -- & 150 \\
+\midrule
+\textbf{Total} & & \textbf{770} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Two boards are already in hand, so the Bronze and Silver deliverables are reachable
+with no purchase. Sponsorship from an industry partner is being pursued to cover
+the third board and extend the Gold objectives.
+
+\section{Schedule and Milestones}
+Milestones fall on two-week boundaries to align with the bi-weekly instructor
+meetings. Modules run in parallel throughout.
+
+\begin{table}[h]
+\centering
+\caption{Bi-weekly milestones}
+\begin{tabular}{@{}cp{6.0cm}@{}}
+\toprule
+\textbf{Wk} & \textbf{Milestone} \\
+\midrule
+2 & Proposal delivered. Vivado toolchain installed and a reference bitstream builds on the board in hand. \\
+4 & Place-and-route added as the fifth signoff gate; utilization and post-route timing reach the profile. \\
+6 & Agent-written RTL placed, routed and loaded onto one board, self-test passing. \textbf{Bronze.} \\
+8 & LLM iteration demonstrated: a block fixed from tool feedback, transcript captured. Multi-role agent split implemented. \\
+10 & Physical board-to-board link characterized; measured data rate feeds the sizing model. \\
+12 & Two boards linked; framing and CRC verified on real hardware. \\
+14 & Ring all-reduce across two boards, bit-exact against a single board. \\
+16 & Qwen3-0.6B hosted end to end on two boards; measured against prediction. \textbf{Silver.} \\
+18 & Coverage instrumentation and formal accumulator proof complete. \\
+20 & Larger model hosted by adding a board; scaling behaviour characterized. \\
+22 & Agent-written testbenches; interconnect comparison study. \textbf{Gold.} \\
+24 & Final integration, full regression, report and demonstration. \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Roughly four weeks of float are held across the second half to absorb hardware
+delays, which historically dominate schedule risk on projects of this type.
+
+\section{Progress Monitoring and Control}\label{sec:monitor}
+Progress is tracked against artifacts rather than self-reported percentages. Every
+milestone above has a binary exit criterion that is either demonstrable or not.
+
+Task tracking uses GitHub issues, one per module, with items owned by name and a
+pinned overview issue carrying the timeline and open decisions. All code lives in a
+public repository with a regression suite that runs from a single command, so
+progress is verifiable by running it. Weekly team meetings review demonstrations
+rather than status, and the bi-weekly instructor meetings align with the milestone
+boundaries.
+
+Three specific control measures address the known risks. First, because
+place-and-route is roughly 500 times slower than the other gates, the loop is
+two-tiered: agents iterate freely against the fast gates and place-and-route runs
+once when they all pass, with agent retries capped so a single block cannot consume
+a day. Second, because vendor place-and-route does not run on every team machine,
+bitstream generation is assigned to a single owner with a documented environment
+rather than assumed to be available to everyone. Third, if the LLM iteration
+objective proves unreachable, the deterministic rule-based agent already in the
+repository satisfies the loop requirement, and the claim is narrowed honestly in
+the report rather than overstated.
+
+If a module falls behind, members on Gold-level work move to unblock the critical
+path, and Gold objectives are dropped before Silver, which is dropped before
+Bronze.
+
+\section{Broader Considerations}
+\textbf{Health and safety.} All hardware is low-voltage and USB or wall-adapter
+powered, presenting minimal electrical hazard. Boards are handled on an ESD mat
+with wrist straps, since FPGAs are static-sensitive. Soldering, if required, is
+done in a ventilated lab space.
+
+\textbf{Sustainability and environment.} The project reuses existing hardware
+rather than purchasing new where possible, and two of the boards are already owned.
+Local inference on low-power FPGAs draws a few watts against the hundreds of watts
+of a datacenter GPU, and the scaleout approach extends the useful life of small
+boards that would otherwise be individually inadequate.
+
+\textbf{Security and privacy.} Inference runs entirely on local hardware and no
+user data leaves the machine, which is the central advantage for medical, legal and
+industrial users for whom cloud inference is not permissible.
+
+\textbf{Ethics.} All code, results and negative findings are published openly.
+Performance figures produced by simulation are labelled as predictions and
+distinguished from measurements, and limitations are stated explicitly rather than
+omitted.
+
+\textbf{Economic.} The system targets a cost reduction of more than an order of
+magnitude against comparable published work, with the explicit aim of making local
+inference and automated hardware design accessible to groups that cannot afford
+commercial tooling.
+
+\textbf{Human factors and aesthetics.} The system is operated through a single
+command and a status display showing per-board activity and throughput, so that a
+user need not understand the internal flow to use it. Tool output is summarised
+into readable tables rather than raw logs.
+
+\textbf{Regulatory and compliance.} All software tools are used within their
+licence terms, including the free tier of the vendor toolchain. Model weights are
+used in accordance with their published licences. No radio, mains-voltage or
+medical-device regulation applies to the hardware built.
+
+\begin{thebibliography}{9}
+\bibitem{redwood} Architect Labs, ``Redwood: A Frontier AI Accelerator Designed,
+Verified, and Deployed from Scratch in 2 Weeks by AI,'' arXiv:2608.26418, 2026.
+\bibitem{mage} Y. Zhao et al., ``MAGE: A Multi-Agent Engine for Automated RTL Code
+Generation,'' arXiv:2412.07822, DAC 2025.
+\bibitem{alphachip} A. Mirhoseini et al., ``A graph placement methodology for fast
+chip design,'' \emph{Nature}, vol. 594, pp. 207--212, 2021.
+\bibitem{chipnemo} M. Liu et al., ``ChipNeMo: Domain-Adapted LLMs for Chip Design,''
+arXiv:2311.00176, 2023.
+\bibitem{megatron} M. Shoeybi et al., ``Megatron-LM: Training Multi-Billion
+Parameter Language Models Using Model Parallelism,'' arXiv:1909.08053, 2019.
+\bibitem{yosys} C. Wolf, ``Yosys Open SYnthesis Suite,'' \url{https://yosyshq.net/yosys/}.
+\end{thebibliography}
+
+\end{document}
