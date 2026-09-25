@@ -109,12 +109,48 @@ class HwModel:
         return self.matvec(r2, "head")
 
 
+def teacher_forced_agreement(ck, hw, n=48):
+    """Next-token agreement under identical context.
+
+    Free-running agreement conflates two different things: how much
+    quantization perturbs a prediction, and how fast greedy decoding
+    amplifies one different character into a different continuation. One
+    early divergence makes everything after it disagree, so that number
+    says almost nothing about the arithmetic. Feeding both models the same
+    ground-truth context isolates the part that is actually about the
+    hardware.
+    """
+    from train_tiny import Tiny
+    from autodiff import V
+    m = Tiny.__new__(Tiny)
+    m.d, m.f, m.seq = ck["d_model"], ck["d_ff"], ck["seq"]
+    w = ck["weights"]
+    for name in ("tok", "pos", "wq", "wk", "wv", "wo", "w1", "w2", "head"):
+        setattr(m, name, [[V(c) for c in row] for row in w[name]])
+    m.vocab = len(ck["chars"])
+    stoi = {c: i for i, c in enumerate(ck["chars"])}
+    ids = [stoi[c] for c in ck["corpus"] if c in stoi]
+    same = total = 0
+    top1_float = []
+    for end in range(2, min(len(ids) - 1, n + 2)):
+        ctx = ids[max(0, end - ck["seq"]):end]
+        fl = m.forward(ctx)[-1]
+        f_top = max(range(len(fl)), key=lambda k: fl[k].d)
+        q_logits = hw.forward(ctx)
+        q_top = max(range(len(q_logits)), key=lambda k: q_logits[k])
+        same += (f_top == q_top)
+        total += 1
+        top1_float.append(f_top)
+    return same, total
+
+
 def float_reference(ck, prompt, n):
     """The same checkpoint in float, so the cost of running it on int8
     hardware is measured rather than assumed."""
     from train_tiny import Tiny
     from autodiff import V
     m = Tiny.__new__(Tiny)
+    m.d, m.f, m.seq = ck["d_model"], ck["d_ff"], ck["seq"]
     w = ck["weights"]
     for name in ("tok", "pos", "wq", "wk", "wv", "wo", "w1", "w2", "head"):
         setattr(m, name, [[V(c) for c in row] for row in w[name]])
@@ -132,11 +168,17 @@ def main():
     ap.add_argument("--tokens", type=int, default=60)
     ap.add_argument("--prompt", default="the agent")
     ap.add_argument("--cosim", type=int, default=12)
+    ap.add_argument("--ckpt", default=None,
+                    help="checkpoint to run; defaults to tiny_llm.json")
     a = ap.parse_args()
 
-    if not os.path.exists(CKPT):
+    path = a.ckpt or CKPT
+    if not os.path.exists(path):
         raise SystemExit("no checkpoint; run: python3 train_tiny.py")
-    ck = json.load(open(CKPT))
+    ck = json.load(open(path))
+    print("checkpoint %s: d_model %d, d_ff %d, vocab %d"
+          % (os.path.basename(path), ck["d_model"], ck["d_ff"],
+             len(ck["chars"])))
     ms = specgen.load_model_spec()
     cspec = specgen.derive_chiplet_spec(ms)
     rspec = specgen.derive_requant_spec(ms)
@@ -165,8 +207,14 @@ def main():
     print("generated: %r" % text[len(a.prompt):])
     print("full:      %r" % text)
     print("float ref: %r" % ref_text[len(a.prompt):])
-    print("quantized output matches the float model on %d of %d characters "
-          "(%.0f%%)\n" % (agree, len(text), 100.0 * agree / len(text)))
+    print("free-running agreement with the float model: %d of %d characters "
+          "(%.0f%%)" % (agree, len(text), 100.0 * agree / len(text)))
+    tf_same, tf_total = teacher_forced_agreement(ck, hw)
+    print("teacher-forced next-token agreement: %d of %d (%.0f%%)"
+          % (tf_same, tf_total, 100.0 * tf_same / max(1, tf_total)))
+    print("  the second number is the one about quantization; the first "
+          "also\n  measures how fast greedy decoding amplifies a single "
+          "divergence\n")
     print("%d dot products sampled, %d requantizations sampled, "
           "%d saturated, %d accumulator overflows"
           % (len(hw.dots), len(hw.rqs), rq.saturations, hw.mac.overflows))

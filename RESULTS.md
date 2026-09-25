@@ -161,14 +161,28 @@ Two things are worth reading off that.
 The text is what the hardware would emit, not what a float model emits.
 Nothing in the decode's arithmetic is unverified against RTL.
 
-And int8 costs this model a great deal: the quantized decode agrees with
-the float decode on 24% of characters. That is not a hardware fault, it is
-the quantization scheme meeting a model with no redundancy to spare. A
-16-dimensional transformer has nothing like the slack a 768 or 1024
-dimensional one has, which is exactly why per-tensor int8 is safe for
-GPT-2 or Qwen and not for this. The useful lesson for the capstone is that
-a quantization scheme has to be validated at the target model's size, not
-at a size that happens to fit the test loop.
+And int8 costs this model real accuracy, though less than the first
+measurement suggested. Two numbers, which mean different things:
+
+| measure | agreement with float |
+|---|---|
+| free-running decode | 41 to 52% of characters |
+| teacher-forced next token | **62%** |
+
+The free-running number is the wrong one to quote for quantization. Greedy
+decoding amplifies a single different character into a completely
+different continuation, so one early divergence makes everything after it
+disagree and the figure mostly measures that amplification. Feeding both
+models the same ground-truth context isolates the part that is actually
+about the arithmetic, and that is 62%.
+
+62% is still poor, and it is a property of the model rather than of the
+hardware: a 16-dimensional transformer has nothing like the slack a 768 or
+1024 dimensional one has, which is why per-tensor int8 is safe for GPT-2
+or Qwen and not for this. The lesson for the capstone is that a
+quantization scheme has to be validated at the target model's size, and
+that a decode-level accuracy metric has to separate quantization error
+from decode divergence or it will blame the hardware for both.
 
 ## A real bitstream exists
 

@@ -43,16 +43,22 @@ def softmax(xs):
 
 
 class Tiny:
-    def __init__(self, vocab, seed=0):
+    """Geometry is per instance, not module level, so a checkpoint of any
+    size can be rebuilt from its own fields rather than from whatever the
+    module happens to be set to."""
+
+    def __init__(self, vocab, seed=0, d_model=None, d_ff=None, seq=None):
         rnd = random.Random(seed)
         self.vocab = vocab
-        d, f = D_MODEL, D_FF
+        self.d = d = d_model or D_MODEL
+        self.f = f = d_ff or D_FF
+        self.seq = seq or SEQ
 
         def mat(r, c, g=None):
             g = g or (1.0 / math.sqrt(r))
             return [[V(rnd.gauss(0, g)) for _ in range(c)] for _ in range(r)]
         self.tok = mat(vocab, d, 0.3)
-        self.pos = mat(SEQ, d, 0.3)
+        self.pos = mat(self.seq, d, 0.3)
         self.wq, self.wk, self.wv, self.wo = (mat(d, d) for _ in range(4))
         self.w1, self.w2 = mat(d, f), mat(f, d)
         self.head = mat(d, vocab)
@@ -77,33 +83,33 @@ class Tiny:
         return out
 
     def forward(self, ids):
-        n = len(ids)
-        h = [[self.tok[t][j] + self.pos[i][j] for j in range(D_MODEL)]
+        n, D = len(ids), self.d
+        h = [[self.tok[t][j] + self.pos[i][j] for j in range(D)]
              for i, t in enumerate(ids)]
         q = [self.mv(v, self.wq) for v in h]
         k = [self.mv(v, self.wk) for v in h]
         val = [self.mv(v, self.wv) for v in h]
-        scale = 1.0 / math.sqrt(D_MODEL)
+        scale = 1.0 / math.sqrt(D)
         ctx = []
         for i in range(n):
             # Causal: position i attends to 0..i only.
             scores = []
             for j in range(i + 1):
                 s = q[i][0] * k[j][0]
-                for t in range(1, D_MODEL):
+                for t in range(1, D):
                     s = s + q[i][t] * k[j][t]
                 scores.append(s * scale)
             w = softmax(scores)
-            acc = [V(0.0)] * D_MODEL
+            acc = [V(0.0)] * D
             for j in range(i + 1):
-                acc = [acc[t] + w[j] * val[j][t] for t in range(D_MODEL)]
+                acc = [acc[t] + w[j] * val[j][t] for t in range(D)]
             ctx.append(acc)
         a = [self.mv(c, self.wo) for c in ctx]
-        h = [[h[i][j] + a[i][j] for j in range(D_MODEL)] for i in range(n)]
+        h = [[h[i][j] + a[i][j] for j in range(D)] for i in range(n)]
         for i in range(n):
             m1 = [u.relu() for u in self.mv(h[i], self.w1)]
             m2 = self.mv(m1, self.w2)
-            h[i] = [h[i][j] + m2[j] for j in range(D_MODEL)]
+            h[i] = [h[i][j] + m2[j] for j in range(D)]
         return [self.mv(h[i], self.head) for i in range(n)]
 
 
@@ -111,17 +117,20 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--steps", type=int, default=400)
     ap.add_argument("--lr", type=float, default=0.05)
+    ap.add_argument("--d-model", type=int, default=D_MODEL)
+    ap.add_argument("--d-ff", type=int, default=D_FF)
+    ap.add_argument("--out", default=CKPT)
     a = ap.parse_args()
 
     chars = sorted(set(CORPUS))
     stoi = {c: i for i, c in enumerate(chars)}
     ids_all = [stoi[c] for c in CORPUS]
-    model = Tiny(len(chars))
+    model = Tiny(len(chars), d_model=a.d_model, d_ff=a.d_ff)
     ps = model.params()
     m = [0.0] * len(ps)
     v = [0.0] * len(ps)
     print("vocab %d, d_model %d, d_ff %d, seq %d, %d parameters"
-          % (len(chars), D_MODEL, D_FF, SEQ, len(ps)))
+          % (len(chars), a.d_model, a.d_ff, SEQ, len(ps)))
 
     rnd = random.Random(1)
     for step in range(1, a.steps + 1):
@@ -156,17 +165,17 @@ def main():
 
     ck = {
         "corpus": CORPUS, "chars": chars,
-        "d_model": D_MODEL, "d_ff": D_FF, "seq": SEQ,
+        "d_model": a.d_model, "d_ff": a.d_ff, "seq": SEQ,
         "weights": {
             name: [[c.d for c in row] for row in getattr(model, name)]
             for name in ("tok", "pos", "wq", "wk", "wv", "wo", "w1", "w2",
                          "head")
         },
     }
-    with open(CKPT, "w") as f:
+    with open(a.out, "w") as f:
         json.dump(ck, f)
-    print("wrote %s (%.0f KB)" % (os.path.basename(CKPT),
-                                  os.path.getsize(CKPT) / 1024.0))
+    print("wrote %s (%.0f KB)" % (os.path.basename(a.out),
+                                  os.path.getsize(a.out) / 1024.0))
 
 
 if __name__ == "__main__":
