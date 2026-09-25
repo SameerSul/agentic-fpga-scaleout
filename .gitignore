@@ -1,24 +1,12 @@
-build/
-build_dv/
-build_sweep/
-build_probe/
-build_tests/
-build_dbg/
-build_tp/
-build_infer/
-build_esc*/
-build_sg*/
-build_probe*/
+# Scratch directories. Every harness makes its own so they can run in
+# parallel, so the pattern is general rather than a list that grows.
+build*/
 __pycache__/
 *.vcd
+*.log
 
-# Consistency harness scratch: regenerated every run, not inputs.
+# Harness inputs and outputs that are regenerated on every run.
 *_bench.json
 *_bench.v
 *_dbg.json
 *_dbg.v
-bench_headtohead.log
-bench_swarm_fixed.log
-bench_swarm_escalate.log
-bench_signed.log
-bench_signed_swarm_fixed.log
