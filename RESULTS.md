@@ -17,15 +17,15 @@ one. The remaining gap is listed at the bottom rather than glossed over.
 ### The full suite
 
 ```
-python3 tests.py            # 173 tests, all passing
+python3 tests.py            # 188 tests, all passing
 ```
 
 ### Spec to RTL, across the spec space
 
-`python3 sweep.py` drives forty five cases through every stage: derivation,
+`python3 sweep.py` drives fifty seven cases through every stage: derivation,
 RTL, simulation, synthesis, timing closure, FPGA mapping, the profile
 fields the sizing model consumes, and a mutation sweep of the testbench
-generated at that width. All forty five clean.
+generated at that width. All fifty seven clean.
 
 | case | cyc/unit | fmax | cells | DV |
 |---|---|---|---|---|
@@ -34,6 +34,8 @@ generated at that width. All forty five clean.
 | recip 26b to 17b | 4.00 | 223 MHz | 1562 | 4/4 |
 | rsqrt 28b to 17b | 4.00 | 174 MHz | 1351 | 4/4 |
 | matvec sequencer | 68.0 | 169 MHz | 1397 | 4/4 |
+| wmem tile + loader | 1024 | 333 MHz | 61712 | 5/5 |
+| softmax sequencer | 64.0 | 106 MHz | 1546 | 6/6 |
 | requant acc28 to 8 | 7.00 | 102 MHz | 9274 | 5/5 |
 | mac int4 weights, acc24 | 1.00 | 187 MHz | 1383 | 8/8 |
 | mac int16, acc46 | 1.00 | 104 MHz | 4570 | 6/6 |
@@ -229,6 +231,8 @@ generic cell library.
 | reciprocal | 184 (2%) | 100 MHz | **299.67 MHz** | 206 checks |
 | inverse square root | 155 (2%) | 100 MHz | **256.81 MHz** | 212 checks |
 | matvec sequencer | 231 (3%) | 100 MHz | **103.89 MHz** | 64 checks |
+| weight memory + loader | 67 (1%) + 2 BRAM | 100 MHz | **218.53 MHz** | 20 checks |
+| softmax sequencer | see note | 100 MHz | **106 MHz** (library) | 121 checks |
 | requantizer | 1924 (25%) | 100 MHz | 97.88 MHz | 173 checks |
 
 **The bitstream is verified, not just produced.** icepack emits the actual
@@ -317,6 +321,38 @@ for the 28-bit one, because a fixed size cannot track a derived width:
 the matrix is now sized from the address width, and the memory is filled
 by a formula so the file stays readable at four figures of entries.
 
+## Blocks that contain other blocks
+
+Three of the nine generated blocks are composite. The sequencer drives
+the MAC, the weight memory is checked feeding both, and softmax
+instantiates the exponential and the reciprocal outright. That last one
+made the flow itself learn something: synthesis, FPGA mapping and the
+bitstream stage all read only the top file, so a block with a hierarchy
+below it failed to elaborate. All three stages now take the extra
+sources, and yosys prunes whatever the top does not reach.
+
+Every one of those composites is checked against the real blocks it
+uses rather than a model of them, and all four bitstreams are verified
+from their packed bits: MAC 613 checks, softmax 121, sequencer and MAC
+64, memory and sequencer and MAC 20.
+
+Softmax took four timing bugs to get right and every one was the same
+family: a transition that pre-issued an address and then reset the
+counter, so element zero was read twice; a valid flag one cycle short
+of the two-cycle read latency, so every pass compared stale data on its
+first element; a registered valid gated on the data-valid flag, which
+asserted it a cycle late so the exponential consumed the next element;
+and the multiply, variable shift and saturate in one stage, a tenth of
+a nanosecond over. Each of them passes a one-element row and fails on
+two, which is why the testbench sweeps rows of 1, 2, 5, 16 and 64.
+
+And one thing only a generated testbench can do. The normalising
+product is shifted right about seventeen bits, so an off-by-one in it
+changes a weight about once in a hundred thousand random rows, and that
+mutation survived every vector. The generator now searches for a row
+that lands on the carry boundary and embeds it, which took under a
+second.
+
 ## Not verified, and not claimed
 
 These are the distance between this repo and a local LLM host.
@@ -334,13 +370,14 @@ These are the distance between this repo and a local LLM host.
    flow generates the multiply-accumulate unit, the requantizer between
    matmuls, the exponential and the reciprocal that softmax needs, the
    inverse square root that RMSNorm needs, and the CRC32 fabric
-   endpoint, and the weight-streaming sequencer that drives the MAC
-   through a matrix. Softmax is hardware apart from accumulating the
+   endpoint, the weight-streaming sequencer that drives the MAC through
+   a matrix, the weight tile and its loader, and softmax as a single
+   sequenced block. Softmax is hardware apart from accumulating the
    sum, and so is the transcendental part of RMSNorm. It does not
-   generate the attention sequencing above the matmul level, nor a
-   memory controller: the sequencer issues addresses and expects a
-   registered read, which is what block RAM gives, but nothing
-   generates the RAM itself or the logic that fills it. In `generate.py` those run on the host, and the
+   generate the attention sequencing above the matmul level: nothing
+   drives several matmuls in order and routes activations between them.
+   The weight tile holds 1024 entries, so a real matrix needs tiling
+   logic that does not exist yet. In `generate.py` those run on the host, and the
    output says so each run.
 3. **The model is small and its weights are its own.** Qwen3-0.6B is not
    loaded; there is no numeric stack here to load it with and no network

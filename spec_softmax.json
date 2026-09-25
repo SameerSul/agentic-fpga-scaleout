@@ -1,0 +1,97 @@
+{
+  "name": "softmax_gpt2_124m",
+  "description": "Softmax sequencer over a row of at most 256 scores: max pass, exponential pass with sum, one reciprocal, normalising multiply",
+  "top_module": "softmax",
+  "unit": "row",
+  "parameters": {
+    "capacity": 256,
+    "index_width": 8,
+    "score_width": 13,
+    "score_frac": 8,
+    "weight_width": 16,
+    "weight_frac": 15,
+    "exp_stages": 3,
+    "recip_stages": 3,
+    "recip_in_width": 26,
+    "recip_out_width": 17,
+    "shift_bias": 42,
+    "signed": true,
+    "pipeline_stages": 1,
+    "target_clock_mhz": 100
+  },
+  "derivation": {
+    "model": "gpt2_124m",
+    "rule": "capacity is one attention row tile; the score and weight formats come from the exponential unit and the normalising shift from the reciprocal, so a change to either changes this block"
+  },
+  "ports": [
+    {
+      "name": "clk",
+      "dir": "input",
+      "width": 1,
+      "desc": "clock, rising edge"
+    },
+    {
+      "name": "rst_n",
+      "dir": "input",
+      "width": 1,
+      "desc": "active-low synchronous reset"
+    },
+    {
+      "name": "start",
+      "dir": "input",
+      "width": 1,
+      "desc": "begin a row"
+    },
+    {
+      "name": "n",
+      "dir": "input",
+      "width": 9,
+      "desc": "number of scores in the row"
+    },
+    {
+      "name": "s_addr",
+      "dir": "output",
+      "width": 8,
+      "desc": "score index being read"
+    },
+    {
+      "name": "s_data",
+      "dir": "input",
+      "width": 13,
+      "signed": true,
+      "desc": "score, registered read, one cycle after s_addr"
+    },
+    {
+      "name": "w_valid",
+      "dir": "output",
+      "width": 1,
+      "desc": "a normalised weight is on w_data"
+    },
+    {
+      "name": "w_index",
+      "dir": "output",
+      "width": 8,
+      "desc": "which score the weight belongs to"
+    },
+    {
+      "name": "w_data",
+      "dir": "output",
+      "width": 16,
+      "desc": "weight in Q0.15"
+    },
+    {
+      "name": "busy",
+      "dir": "output",
+      "width": 1,
+      "desc": "a row is in progress"
+    }
+  ],
+  "behavior": [
+    "start begins a row of n scores.",
+    "The first pass reads every score and keeps the maximum, because the exponential is only defined for non-positive arguments and subtracting the row maximum is what guarantees that.",
+    "The second pass reads them again, feeds score minus maximum to the exponential unit, buffers each result and accumulates their sum.",
+    "The sum then goes through the reciprocal unit once. A divide per weight would be absurd.",
+    "The third pass multiplies each buffered exponential by that reciprocal and emits it with w_valid.",
+    "Every read is registered, so addresses lead data by one cycle throughout."
+  ]
+}

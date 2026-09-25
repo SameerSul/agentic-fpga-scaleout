@@ -31,7 +31,8 @@ import sys
 import specgen
 from agent import (RuleBasedAgent, FIX_WIDTH, FIX_CLEAR,
                    FIX_SATURATE, FIX_XOR, FIX_LUT, FIX_NORM, FIX_EVEN,
-                   FIX_CLRCOL, FIX_MEMLAT)
+                   FIX_CLRCOL, FIX_MEMLAT, FIX_REGRD,
+                   FIX_SUBMAX)
 from chiplet_flow import ROOT, TARGET_LINK_GBPS
 
 WORK = os.path.join(ROOT, "build_bitstream")
@@ -49,6 +50,8 @@ TB_FOR = {
     "recip": lambda spec: specgen.render_recip_testbench(spec),
     "rsqrt": lambda spec: specgen.render_rsqrt_testbench(spec),
     "matvec": lambda spec: specgen.render_matvec_testbench(spec),
+    "wmem": lambda spec: specgen.render_wmem_testbench(spec),
+    "softmax": lambda spec: specgen.render_softmax_testbench(spec),
 }
 
 BLOCKS = {
@@ -67,8 +70,15 @@ BLOCKS = {
     # check needs that source alongside the unpacked design.
     "matvec": ("matvec", lambda ms: specgen.derive_matvec_spec(ms),
                {FIX_CLRCOL, FIX_MEMLAT}),
+    "wmem": ("wmem", lambda ms: specgen.derive_wmem_spec(ms),
+             {FIX_REGRD}),
+    "softmax": ("softmax", lambda ms: specgen.derive_softmax_spec(ms),
+                {FIX_SUBMAX}),
 }
-EXTRA_SRC = {"matvec": "mac"}
+# Blocks whose testbench instantiates other generated blocks. Those are
+# rendered and compiled alongside the unpacked bitstream.
+EXTRA_SRC = {"matvec": ("mac",), "wmem": ("mac", "matvec"),
+             "softmax": ("exp", "recip")}
 
 
 ICEBOX_PY = "/opt/homebrew/Cellar/icestorm/1.1/share/icestorm/python"
@@ -210,10 +220,18 @@ def main():
     print("block %s (%s), device iCE40 %s %s, target %g MHz\n"
           % (a.block, spec["name"], a.device, a.package, freq))
 
+    extra = []
+    for n, dep in enumerate(EXTRA_SRC.get(a.block, ())):
+        dtop, dderive, dfixes = BLOCKS[dep]
+        fn = "dep%d.v" % n
+        open(os.path.join(WORK, fn), "w").write(
+            getattr(RuleBasedAgent(), "render_" + dep)(dderive(ms), dfixes))
+        extra.append(fn)
     print("synthesising to iCE40 primitives")
+    srcs = " ".join(["top.v"] + extra)
     rc, out = run(["yosys", "-p",
-                   "read_verilog top.v; synth_ice40 -top %s -json top.json"
-                   % top])
+                   "read_verilog %s; synth_ice40 -top %s -json top.json"
+                   % (srcs, top)])
     if rc:
         print(out[-2500:])
         raise SystemExit("synth_ice40 failed")
@@ -280,13 +298,6 @@ def main():
                                                      top + "_bits"))
     tb = "tb_block.v"
     open(os.path.join(WORK, tb), "w").write(TB_FOR[a.block](spec))
-    extra = []
-    if a.block in EXTRA_SRC:
-        dep = EXTRA_SRC[a.block]
-        dtop, dderive, dfixes = BLOCKS[dep]
-        open(os.path.join(WORK, "dep.v"), "w").write(
-            getattr(RuleBasedAgent(), "render_" + dep)(dderive(ms), dfixes))
-        extra = ["dep.v"]
     cells = os.path.join(
         subprocess.run(["yosys-config", "--datdir"], capture_output=True,
                        text=True).stdout.strip(), "ice40", "cells_sim.v")

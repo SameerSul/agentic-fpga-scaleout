@@ -1,0 +1,169 @@
+{
+  "spec": {
+    "name": "wmem1024_gpt2_124m",
+    "description": "Weight tile memory with a streaming loader: 1024 entries of 8 bits, sequential write port, registered read port",
+    "top_module": "wmem",
+    "unit": "tile",
+    "parameters": {
+      "data_width": 8,
+      "capacity": 1024,
+      "addr_width": 10,
+      "signed": true,
+      "pipeline_stages": 1,
+      "target_clock_mhz": 100
+    },
+    "derivation": {
+      "model": "gpt2_124m",
+      "rule": "one tile of 1024 weights at the model's datapath width; the read port is registered because that is what the sequencer was built against and what block RAM provides"
+    },
+    "ports": [
+      {
+        "name": "clk",
+        "dir": "input",
+        "width": 1,
+        "desc": "clock, rising edge"
+      },
+      {
+        "name": "rst_n",
+        "dir": "input",
+        "width": 1,
+        "desc": "active-low synchronous reset"
+      },
+      {
+        "name": "load_start",
+        "dir": "input",
+        "width": 1,
+        "desc": "reset the write pointer and begin a load"
+      },
+      {
+        "name": "load_valid",
+        "dir": "input",
+        "width": 1,
+        "desc": "write load_data at the current pointer"
+      },
+      {
+        "name": "load_data",
+        "dir": "input",
+        "width": 8,
+        "signed": true,
+        "desc": "weight being written"
+      },
+      {
+        "name": "load_count",
+        "dir": "output",
+        "width": 11,
+        "desc": "how many weights have been written"
+      },
+      {
+        "name": "rd_addr",
+        "dir": "input",
+        "width": 10,
+        "desc": "read address"
+      },
+      {
+        "name": "rd_data",
+        "dir": "output",
+        "width": 8,
+        "signed": true,
+        "desc": "registered read data, one cycle after rd_addr"
+      }
+    ],
+    "behavior": [
+      "load_start clears the write pointer.",
+      "Each cycle load_valid is high, load_data is written at the pointer and the pointer advances, saturating at capacity.",
+      "load_count reports the pointer, so a loader outside can tell when the tile is full.",
+      "rd_data is registered: it presents mem[rd_addr] one cycle after rd_addr. A combinational read would deliver data a cycle early and the sequencer would multiply the wrong element.",
+      "A write and a read of the same address in one cycle return the old contents, which is read-first behaviour."
+    ]
+  },
+  "tools": {
+    "iverilog": "/opt/homebrew/bin/iverilog",
+    "vvp": "/opt/homebrew/bin/vvp",
+    "yosys": "/opt/homebrew/bin/yosys",
+    "sta": "/Users/ssuleman/.local/bin/sta"
+  },
+  "agent": "RuleBasedAgent",
+  "converged": true,
+  "iterations_used": 2,
+  "history": [
+    {
+      "iteration": 1,
+      "fixes_applied": [],
+      "sim": {
+        "stage": "sim",
+        "status": "fail",
+        "checks": null,
+        "mismatches": [
+          {
+            "test": "system",
+            "col": "0",
+            "expected_acc": "-2803",
+            "got_acc": "3211"
+          }
+        ]
+      },
+      "synth": null,
+      "timing": null,
+      "fpga": null
+    },
+    {
+      "iteration": 2,
+      "fixes_applied": [
+        "register_the_read_port"
+      ],
+      "sim": {
+        "stage": "sim",
+        "status": "pass",
+        "checks": 18,
+        "mismatches": [],
+        "throughput": {
+          "tiles": 1,
+          "span_cycles": 1024,
+          "latency_cycles": 64,
+          "units": 1,
+          "cycles_per_unit": 1024.0
+        }
+      },
+      "synth": {
+        "stage": "synth",
+        "status": "pass",
+        "cell_count": 61712,
+        "area": 154192.0
+      },
+      "timing": {
+        "stage": "timing",
+        "status": "pass",
+        "method": "opensta",
+        "clock_period_ns": 10.0,
+        "worst_slack_ns": 7.0
+      },
+      "fpga": {
+        "luts": 6,
+        "ffs": 11,
+        "dsps": 0,
+        "brams": 1,
+        "urams": 0,
+        "carry": 3,
+        "muxf": 0,
+        "status": "pass",
+        "family": "xcup",
+        "top": "wmem",
+        "lint": [],
+        "stage": "fpga"
+      }
+    }
+  ],
+  "final_metrics": {
+    "sim_pass": true,
+    "sim_checks": 18,
+    "cell_count": 61712,
+    "area": 154192.0,
+    "timing": {
+      "stage": "timing",
+      "status": "pass",
+      "method": "opensta",
+      "clock_period_ns": 10.0,
+      "worst_slack_ns": 7.0
+    }
+  }
+}

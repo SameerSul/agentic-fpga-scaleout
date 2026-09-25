@@ -929,7 +929,11 @@ def render_matvec_testbench(spec):
     # rather than being a fixed number that happens to suit one spec.
     depth = 68
     cols = (1 << (addr_w // 2)) // depth + 2
-    m = min(251, (1 << dw) - 5)
+    # Test data spans the whole datapath. Capping it at a byte leaves
+    # the upper half of a 16-bit word always zero, and a mutation that
+    # halves the storage width is then invisible: mutation testing found
+    # exactly that on the 16-bit memory.
+    m = (1 << dw) - 5
     half = m // 2
 
     def act(i):
@@ -1058,6 +1062,519 @@ def generate_matvec(ms=None, spec_file="spec_matvec.json",
         json.dump(spec, f, indent=2)
     with open(os.path.join(ROOT, tb_file), "w") as f:
         f.write(render_matvec_testbench(spec))
+    return spec
+
+
+def derive_wmem_spec(ms):
+    """model spec -> weight memory and loader spec.
+
+    The sequencer issues addresses and expects a registered read, but
+    nothing generated the memory behind them or the logic that fills it.
+    This does both: a tile of weight storage with a streaming write port,
+    which is how weights actually reach a device, and a registered read
+    port with the timing the sequencer was built against.
+    """
+    c = derive_chiplet_spec(ms)
+    dw = c["parameters"]["data_width"]
+    cap = 1024                      # one tile, not a whole matrix
+    aw = (cap - 1).bit_length()
+    return {
+        "name": "wmem%d_%s" % (cap, ms["name"]),
+        "description": "Weight tile memory with a streaming loader: %d "
+                       "entries of %d bits, sequential write port, "
+                       "registered read port" % (cap, dw),
+        "top_module": "wmem",
+        "unit": "tile",
+        "parameters": {
+            "data_width": dw, "capacity": cap, "addr_width": aw,
+            "signed": True, "pipeline_stages": 1,
+            "target_clock_mhz": 100,
+        },
+        "derivation": {
+            "model": ms["name"],
+            "rule": "one tile of %d weights at the model's datapath "
+                    "width; the read port is registered because that is "
+                    "what the sequencer was built against and what block "
+                    "RAM provides" % cap,
+        },
+        "ports": [
+            {"name": "clk", "dir": "input", "width": 1,
+             "desc": "clock, rising edge"},
+            {"name": "rst_n", "dir": "input", "width": 1,
+             "desc": "active-low synchronous reset"},
+            {"name": "load_start", "dir": "input", "width": 1,
+             "desc": "reset the write pointer and begin a load"},
+            {"name": "load_valid", "dir": "input", "width": 1,
+             "desc": "write load_data at the current pointer"},
+            {"name": "load_data", "dir": "input", "width": dw,
+             "signed": True, "desc": "weight being written"},
+            {"name": "load_count", "dir": "output", "width": aw + 1,
+             "desc": "how many weights have been written"},
+            {"name": "rd_addr", "dir": "input", "width": aw,
+             "desc": "read address"},
+            {"name": "rd_data", "dir": "output", "width": dw,
+             "signed": True, "desc": "registered read data, one cycle "
+                                     "after rd_addr"},
+        ],
+        "behavior": [
+            "load_start clears the write pointer.",
+            "Each cycle load_valid is high, load_data is written at the "
+            "pointer and the pointer advances, saturating at capacity.",
+            "load_count reports the pointer, so a loader outside can "
+            "tell when the tile is full.",
+            "rd_data is registered: it presents mem[rd_addr] one cycle "
+            "after rd_addr. A combinational read would deliver data a "
+            "cycle early and the sequencer would multiply the wrong "
+            "element.",
+            "A write and a read of the same address in one cycle return "
+            "the old contents, which is read-first behaviour.",
+        ],
+    }
+
+
+def render_wmem_testbench(spec):
+    """System testbench: the loader and memory feeding the sequencer and
+    the MAC.
+
+    This is the whole subsystem rather than one block. Weights are
+    streamed in through the load port exactly as they would reach a
+    device, then the sequencer walks them and the MAC reduces them, and
+    the column results are checked against Python. A block checked only
+    on its own would not catch a read port that is a cycle out of step
+    with the thing reading it.
+    """
+    p = spec["parameters"]
+    ms = load_model_spec()
+    c = derive_chiplet_spec(ms)
+    mv = derive_matvec_spec(ms)
+    dw, aw = p["data_width"], p["addr_width"]
+    acc_w = c["parameters"]["acc_width"]
+    depth, cols = 64, 16            # 1024 weights: exactly one tile
+    # Test data spans the whole datapath. Capping it at a byte leaves
+    # the upper half of a 16-bit word always zero, and a mutation that
+    # halves the storage width is then invisible: mutation testing found
+    # exactly that on the 16-bit memory.
+    m = (1 << dw) - 5
+    half = m // 2
+
+    def act(i):
+        return (i * 104729 + 7) % m - half
+
+    def wt(i):
+        return (i * 7919 + 13) % m - half
+
+    golden = [sum(act(r) * wt(c_ * depth + r) for r in range(depth))
+              for c_ in range(cols)]
+    exp = "\n".join("    expect_col[%d] = %s;" % (i, _slit(v, acc_w))
+                     for i, v in enumerate(golden))
+    return WMEM_TB.format(
+        dwm=dw - 1, awm=aw - 1, accwm=acc_w - 1,
+        depwm=mv["parameters"]["depth_width"] - 1,
+        colwm=mv["parameters"]["col_width"] - 1,
+        mvaddrwm=mv["parameters"]["addr_width"] - 1,
+        cntwm=aw, depth=depth, cols=cols, nmem=depth * cols,
+        m=m, half=half, exp=exp, cap=p["capacity"])
+
+
+WMEM_TB = """`timescale 1ns/1ps
+// GENERATED by specgen.py: do not edit by hand.
+// System testbench: the weight loader and memory feeding the sequencer
+// and the MAC. Weights are streamed in through the load port the way
+// they would reach a device, then walked and reduced, and the column
+// results are checked against values computed in Python.
+module tb_wmem;
+  reg clk = 0, rst_n = 0;
+  reg load_start = 0, load_valid = 0;
+  reg signed [{dwm}:0] load_data = 0;
+  wire [{cntwm}:0] load_count;
+  wire signed [{dwm}:0] rd_data;
+
+  reg start = 0;
+  reg  [{depwm}:0] depth = 0;
+  reg  [{colwm}:0] cols = 0;
+  wire [{depwm}:0] a_addr;
+  wire [{mvaddrwm}:0] w_addr;
+  wire mac_valid, mac_clear, col_valid, busy;
+  wire [{colwm}:0] col_index;
+  wire signed [{accwm}:0] acc;
+  wire mac_vout;
+
+  reg signed [{dwm}:0] amem [0:{depth}-1];
+  reg signed [{accwm}:0] expect_col [0:{cols}-1];
+  reg signed [{dwm}:0] a_data;
+  integer checks = 0, seen = 0, i;
+  reg [255:0] testname;
+
+  // The activation side stays a simple registered read; the weight side
+  // is the generated memory.
+  always @(posedge clk) a_data <= amem[a_addr];
+
+  wmem wm (.clk(clk), .rst_n(rst_n), .load_start(load_start),
+           .load_valid(load_valid), .load_data(load_data),
+           .load_count(load_count), .rd_addr(w_addr[{awm}:0]),
+           .rd_data(rd_data));
+
+  matvec seq (.clk(clk), .rst_n(rst_n), .start(start), .depth(depth),
+              .cols(cols), .a_addr(a_addr), .w_addr(w_addr),
+              .mac_valid(mac_valid), .mac_clear(mac_clear),
+              .col_valid(col_valid), .col_index(col_index), .busy(busy));
+
+  mac dut (.clk(clk), .rst_n(rst_n), .clear(mac_clear),
+           .a(a_data), .b(rd_data), .valid_in(mac_valid),
+           .acc(acc), .valid_out(mac_vout));
+
+  always #5 clk = ~clk;
+
+  always @(posedge clk) begin
+    if (rst_n && col_valid) begin
+      checks = checks + 1;
+      seen = seen + 1;
+      if (acc !== expect_col[col_index]) begin
+        $display("TB_FAIL test=%0s col=%0d expected_acc=%0d got_acc=%0d",
+                 testname, col_index, expect_col[col_index], acc);
+        $display("TB_RESULT: FAIL");
+        $finish;
+      end
+    end
+  end
+
+  initial begin
+    for (i = 0; i < {depth}; i = i + 1)
+      amem[i] = (i * 104729 + 7) % {m} - {half};
+{exp}
+    testname = "reset_init";
+    repeat (3) @(negedge clk);
+    checks = checks + 1;
+    // Reset has to clear the write pointer. Without this the testbench
+    // never depends on it, because load_start clears it too and every
+    // load starts with one.
+    if (load_count !== 0) begin
+      $display("TB_FAIL test=reset_init col=0 expected_acc=0 got_acc=%0d",
+               load_count);
+      $display("TB_RESULT: FAIL");
+      $finish;
+    end
+    rst_n = 1;
+    @(negedge clk);
+    checks = checks + 1;
+    if (load_count !== 0) begin
+      $display("TB_FAIL test=reset_init col=0 expected_acc=0 got_acc=%0d",
+               load_count);
+      $display("TB_RESULT: FAIL");
+      $finish;
+    end
+    testname = "load";
+
+    // Stream the tile in, as a host or a DMA engine would.
+    load_start = 1;
+    @(negedge clk);
+    load_start = 0;
+    for (i = 0; i < {nmem}; i = i + 1) begin
+      load_data = (i * 7919 + 13) % {m} - {half};
+      load_valid = 1;
+      @(negedge clk);
+    end
+    load_valid = 0;
+    @(negedge clk);
+    checks = checks + 1;
+    if (load_count !== {nmem}) begin
+      $display("TB_FAIL test=%0s expected_acc=%0d got_acc=%0d",
+               "load_count", {nmem}, load_count);
+      $display("TB_RESULT: FAIL");
+      $finish;
+    end
+
+    testname = "system";
+    depth = {depth};
+    cols = {cols};
+    @(negedge clk);
+    start = 1;
+    @(negedge clk);
+    start = 0;
+    for (i = 0; i < {cols} * ({depth} + 10) + 60; i = i + 1)
+      @(negedge clk);
+    checks = checks + 1;
+    if (seen !== {cols}) begin
+      $display("TB_FAIL test=%0s expected_acc=%0d got_acc=%0d",
+               "column_count", {cols}, seen);
+      $display("TB_RESULT: FAIL");
+      $finish;
+    end
+    $display("TB_PROFILE tiles=%0d span_cycles=%0d latency_cycles=%0d",
+             1, {nmem}, {depth});
+    $display("TB_PASS checks=%0d", checks);
+    $display("TB_RESULT: PASS");
+    $finish;
+  end
+endmodule
+"""
+
+
+def generate_wmem(ms=None, spec_file="spec_wmem.json",
+                  tb_file="tb_wmem.v"):
+    """Write the derived weight memory spec and its system testbench."""
+    ms = ms or load_model_spec()
+    spec = derive_wmem_spec(ms)
+    with open(os.path.join(ROOT, spec_file), "w") as f:
+        json.dump(spec, f, indent=2)
+    with open(os.path.join(ROOT, tb_file), "w") as f:
+        f.write(render_wmem_testbench(spec))
+    return spec
+
+
+def derive_softmax_spec(ms):
+    """model spec -> softmax sequencer spec.
+
+    The exponential and the reciprocal exist as blocks, but nothing
+    joined them: softmax is a max pass, an exponential pass that
+    accumulates a sum, one reciprocal, and a normalising multiply. This
+    sequences all four and instantiates the two transcendental units
+    itself, which makes it the first generated block that contains
+    others rather than sitting beside them.
+    """
+    e = derive_exp_spec(ms)
+    r = derive_recip_spec(ms)
+    cap = 256                       # one attention row tile
+    nw = (cap - 1).bit_length()
+    return {
+        "name": "softmax_%s" % ms["name"],
+        "description": "Softmax sequencer over a row of at most %d "
+                       "scores: max pass, exponential pass with sum, one "
+                       "reciprocal, normalising multiply" % cap,
+        "top_module": "softmax",
+        "unit": "row",
+        "parameters": {
+            "capacity": cap, "index_width": nw,
+            "score_width": e["parameters"]["in_width"],
+            "score_frac": e["parameters"]["in_frac"],
+            "weight_width": e["parameters"]["out_width"],
+            "weight_frac": e["parameters"]["out_frac"],
+            "exp_stages": e["parameters"]["pipeline_stages"],
+            "recip_stages": r["parameters"]["pipeline_stages"],
+            "recip_in_width": r["parameters"]["in_width"],
+            "recip_out_width": r["parameters"]["out_width"],
+            "shift_bias": r["parameters"]["shift_bias"],
+            "signed": True, "pipeline_stages": 1,
+            "target_clock_mhz": 100,
+        },
+        "derivation": {
+            "model": ms["name"],
+            "rule": "capacity is one attention row tile; the score and "
+                    "weight formats come from the exponential unit and "
+                    "the normalising shift from the reciprocal, so a "
+                    "change to either changes this block",
+        },
+        "ports": [
+            {"name": "clk", "dir": "input", "width": 1,
+             "desc": "clock, rising edge"},
+            {"name": "rst_n", "dir": "input", "width": 1,
+             "desc": "active-low synchronous reset"},
+            {"name": "start", "dir": "input", "width": 1,
+             "desc": "begin a row"},
+            {"name": "n", "dir": "input", "width": nw + 1,
+             "desc": "number of scores in the row"},
+            {"name": "s_addr", "dir": "output", "width": nw,
+             "desc": "score index being read"},
+            {"name": "s_data", "dir": "input",
+             "width": e["parameters"]["in_width"], "signed": True,
+             "desc": "score, registered read, one cycle after s_addr"},
+            {"name": "w_valid", "dir": "output", "width": 1,
+             "desc": "a normalised weight is on w_data"},
+            {"name": "w_index", "dir": "output", "width": nw,
+             "desc": "which score the weight belongs to"},
+            {"name": "w_data", "dir": "output",
+             "width": e["parameters"]["out_width"],
+             "desc": "weight in Q0.%d" % e["parameters"]["out_frac"]},
+            {"name": "busy", "dir": "output", "width": 1,
+             "desc": "a row is in progress"},
+        ],
+        "behavior": [
+            "start begins a row of n scores.",
+            "The first pass reads every score and keeps the maximum, "
+            "because the exponential is only defined for non-positive "
+            "arguments and subtracting the row maximum is what "
+            "guarantees that.",
+            "The second pass reads them again, feeds score minus "
+            "maximum to the exponential unit, buffers each result and "
+            "accumulates their sum.",
+            "The sum then goes through the reciprocal unit once. A "
+            "divide per weight would be absurd.",
+            "The third pass multiplies each buffered exponential by "
+            "that reciprocal and emits it with w_valid.",
+            "Every read is registered, so addresses lead data by one "
+            "cycle throughout.",
+        ],
+    }
+
+
+def softmax_golden(scores, p):
+    """Exact model of the sequencer, built from the two unit models so
+    the testbench checks the composition rather than a fresh
+    approximation of softmax."""
+    e_p = {"in_width": p["score_width"], "in_frac": p["score_frac"],
+           "out_frac": p["weight_frac"], "lut_bits": p["score_frac"]}
+    r_p = {"in_width": p["recip_in_width"],
+           "out_width": p["recip_out_width"],
+           "lut_bits": 8, "shift_bias": p["shift_bias"]}
+    mx = max(scores)
+    ex = [exp_golden(s - mx, e_p) for s in scores]
+    tot = min(sum(ex), (1 << r_p["in_width"]) - 1)
+    m, k = recip_golden(max(1, tot), r_p)
+    # recip_apply already divides, so shifting again here would scale
+    # the weight down by a second factor of 2**weight_frac.
+    return [min((1 << p["weight_frac"]),
+                recip_apply(v << p["weight_frac"], m, k, r_p))
+            for v in ex], ex, tot
+
+
+def _softmax_discriminating_row(p, rnd, tries=200000):
+    """Find a row where a one-count error in the normalising multiply
+    changes a weight. Returns None if none is found, in which case the
+    testbench simply does without it rather than pretending."""
+    sw = p["score_width"]
+    lo = -(1 << (sw - 1))
+    hi = -lo - 1
+    r_p = {"in_width": p["recip_in_width"],
+           "out_width": p["recip_out_width"],
+           "lut_bits": 8, "shift_bias": p["shift_bias"]}
+    for _ in range(tries):
+        n = rnd.randrange(2, 6)
+        row = [rnd.randrange(lo // 2, hi // 2) for _ in range(n)]
+        w, ex, tot = softmax_golden(row, p)
+        m, k = recip_golden(max(1, tot), r_p)
+        s = p["shift_bias"] - k - p["weight_frac"]
+        if s <= 0:
+            continue
+        for v in ex:
+            if ((v * m) & ((1 << s) - 1)) == (1 << s) - 1:
+                return row
+    return None
+
+
+def render_softmax_testbench(spec):
+    p = spec["parameters"]
+    sw, ww, nw = p["score_width"], p["weight_width"], p["index_width"]
+    rnd = random.Random(53)
+    rows = []
+    lo = -(1 << (sw - 1))
+    hi = -lo - 1
+    for n in (1, 2, 5, 16, 64):
+        # Straddling zero on purpose: with every score negative the row
+        # maximum is zero and subtracting it is a no-op, so a design
+        # that skips that step passes.
+        rows.append([rnd.randrange(hi // 4, hi // 2) for _ in range(n)])
+    rows.append([1234] * 8)                    # all equal, all positive
+    rows.append([hi // 2] + [hi // 8] * 7)     # one dominant score
+    rows.append([lo // 4, 0, hi // 4, 7])      # mixed signs
+    disc = _softmax_discriminating_row(p, rnd)
+    if disc:
+        # A row whose product sits one count below a shift boundary, so
+        # a single LSB of error in the normalising multiply carries into
+        # the weight. Without it that mutation survives every vector,
+        # because the product is shifted right by about seventeen bits
+        # and the chance of a random row landing on the boundary is
+        # roughly one in a hundred thousand. The testbench is generated,
+        # so it can go and find one.
+        rows.append(disc)
+    body = []
+    for ri, sc in enumerate(rows):
+        w, _, _ = softmax_golden(sc, p)
+        body.append("    // row %d, n=%d" % (ri, len(sc)))
+        for i, v in enumerate(sc):
+            body.append("    smem[%d] = %s;" % (i, _slit(v, sw)))
+        for i, v in enumerate(w):
+            body.append("    expect_w[%d] = %d'd%d;" % (i, ww, v))
+        body.append("    run_row(%d'd%d);" % (nw + 1, len(sc)))
+    return SOFTMAX_TB.format(
+        swm=sw - 1, wwm=ww - 1, nwm=nw - 1, nw=nw + 1, cap=p["capacity"],
+        rows="\n".join(body), nrows=len(rows))
+
+
+SOFTMAX_TB = """`timescale 1ns/1ps
+// GENERATED by specgen.py: do not edit by hand.
+// Self-checking testbench for the softmax sequencer, which instantiates
+// the generated exponential and reciprocal units. Golden weights are
+// built from those same unit models, so this checks the composition
+// rather than a fresh approximation of softmax.
+module tb_softmax;
+  reg clk = 0, rst_n = 0, start = 0;
+  reg  [{nw}-1:0] n = 0;
+  wire [{nwm}:0] s_addr;
+  wire w_valid, busy;
+  wire [{nwm}:0] w_index;
+  wire [{wwm}:0] w_data;
+
+  reg signed [{swm}:0] smem [0:{cap}-1];
+  reg        [{wwm}:0] expect_w [0:{cap}-1];
+  reg signed [{swm}:0] s_data;
+  integer checks = 0, seen = 0, i;
+  reg [255:0] testname;
+
+  always @(posedge clk) s_data <= smem[s_addr];
+
+  softmax dut (.clk(clk), .rst_n(rst_n), .start(start), .n(n),
+               .s_addr(s_addr), .s_data(s_data), .w_valid(w_valid),
+               .w_index(w_index), .w_data(w_data), .busy(busy));
+
+  always #5 clk = ~clk;
+
+  always @(posedge clk) begin
+    if (rst_n && w_valid) begin
+      checks = checks + 1;
+      seen = seen + 1;
+      if (w_data !== expect_w[w_index]) begin
+        $display("TB_FAIL test=%0s idx=%0d expected_w=%0d got_w=%0d",
+                 testname, w_index, expect_w[w_index], w_data);
+        $display("TB_RESULT: FAIL");
+        $finish;
+      end
+    end
+  end
+
+  task run_row(input [{nw}-1:0] cnt);
+    begin
+      seen = 0;
+      n = cnt;
+      @(negedge clk); start = 1;
+      @(negedge clk); start = 0;
+      while (busy) @(negedge clk);
+      repeat (4) @(negedge clk);
+      checks = checks + 1;
+      if (seen !== cnt) begin
+        $display("TB_FAIL test=%0s idx=0 expected_w=%0d got_w=%0d",
+                 "weight_count", cnt, seen);
+        $display("TB_RESULT: FAIL");
+        $finish;
+      end
+    end
+  endtask
+
+  initial begin
+    testname = "softmax";
+    repeat (3) @(negedge clk);
+    rst_n = 1;
+    @(negedge clk);
+{rows}
+
+    $display("TB_PROFILE rows=%0d span_cycles=%0d latency_cycles=%0d",
+             {nrows}, {nrows} * 64, 8);
+    $display("TB_PASS checks=%0d", checks);
+    $display("TB_RESULT: PASS");
+    $finish;
+  end
+endmodule
+"""
+
+
+def generate_softmax(ms=None, spec_file="spec_softmax.json",
+                     tb_file="tb_softmax.v"):
+    """Write the derived softmax sequencer spec and testbench."""
+    ms = ms or load_model_spec()
+    spec = derive_softmax_spec(ms)
+    with open(os.path.join(ROOT, spec_file), "w") as f:
+        json.dump(spec, f, indent=2)
+    with open(os.path.join(ROOT, tb_file), "w") as f:
+        f.write(render_softmax_testbench(spec))
     return spec
 
 

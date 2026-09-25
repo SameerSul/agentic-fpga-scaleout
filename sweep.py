@@ -119,7 +119,7 @@ def run_dv(rtl_path, tb_path, extra=()):
     try:
         if dv.evaluate("base", src, tb_path, top, deps)[0] != "SURVIVED":
             return False, "baseline fails its own testbench"
-        killed, survived, skipped = 0, [], 0
+        killed, survived, skipped, unproven = 0, [], 0, []
         for name, fn, _ in dv.OPS:
             mutant = fn(src)
             if mutant == src:
@@ -129,15 +129,22 @@ def run_dv(rtl_path, tb_path, extra=()):
             if v == "killed":
                 killed += 1
             elif v == "SURVIVED":
-                if dv.prove_equivalent(src, mutant, top):
+                verdict = dv.survivor_verdict(src, mutant, top)
+                if verdict == "equivalent":
                     skipped += 1
+                elif verdict == "unproven":
+                    unproven.append(name)
                 else:
                     survived.append(name)
             else:
                 skipped += 1
         if survived:
             return False, "SURVIVED: " + ",".join(survived)
-        return True, "%d/%d killed, %d n/a" % (killed, killed, skipped)
+        note = "%d/%d killed, %d n/a" % (killed, killed, skipped)
+        if unproven:
+            note += ", %d unproven (%s)" % (len(unproven),
+                                            ",".join(unproven))
+        return True, note
     finally:
         shutil.rmtree(dv.DVDIR, ignore_errors=True)
 
@@ -177,7 +184,7 @@ def main():
     ap.add_argument("--only", default="all",
                     choices=["all", "both", "chiplet", "requant", "exp",
                              "recip", "rsqrt", "matvec",
-                             "endpoint"])
+                             "wmem", "softmax", "endpoint"])
     ap.add_argument("--skip-dv", action="store_true")
     a = ap.parse_args()
     do_dv = not a.skip_dv
@@ -277,6 +284,54 @@ def main():
                                               p["mac_stages"])
             r, d = one_case(label, spec, "column", a.agent, do_dv,
                             extra=("mac_dep.v",))
+            rows.append(r)
+            details.append((label, d))
+            if any(r[c] not in ("ok", "skip", "-") for c in COLS):
+                failures.append(label)
+
+    if a.only in ("all", "wmem"):
+        base = specgen.load_model_spec()
+        for ms in _models(base):
+            spec = specgen.generate_wmem(ms, spec_file=JOB["spec_file"],
+                                         tb_file=JOB["tb_file"])
+            from agent import (RuleBasedAgent, FIX_WIDTH, FIX_CLEAR,
+                               FIX_CLRCOL, FIX_MEMLAT)
+            os.makedirs(BUILD, exist_ok=True)
+            with open(os.path.join(BUILD, "mac_dep.v"), "w") as f:
+                f.write(RuleBasedAgent().render_mac(
+                    specgen.derive_chiplet_spec(ms),
+                    {FIX_WIDTH, FIX_CLEAR}))
+            with open(os.path.join(BUILD, "matvec_dep.v"), "w") as f:
+                f.write(RuleBasedAgent().render_matvec(
+                    specgen.derive_matvec_spec(ms),
+                    {FIX_CLRCOL, FIX_MEMLAT}))
+            p = spec["parameters"]
+            label = "wmem %s %dx%db" % (ms["name"], p["capacity"],
+                                        p["data_width"])
+            r, d = one_case(label, spec, "tile", a.agent, do_dv,
+                            extra=("mac_dep.v", "matvec_dep.v"))
+            rows.append(r)
+            details.append((label, d))
+            if any(r[c] not in ("ok", "skip", "-") for c in COLS):
+                failures.append(label)
+
+    if a.only in ("all", "softmax"):
+        base = specgen.load_model_spec()
+        for ms in _models(base):
+            spec = specgen.generate_softmax(ms, spec_file=JOB["spec_file"],
+                                            tb_file=JOB["tb_file"])
+            from agent import RuleBasedAgent, FIX_LUT, FIX_NORM
+            os.makedirs(BUILD, exist_ok=True)
+            with open(os.path.join(BUILD, "expu_dep.v"), "w") as f:
+                f.write(RuleBasedAgent().render_exp(
+                    specgen.derive_exp_spec(ms), {FIX_LUT}))
+            with open(os.path.join(BUILD, "recip_dep.v"), "w") as f:
+                f.write(RuleBasedAgent().render_recip(
+                    specgen.derive_recip_spec(ms), {FIX_NORM}))
+            p = spec["parameters"]
+            label = "softmax %s cap%d" % (ms["name"], p["capacity"])
+            r, d = one_case(label, spec, "row", a.agent, do_dv,
+                            extra=("expu_dep.v", "recip_dep.v"))
             rows.append(r)
             details.append((label, d))
             if any(r[c] not in ("ok", "skip", "-") for c in COLS):

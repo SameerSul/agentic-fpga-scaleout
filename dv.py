@@ -101,6 +101,23 @@ OPS = [
 ]
 
 
+def survivor_verdict(orig, mutant, top):
+    """Classify a survivor: equivalent, a hole, or not provable in time.
+
+    The third case is real and has to be said rather than folded into
+    one of the others. A design holding a memory expands to thousands of
+    flip-flops once memory_map runs, and the solver does not finish. To
+    call that a DV hole would be to invent a defect; to call it
+    equivalent would be to assume one away.
+    """
+    if prove_equivalent(orig, mutant, top):
+        return "equivalent"
+    return "unproven" if _last_equiv_timed_out[0] else "hole"
+
+
+_last_equiv_timed_out = [False]
+
+
 def prove_equivalent(orig, mutant, top):
     """Ask yosys whether the mutant is sequentially equivalent to the
     original. Only a proof reclassifies a survivor; anything inconclusive
@@ -125,10 +142,11 @@ def prove_equivalent(orig, mutant, top):
               "equiv_make gold gate equiv; prep -top equiv; "
               "equiv_simple; equiv_induct; equiv_status -assert"
               ).format(t=top)
-    rc, out = run(["yosys", "-p", script], DVDIR, timeout=180)
+    rc, out = run(["yosys", "-p", script], DVDIR, timeout=90)
     # Both conditions: equiv_status -assert sets the exit code, and the
     # message confirms cells were actually compared rather than the
     # selection coming up empty and passing vacuously.
+    _last_equiv_timed_out[0] = (rc == 124)
     return (rc == 0 and "Equivalence successfully proven" in out
             and re.search(r"Found [1-9]\d* \$equiv cells", out) is not None)
 

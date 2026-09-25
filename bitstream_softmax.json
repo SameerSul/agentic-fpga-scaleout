@@ -1,9 +1,9 @@
 {
-  "block": "matvec",
-  "spec": "matvec_gpt2_124m",
+  "block": "softmax",
+  "spec": "softmax_gpt2_124m",
   "device": "ice40-hx8k-ct256",
   "target_mhz": 100,
-  "post_route_fmax_mhz": 99.52,
+  "post_route_fmax_mhz": 57.16,
   "timing_met": false,
   "luts": 0,
   "bitstream_bytes": 135100,

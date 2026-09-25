@@ -20,6 +20,8 @@ FIX_NORM = "normalise_before_the_table"
 FIX_EVEN = "align_the_exponent_to_an_even_boundary"
 FIX_CLRCOL = "clear_the_accumulator_between_columns"
 FIX_MEMLAT = "delay_valid_for_the_memory_read"
+FIX_REGRD = "register_the_read_port"
+FIX_SUBMAX = "subtract_the_row_maximum"
 # One definition, in specgen, so the declared depth and the generated
 # depth cannot disagree.
 WIDE_ADD_BITS = specgen.WIDE_ADD_BITS
@@ -44,6 +46,10 @@ class RuleBasedAgent:
             return self.render_rsqrt(spec, fixes), sorted(fixes)
         if spec["top_module"] == "matvec":
             return self.render_matvec(spec, fixes), sorted(fixes)
+        if spec["top_module"] == "wmem":
+            return self.render_wmem(spec, fixes), sorted(fixes)
+        if spec["top_module"] == "softmax":
+            return self.render_softmax(spec, fixes), sorted(fixes)
         return self.render_mac(spec, fixes), sorted(fixes)
 
     def diagnose(self, spec, history):
@@ -61,6 +67,15 @@ class RuleBasedAgent:
                     fixes.add(FIX_XOR)
                 elif "clear" in m.get("test", "").lower():
                     fixes.add(FIX_CLEAR)
+                elif "expected_w" in m:
+                    # The sequencer's only seeded bug: raw scores fed to
+                    # the exponential instead of score minus the row max.
+                    fixes.add(FIX_SUBMAX)
+                elif spec["top_module"] == "wmem" and "col" in m:
+                    # The memory's only seeded bug: a combinational read
+                    # delivers data a cycle early and the sequencer
+                    # reduces the wrong element.
+                    fixes.add(FIX_REGRD)
                 elif "col" in m:
                     # Which column failed says which bug it is, which is
                     # the same inference a human makes here. A wrong
@@ -92,6 +107,230 @@ class RuleBasedAgent:
                 elif m.get("got_acc") != m.get("expected_acc"):
                     fixes.add(FIX_WIDTH)
         return fixes
+
+    def render_softmax(self, spec, fixes):
+        """Softmax sequencer: max pass, exponential pass, one reciprocal,
+        normalising multiply.
+
+        This block instantiates the generated exponential and reciprocal
+        units rather than reimplementing them, so it is the first
+        generated block that contains others. Both are driven through
+        their valid handshakes, which is what lets the collect index
+        trail the issue index without counting pipeline stages here.
+
+        The seeded first-cut bug is feeding raw scores to the
+        exponential instead of the score minus the row maximum. The
+        exponential is only defined for non-positive arguments, so a
+        positive score produces nonsense, and the bug is invisible on
+        any row whose scores are all negative.
+        """
+        p = spec["parameters"]
+        nw, sw = p["index_width"], p["score_width"]
+        ww, wf = p["weight_width"], p["weight_frac"]
+        rw, riw = p["recip_out_width"], p["recip_in_width"]
+        bias = p["shift_bias"]
+        kw = max(4, riw.bit_length())
+        pw = ww + wf + rw
+        sub = "sub_max" if FIX_SUBMAX in fixes else "s_data"
+        return """module softmax (
+  input                    clk,
+  input                    rst_n,
+  input                    start,
+  input      [{nw}:0] n,
+  output reg [{nwm}:0] s_addr,
+  input      signed [{swm}:0] s_data,
+  output reg               w_valid,
+  output reg [{nwm}:0] w_index,
+  output reg [{wwm}:0] w_data,
+  output reg               busy
+);
+  // Four phases. The exponential is only defined for non-positive
+  // arguments, which is why the row maximum is found first and
+  // subtracted: that is what makes every argument non-positive.
+  localparam P_IDLE = 3'd0, P_MAX = 3'd1, P_EXP = 3'd2,
+             P_RCP  = 3'd3, P_OUT = 3'd4;
+  reg [2:0] ph;
+  reg [{nw}:0] iss, col;
+  reg signed [{swm}:0] mx;
+  reg [{riwm}:0] sum;
+  reg [{rwm}:0] rm;
+  reg [{kwm}:0] rk;
+  reg [{wwm}:0] buf_mem [0:{capm}];
+  reg [{wwm}:0] bq;
+  // Both s_addr and the memory read are registered, so the datum for an
+  // address assigned at a posedge is valid two cycles later, not one. A
+  // single valid flag compares stale data on the first element of every
+  // pass, which is the kind of thing that passes a one-element row.
+  reg v1, v2;
+
+  wire signed [{swm}:0] sub_max = s_data - mx;
+  reg  e_vin;
+  wire [{wwm}:0] e_y;
+  wire e_vout;
+  expu eu (.clk(clk), .rst_n(rst_n), .x({sub}), .valid_in(e_vin),
+           .y(e_y), .valid_out(e_vout));
+
+  reg  r_vin;
+  wire [{rwm}:0] r_y;
+  wire [{kwm}:0] r_k;
+  wire r_vout;
+  recip ru (.clk(clk), .rst_n(rst_n), .x(sum), .valid_in(r_vin),
+            .y(r_y), .k(r_k), .valid_out(r_vout));
+
+  // The multiply, the variable shift and the saturate together miss
+  // the clock by a tenth of a nanosecond, so the product is registered
+  // between them and the output valid follows it.
+  reg  [{pwm}:0] prod_r;
+  reg  [{nwm}:0] idx_r;
+  reg            ov1;
+  wire [{pwm}:0] shifted = prod_r >> ({bias} - rk - {wf});
+  wire [{wwm}:0] wsat = (shifted > {one}) ? {ww}'d{one} : shifted[{wwm}:0];
+
+  always @(posedge clk) begin
+    if (!rst_n) begin
+      ph <= P_IDLE; iss <= 0; col <= 0; mx <= 0; sum <= 0;
+      rm <= 0; rk <= 0; s_addr <= 0; e_vin <= 1'b0; r_vin <= 1'b0;
+      w_valid <= 1'b0; w_index <= 0; w_data <= 0; busy <= 1'b0;
+      v1 <= 1'b0; v2 <= 1'b0; bq <= 0;
+      prod_r <= 0; idx_r <= 0; ov1 <= 1'b0;
+    end else begin
+      e_vin   <= 1'b0;
+      r_vin   <= 1'b0;
+      w_valid <= 1'b0;
+      v1      <= 1'b0;
+      v2      <= v1;
+      ov1     <= 1'b0;
+      bq      <= buf_mem[s_addr[{nwm}:0]];
+      case (ph)
+        P_IDLE: if (start && n != 0) begin
+          ph <= P_MAX; iss <= 1; col <= 0; s_addr <= 0;
+          busy <= 1'b1; v1 <= 1'b1;
+          mx <= {sw}'sh{minv};
+        end
+        P_MAX: begin
+          // Reads are registered, so the datum for an address arrives
+          // the cycle after it is issued: iss leads col by one.
+          if (col != n) begin
+            if (iss != n) begin
+              s_addr <= iss[{nwm}:0]; iss <= iss + 1; v1 <= 1'b1;
+            end
+            if (v2) begin
+              if (s_data > mx) mx <= s_data;
+              col <= col + 1;
+            end
+          end else begin
+            // Address zero is issued by this transition, so the next
+            // one to issue is one. Resetting iss to zero here reads
+            // element zero twice and sums its exponential twice.
+            ph <= P_EXP; iss <= 1; col <= 0; s_addr <= 0; v1 <= 1'b1;
+            sum <= 0;
+          end
+        end
+        P_EXP: begin
+          if (iss != n) begin
+            s_addr <= iss[{nwm}:0]; iss <= iss + 1; v1 <= 1'b1;
+          end
+          // e_vin is registered, so driving it from v1 makes it high
+          // in the same cycle v2 is, which is the cycle s_data holds
+          // the value. Gating it on v2 asserts it a cycle late and the
+          // exponential consumes the next element instead.
+          e_vin <= v1;
+          if (e_vout) begin
+            buf_mem[col[{nwm}:0]] <= e_y;
+            sum <= sum + e_y;
+            col <= col + 1;
+          end
+          if (col == n) begin
+            ph <= P_RCP; r_vin <= 1'b1;
+          end
+        end
+        P_RCP: if (r_vout) begin
+          rm <= r_y; rk <= r_k;
+          ph <= P_OUT; iss <= 1; col <= 0; s_addr <= 0; v1 <= 1'b1;
+        end
+        P_OUT: begin
+          if (iss != n) begin
+            s_addr <= iss[{nwm}:0]; iss <= iss + 1; v1 <= 1'b1;
+          end
+          if (v2) begin
+            prod_r <= bq * rm;
+            idx_r  <= col[{nwm}:0];
+            ov1    <= 1'b1;
+            col    <= col + 1;
+          end
+          if (ov1) begin
+            w_valid <= 1'b1;
+            w_index <= idx_r;
+            w_data  <= wsat;
+          end
+          if (col == n && !ov1 && !v2) begin
+            ph <= P_IDLE; busy <= 1'b0;
+          end
+        end
+      endcase
+    end
+  end
+endmodule
+""".format(nw=nw, nwm=nw - 1, swm=sw - 1, wwm=ww - 1, ww=ww, wf=wf,
+           rwm=rw - 1, riwm=riw - 1, kwm=kw - 1, pwm=pw - 1,
+           capm=p["capacity"] - 1, bias=bias, sub=sub,
+           sw=sw, one=(1 << wf), minv="%x" % (1 << (sw - 1)))
+
+    def render_wmem(self, spec, fixes):
+        """Weight tile memory with a streaming loader.
+
+        The write port is sequential, which is how weights actually
+        reach a device: a host or a DMA engine pushes them in order and
+        the pointer advances. The read port is registered, because that
+        is what block RAM gives and what the sequencer was built
+        against.
+
+        The seeded first-cut bug is a combinational read. It looks
+        harmless and the memory alone behaves, but it delivers data a
+        cycle early, so the sequencer multiplies the wrong element. It
+        is only visible when the two run together, which is why this
+        block's testbench is the whole subsystem.
+        """
+        p = spec["parameters"]
+        dw, cap, aw = p["data_width"], p["capacity"], p["addr_width"]
+        if FIX_REGRD in fixes:
+            rd = ("  always @(posedge clk)\n"
+                  "    rd_data <= mem[rd_addr];")
+            decl = "  output reg signed [%d:0] rd_data" % (dw - 1)
+        else:   # first cut: combinational read, a cycle too early
+            rd = "  always @(*)\n    rd_data = mem[rd_addr];"
+            decl = "  output reg signed [%d:0] rd_data" % (dw - 1)
+        return """module wmem (
+  input                    clk,
+  input                    rst_n,
+  input                    load_start,
+  input                    load_valid,
+  input      signed [{dwm}:0] load_data,
+  output reg [{cntwm}:0] load_count,
+  input      [{awm}:0] rd_addr,
+{decl}
+);
+  reg signed [{dwm}:0] mem [0:{capm}];
+
+  // Sequential write port: a host or a DMA engine pushes weights in
+  // order and the pointer advances, saturating at capacity so an
+  // overrun corrupts nothing.
+  always @(posedge clk) begin
+    if (!rst_n) begin
+      load_count <= 0;
+    end else if (load_start) begin
+      load_count <= 0;
+    end else if (load_valid && load_count != {cap}) begin
+      mem[load_count[{awm}:0]] <= load_data;
+      load_count <= load_count + 1;
+    end
+  end
+
+  // Read port. Registered, one cycle behind rd_addr.
+{rd}
+endmodule
+""".format(dwm=dw - 1, awm=aw - 1, cntwm=aw, capm=cap - 1, cap=cap,
+           decl=decl, rd=rd)
 
     def render_matvec(self, spec, fixes):
         """Weight-streaming sequencer for the MAC chiplet.

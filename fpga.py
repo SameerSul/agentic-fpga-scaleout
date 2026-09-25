@@ -48,7 +48,7 @@ def _run(args, cwd, timeout=300):
     return r.returncode, r.stdout + r.stderr
 
 
-def synth_fpga(rtl_file, top, build_dir, family="xcup"):
+def synth_fpga(rtl_file, top, build_dir, family="xcup", extra=()):
     """Synthesize one block for an FPGA family and return its resource use.
 
     rtl_file is a bare filename inside build_dir: every tool call runs with
@@ -58,9 +58,13 @@ def synth_fpga(rtl_file, top, build_dir, family="xcup"):
     -noiopad is deliberate: these blocks are instantiated inside a larger
     design, so counting I/O buffers for their ports would charge pins the
     real system never spends."""
+    # A block that instantiates other generated blocks needs them read
+    # in, or the hierarchy is a black box and the resource count is a
+    # fiction.
+    files = " ".join([rtl_file] + list(extra))
     script = ("read_verilog {rtl}; synth_xilinx -family {fam} -noiopad "
               "-top {top}; check; stat".format(
-                  rtl=rtl_file, fam=family, top=top))
+                  rtl=files, fam=family, top=top))
     rc, out = _run(["yosys", "-p", script], build_dir)
     if rc != 0:
         return {"status": "fail", "family": family,

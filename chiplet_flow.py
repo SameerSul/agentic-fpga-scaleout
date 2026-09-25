@@ -42,6 +42,25 @@ FABRIC_JOB = {
     "profile_file": "fabric_profile.json", "report_file": "report_crc.json",
     "derive_from_link": True,
 }
+SOFTMAX_JOB = {
+    "spec_file": "spec_softmax.json", "tb_file": "tb_softmax.v",
+    "rtl_file": "softmax.v", "profile_file": "softmax_profile.json",
+    "report_file": "report_softmax.json",
+    "derive_from_model": "softmax",
+    # It instantiates these, so they are part of the design under test
+    # rather than companions to it.
+    "extra_sources": ("expu_dep.v", "recip_dep.v"),
+}
+WMEM_JOB = {
+    "spec_file": "spec_wmem.json", "tb_file": "tb_wmem.v",
+    "rtl_file": "wmem.v", "profile_file": "wmem_profile.json",
+    "report_file": "report_wmem.json",
+    "derive_from_model": "wmem",
+    # The whole subsystem: the memory is checked feeding the sequencer
+    # and the MAC, because a read port a cycle out of step with its
+    # reader is invisible to either block alone.
+    "extra_sources": ("mac_dep.v", "matvec_dep.v"),
+}
 MATVEC_JOB = {
     "spec_file": "spec_matvec.json", "tb_file": "tb_matvec.v",
     "rtl_file": "matvec.v", "profile_file": "matvec_profile.json",
@@ -155,11 +174,15 @@ def stage_sim(job, rtl_path):
 def stage_synth(job, spec, rtl_path):
     # Relative names only: all stages run with cwd=BUILD and the project path
     # contains a space, which yosys script parsing does not tolerate unquoted.
+    # Extra sources are part of the design when the top instantiates
+    # them, so they are read here too; yosys prunes whatever the top
+    # does not reach.
+    files = " ".join([os.path.basename(rtl_path)]
+                     + list(job.get("extra_sources", ())))
     script = ("read_verilog {rtl}; synth -top {top}; dfflibmap -liberty {lib}; "
               "abc -liberty {lib}; opt_clean; stat -liberty {lib}; "
               "write_verilog -noattr netlist.v").format(
-                  rtl=os.path.basename(rtl_path), top=spec["top_module"],
-                  lib="cells.lib")
+                  rtl=files, top=spec["top_module"], lib="cells.lib")
     rc, out = run(["yosys", "-p", script])
     if rc != 0:
         return {"stage": "synth", "status": "fail",
@@ -227,7 +250,9 @@ exit
     rc, out = run(["yosys", "-p",
                    "read_verilog {rtl}; synth -top {top} -flatten; "
                    "abc -g AND; ltp -noff".format(
-                       rtl=job["rtl_file"], top=spec["top_module"])])
+                       rtl=" ".join([job["rtl_file"]]
+                                    + list(job.get("extra_sources", ()))),
+                       top=spec["top_module"])])
     m = re.search(r"length=(\d+)", out)
     if rc == 0 and m:
         return {"stage": "timing", "status": "pass", "method": "proxy_gate_depth",
@@ -245,7 +270,8 @@ def stage_fpga(job, spec, rtl_path, family=FPGA_FAMILY):
     structured feedback, because they are exactly the defects that pass
     simulation and then misbehave on a real part."""
     res = fpga.synth_fpga(os.path.basename(rtl_path), spec["top_module"],
-                          BUILD, family)
+                          BUILD, family,
+                          extra=job.get("extra_sources", ()))
     if res.get("status") != "pass":
         return {"stage": "fpga", "status": "fail", "family": family,
                 "errors": res.get("errors", [])}
@@ -336,6 +362,9 @@ def derive_profile(spec, final):
         prof["chiplet"] = spec["name"]
         prof["data_width"] = spec["parameters"]["data_width"]
         prof["acc_width"] = spec["parameters"]["acc_width"]
+    elif unit == "tile":
+        prof["memory"] = spec["name"]
+        prof["capacity"] = spec["parameters"]["capacity"]
     elif unit == "column":
         prof["sequencer"] = spec["name"]
         prof["mac_stages"] = spec["parameters"]["mac_stages"]
@@ -409,7 +438,33 @@ def run_flow(job=None, verbose=True, agent=None, max_iters=None):
     say = print if verbose else (lambda *a, **k: None)
     os.makedirs(BUILD, exist_ok=True)
     shutil.copy(LIB, BUILD)
-    if job.get("derive_from_model") == "matvec":
+    if job.get("derive_from_model") == "softmax":
+        specgen.generate_softmax(spec_file=job["spec_file"],
+                                 tb_file=job["tb_file"])
+        from agent import RuleBasedAgent, FIX_LUT, FIX_NORM
+        os.makedirs(BUILD, exist_ok=True)
+        _ms = specgen.load_model_spec()
+        with open(os.path.join(BUILD, "expu_dep.v"), "w") as f:
+            f.write(RuleBasedAgent().render_exp(
+                specgen.derive_exp_spec(_ms), {FIX_LUT}))
+        with open(os.path.join(BUILD, "recip_dep.v"), "w") as f:
+            f.write(RuleBasedAgent().render_recip(
+                specgen.derive_recip_spec(_ms), {FIX_NORM}))
+    elif job.get("derive_from_model") == "wmem":
+        specgen.generate_wmem(spec_file=job["spec_file"],
+                              tb_file=job["tb_file"])
+        from agent import (RuleBasedAgent, FIX_WIDTH, FIX_CLEAR,
+                           FIX_CLRCOL, FIX_MEMLAT)
+        os.makedirs(BUILD, exist_ok=True)
+        _ms = specgen.load_model_spec()
+        with open(os.path.join(BUILD, "mac_dep.v"), "w") as f:
+            f.write(RuleBasedAgent().render_mac(
+                specgen.derive_chiplet_spec(_ms), {FIX_WIDTH, FIX_CLEAR}))
+        with open(os.path.join(BUILD, "matvec_dep.v"), "w") as f:
+            f.write(RuleBasedAgent().render_matvec(
+                specgen.derive_matvec_spec(_ms),
+                {FIX_CLRCOL, FIX_MEMLAT}))
+    elif job.get("derive_from_model") == "matvec":
         specgen.generate_matvec(spec_file=job["spec_file"],
                                 tb_file=job["tb_file"])
         # Render the block it drives, from the same model spec, with the

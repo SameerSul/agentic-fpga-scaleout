@@ -1,0 +1,30 @@
+{
+  "block": "softmax_gpt2_124m",
+  "top_module": "softmax",
+  "unit": "row",
+  "cycles_per_row": 64.0,
+  "latency_cycles": 8,
+  "cell_count": 1546,
+  "area": 3179.0,
+  "fmax_estimate_mhz": 106.15711252653928,
+  "fmax_method": "opensta_slack",
+  "target_clock_mhz": 100,
+  "sim_checks_passed": 116,
+  "fpga": {
+    "family": "xcup",
+    "luts": 1288,
+    "ffs": 443,
+    "dsps": 3,
+    "brams": 2,
+    "urams": 0,
+    "carry": 60,
+    "muxf": 308
+  },
+  "derivation": {
+    "model": "gpt2_124m",
+    "rule": "capacity is one attention row tile; the score and weight formats come from the exponential unit and the normalising shift from the reciprocal, so a change to either changes this block"
+  },
+  "row_unit": "softmax_gpt2_124m",
+  "shift_bias": 42,
+  "agent": "RuleBasedAgent"
+}

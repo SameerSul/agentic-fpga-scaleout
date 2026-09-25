@@ -830,6 +830,124 @@ def test_matvec_sequencer():
         shutil.rmtree(work, ignore_errors=True)
 
 
+def test_wmem_subsystem():
+    """The weight tile and its loader, checked as a subsystem.
+
+    The block's own testbench instantiates the sequencer and the MAC,
+    because the bug it is most prone to is a read port a cycle out of
+    step with whatever reads it. That is invisible to the memory alone:
+    a combinational read is perfectly well behaved until something
+    depends on when the data arrives.
+    """
+    ms = load_model_spec()
+    spec = specgen_mod.derive_wmem_spec(ms)
+    p = spec['parameters']
+    check('the tile is addressed by exactly its capacity',
+          (1 << p['addr_width']) == p['capacity'])
+    check('the read port is specified as registered',
+          any('registered' in b for b in spec['behavior']))
+
+    work = os.path.join(ROOT, 'build_wmemtest')
+    shutil.rmtree(work, ignore_errors=True)
+    os.makedirs(work)
+    try:
+        open(os.path.join(work, 'tb.v'), 'w').write(
+            specgen_mod.render_wmem_testbench(spec))
+        open(os.path.join(work, 'mac.v'), 'w').write(
+            RuleBasedAgent().render_mac(derive_chiplet_spec(ms),
+                                        {agent_mod.FIX_WIDTH,
+                                         agent_mod.FIX_CLEAR}))
+        open(os.path.join(work, 'mv.v'), 'w').write(
+            RuleBasedAgent().render_matvec(
+                specgen_mod.derive_matvec_spec(ms),
+                {agent_mod.FIX_CLRCOL, agent_mod.FIX_MEMLAT}))
+        res = {}
+        for label, fx in (('comb_read', set()),
+                          ('fixed', {agent_mod.FIX_REGRD})):
+            open(os.path.join(work, 'wm.v'), 'w').write(
+                RuleBasedAgent().render_wmem(spec, fx))
+            r = subprocess.run(['iverilog', '-g2005', '-o', 's.out',
+                                'tb.v', 'wm.v', 'mv.v', 'mac.v'], cwd=work,
+                               capture_output=True, text=True)
+            assert r.returncode == 0, r.stdout + r.stderr
+            r = subprocess.run(['vvp', 's.out'], cwd=work,
+                               capture_output=True, text=True, timeout=900)
+            res[label] = 'TB_RESULT: PASS' in r.stdout
+        check('loader, memory, sequencer and MAC compute the product',
+              res['fixed'])
+        check('a combinational read port is caught by the subsystem',
+              not res['comb_read'])
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+    # Survivors are classified three ways. A timeout is not a defect and
+    # not an equivalence; saying so is the only honest option.
+    check('the DV tooling separates unproven from a real hole',
+          hasattr(dv, 'survivor_verdict'))
+
+
+def test_softmax_sequencer():
+    """Softmax as one block: max pass, exponential pass with sum, one
+    reciprocal, normalising multiply. It instantiates the generated
+    exponential and reciprocal rather than reimplementing them, so it is
+    the first generated block that contains others."""
+    ms = load_model_spec()
+    spec = specgen_mod.derive_softmax_spec(ms)
+    p = spec['parameters']
+    e = specgen_mod.derive_exp_spec(ms)
+    check('the score and weight formats come from the exponential unit',
+          p['score_width'] == e['parameters']['in_width']
+          and p['weight_frac'] == e['parameters']['out_frac'])
+
+    one = 1 << p['weight_frac']
+    for scores in ([0, -256, -512, -1024], [7, 7, 7, 7], [100, -100]):
+        w, ex, tot = specgen_mod.softmax_golden(scores, p)
+        check('weights for %s sum to one within 1%%' % (scores,),
+              abs(sum(w) - one) < one // 100)
+        check('weights for %s are ordered like their scores' % (scores,),
+              all((w[i] >= w[j]) == (scores[i] >= scores[j])
+                  for i in range(len(w)) for j in range(len(w))))
+
+    work = os.path.join(ROOT, 'build_smtest')
+    shutil.rmtree(work, ignore_errors=True)
+    os.makedirs(work)
+    try:
+        open(os.path.join(work, 'tb.v'), 'w').write(
+            specgen_mod.render_softmax_testbench(spec))
+        open(os.path.join(work, 'expu.v'), 'w').write(
+            RuleBasedAgent().render_exp(e, {agent_mod.FIX_LUT}))
+        open(os.path.join(work, 'recip.v'), 'w').write(
+            RuleBasedAgent().render_recip(
+                specgen_mod.derive_recip_spec(ms), {agent_mod.FIX_NORM}))
+        res = {}
+        for label, fx in (('raw_scores', set()),
+                          ('fixed', {agent_mod.FIX_SUBMAX})):
+            open(os.path.join(work, 'sm.v'), 'w').write(
+                RuleBasedAgent().render_softmax(spec, fx))
+            r = subprocess.run(['iverilog', '-g2005', '-o', 's.out',
+                                'tb.v', 'sm.v', 'expu.v', 'recip.v'],
+                               cwd=work, capture_output=True, text=True)
+            assert r.returncode == 0, r.stdout + r.stderr
+            r = subprocess.run(['vvp', 's.out'], cwd=work,
+                               capture_output=True, text=True, timeout=900)
+            res[label] = 'TB_RESULT: PASS' in r.stdout
+        check('the sequencer and both units compute softmax', res['fixed'])
+        # The exponential is only defined for non-positive arguments, so
+        # skipping the max subtraction feeds it positive ones.
+        check('feeding raw scores to the exponential is caught',
+              not res['raw_scores'])
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+    # A generated testbench can search for a vector that discriminates,
+    # which is the only way to reach a boundary a random row hits about
+    # once in a hundred thousand.
+    import random as _r
+    check('the testbench finds a vector exposing a one-count error',
+          specgen_mod._softmax_discriminating_row(p, _r.Random(53))
+          is not None)
+
+
 def test_fpga_backend(profile, fp):
     """Real device mapping, not generic cells: the two generated blocks land
     on different resources, which is what makes a single capacity proxy
@@ -1053,6 +1171,8 @@ if __name__ == '__main__':
     test_recip_block()
     test_rsqrt_block()
     test_matvec_sequencer()
+    test_wmem_subsystem()
+    test_softmax_sequencer()
     test_generation()
     test_bitstream()
     test_fit_monotonic(profile)
