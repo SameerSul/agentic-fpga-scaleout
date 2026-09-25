@@ -7,6 +7,8 @@ build_dbg/
 build_tp/
 build_infer/
 build_esc*/
+build_sg*/
+build_probe*/
 __pycache__/
 *.vcd
 
@@ -18,3 +20,4 @@ __pycache__/
 bench_headtohead.log
 bench_swarm_fixed.log
 bench_swarm_escalate.log
+bench_signed.log
