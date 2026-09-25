@@ -26,9 +26,10 @@ import shutil
 import sys
 
 import specgen
-from agent import RuleBasedAgent, FIX_WIDTH, FIX_CLEAR, FIX_SATURATE
-from inference import MacModel, RequantModel, quantize, run_cosim, \
-    run_requant_cosim, WORK
+from agent import (RuleBasedAgent, FIX_WIDTH, FIX_CLEAR,
+                   FIX_SATURATE, FIX_LUT)
+from inference import (MacModel, RequantModel, quantize, run_cosim,
+                       run_requant_cosim, run_exp_cosim, WORK)
 from train_tiny import CKPT
 
 
@@ -59,7 +60,7 @@ def qmat(m, bits):
 class HwModel:
     """The checkpoint, executed the way the hardware would execute it."""
 
-    def __init__(self, ck, dw, aw, rq):
+    def __init__(self, ck, dw, aw, rq, espec=None):
         self.d = ck["d_model"]
         self.f = ck["d_ff"]
         self.seq = ck["seq"]
@@ -75,7 +76,9 @@ class HwModel:
         self.rq = rq
         self.dots = []               # (x, w_col) for co-simulation
         self.rqs = []                # (acc, scale, shift)
+        self.exps = []               # (x,) for the exponential unit
         self.dw = dw
+        self.espec = espec
 
     def matvec(self, x, name, keep=1):
         """Returns (accumulators, per-column weight scales)."""
@@ -114,8 +117,8 @@ class HwModel:
         scores = [sum(a * b for a, b in zip(qs[i][0], ks[j][0]))
                   * qs[i][1] * ks[j][1] * sc for j in range(i + 1)]
         mx = max(scores)
-        ex = [math.exp(s_ - mx) for s_ in scores]
-        tot = sum(ex)
+        ex = [self.expf(s_ - mx) for s_ in scores]
+        tot = sum(ex) or 1.0
         ctx = [sum(ex[j] * vs[j][0][t] * vs[j][1] for j in range(i + 1)) / tot
                for t in range(D)]
         att = self.project(self.qact(ctx), "wo")
@@ -126,6 +129,23 @@ class HwModel:
         res2 = self.add(res, h2)
         logits, ls = self.project(res2, "head")
         return [v * ls for v in logits]
+
+    def expf(self, d):
+        """exp of a non-positive value, through the generated unit.
+
+        Softmax subtracts the row maximum first, so the argument is never
+        positive, which is the precondition the hardware is built on. The
+        argument is quantized to the unit's input format and clamped to
+        what its port can represent; anything past that underflows the
+        output anyway.
+        """
+        if self.espec is None:
+            return math.exp(d)
+        p = self.espec["parameters"]
+        lo = -(1 << (p["in_width"] - 1))
+        x = max(lo, min(0, int(round(d * (1 << p["in_frac"])))))
+        self.exps.append(x)
+        return specgen.exp_golden(x, p) / float(1 << p["out_frac"])
 
     def qact(self, vals):
         """Quantize a float activation vector, returning codes and scale."""
@@ -234,8 +254,9 @@ def main():
     print("hardware: int%d MAC, %d-bit signed accumulator; requantizer "
           "%d -> %d bits\n" % (dw, aw, rp["acc_width"], rp["out_width"]))
 
+    espec = specgen.derive_exp_spec(ms)
     rq = RequantModel(rp["out_width"], rp["scale_width"], rp["shift_width"])
-    hw = HwModel(ck, dw, aw, rq)
+    hw = HwModel(ck, dw, aw, rq, espec)
 
     ids = [hw.stoi[c] for c in a.prompt if c in hw.stoi]
     if not ids:
@@ -291,14 +312,25 @@ def main():
             if got2.get(i) != ref.apply(acc, sc, sh)]
     print("  requant:   %d/%d requantizations bit exact"
           % (len(rqs) - len(bad2), len(rqs)))
+    rnd.shuffle(hw.exps)
+    exps = hw.exps[:a.cosim]
+    bad3 = []
+    if exps:
+        erl = RuleBasedAgent().render_exp(espec, {FIX_LUT})
+        got3 = run_exp_cosim(espec, exps, erl)
+        bad3 = [i for i, x in enumerate(exps)
+                if got3.get(i) != specgen.exp_golden(x, espec["parameters"])]
+        print("  exp:       %d/%d exponentials bit exact"
+              % (len(exps) - len(bad3), len(exps)))
     shutil.rmtree(WORK, ignore_errors=True)
-    if bad or bad2:
+    if bad or bad2 or bad3:
         print("\nMISMATCH: the text above is not what the hardware produces")
         return 1
-    print("\nEvery dot product and every requantization in this decode is "
-          "arithmetic\nthe generated RTL reproduces exactly, so the text is "
-          "what the hardware\nwould emit. Softmax and argmax ran on the "
-          "host; no RTL exists for them yet.")
+    print("\nEvery dot product, every requantization and every exponential "
+          "in this\ndecode is arithmetic the generated RTL reproduces "
+          "exactly, so the text is\nwhat the hardware would emit. The "
+          "softmax sum, its reciprocal and the\nargmax ran on the host; "
+          "no RTL exists for those yet.")
     return 0
 
 

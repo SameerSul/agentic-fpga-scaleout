@@ -1,0 +1,69 @@
+{
+  "name": "exp16_gpt2_124m",
+  "description": "Fixed-point exponential for the attention softmax: Q7.8 signed input constrained to be non-positive, Q0.15 unsigned output, by a 256-entry table of 2**f and an arithmetic shift",
+  "top_module": "expu",
+  "unit": "score",
+  "parameters": {
+    "in_width": 16,
+    "in_frac": 8,
+    "out_width": 16,
+    "out_frac": 15,
+    "lut_bits": 8,
+    "signed": true,
+    "pipeline_stages": 3,
+    "target_clock_mhz": 100
+  },
+  "derivation": {
+    "model": "gpt2_124m",
+    "activation_bits": 8,
+    "rule": "exp(x) = 2**(x*log2(e)); the integer part of x*log2(e) is an arithmetic right shift and the fractional part indexes a 256-entry table of 2**f",
+    "log2e_q16": 94548
+  },
+  "ports": [
+    {
+      "name": "clk",
+      "dir": "input",
+      "width": 1,
+      "desc": "clock, rising edge"
+    },
+    {
+      "name": "rst_n",
+      "dir": "input",
+      "width": 1,
+      "desc": "active-low synchronous reset"
+    },
+    {
+      "name": "x",
+      "dir": "input",
+      "width": 16,
+      "signed": true,
+      "desc": "score minus the row maximum, Q7.8, non-positive"
+    },
+    {
+      "name": "valid_in",
+      "dir": "input",
+      "width": 1,
+      "desc": "x valid"
+    },
+    {
+      "name": "y",
+      "dir": "output",
+      "width": 16,
+      "desc": "exp(x) in Q0.15, 1.0 represented as 32768"
+    },
+    {
+      "name": "valid_out",
+      "dir": "output",
+      "width": 1,
+      "desc": "y updated this cycle"
+    }
+  ],
+  "behavior": [
+    "Stage 1 registers x*log2(e) as a Q.8 value, using a 17-bit fixed-point constant.",
+    "Stage 2 splits it into an integer part and a fractional part and registers the table entry the fraction selects.",
+    "Stage 3 shifts that entry right by the magnitude of the integer part and registers the result.",
+    "An input small enough that the shift exceeds 15 output fraction bits flushes to zero rather than wrapping.",
+    "x is required to be non-positive, which softmax guarantees by subtracting the row maximum first.",
+    "Latency from valid_in to valid_out is 3 cycles."
+  ]
+}

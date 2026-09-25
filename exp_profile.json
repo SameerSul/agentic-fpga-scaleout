@@ -1,0 +1,33 @@
+{
+  "block": "exp16_gpt2_124m",
+  "top_module": "expu",
+  "unit": "score",
+  "cycles_per_score": 4.0,
+  "latency_cycles": 3,
+  "cell_count": 2897,
+  "area": 5750.0,
+  "fmax_estimate_mhz": 151.05740181268882,
+  "fmax_method": "opensta_slack",
+  "target_clock_mhz": 100,
+  "sim_checks_passed": 153,
+  "fpga": {
+    "family": "xcup",
+    "luts": 160,
+    "ffs": 59,
+    "dsps": 1,
+    "brams": 0,
+    "urams": 0,
+    "carry": 11,
+    "muxf": 52
+  },
+  "derivation": {
+    "model": "gpt2_124m",
+    "activation_bits": 8,
+    "rule": "exp(x) = 2**(x*log2(e)); the integer part of x*log2(e) is an arithmetic right shift and the fractional part indexes a 256-entry table of 2**f",
+    "log2e_q16": 94548
+  },
+  "exp_unit": "exp16_gpt2_124m",
+  "in_frac": 8,
+  "out_frac": 15,
+  "agent": "RuleBasedAgent"
+}

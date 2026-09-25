@@ -29,7 +29,8 @@ import subprocess
 import sys
 
 import specgen
-from agent import RuleBasedAgent, FIX_WIDTH, FIX_CLEAR, FIX_SATURATE, FIX_XOR
+from agent import (RuleBasedAgent, FIX_WIDTH, FIX_CLEAR,
+                   FIX_SATURATE, FIX_XOR, FIX_LUT)
 from chiplet_flow import ROOT, TARGET_LINK_GBPS
 
 WORK = os.path.join(ROOT, "build_bitstream")
@@ -43,6 +44,7 @@ TB_FOR = {
     "mac": lambda spec: specgen.render_testbench(spec),
     "requant": lambda spec: specgen.render_requant_testbench(spec),
     "crc": lambda spec: specgen.render_crc_testbench(spec),
+    "exp": lambda spec: specgen.render_exp_testbench(spec),
 }
 
 BLOCKS = {
@@ -52,6 +54,7 @@ BLOCKS = {
                 {FIX_SATURATE}),
     "crc": ("crc32", lambda ms: specgen.derive_endpoint_spec(1.0),
             {FIX_XOR}),
+    "exp": ("expu", lambda ms: specgen.derive_exp_spec(ms), {FIX_LUT}),
 }
 
 
@@ -185,8 +188,7 @@ def main():
     top, derive, fixes = BLOCKS[a.block]
     ms = specgen.load_model_spec()
     spec = derive(ms)
-    rtl = getattr(RuleBasedAgent(), "render_" + (
-        "crc" if a.block == "crc" else a.block))(spec, fixes)
+    rtl = getattr(RuleBasedAgent(), "render_" + a.block)(spec, fixes)
     freq = a.freq or spec["parameters"]["target_clock_mhz"]
 
     shutil.rmtree(WORK, ignore_errors=True)

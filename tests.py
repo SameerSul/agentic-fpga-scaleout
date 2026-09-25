@@ -616,6 +616,52 @@ def test_bitstream():
     shutil.rmtree(bs.WORK, ignore_errors=True)
 
 
+def test_exp_block():
+    """The exponential for attention's softmax, the last piece of the
+    decode that was running on the host as floating point."""
+    ms = load_model_spec()
+    spec = specgen_mod.derive_exp_spec(ms)
+    p = spec['parameters']
+    check('the table is indexed by the whole fractional part',
+          p['lut_bits'] == p['in_frac'])
+    # Input width follows the output format's useful range, not the
+    # model's activation width: past the underflow point a wider input
+    # buys nothing and costs timing.
+    big = dict(ms, weight_bits=16, activation_bits=16)
+    check('input width does not grow with the activation width',
+          specgen_mod.derive_exp_spec(big)['parameters']['in_width']
+          == p['in_width'])
+
+    worst = max(
+        abs(specgen_mod.exp_golden(-i, p) / float(1 << p['out_frac'])
+            - math.exp(-i / float(1 << p['in_frac'])))
+        for i in range(0, (1 << (p['in_width'] - 1))))
+    check('fixed-point exp is within 0.005 of math.exp (%.4f)' % worst,
+          worst < 0.005)
+    check('exp(0) is exactly one in the output format',
+          specgen_mod.exp_golden(0, p) == (1 << p['out_frac']))
+    check('a large negative argument underflows to zero, not wrap',
+          specgen_mod.exp_golden(-(1 << (p['in_width'] - 1)), p) == 0)
+
+    rtl = RuleBasedAgent().render_exp(spec, {agent_mod.FIX_LUT})
+    xs = [0, -1, -(1 << p['in_frac']), -(3 << p['in_frac']),
+          -(1 << (p['in_width'] - 1))]
+    got = inference.run_exp_cosim(spec, xs, rtl)
+    check('generated exponential matches its model bit-exactly',
+          all(got.get(i) == specgen_mod.exp_golden(x, p)
+              for i, x in enumerate(xs)))
+    shutil.rmtree(inference.WORK, ignore_errors=True)
+
+    # A table becomes a memory in synthesis, and the SAT solver cannot
+    # reason about one. Without memory_map every mutant of a design with a
+    # lookup table is misreported as a surviving DV hole.
+    mut = [fn for n, fn, _ in dv.OPS if n == 'product_off_by_one'][0](rtl)
+    os.makedirs(dv.DVDIR, exist_ok=True)
+    check('equivalence checking works on a design with a lookup table',
+          dv.prove_equivalent(rtl, mut, 'expu'))
+    shutil.rmtree(dv.DVDIR, ignore_errors=True)
+
+
 def test_fpga_backend(profile, fp):
     """Real device mapping, not generic cells: the two generated blocks land
     on different resources, which is what makes a single capacity proxy
@@ -835,6 +881,7 @@ if __name__ == '__main__':
     test_crc_matrix()
     test_inference_arithmetic()
     test_requant_block()
+    test_exp_block()
     test_generation()
     test_bitstream()
     test_fit_monotonic(profile)

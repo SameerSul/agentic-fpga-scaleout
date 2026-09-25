@@ -333,6 +333,58 @@ def run_requant_cosim(spec, vectors, rtl_src):
     return got
 
 
+def run_exp_cosim(spec, xs, rtl_src):
+    """Drive real softmax arguments through the generated exponential."""
+    p = spec["parameters"]
+    iw, ow = p["in_width"], p["out_width"]
+    body = "\n".join("    drive(%s, %d);" % (slit(x, iw), i)
+                     for i, x in enumerate(xs))
+    tb = """`timescale 1ns/1ps
+module tb_expcosim;
+  reg clk = 0, rst_n = 0, valid_in = 0;
+  reg  signed [{iwm}:0] x = 0;
+  wire        [{owm}:0] y;
+  wire valid_out;
+  expu dut (.clk(clk), .rst_n(rst_n), .x(x), .valid_in(valid_in),
+            .y(y), .valid_out(valid_out));
+  always #5 clk = ~clk;
+  task drive(input signed [{iwm}:0] xi, input integer idx);
+    begin
+      @(negedge clk); x = xi; valid_in = 1;
+      @(negedge clk); valid_in = 0;
+      repeat ({settle}) @(negedge clk);
+      $display("EX %0d %0d", idx, y);
+    end
+  endtask
+  initial begin
+    repeat (3) @(negedge clk); rst_n = 1; @(negedge clk);
+{body}
+    $display("COSIM_DONE");
+    $finish;
+  end
+endmodule
+""".format(iwm=iw - 1, owm=ow - 1, settle=p["pipeline_stages"] - 1,
+           body=body)
+    shutil.rmtree(WORK, ignore_errors=True)
+    os.makedirs(WORK)
+    open(os.path.join(WORK, "expu.v"), "w").write(rtl_src)
+    open(os.path.join(WORK, "tb.v"), "w").write(tb)
+    r = subprocess.run(["iverilog", "-g2005", "-o", "ex.out", "tb.v",
+                        "expu.v"], cwd=WORK, capture_output=True, text=True)
+    if r.returncode:
+        raise SystemExit("exp cosim compile failed:\n" + r.stdout + r.stderr)
+    r = subprocess.run(["vvp", "ex.out"], cwd=WORK, capture_output=True,
+                       text=True, timeout=600)
+    got = {}
+    for line in r.stdout.splitlines():
+        if line.startswith("EX "):
+            _, idx, val = line.split()
+            got[int(idx)] = int(val)
+    if "COSIM_DONE" not in r.stdout:
+        raise SystemExit("exp cosim did not finish:\n" + r.stdout[-800:])
+    return got
+
+
 def run_cosim(spec, vectors, rtl_src):
     shutil.rmtree(WORK, ignore_errors=True)
     os.makedirs(WORK)

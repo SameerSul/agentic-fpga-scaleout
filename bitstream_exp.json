@@ -1,0 +1,12 @@
+{
+  "block": "exp",
+  "spec": "exp13_gpt2_124m",
+  "device": "ice40-hx8k-ct256",
+  "target_mhz": 100,
+  "post_route_fmax_mhz": 101.73,
+  "timing_met": true,
+  "luts": 0,
+  "bitstream_bytes": 135100,
+  "bitstream_verified": true,
+  "icetime_mhz": null
+}

@@ -112,9 +112,14 @@ def prove_equivalent(orig, mutant, top):
         f.write(orig)
     with open(os.path.join(DVDIR, "gate.v"), "w") as f:
         f.write(mutant)
-    script = ("read_verilog gold.v; prep -top {t} -flatten; "
-              "design -stash gold; read_verilog gate.v; "
-              "prep -top {t} -flatten; design -stash gate; "
+    # memory_map turns an inferred ROM into plain logic. Without it a
+    # design with a lookup table cannot be proven at all: the SAT solver
+    # reports "no SAT model available" for the $mem cell and every mutant
+    # in such a design is misreported as a surviving DV hole.
+    script = ("read_verilog gold.v; prep -top {t} -flatten; memory_map; "
+              "opt -full; design -stash gold; read_verilog gate.v; "
+              "prep -top {t} -flatten; memory_map; opt -full; "
+              "design -stash gate; "
               "design -copy-from gold -as gold {t}; "
               "design -copy-from gate -as gate {t}; "
               "equiv_make gold gate equiv; prep -top equiv; "

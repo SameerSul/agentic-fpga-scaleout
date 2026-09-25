@@ -170,7 +170,8 @@ def main():
     ap.add_argument("--agent", default="rules",
                     choices=["rules", "llm", "swarm"])
     ap.add_argument("--only", default="all",
-                    choices=["all", "both", "chiplet", "requant", "endpoint"])
+                    choices=["all", "both", "chiplet", "requant", "exp",
+                             "endpoint"])
     ap.add_argument("--skip-dv", action="store_true")
     a = ap.parse_args()
     do_dv = not a.skip_dv
@@ -204,6 +205,21 @@ def main():
             label = "requant %s acc%d->%d" % (ms["name"], p["acc_width"],
                                               p["out_width"])
             r, d = one_case(label, spec, "activation", a.agent, do_dv)
+            rows.append(r)
+            details.append((label, d))
+            if any(r[c] not in ("ok", "skip", "-") for c in COLS):
+                failures.append(label)
+
+    if a.only in ("all", "exp"):
+        base = specgen.load_model_spec()
+        for ms in _models(base):
+            spec = specgen.generate_exp(ms, spec_file=JOB["spec_file"],
+                                        tb_file=JOB["tb_file"])
+            p = spec["parameters"]
+            label = "exp %s Q%d.%d->Q0.%d" % (
+                ms["name"], p["in_width"] - 1 - p["in_frac"], p["in_frac"],
+                p["out_frac"])
+            r, d = one_case(label, spec, "score", a.agent, do_dv)
             rows.append(r)
             details.append((label, d))
             if any(r[c] not in ("ok", "skip", "-") for c in COLS):

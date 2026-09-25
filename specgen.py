@@ -165,6 +165,233 @@ def requant_stages(aw, mw, splits):
     return 1 + levels * per_add + per_add + 1 + 1
 
 
+def exp_lut(lut_bits, out_frac):
+    """2**f for f in [0,1), the table the exponential unit indexes.
+
+    Stored scaled by 2**out_frac, so entries run from 1.0 to just under
+    2.0 in that fixed point. Derived here rather than written out, so the
+    table and the golden model cannot drift apart.
+    """
+    return [int(round((2.0 ** (i / float(1 << lut_bits)))
+                      * (1 << out_frac)))
+            for i in range(1 << lut_bits)]
+
+
+LOG2E_Q16 = int(round(1.4426950408889634 * (1 << 16)))
+
+
+def exp_golden(x, p):
+    """Exact fixed-point model of the exponential unit.
+
+    exp(x) = 2**(x*log2(e)), and a power of two splits into a shift and a
+    table lookup: t = n + f with n the integer part and f in [0,1), so
+    2**t is 2**f shifted right by -n. x is required to be non-positive,
+    which is what softmax guarantees after subtracting the row maximum,
+    and that is why only right shifts appear.
+    """
+    fi, fo, lb = p["in_frac"], p["out_frac"], p["lut_bits"]
+    t = (x * LOG2E_Q16) >> 16          # x*log2(e), still Q.in_frac
+    n = t >> fi                        # floor, negative or zero
+    f = t - (n << fi)                  # fractional part, [0, 1)
+    idx = f >> (fi - lb)
+    m = exp_lut(lb, fo)[idx]
+    sh = -n
+    if sh > fo:                        # underflows the output format
+        return 0
+    return m >> sh
+
+
+def derive_exp_spec(ms):
+    """model spec -> exponential unit spec.
+
+    Softmax is the last piece of the attention datapath still running on
+    the host, and the exponential is the part of it that actually needs
+    hardware: the sum and the reciprocal are an accumulator and a divide,
+    but exp is transcendental. Everything else in the block is a shift.
+    """
+    ab = ms["activation_bits"]
+    # The table is indexed by the whole fractional part, so no bits of it
+    # are thrown away: at 6 bits the truncation cost 1% absolute error,
+    # which is the table and not the arithmetic.
+    fi, fo = 8, 15
+    lb = fi
+    # The input is a score minus the row maximum, so it is non-positive
+    # and anything below about -(out_frac+1)/log2(e) underflows the output
+    # format entirely. The useful range is therefore fixed by the output
+    # format, not by the model's activation width: tying it to 2*ab gave a
+    # 32-bit operand for a 16-bit model, which missed timing for range
+    # that can never be used.
+    span = int(math.ceil((fo + 2) / 1.4426950408889634))
+    iw = 1 + max(4, span.bit_length()) + fi
+    return {
+        "name": "exp%d_%s" % (iw, ms["name"]),
+        "description": "Fixed-point exponential for the attention softmax: "
+                       "Q%d.%d signed input constrained to be non-positive, "
+                       "Q0.%d unsigned output, by a %d-entry table of 2**f "
+                       "and an arithmetic shift"
+                       % (iw - 1 - fi, fi, fo, 1 << lb),
+        "top_module": "expu",
+        "unit": "score",
+        "parameters": {
+            "in_width": iw, "in_frac": fi,
+            "out_width": fo + 1, "out_frac": fo,
+            "lut_bits": lb,
+            "signed": True,
+            "pipeline_stages": 3,
+            "target_clock_mhz": 100,
+        },
+        "derivation": {
+            "model": ms["name"],
+            "activation_bits": ab,
+            "rule": "exp(x) = 2**(x*log2(e)); the integer part of "
+                    "x*log2(e) is an arithmetic right shift and the "
+                    "fractional part indexes a %d-entry table of 2**f"
+                    % (1 << lb),
+            "log2e_q16": LOG2E_Q16,
+        },
+        "ports": [
+            {"name": "clk", "dir": "input", "width": 1,
+             "desc": "clock, rising edge"},
+            {"name": "rst_n", "dir": "input", "width": 1,
+             "desc": "active-low synchronous reset"},
+            {"name": "x", "dir": "input", "width": iw, "signed": True,
+             "desc": "score minus the row maximum, Q%d.%d, non-positive"
+                     % (iw - 1 - fi, fi)},
+            {"name": "valid_in", "dir": "input", "width": 1,
+             "desc": "x valid"},
+            {"name": "y", "dir": "output", "width": fo + 1,
+             "desc": "exp(x) in Q0.%d, 1.0 represented as %d"
+                     % (fo, 1 << fo)},
+            {"name": "valid_out", "dir": "output", "width": 1,
+             "desc": "y updated this cycle"},
+        ],
+        "behavior": [
+            "Stage 1 registers x*log2(e) as a Q.%d value, using a %d-bit "
+            "fixed-point constant." % (fi, 17),
+            "Stage 2 splits it into an integer part and a fractional "
+            "part and registers the table entry the fraction selects.",
+            "Stage 3 shifts that entry right by the magnitude of the "
+            "integer part and registers the result.",
+            "An input small enough that the shift exceeds %d output "
+            "fraction bits flushes to zero rather than wrapping." % fo,
+            "x is required to be non-positive, which softmax guarantees "
+            "by subtracting the row maximum first.",
+            "Latency from valid_in to valid_out is 3 cycles.",
+        ],
+    }
+
+
+def render_exp_testbench(spec):
+    """Golden outputs come from exp_golden here, and the accuracy of the
+    scheme itself is checked against math.exp separately, so a design that
+    reproduces its own approximation cannot pass on that alone."""
+    p = spec["parameters"]
+    iw, fi, fo = p["in_width"], p["in_frac"], p["out_frac"]
+    rnd = random.Random(23)
+    # Everything is clamped to what the port can represent. The input
+    # width is derived from the useful exponent range, so a vector past
+    # the underflow point is not a harder test, it is an unrepresentable
+    # one, and it fails on truncation rather than on anything real.
+    lo = -(1 << (iw - 1))
+    def rep(v):
+        return max(lo, min(0, v))
+    xs = [rep(v) for v in
+          [0, -1, -(1 << fi), -(2 << fi), -(3 << fi), -(1 << (fi - 1)),
+           -((1 << fi) - 1), -(fo << fi), -((fo + 1) << fi),
+           -((fo + 4) << fi), lo]]
+    xs += [-rnd.randrange(0, -lo) for _ in range(140)]
+    # Inputs where the product sits one count below a shift boundary, so a
+    # single LSB of error in it carries into the shifted exponent. Without
+    # these the testbench cannot see an off-by-one in the multiply at all,
+    # which mutation testing demonstrated.
+    edge = [x for x in range(-1, lo, -1)
+            if ((x * LOG2E_Q16) & 0xFFFF) in (0xFFFF, 0, 1)]
+    xs += edge[:40]
+    body = []
+    for x in xs:
+        body.append("    drive(%s, %d'd%d);"
+                    % (_slit(x, iw), p["out_width"], exp_golden(x, p)))
+    return EXP_TB.format(iwm=iw - 1, owm=p["out_width"] - 1,
+                         settle=p["pipeline_stages"] - 1,
+                         cases="\n".join(body), n=len(xs))
+
+
+EXP_TB = """`timescale 1ns/1ps
+// GENERATED by specgen.py: do not edit by hand.
+// Self-checking testbench for the fixed-point exponential. Golden values
+// come from the Python fixed-point model, and tests.py separately checks
+// that model against math.exp, so a design that merely reproduces its own
+// approximation error cannot pass.
+module tb_expu;
+  reg clk = 0, rst_n = 0, valid_in = 0;
+  reg  signed [{iwm}:0] x = 0;
+  wire        [{owm}:0] y;
+  wire valid_out;
+  integer checks = 0, i;
+  reg [255:0] testname;
+
+  expu dut (.clk(clk), .rst_n(rst_n), .x(x), .valid_in(valid_in),
+            .y(y), .valid_out(valid_out));
+  always #5 clk = ~clk;
+
+  task expect_quiet;
+    begin
+      checks = checks + 1;
+      if (valid_out !== 1'b0 || y !== 0) begin
+        $display("TB_FAIL test=reset_init expected_y=0 got_y=%0d vout=%b",
+                 y, valid_out);
+        $display("TB_RESULT: FAIL");
+        $finish;
+      end
+    end
+  endtask
+
+  task drive(input signed [{iwm}:0] xi, input [{owm}:0] want);
+    begin
+      @(negedge clk); x = xi; valid_in = 1;
+      @(negedge clk); valid_in = 0;
+      repeat ({settle}) @(negedge clk);
+      checks = checks + 1;
+      if (y !== want || valid_out !== 1'b1) begin
+        $display("TB_FAIL test=%0s x=%0d expected_y=%0d got_y=%0d vout=%b",
+                 testname, xi, want, y, valid_out);
+        $display("TB_RESULT: FAIL");
+        $finish;
+      end
+    end
+  endtask
+
+  initial begin
+    testname = "reset_init";
+    repeat (3) @(negedge clk);
+    expect_quiet;
+    rst_n = 1;
+    @(negedge clk);
+    expect_quiet;
+    testname = "exp";
+{cases}
+
+    $display("TB_PROFILE scores=%0d span_cycles=%0d latency_cycles=%0d",
+             {n}, {n} * (2 + {settle}), 1 + {settle});
+    $display("TB_PASS checks=%0d", checks);
+    $display("TB_RESULT: PASS");
+    $finish;
+  end
+endmodule
+"""
+
+
+def generate_exp(ms=None, spec_file="spec_exp.json", tb_file="tb_expu.v"):
+    """Write the derived exponential spec and testbench, return the spec."""
+    ms = ms or load_model_spec()
+    spec = derive_exp_spec(ms)
+    with open(os.path.join(ROOT, spec_file), "w") as f:
+        json.dump(spec, f, indent=2)
+    with open(os.path.join(ROOT, tb_file), "w") as f:
+        f.write(render_exp_testbench(spec))
+    return spec
+
+
 def derive_requant_spec(ms):
     """model spec -> requantization spec.
 

@@ -15,6 +15,7 @@ FIX_WIDTH = "widen_product_register"
 FIX_CLEAR = "implement_sync_clear"
 FIX_XOR = "apply_final_inversion"
 FIX_SATURATE = "saturate_instead_of_wrap"
+FIX_LUT = "interpolate_the_fractional_part"
 # One definition, in specgen, so the declared depth and the generated
 # depth cannot disagree.
 WIDE_ADD_BITS = specgen.WIDE_ADD_BITS
@@ -31,6 +32,8 @@ class RuleBasedAgent:
             return self.render_crc(spec, fixes), sorted(fixes)
         if spec["top_module"] == "requant":
             return self.render_requant(spec, fixes), sorted(fixes)
+        if spec["top_module"] == "expu":
+            return self.render_exp(spec, fixes), sorted(fixes)
         return self.render_mac(spec, fixes), sorted(fixes)
 
     def diagnose(self, spec, history):
@@ -48,6 +51,10 @@ class RuleBasedAgent:
                     fixes.add(FIX_XOR)
                 elif "clear" in m.get("test", "").lower():
                     fixes.add(FIX_CLEAR)
+                elif "expected_y" in m:
+                    # The exponential's only seeded bug: the fractional
+                    # part of the exponent was thrown away.
+                    fixes.add(FIX_LUT)
                 elif "expected_q" in m:
                     # The requantizer's only seeded bug: it wrapped where
                     # it had to saturate.
@@ -55,6 +62,92 @@ class RuleBasedAgent:
                 elif m.get("got_acc") != m.get("expected_acc"):
                     fixes.add(FIX_WIDTH)
         return fixes
+
+    def render_exp(self, spec, fixes):
+        """Fixed-point exponential by table and shift.
+
+        exp(x) = 2**(x*log2(e)). Split x*log2(e) into an integer part and
+        a fraction: the fraction indexes a table of 2**f and the integer
+        part, which is non-positive because softmax subtracts the row
+        maximum first, is a right shift.
+
+        The seeded first-cut bug is dropping the fractional part, so the
+        unit returns a plain power of two and every value between them is
+        wrong by up to a factor of two.
+
+        A logical shift where the integer part wants an arithmetic one was
+        tried as the seeded bug first and turned out to be unobservable
+        here: the two differ only in the high bits, and only the low bits
+        of the shift amount survive into sh, so they agree modulo its
+        width. The same reasoning showed a separate flush-to-zero flag was
+        dead logic, because clamping the shift already drives the output
+        to zero. Both are gone; the shift is arithmetic because that is
+        what it means, not because the testbench can tell.
+        """
+        p = spec["parameters"]
+        iw, fi = p["in_width"], p["in_frac"]
+        ow, fo, lb = p["out_width"], p["out_frac"], p["lut_bits"]
+        tw = iw + 18
+        shw = max(4, (tw).bit_length())
+        lut = specgen.exp_lut(lb, fo)
+        arms = "\n".join(
+            "      %d'd%d: lut = %d'd%d;" % (lb, i, ow, v)
+            for i, v in enumerate(lut))
+        return """module expu (
+  input                     clk,
+  input                     rst_n,
+  input      signed [{iwm}:0] x,
+  input                     valid_in,
+  output reg        [{owm}:0] y,
+  output reg                valid_out
+);
+  // exp(x) = 2**(x*log2(e)); the fraction of x*log2(e) indexes a table of
+  // 2**f and its integer part is a right shift. x is non-positive, which
+  // softmax guarantees by subtracting the row maximum, so the shift only
+  // ever goes right.
+  function [{owm}:0] lut;
+    input [{lbm}:0] idx;
+    case (idx)
+{arms}
+      default: lut = {ow}'d{one};
+    endcase
+  endfunction
+
+  reg signed [{twm}:0] t;
+  reg        [{owm}:0] m;
+  reg        [{shm}:0] sh;
+  reg                  vpipe, vpipe2;
+  wire signed [{twm}:0] prod = x * $signed({{1'b0, 18'd{log2e}}});
+  wire signed [{twm}:0] tt   = prod >>> 16;
+  wire signed [{twm}:0] n    = t >>> {fi};
+  always @(posedge clk) begin
+    if (!rst_n) begin
+      t         <= 0;
+      m         <= 0;
+      sh        <= 0;
+      vpipe     <= 1'b0;
+      vpipe2    <= 1'b0;
+      y         <= 0;
+      valid_out <= 1'b0;
+    end else begin
+      t         <= tt;
+      vpipe     <= valid_in;
+      m         <= {mexpr};
+      // Clamping the shift is what drives an underflowing input to zero:
+      // the table entry is {ow} bits, so a shift of {fo1} empties it. A
+      // separate flush flag was redundant.
+      sh        <= (-n) > {fo} ? {fo1} : (-n);
+      vpipe2    <= vpipe;
+      y         <= m >> sh;
+      valid_out <= vpipe2;
+    end
+  end
+endmodule
+""".format(iwm=iw - 1, owm=ow - 1, twm=tw - 1, shm=shw - 1, lbm=lb - 1,
+           fim=fi - 1, fi=fi, fo=fo, fo1=fo + 1, ow=ow, arms=arms,
+           one=1 << fo, log2e=specgen.LOG2E_Q16,
+           mexpr=("lut(t[%d:0])" % (fi - 1)) if FIX_LUT in fixes
+                 else ("%d'd%d" % (ow, 1 << fo)))
 
     def render_requant(self, spec, fixes):
         """Requantizer: scale, round, saturate.
