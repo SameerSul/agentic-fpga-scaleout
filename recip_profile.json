@@ -1,0 +1,32 @@
+{
+  "block": "recip26_gpt2_124m",
+  "top_module": "recip",
+  "unit": "row",
+  "cycles_per_row": 4.0,
+  "latency_cycles": 3,
+  "cell_count": 1562,
+  "area": 3216.0,
+  "fmax_estimate_mhz": 223.2142857142857,
+  "fmax_method": "opensta_slack",
+  "target_clock_mhz": 100,
+  "sim_checks_passed": 206,
+  "fpga": {
+    "family": "xcup",
+    "luts": 238,
+    "ffs": 60,
+    "dsps": 0,
+    "brams": 0,
+    "urams": 0,
+    "carry": 0,
+    "muxf": 129
+  },
+  "derivation": {
+    "model": "gpt2_124m",
+    "exp_out_frac": 15,
+    "max_terms": 1024,
+    "rule": "in_width bounds a sum of at most 1024 exponentials each below 2**15; the output is a mantissa and a shift, so a softmax weight is one multiply and one shift"
+  },
+  "recip_unit": "recip26_gpt2_124m",
+  "shift_bias": 42,
+  "agent": "RuleBasedAgent"
+}

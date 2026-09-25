@@ -337,7 +337,7 @@ module tb_expu;
   task expect_quiet;
     begin
       checks = checks + 1;
-      if (valid_out !== 1'b0 || y !== 0) begin
+      if (valid_out !== 1'b0 || y !== 0 || k !== 0) begin
         $display("TB_FAIL test=reset_init expected_y=0 got_y=%0d vout=%b",
                  y, valid_out);
         $display("TB_RESULT: FAIL");
@@ -352,9 +352,9 @@ module tb_expu;
       @(negedge clk); valid_in = 0;
       repeat ({settle}) @(negedge clk);
       checks = checks + 1;
-      if (y !== want || valid_out !== 1'b1) begin
-        $display("TB_FAIL test=%0s x=%0d expected_y=%0d got_y=%0d vout=%b",
-                 testname, xi, want, y, valid_out);
+      if (y !== want || k !== wantk || valid_out !== 1'b1) begin
+        $display("TB_FAIL test=%0s x=%0d expected_y=%0d got_y=%0d expected_k=%0d got_k=%0d vout=%b",
+                 testname, xi, want, y, wantk, k, valid_out);
         $display("TB_RESULT: FAIL");
         $finish;
       end
@@ -389,6 +389,218 @@ def generate_exp(ms=None, spec_file="spec_exp.json", tb_file="tb_expu.v"):
         json.dump(spec, f, indent=2)
     with open(os.path.join(ROOT, tb_file), "w") as f:
         f.write(render_exp_testbench(spec))
+    return spec
+
+
+def recip_lut(lut_bits, out_width):
+    """1/m for m in [1,2), scaled by 2**out_width.
+
+    Entries run from 2**out_width down to just above half of it. The
+    table is derived rather than written out so it cannot drift from the
+    golden model.
+    """
+    n = 1 << lut_bits
+    return [min((1 << out_width) - 1,
+                int(round((1 << out_width) / (1.0 + i / float(n)))))
+            for i in range(n)]
+
+
+def recip_golden(x, p):
+    """Exact fixed-point model of the reciprocal unit.
+
+    Returns (mantissa, shift) with 1/x == mantissa >> (shift + bias), the
+    bias being out_width + in_width - 1. Returning a mantissa and a shift
+    rather than a pre-shifted number is the whole point: the softmax
+    denominator spans ten bits of range, so a single fixed-point output
+    would hold as few as five significant bits at the top of that range
+    and carry 6% error. The mantissa is always full width, and the
+    consumer folds the shift into the multiply it was going to do anyway.
+    """
+    iw, ow, lb = p["in_width"], p["out_width"], p["lut_bits"]
+    if x <= 0:
+        return (1 << ow) - 1, 0
+    k = iw - x.bit_length()            # leading zeros within in_width
+    xn = x << k                        # msb now at bit iw-1
+    idx = (xn >> (iw - 1 - lb)) & ((1 << lb) - 1)
+    return recip_lut(lb, ow)[idx], k
+
+
+def recip_apply(num, m, k, p):
+    """What a consumer does with (mantissa, shift): num / x, to the
+    precision the unit provides."""
+    bias = p["out_width"] + p["in_width"] - 1
+    return (num * m) >> (bias - k)
+
+
+def derive_recip_spec(ms):
+    """model spec -> reciprocal spec.
+
+    The other half of softmax. Once the exponentials are summed, every
+    weight is that exponential divided by the sum, and a divider per
+    weight is absurd: the reciprocal is computed once per row and
+    multiplied in. This is the reciprocal.
+    """
+    e = derive_exp_spec(ms)
+    ef = e["parameters"]["out_frac"]
+    seq = ms.get("seq_len", 1024)
+    # The denominator is a sum of exponentials, each at most 1.0, so it is
+    # bounded by the number of terms. Attention sums over the context, but
+    # the hardware only needs the width, not the count.
+    terms = min(seq, 4096)
+    iw = (terms << ef).bit_length()
+    ow, lb = 17, 8
+    return {
+        "name": "recip%d_%s" % (iw, ms["name"]),
+        "description": "Reciprocal for the attention softmax denominator: "
+                       "%d-bit unsigned input, returns a %d-bit mantissa "
+                       "and the shift that goes with it, by normalising "
+                       "to [1,2) and a %d-entry table"
+                       % (iw, ow, 1 << lb),
+        "top_module": "recip",
+        "unit": "row",
+        "parameters": {
+            "in_width": iw, "out_width": ow, "lut_bits": lb,
+            "shift_bias": ow + iw - 1, "signed": False,
+            "pipeline_stages": 3, "target_clock_mhz": 100,
+        },
+        "derivation": {
+            "model": ms["name"],
+            "exp_out_frac": ef,
+            "max_terms": terms,
+            "rule": "in_width bounds a sum of at most %d exponentials "
+                    "each below 2**%d; the output is a mantissa and a "
+                    "shift, so a softmax weight is one multiply and one "
+                    "shift" % (terms, ef),
+        },
+        "ports": [
+            {"name": "clk", "dir": "input", "width": 1,
+             "desc": "clock, rising edge"},
+            {"name": "rst_n", "dir": "input", "width": 1,
+             "desc": "active-low synchronous reset"},
+            {"name": "x", "dir": "input", "width": iw,
+             "desc": "softmax denominator, unsigned, non-zero"},
+            {"name": "valid_in", "dir": "input", "width": 1,
+             "desc": "x valid"},
+            {"name": "y", "dir": "output", "width": ow,
+             "desc": "reciprocal mantissa, always full width"},
+            {"name": "k", "dir": "output", "width": max(4, iw.bit_length()),
+             "desc": "normalisation shift; 1/x is y >> (%d - k)"
+                     % (ow + iw - 1)},
+            {"name": "valid_out", "dir": "output", "width": 1,
+             "desc": "y updated this cycle"},
+        ],
+        "behavior": [
+            "Stage 1 counts the leading zeros of x and registers both the "
+            "count and x shifted left by it, so the value sits in [1,2).",
+            "Stage 2 registers the table entry the normalised mantissa "
+            "selects and the shift the count implies.",
+            "Stage 3 registers the table entry and the count. The "
+            "consumer applies the shift, which keeps the mantissa at "
+            "full precision instead of truncating it here.",
+            "x is required to be non-zero, which the softmax denominator "
+            "guarantees because it always contains exp(0) = 1.",
+            "Latency from valid_in to valid_out is 3 cycles.",
+        ],
+    }
+
+
+def render_recip_testbench(spec):
+    p = spec["parameters"]
+    iw = p["in_width"]
+    rnd = random.Random(31)
+    xs = [1, 2, 3, (1 << 15), (1 << 15) + 1, (1 << (iw - 1)),
+          (1 << iw) - 1, (1 << iw) - 2, (3 << (iw - 2))]
+    xs += [rnd.randrange(1, 1 << iw) for _ in range(120)]
+    # Powers of two and their neighbours, where the normalisation count
+    # changes and an off-by-one in it is visible.
+    for b in range(1, iw):
+        xs += [(1 << b) - 1, (1 << b), (1 << b) + 1]
+    xs = [x for x in xs if 1 <= x < (1 << iw)]
+    kw = max(4, iw.bit_length())
+    body = "\n".join("    drive(%d'd%d, %d'd%d, %d'd%d);"
+                      % ((iw, x, p["out_width"]) + recip_golden(x, p)[:1]
+                         + (kw, recip_golden(x, p)[1]))
+                      for x in xs)
+    return RECIP_TB.format(iwm=iw - 1, owm=p["out_width"] - 1,
+                           kwm=kw - 1, settle=p["pipeline_stages"] - 1,
+                           cases=body, n=len(xs))
+
+
+RECIP_TB = """`timescale 1ns/1ps
+// GENERATED by specgen.py: do not edit by hand.
+// Self-checking testbench for the softmax reciprocal. Golden values come
+// from the Python fixed-point model; tests.py separately checks that
+// model against true division.
+module tb_recip;
+  reg clk = 0, rst_n = 0, valid_in = 0;
+  reg  [{iwm}:0] x = 0;
+  wire [{owm}:0] y;
+  wire [{kwm}:0] k;
+  wire valid_out;
+  integer checks = 0;
+  reg [255:0] testname;
+
+  recip dut (.clk(clk), .rst_n(rst_n), .x(x), .valid_in(valid_in),
+             .y(y), .k(k), .valid_out(valid_out));
+  always #5 clk = ~clk;
+
+  task expect_quiet;
+    begin
+      checks = checks + 1;
+      if (valid_out !== 1'b0 || y !== 0 || k !== 0) begin
+        $display("TB_FAIL test=reset_init expected_y=0 got_y=%0d vout=%b",
+                 y, valid_out);
+        $display("TB_RESULT: FAIL");
+        $finish;
+      end
+    end
+  endtask
+
+  task drive(input [{iwm}:0] xi, input [{owm}:0] want,
+             input [{kwm}:0] wantk);
+    begin
+      @(negedge clk); x = xi; valid_in = 1;
+      @(negedge clk); valid_in = 0;
+      repeat ({settle}) @(negedge clk);
+      checks = checks + 1;
+      if (y !== want || k !== wantk || valid_out !== 1'b1) begin
+        $display("TB_FAIL test=%0s x=%0d expected_y=%0d got_y=%0d expected_k=%0d got_k=%0d vout=%b",
+                 testname, xi, want, y, wantk, k, valid_out);
+        $display("TB_RESULT: FAIL");
+        $finish;
+      end
+    end
+  endtask
+
+  initial begin
+    testname = "reset_init";
+    repeat (3) @(negedge clk);
+    expect_quiet;
+    rst_n = 1;
+    @(negedge clk);
+    expect_quiet;
+    testname = "recip";
+{cases}
+
+    $display("TB_PROFILE rows=%0d span_cycles=%0d latency_cycles=%0d",
+             {n}, {n} * (2 + {settle}), 1 + {settle});
+    $display("TB_PASS checks=%0d", checks);
+    $display("TB_RESULT: PASS");
+    $finish;
+  end
+endmodule
+"""
+
+
+def generate_recip(ms=None, spec_file="spec_recip.json",
+                   tb_file="tb_recip.v"):
+    """Write the derived reciprocal spec and testbench, return the spec."""
+    ms = ms or load_model_spec()
+    spec = derive_recip_spec(ms)
+    with open(os.path.join(ROOT, spec_file), "w") as f:
+        json.dump(spec, f, indent=2)
+    with open(os.path.join(ROOT, tb_file), "w") as f:
+        f.write(render_recip_testbench(spec))
     return spec
 
 

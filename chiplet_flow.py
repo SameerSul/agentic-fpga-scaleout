@@ -42,6 +42,12 @@ FABRIC_JOB = {
     "profile_file": "fabric_profile.json", "report_file": "report_crc.json",
     "derive_from_link": True,
 }
+RECIP_JOB = {
+    "spec_file": "spec_recip.json", "tb_file": "tb_recip.v",
+    "rtl_file": "recip.v", "profile_file": "recip_profile.json",
+    "report_file": "report_recip.json",
+    "derive_from_model": "recip",
+}
 EXP_JOB = {
     "spec_file": "spec_exp.json", "tb_file": "tb_expu.v",
     "rtl_file": "expu.v", "profile_file": "exp_profile.json",
@@ -308,6 +314,9 @@ def derive_profile(spec, final):
         prof["chiplet"] = spec["name"]
         prof["data_width"] = spec["parameters"]["data_width"]
         prof["acc_width"] = spec["parameters"]["acc_width"]
+    elif unit == "row":
+        prof["recip_unit"] = spec["name"]
+        prof["shift_bias"] = spec["parameters"]["shift_bias"]
     elif unit == "score":
         prof["exp_unit"] = spec["name"]
         prof["in_frac"] = spec["parameters"]["in_frac"]
@@ -374,7 +383,10 @@ def run_flow(job=None, verbose=True, agent=None, max_iters=None):
     say = print if verbose else (lambda *a, **k: None)
     os.makedirs(BUILD, exist_ok=True)
     shutil.copy(LIB, BUILD)
-    if job.get("derive_from_model") == "exp":
+    if job.get("derive_from_model") == "recip":
+        specgen.generate_recip(spec_file=job["spec_file"],
+                               tb_file=job["tb_file"])
+    elif job.get("derive_from_model") == "exp":
         specgen.generate_exp(spec_file=job["spec_file"],
                              tb_file=job["tb_file"])
     elif job.get("derive_from_model") == "requant":

@@ -27,9 +27,10 @@ import sys
 
 import specgen
 from agent import (RuleBasedAgent, FIX_WIDTH, FIX_CLEAR,
-                   FIX_SATURATE, FIX_LUT)
+                   FIX_SATURATE, FIX_LUT, FIX_NORM)
 from inference import (MacModel, RequantModel, quantize, run_cosim,
-                       run_requant_cosim, run_exp_cosim, WORK)
+                       run_requant_cosim, run_exp_cosim,
+                       run_recip_cosim, WORK)
 from train_tiny import CKPT
 
 
@@ -60,7 +61,7 @@ def qmat(m, bits):
 class HwModel:
     """The checkpoint, executed the way the hardware would execute it."""
 
-    def __init__(self, ck, dw, aw, rq, espec=None):
+    def __init__(self, ck, dw, aw, rq, espec=None, rspec=None):
         self.d = ck["d_model"]
         self.f = ck["d_ff"]
         self.seq = ck["seq"]
@@ -77,8 +78,10 @@ class HwModel:
         self.dots = []               # (x, w_col) for co-simulation
         self.rqs = []                # (acc, scale, shift)
         self.exps = []               # (x,) for the exponential unit
+        self.recips = []             # (x,) for the reciprocal unit
         self.dw = dw
         self.espec = espec
+        self.rspec = rspec
 
     def matvec(self, x, name, keep=1):
         """Returns (accumulators, per-column weight scales)."""
@@ -116,10 +119,13 @@ class HwModel:
         sc = 1.0 / math.sqrt(D)
         scores = [sum(a * b for a, b in zip(qs[i][0], ks[j][0]))
                   * qs[i][1] * ks[j][1] * sc for j in range(i + 1)]
+        # Softmax entirely in the generated units: the exponential from
+        # the table-and-shift block, the normalisation from the
+        # reciprocal block. Only the sum is plain accumulation.
         mx = max(scores)
-        ex = [self.expf(s_ - mx) for s_ in scores]
-        tot = sum(ex) or 1.0
-        ctx = [sum(ex[j] * vs[j][0][t] * vs[j][1] for j in range(i + 1)) / tot
+        ex = [self.expi(s_ - mx) for s_ in scores]
+        w = self.normalise(ex)
+        ctx = [sum(w[j] * vs[j][0][t] * vs[j][1] for j in range(i + 1))
                for t in range(D)]
         att = self.project(self.qact(ctx), "wo")
         res = self.add(hq[i], att)
@@ -129,6 +135,35 @@ class HwModel:
         res2 = self.add(res, h2)
         logits, ls = self.project(res2, "head")
         return [v * ls for v in logits]
+
+    def normalise(self, ex):
+        """Turn exponentials into weights using the reciprocal unit.
+
+        A divider per weight would be absurd, so the denominator is
+        reciprocated once and multiplied in, which is what the block
+        returns a mantissa and a shift for.
+        """
+        tot = sum(ex)
+        if self.rspec is None or tot <= 0:
+            t = float(tot) or 1.0
+            return [e / t for e in ex]
+        p = self.rspec["parameters"]
+        tot = min(tot, (1 << p["in_width"]) - 1)
+        self.recips.append(tot)
+        m, k = specgen.recip_golden(tot, p)
+        ef = self.espec["parameters"]["out_frac"] if self.espec else 15
+        return [specgen.recip_apply(e << ef, m, k, p) / float(1 << ef)
+                for e in ex]
+
+    def expi(self, d):
+        """exp as the unit's raw output, an integer in Q0.out_frac."""
+        if self.espec is None:
+            return int(round(math.exp(d) * (1 << 15)))
+        p = self.espec["parameters"]
+        lo = -(1 << (p["in_width"] - 1))
+        x = max(lo, min(0, int(round(d * (1 << p["in_frac"])))))
+        self.exps.append(x)
+        return specgen.exp_golden(x, p)
 
     def expf(self, d):
         """exp of a non-positive value, through the generated unit.
@@ -255,8 +290,9 @@ def main():
           "%d -> %d bits\n" % (dw, aw, rp["acc_width"], rp["out_width"]))
 
     espec = specgen.derive_exp_spec(ms)
+    rcspec = specgen.derive_recip_spec(ms)
     rq = RequantModel(rp["out_width"], rp["scale_width"], rp["shift_width"])
-    hw = HwModel(ck, dw, aw, rq, espec)
+    hw = HwModel(ck, dw, aw, rq, espec, rcspec)
 
     ids = [hw.stoi[c] for c in a.prompt if c in hw.stoi]
     if not ids:
@@ -323,14 +359,26 @@ def main():
         print("  exp:       %d/%d exponentials bit exact"
               % (len(exps) - len(bad3), len(exps)))
     shutil.rmtree(WORK, ignore_errors=True)
-    if bad or bad2 or bad3:
+    rnd.shuffle(hw.recips)
+    rcs = hw.recips[:a.cosim]
+    bad4 = []
+    if rcs:
+        rrl = RuleBasedAgent().render_recip(rcspec, {FIX_NORM})
+        got4 = run_recip_cosim(rcspec, rcs, rrl)
+        bad4 = [i for i, x in enumerate(rcs)
+                if got4.get(i) != specgen.recip_golden(
+                    x, rcspec["parameters"])]
+        print("  recip:     %d/%d reciprocals bit exact"
+              % (len(rcs) - len(bad4), len(rcs)))
+    if bad or bad2 or bad3 or bad4:
         print("\nMISMATCH: the text above is not what the hardware produces")
         return 1
-    print("\nEvery dot product, every requantization and every exponential "
-          "in this\ndecode is arithmetic the generated RTL reproduces "
-          "exactly, so the text is\nwhat the hardware would emit. The "
-          "softmax sum, its reciprocal and the\nargmax ran on the host; "
-          "no RTL exists for those yet.")
+    print("\nEvery dot product, requantization, exponential and "
+          "reciprocal in this\ndecode is arithmetic the generated RTL "
+          "reproduces exactly, so the text is\nwhat the hardware would "
+          "emit. The softmax sum is plain accumulation; the\n"
+          "normalisations, attention sequencing, weight streaming and "
+          "argmax ran on\nthe host, and no RTL exists for those yet.")
     return 0
 
 

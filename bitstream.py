@@ -30,7 +30,7 @@ import sys
 
 import specgen
 from agent import (RuleBasedAgent, FIX_WIDTH, FIX_CLEAR,
-                   FIX_SATURATE, FIX_XOR, FIX_LUT)
+                   FIX_SATURATE, FIX_XOR, FIX_LUT, FIX_NORM)
 from chiplet_flow import ROOT, TARGET_LINK_GBPS
 
 WORK = os.path.join(ROOT, "build_bitstream")
@@ -45,6 +45,7 @@ TB_FOR = {
     "requant": lambda spec: specgen.render_requant_testbench(spec),
     "crc": lambda spec: specgen.render_crc_testbench(spec),
     "exp": lambda spec: specgen.render_exp_testbench(spec),
+    "recip": lambda spec: specgen.render_recip_testbench(spec),
 }
 
 BLOCKS = {
@@ -55,6 +56,8 @@ BLOCKS = {
     "crc": ("crc32", lambda ms: specgen.derive_endpoint_spec(1.0),
             {FIX_XOR}),
     "exp": ("expu", lambda ms: specgen.derive_exp_spec(ms), {FIX_LUT}),
+    "recip": ("recip", lambda ms: specgen.derive_recip_spec(ms),
+              {FIX_NORM}),
 }
 
 

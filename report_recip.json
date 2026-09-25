@@ -1,0 +1,167 @@
+{
+  "spec": {
+    "name": "recip26_gpt2_124m",
+    "description": "Reciprocal for the attention softmax denominator: 26-bit unsigned input, returns a 17-bit mantissa and the shift that goes with it, by normalising to [1,2) and a 256-entry table",
+    "top_module": "recip",
+    "unit": "row",
+    "parameters": {
+      "in_width": 26,
+      "out_width": 17,
+      "lut_bits": 8,
+      "shift_bias": 42,
+      "signed": false,
+      "pipeline_stages": 3,
+      "target_clock_mhz": 100
+    },
+    "derivation": {
+      "model": "gpt2_124m",
+      "exp_out_frac": 15,
+      "max_terms": 1024,
+      "rule": "in_width bounds a sum of at most 1024 exponentials each below 2**15; the output is a mantissa and a shift, so a softmax weight is one multiply and one shift"
+    },
+    "ports": [
+      {
+        "name": "clk",
+        "dir": "input",
+        "width": 1,
+        "desc": "clock, rising edge"
+      },
+      {
+        "name": "rst_n",
+        "dir": "input",
+        "width": 1,
+        "desc": "active-low synchronous reset"
+      },
+      {
+        "name": "x",
+        "dir": "input",
+        "width": 26,
+        "desc": "softmax denominator, unsigned, non-zero"
+      },
+      {
+        "name": "valid_in",
+        "dir": "input",
+        "width": 1,
+        "desc": "x valid"
+      },
+      {
+        "name": "y",
+        "dir": "output",
+        "width": 17,
+        "desc": "reciprocal mantissa, always full width"
+      },
+      {
+        "name": "k",
+        "dir": "output",
+        "width": 5,
+        "desc": "normalisation shift; 1/x is y >> (42 - k)"
+      },
+      {
+        "name": "valid_out",
+        "dir": "output",
+        "width": 1,
+        "desc": "y updated this cycle"
+      }
+    ],
+    "behavior": [
+      "Stage 1 counts the leading zeros of x and registers both the count and x shifted left by it, so the value sits in [1,2).",
+      "Stage 2 registers the table entry the normalised mantissa selects and the shift the count implies.",
+      "Stage 3 registers the table entry and the count. The consumer applies the shift, which keeps the mantissa at full precision instead of truncating it here.",
+      "x is required to be non-zero, which the softmax denominator guarantees because it always contains exp(0) = 1.",
+      "Latency from valid_in to valid_out is 3 cycles."
+    ]
+  },
+  "tools": {
+    "iverilog": "/opt/homebrew/bin/iverilog",
+    "vvp": "/opt/homebrew/bin/vvp",
+    "yosys": "/opt/homebrew/bin/yosys",
+    "sta": "/Users/ssuleman/.local/bin/sta"
+  },
+  "agent": "RuleBasedAgent",
+  "converged": true,
+  "iterations_used": 2,
+  "history": [
+    {
+      "iteration": 1,
+      "fixes_applied": [],
+      "sim": {
+        "stage": "sim",
+        "status": "fail",
+        "checks": null,
+        "mismatches": [
+          {
+            "test": "recip",
+            "x": "3",
+            "expected_y": "87381",
+            "got_y": "131071",
+            "expected_k": "24",
+            "got_k": "24",
+            "vout": "1"
+          }
+        ]
+      },
+      "synth": null,
+      "timing": null,
+      "fpga": null
+    },
+    {
+      "iteration": 2,
+      "fixes_applied": [
+        "normalise_before_the_table"
+      ],
+      "sim": {
+        "stage": "sim",
+        "status": "pass",
+        "checks": 206,
+        "mismatches": [],
+        "throughput": {
+          "rows": 204,
+          "span_cycles": 816,
+          "latency_cycles": 3,
+          "units": 204,
+          "cycles_per_unit": 4.0
+        }
+      },
+      "synth": {
+        "stage": "synth",
+        "status": "pass",
+        "cell_count": 1562,
+        "area": 3216.0
+      },
+      "timing": {
+        "stage": "timing",
+        "status": "pass",
+        "method": "opensta",
+        "clock_period_ns": 10.0,
+        "worst_slack_ns": 5.52
+      },
+      "fpga": {
+        "luts": 238,
+        "ffs": 60,
+        "dsps": 0,
+        "brams": 0,
+        "urams": 0,
+        "carry": 0,
+        "muxf": 129,
+        "status": "pass",
+        "family": "xcup",
+        "top": "recip",
+        "lint": [],
+        "stage": "fpga"
+      }
+    }
+  ],
+  "final_metrics": {
+    "sim_pass": true,
+    "sim_checks": 206,
+    "cell_count": 1562,
+    "area": 3216.0,
+    "timing": {
+      "stage": "timing",
+      "status": "pass",
+      "method": "opensta",
+      "clock_period_ns": 10.0,
+      "worst_slack_ns": 5.52
+    }
+  }
+}

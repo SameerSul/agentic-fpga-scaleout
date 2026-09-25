@@ -662,6 +662,50 @@ def test_exp_block():
     shutil.rmtree(dv.DVDIR, ignore_errors=True)
 
 
+def test_recip_block():
+    """The other half of softmax: one reciprocal per row, multiplied in,
+    instead of a divider per weight."""
+    ms = load_model_spec()
+    spec = specgen_mod.derive_recip_spec(ms)
+    p = spec['parameters']
+    # Returning a mantissa and a shift rather than a pre-shifted value is
+    # the design decision worth pinning: the denominator spans ten bits,
+    # so a single fixed-point output holds as few as five significant
+    # bits at the top of the range and carries 6% error.
+    rnd = random.Random(2)
+    worst = 0.0
+    for _ in range(4000):
+        x = rnd.randrange(1 << 15, 1 << p['in_width'])
+        m, k = specgen_mod.recip_golden(x, p)
+        got = specgen_mod.recip_apply(1 << 40, m, k, p)
+        worst = max(worst, abs(got - (1 << 40) // x) / float((1 << 40) // x))
+    check('reciprocal is within 0.5%% of true division (%.3f%%)'
+          % (100 * worst), worst < 0.005)
+    check('the mantissa always uses its full width',
+          all(specgen_mod.recip_golden(x, p)[0] >= (1 << (p['out_width'] - 1))
+              for x in (1, 3, 1 << 15, (1 << p['in_width']) - 1)))
+
+    rtl = RuleBasedAgent().render_recip(spec, {agent_mod.FIX_NORM})
+    xs = [1, 2, 3, 1 << 15, (1 << 15) + 1, (1 << p['in_width']) - 1]
+    got = inference.run_recip_cosim(spec, xs, rtl)
+    check('generated reciprocal matches its model bit-exactly',
+          all(got.get(i) == specgen_mod.recip_golden(x, p)
+              for i, x in enumerate(xs)))
+    shutil.rmtree(inference.WORK, ignore_errors=True)
+
+    # Softmax end to end through both generated units.
+    import generate as g3
+    espec = specgen_mod.derive_exp_spec(ms)
+    hw = g3.HwModel(json.load(open(os.path.join(ROOT, 'tiny_llm.json'))),
+                    8, 28, inference.RequantModel(8, 18, 7), espec, spec)
+    ex = [hw.expi(-d) for d in (0.0, 0.5, 1.0, 3.0)]
+    w = hw.normalise(ex)
+    check('softmax weights through the generated units sum to one',
+          abs(sum(w) - 1.0) < 0.01)
+    check('softmax weights are ordered like their scores',
+          all(w[i] >= w[i + 1] for i in range(len(w) - 1)))
+
+
 def test_fpga_backend(profile, fp):
     """Real device mapping, not generic cells: the two generated blocks land
     on different resources, which is what makes a single capacity proxy
@@ -882,6 +926,7 @@ if __name__ == '__main__':
     test_inference_arithmetic()
     test_requant_block()
     test_exp_block()
+    test_recip_block()
     test_generation()
     test_bitstream()
     test_fit_monotonic(profile)
