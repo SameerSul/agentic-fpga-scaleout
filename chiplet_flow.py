@@ -42,6 +42,12 @@ FABRIC_JOB = {
     "profile_file": "fabric_profile.json", "report_file": "report_crc.json",
     "derive_from_link": True,
 }
+RSQRT_JOB = {
+    "spec_file": "spec_rsqrt.json", "tb_file": "tb_rsqrt.v",
+    "rtl_file": "rsqrt.v", "profile_file": "rsqrt_profile.json",
+    "report_file": "report_rsqrt.json",
+    "derive_from_model": "rsqrt",
+}
 RECIP_JOB = {
     "spec_file": "spec_recip.json", "tb_file": "tb_recip.v",
     "rtl_file": "recip.v", "profile_file": "recip_profile.json",
@@ -315,8 +321,9 @@ def derive_profile(spec, final):
         prof["data_width"] = spec["parameters"]["data_width"]
         prof["acc_width"] = spec["parameters"]["acc_width"]
     elif unit == "row":
-        prof["recip_unit"] = spec["name"]
-        prof["shift_bias"] = spec["parameters"]["shift_bias"]
+        prof["row_unit"] = spec["name"]
+        if "shift_bias" in spec["parameters"]:
+            prof["shift_bias"] = spec["parameters"]["shift_bias"]
     elif unit == "score":
         prof["exp_unit"] = spec["name"]
         prof["in_frac"] = spec["parameters"]["in_frac"]
@@ -383,7 +390,10 @@ def run_flow(job=None, verbose=True, agent=None, max_iters=None):
     say = print if verbose else (lambda *a, **k: None)
     os.makedirs(BUILD, exist_ok=True)
     shutil.copy(LIB, BUILD)
-    if job.get("derive_from_model") == "recip":
+    if job.get("derive_from_model") == "rsqrt":
+        specgen.generate_rsqrt(spec_file=job["spec_file"],
+                               tb_file=job["tb_file"])
+    elif job.get("derive_from_model") == "recip":
         specgen.generate_recip(spec_file=job["spec_file"],
                                tb_file=job["tb_file"])
     elif job.get("derive_from_model") == "exp":

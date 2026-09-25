@@ -333,6 +333,60 @@ def run_requant_cosim(spec, vectors, rtl_src):
     return got
 
 
+def run_rsqrt_cosim(spec, xs, rtl_src):
+    """Drive real mean-of-squares values through the generated rsqrt."""
+    p = spec["parameters"]
+    iw, ow = p["in_width"], p["out_width"]
+    ew = max(4, iw.bit_length())
+    body = "\n".join("    drive(%d'd%d, %d);" % (iw, x, i)
+                     for i, x in enumerate(xs))
+    tb = """`timescale 1ns/1ps
+module tb_rscosim;
+  reg clk = 0, rst_n = 0, valid_in = 0;
+  reg  [{iwm}:0] x = 0;
+  wire [{owm}:0] y;
+  wire [{ewm}:0] e;
+  wire valid_out;
+  rsqrt dut (.clk(clk), .rst_n(rst_n), .x(x), .valid_in(valid_in),
+             .y(y), .e(e), .valid_out(valid_out));
+  always #5 clk = ~clk;
+  task drive(input [{iwm}:0] xi, input integer idx);
+    begin
+      @(negedge clk); x = xi; valid_in = 1;
+      @(negedge clk); valid_in = 0;
+      repeat ({settle}) @(negedge clk);
+      $display("RS %0d %0d %0d", idx, y, e);
+    end
+  endtask
+  initial begin
+    repeat (3) @(negedge clk); rst_n = 1; @(negedge clk);
+{body}
+    $display("COSIM_DONE");
+    $finish;
+  end
+endmodule
+""".format(iwm=iw - 1, owm=ow - 1, ewm=ew - 1,
+           settle=p["pipeline_stages"] - 1, body=body)
+    shutil.rmtree(WORK, ignore_errors=True)
+    os.makedirs(WORK)
+    open(os.path.join(WORK, "rsqrt.v"), "w").write(rtl_src)
+    open(os.path.join(WORK, "tb.v"), "w").write(tb)
+    r = subprocess.run(["iverilog", "-g2005", "-o", "rs.out", "tb.v",
+                        "rsqrt.v"], cwd=WORK, capture_output=True, text=True)
+    if r.returncode:
+        raise SystemExit("rsqrt cosim compile failed:\n" + r.stdout + r.stderr)
+    r = subprocess.run(["vvp", "rs.out"], cwd=WORK, capture_output=True,
+                       text=True, timeout=600)
+    got = {}
+    for line in r.stdout.splitlines():
+        if line.startswith("RS "):
+            _, idx, m, e = line.split()
+            got[int(idx)] = (int(m), int(e))
+    if "COSIM_DONE" not in r.stdout:
+        raise SystemExit("rsqrt cosim did not finish:\n" + r.stdout[-800:])
+    return got
+
+
 def run_recip_cosim(spec, xs, rtl_src):
     """Drive real softmax denominators through the generated reciprocal."""
     p = spec["parameters"]

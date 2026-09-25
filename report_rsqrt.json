@@ -1,0 +1,166 @@
+{
+  "spec": {
+    "name": "rsqrt28_gpt2_124m",
+    "description": "Inverse square root for RMSNorm: 28-bit unsigned mean of squares, returns a 17-bit mantissa and a halved exponent, by normalising to [1,4) and a 256-entry table",
+    "top_module": "rsqrt",
+    "unit": "row",
+    "parameters": {
+      "in_width": 28,
+      "out_width": 17,
+      "lut_bits": 8,
+      "signed": false,
+      "pipeline_stages": 3,
+      "target_clock_mhz": 100
+    },
+    "derivation": {
+      "model": "gpt2_124m",
+      "activation_bits": 8,
+      "reduction_depth": 3072,
+      "rule": "in_width holds a sum of 3072 squares of 8-bit values; the output is a mantissa and a halved exponent, so a normalised activation is one multiply and one shift"
+    },
+    "ports": [
+      {
+        "name": "clk",
+        "dir": "input",
+        "width": 1,
+        "desc": "clock, rising edge"
+      },
+      {
+        "name": "rst_n",
+        "dir": "input",
+        "width": 1,
+        "desc": "active-low synchronous reset"
+      },
+      {
+        "name": "x",
+        "dir": "input",
+        "width": 28,
+        "desc": "mean of squares, unsigned"
+      },
+      {
+        "name": "valid_in",
+        "dir": "input",
+        "width": 1,
+        "desc": "x valid"
+      },
+      {
+        "name": "y",
+        "dir": "output",
+        "width": 17,
+        "desc": "1/sqrt mantissa, always full width"
+      },
+      {
+        "name": "e",
+        "dir": "output",
+        "width": 5,
+        "desc": "halved exponent; 1/sqrt(x) is y >> (17 + e)"
+      },
+      {
+        "name": "valid_out",
+        "dir": "output",
+        "width": 1,
+        "desc": "y updated this cycle"
+      }
+    ],
+    "behavior": [
+      "Stage 1 finds the position of the highest set bit and halves it, registering both the even normalisation and the shifted value, which then lies in [1,4).",
+      "Stage 2 registers the table entry that mantissa selects.",
+      "Stage 3 registers the entry and the halved exponent. The consumer applies the shift, keeping the mantissa full width.",
+      "A zero input returns the saturated mantissa; RMSNorm adds an epsilon before this unit so that case does not arise.",
+      "Latency from valid_in to valid_out is 3 cycles."
+    ]
+  },
+  "tools": {
+    "iverilog": "/opt/homebrew/bin/iverilog",
+    "vvp": "/opt/homebrew/bin/vvp",
+    "yosys": "/opt/homebrew/bin/yosys",
+    "sta": "/Users/ssuleman/.local/bin/sta"
+  },
+  "agent": "RuleBasedAgent",
+  "converged": true,
+  "iterations_used": 2,
+  "history": [
+    {
+      "iteration": 1,
+      "fixes_applied": [],
+      "sim": {
+        "stage": "sim",
+        "status": "fail",
+        "checks": null,
+        "mismatches": [
+          {
+            "test": "rsqrt",
+            "x": "1",
+            "expected_y": "131071",
+            "got_y": "92682",
+            "expected_e": "0",
+            "got_e": "0",
+            "vout": "1"
+          }
+        ]
+      },
+      "synth": null,
+      "timing": null,
+      "fpga": null
+    },
+    {
+      "iteration": 2,
+      "fixes_applied": [
+        "align_the_exponent_to_an_even_boundary"
+      ],
+      "sim": {
+        "stage": "sim",
+        "status": "pass",
+        "checks": 212,
+        "mismatches": [],
+        "throughput": {
+          "rows": 210,
+          "span_cycles": 840,
+          "latency_cycles": 3,
+          "units": 210,
+          "cycles_per_unit": 4.0
+        }
+      },
+      "synth": {
+        "stage": "synth",
+        "status": "pass",
+        "cell_count": 1351,
+        "area": 2797.0
+      },
+      "timing": {
+        "stage": "timing",
+        "status": "pass",
+        "method": "opensta",
+        "clock_period_ns": 10.0,
+        "worst_slack_ns": 4.24
+      },
+      "fpga": {
+        "luts": 214,
+        "ffs": 57,
+        "dsps": 0,
+        "brams": 0,
+        "urams": 0,
+        "carry": 1,
+        "muxf": 115,
+        "status": "pass",
+        "family": "xcup",
+        "top": "rsqrt",
+        "lint": [],
+        "stage": "fpga"
+      }
+    }
+  ],
+  "final_metrics": {
+    "sim_pass": true,
+    "sim_checks": 212,
+    "cell_count": 1351,
+    "area": 2797.0,
+    "timing": {
+      "stage": "timing",
+      "status": "pass",
+      "method": "opensta",
+      "clock_period_ns": 10.0,
+      "worst_slack_ns": 4.24
+    }
+  }
+}

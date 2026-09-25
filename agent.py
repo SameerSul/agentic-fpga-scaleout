@@ -17,6 +17,7 @@ FIX_XOR = "apply_final_inversion"
 FIX_SATURATE = "saturate_instead_of_wrap"
 FIX_LUT = "interpolate_the_fractional_part"
 FIX_NORM = "normalise_before_the_table"
+FIX_EVEN = "align_the_exponent_to_an_even_boundary"
 # One definition, in specgen, so the declared depth and the generated
 # depth cannot disagree.
 WIDE_ADD_BITS = specgen.WIDE_ADD_BITS
@@ -37,6 +38,8 @@ class RuleBasedAgent:
             return self.render_exp(spec, fixes), sorted(fixes)
         if spec["top_module"] == "recip":
             return self.render_recip(spec, fixes), sorted(fixes)
+        if spec["top_module"] == "rsqrt":
+            return self.render_rsqrt(spec, fixes), sorted(fixes)
         return self.render_mac(spec, fixes), sorted(fixes)
 
     def diagnose(self, spec, history):
@@ -54,6 +57,10 @@ class RuleBasedAgent:
                     fixes.add(FIX_XOR)
                 elif "clear" in m.get("test", "").lower():
                     fixes.add(FIX_CLEAR)
+                elif "expected_e" in m:
+                    # The inverse square root's only seeded bug: the
+                    # normalisation was aligned to an odd boundary.
+                    fixes.add(FIX_EVEN)
                 elif "expected_k" in m:
                     # The reciprocal's only seeded bug: the table was
                     # indexed before normalisation.
@@ -69,6 +76,92 @@ class RuleBasedAgent:
                 elif m.get("got_acc") != m.get("expected_acc"):
                     fixes.add(FIX_WIDTH)
         return fixes
+
+    def render_rsqrt(self, spec, fixes):
+        """Inverse square root by even normalisation, table, and a halved
+        exponent.
+
+        A square root halves the exponent, so the input has to be
+        normalised by an even number of bits or the halved exponent is
+        not an integer. That makes the mantissa span two octaves instead
+        of one, which is why the table covers [1,4).
+
+        The seeded first-cut bug is aligning to an odd boundary, which
+        leaves the result wrong by a factor of root two for half of all
+        inputs and exactly right for the other half.
+        """
+        p = spec["parameters"]
+        iw, ow, lb = p["in_width"], p["out_width"], p["lut_bits"]
+        ew = max(4, iw.bit_length())
+        lut = specgen.rsqrt_lut(lb, ow)
+        arms = "\n".join("      %d'd%d: lut = %d'd%d;" % (lb, i, ow, v)
+                          for i, v in enumerate(lut))
+        align = iw - 2 if FIX_EVEN in fixes else iw - 1
+        return """module rsqrt (
+  input               clk,
+  input               rst_n,
+  input      [{iwm}:0] x,
+  input               valid_in,
+  output reg [{owm}:0] y,
+  output reg [{ewm}:0] e,
+  output reg          valid_out
+);
+  // Normalise by an even number of bits so the halved exponent is an
+  // integer, which makes the mantissa span [1,4) and the table index the
+  // top bits of it directly. The consumer applies the shift, so the
+  // mantissa stays full width.
+  function [{ewm}:0] msb;
+    input [{iwm}:0] v;
+    integer i;
+    begin
+      msb = 0;
+      for (i = {iwm}; i >= 0; i = i - 1)
+        if (v[i] && msb == 0) msb = i[{ewm}:0];
+    end
+  endfunction
+
+  function [{owm}:0] lut;
+    input [{lbm}:0] idx;
+    case (idx)
+{arms}
+      default: lut = {ow}'d{one};
+    endcase
+  endfunction
+
+  wire [{ewm}:0] e_w  = msb(x) >> 1;
+  wire [{ewm}:0] s_w  = {align} - (e_w << 1);
+  wire [{iwm}:0] xn_w = x << s_w;
+  reg  [{iwm}:0] xn;
+  reg  [{ewm}:0] e1, e2;
+  reg  [{owm}:0] m;
+  reg            vpipe, vpipe2;
+  always @(posedge clk) begin
+    if (!rst_n) begin
+      xn        <= 0;
+      e1        <= 0;
+      e2        <= 0;
+      m         <= 0;
+      y         <= 0;
+      e         <= 0;
+      vpipe     <= 1'b0;
+      vpipe2    <= 1'b0;
+      valid_out <= 1'b0;
+    end else begin
+      xn        <= xn_w;
+      e1        <= e_w;
+      vpipe     <= valid_in;
+      m         <= lut(xn[{hi}:{lo}]);
+      e2        <= e1;
+      vpipe2    <= vpipe;
+      y         <= m;
+      e         <= e2;
+      valid_out <= vpipe2;
+    end
+  end
+endmodule
+""".format(iwm=iw - 1, owm=ow - 1, ewm=ew - 1, lbm=lb - 1, ow=ow,
+           arms=arms, one=(1 << ow) - 1, align=align,
+           hi=iw - 1, lo=iw - lb)
 
     def render_recip(self, spec, fixes):
         """Reciprocal by normalise, look up, and hand back the shift.

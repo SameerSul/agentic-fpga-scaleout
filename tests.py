@@ -706,6 +706,50 @@ def test_recip_block():
           all(w[i] >= w[i + 1] for i in range(len(w) - 1)))
 
 
+def test_rsqrt_block():
+    """The inverse square root RMSNorm needs. The sum of squares is the
+    MAC unit and the mean is a shift; this is the part that needs its own
+    hardware."""
+    ms = load_model_spec()
+    spec = specgen_mod.derive_rsqrt_spec(ms)
+    p = spec['parameters']
+    # A square root halves the exponent, so the normalisation must move
+    # the value an even number of bits. At an odd input width that shift
+    # goes negative for the largest inputs.
+    check('input width is even so the halved exponent is an integer',
+          p['in_width'] % 2 == 0)
+    big = dict(ms, weight_bits=8, activation_bits=16, d_model=2048,
+               d_ff=8192)
+    check('the width stays even for every model spec',
+          specgen_mod.derive_rsqrt_spec(big)['parameters']['in_width'] % 2
+          == 0)
+
+    rnd = random.Random(8)
+    worst = 0.0
+    for _ in range(4000):
+        x = rnd.randrange(1, 1 << p['in_width'])
+        m, e = specgen_mod.rsqrt_golden(x, p)
+        got = specgen_mod.rsqrt_apply(1 << 30, m, e, p)
+        want = (1 << 30) / math.sqrt(x)
+        worst = max(worst, abs(got - want) / want)
+    check('inverse square root within 1%% of true (%.3f%%)' % (100 * worst),
+          worst < 0.01)
+    check('exact at the powers of four, where the table is exact',
+          all(abs(specgen_mod.rsqrt_apply(1 << 20,
+                                          *specgen_mod.rsqrt_golden(x, p),
+                                          p=p) / 2.0 ** 20
+                  - 1.0 / math.sqrt(x)) < 1e-5
+              for x in (1, 4, 16, 64, 256)))
+
+    rtl = RuleBasedAgent().render_rsqrt(spec, {agent_mod.FIX_EVEN})
+    xs = [1, 2, 3, 4, 1 << 10, (1 << p['in_width']) - 1]
+    got = inference.run_rsqrt_cosim(spec, xs, rtl)
+    check('generated inverse square root matches its model bit-exactly',
+          all(got.get(i) == specgen_mod.rsqrt_golden(x, p)
+              for i, x in enumerate(xs)))
+    shutil.rmtree(inference.WORK, ignore_errors=True)
+
+
 def test_fpga_backend(profile, fp):
     """Real device mapping, not generic cells: the two generated blocks land
     on different resources, which is what makes a single capacity proxy
@@ -927,6 +971,7 @@ if __name__ == '__main__':
     test_requant_block()
     test_exp_block()
     test_recip_block()
+    test_rsqrt_block()
     test_generation()
     test_bitstream()
     test_fit_monotonic(profile)

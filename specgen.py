@@ -604,6 +604,219 @@ def generate_recip(ms=None, spec_file="spec_recip.json",
     return spec
 
 
+def rsqrt_lut(lut_bits, out_width):
+    """Indexed by the top lut_bits of the normalised input.
+
+    A square root halves the exponent, so the input is normalised by an
+    even number of bits and its mantissa spans two octaves rather than
+    one: the index runs over [2**(lut_bits-2), 2**lut_bits), standing for
+    a value in [1,4). Indexing by those bits directly is what lets the
+    hardware skip a divide; an earlier formulation mapped the mantissa
+    linearly onto the table and needed a division by three to do it.
+    """
+    n, lo = 1 << lut_bits, 1 << (lut_bits - 2)
+    out = []
+    for i in range(n):
+        if i < lo:
+            out.append((1 << out_width) - 1)      # only reachable at x = 0
+        else:
+            out.append(min((1 << out_width) - 1,
+                           int(round((1 << out_width)
+                                     / math.sqrt(i / float(lo))))))
+    return out
+
+
+def rsqrt_golden(x, p):
+    """Exact fixed-point model of the inverse square root unit.
+
+    Returns (mantissa, e) with 1/sqrt(x) == mantissa >> (out_width + e).
+    x is a mean of squares, so it is non-negative; zero returns the
+    saturated mantissa, which is what a normalisation epsilon is for.
+    """
+    iw, ow, lb = p["in_width"], p["out_width"], p["lut_bits"]
+    if x <= 0:
+        return (1 << ow) - 1, 0
+    e = (x.bit_length() - 1) // 2      # halved exponent
+    s = iw - 2 - 2 * e                 # even-aligned left shift, >= 0
+    xn = x << s
+    idx = (xn >> (iw - lb)) & ((1 << lb) - 1)
+    return rsqrt_lut(lb, ow)[idx], e
+
+
+def rsqrt_apply(num, m, e, p):
+    """What a consumer does with (mantissa, e): num / sqrt(x)."""
+    return (num * m) >> (p["out_width"] + e)
+
+
+def derive_rsqrt_spec(ms):
+    """model spec -> inverse square root spec.
+
+    RMSNorm, which is what the target model family normalises with,
+    divides an activation by the root mean square of its row. The sum of
+    squares is the MAC unit and the mean is a shift; this is the only
+    part that needs its own hardware.
+    """
+    ab = ms["activation_bits"]
+    depth = max(ms["d_model"], ms["d_ff"])
+    # A sum of depth squares of ab-bit values, before the mean shift.
+    # Rounded up to an even width: the normalisation has to move the
+    # value by an even number of bits so the halved exponent is an
+    # integer, and at an odd width that shift goes negative for the
+    # largest inputs. One spare bit is cheaper than handling it.
+    iw = 2 * ab + math.ceil(math.log2(depth))
+    iw += iw & 1
+    ow, lb = 17, 8
+    return {
+        "name": "rsqrt%d_%s" % (iw, ms["name"]),
+        "description": "Inverse square root for RMSNorm: %d-bit unsigned "
+                       "mean of squares, returns a %d-bit mantissa and a "
+                       "halved exponent, by normalising to [1,4) and a "
+                       "%d-entry table" % (iw, ow, 1 << lb),
+        "top_module": "rsqrt",
+        "unit": "row",
+        "parameters": {
+            "in_width": iw, "out_width": ow, "lut_bits": lb,
+            "signed": False, "pipeline_stages": 3,
+            "target_clock_mhz": 100,
+        },
+        "derivation": {
+            "model": ms["name"],
+            "activation_bits": ab,
+            "reduction_depth": depth,
+            "rule": "in_width holds a sum of %d squares of %d-bit values; "
+                    "the output is a mantissa and a halved exponent, so a "
+                    "normalised activation is one multiply and one shift"
+                    % (depth, ab),
+        },
+        "ports": [
+            {"name": "clk", "dir": "input", "width": 1,
+             "desc": "clock, rising edge"},
+            {"name": "rst_n", "dir": "input", "width": 1,
+             "desc": "active-low synchronous reset"},
+            {"name": "x", "dir": "input", "width": iw,
+             "desc": "mean of squares, unsigned"},
+            {"name": "valid_in", "dir": "input", "width": 1,
+             "desc": "x valid"},
+            {"name": "y", "dir": "output", "width": ow,
+             "desc": "1/sqrt mantissa, always full width"},
+            {"name": "e", "dir": "output", "width": max(4, iw.bit_length()),
+             "desc": "halved exponent; 1/sqrt(x) is y >> (%d + e)" % ow},
+            {"name": "valid_out", "dir": "output", "width": 1,
+             "desc": "y updated this cycle"},
+        ],
+        "behavior": [
+            "Stage 1 finds the position of the highest set bit and halves "
+            "it, registering both the even normalisation and the shifted "
+            "value, which then lies in [1,4).",
+            "Stage 2 registers the table entry that mantissa selects.",
+            "Stage 3 registers the entry and the halved exponent. The "
+            "consumer applies the shift, keeping the mantissa full width.",
+            "A zero input returns the saturated mantissa; RMSNorm adds an "
+            "epsilon before this unit so that case does not arise.",
+            "Latency from valid_in to valid_out is 3 cycles.",
+        ],
+    }
+
+
+def render_rsqrt_testbench(spec):
+    p = spec["parameters"]
+    iw = p["in_width"]
+    rnd = random.Random(37)
+    xs = [1, 2, 3, 4, 5, (1 << 10), (1 << 10) + 7, (1 << (iw - 1)),
+          (1 << iw) - 1]
+    xs += [rnd.randrange(1, 1 << iw) for _ in range(120)]
+    for b in range(1, iw):
+        xs += [(1 << b) - 1, (1 << b), (1 << b) + 1]
+    xs = [x for x in xs if 1 <= x < (1 << iw)]
+    ew = max(4, iw.bit_length())
+    body = "\n".join(
+        "    drive(%d'd%d, %d'd%d, %d'd%d);"
+        % ((iw, x, p["out_width"]) + (rsqrt_golden(x, p)[0],)
+           + (ew, rsqrt_golden(x, p)[1]))
+        for x in xs)
+    return RSQRT_TB.format(iwm=iw - 1, owm=p["out_width"] - 1, ewm=ew - 1,
+                           settle=p["pipeline_stages"] - 1,
+                           cases=body, n=len(xs))
+
+
+RSQRT_TB = """`timescale 1ns/1ps
+// GENERATED by specgen.py: do not edit by hand.
+// Self-checking testbench for the RMSNorm inverse square root. Golden
+// values come from the Python fixed-point model; tests.py separately
+// checks that model against true 1/sqrt.
+module tb_rsqrt;
+  reg clk = 0, rst_n = 0, valid_in = 0;
+  reg  [{iwm}:0] x = 0;
+  wire [{owm}:0] y;
+  wire [{ewm}:0] e;
+  wire valid_out;
+  integer checks = 0;
+  reg [255:0] testname;
+
+  rsqrt dut (.clk(clk), .rst_n(rst_n), .x(x), .valid_in(valid_in),
+             .y(y), .e(e), .valid_out(valid_out));
+  always #5 clk = ~clk;
+
+  task expect_idle;
+    begin
+      checks = checks + 1;
+      if (valid_out !== 1'b0 || y !== 0 || e !== 0) begin
+        $display("TB_FAIL test=reset_init expected_y=0 got_y=%0d vout=%b",
+                 y, valid_out);
+        $display("TB_RESULT: FAIL");
+        $finish;
+      end
+    end
+  endtask
+
+  task drive(input [{iwm}:0] xi, input [{owm}:0] want,
+             input [{ewm}:0] wante);
+    begin
+      @(negedge clk); x = xi; valid_in = 1;
+      @(negedge clk); valid_in = 0;
+      repeat ({settle}) @(negedge clk);
+      checks = checks + 1;
+      if (y !== want || e !== wante || valid_out !== 1'b1) begin
+        $display("TB_FAIL test=%0s x=%0d expected_y=%0d got_y=%0d expected_e=%0d got_e=%0d vout=%b",
+                 testname, xi, want, y, wante, e, valid_out);
+        $display("TB_RESULT: FAIL");
+        $finish;
+      end
+    end
+  endtask
+
+  initial begin
+    testname = "reset_init";
+    repeat (3) @(negedge clk);
+    expect_idle;
+    rst_n = 1;
+    @(negedge clk);
+    expect_idle;
+    testname = "rsqrt";
+{cases}
+
+    $display("TB_PROFILE rows=%0d span_cycles=%0d latency_cycles=%0d",
+             {n}, {n} * (2 + {settle}), 1 + {settle});
+    $display("TB_PASS checks=%0d", checks);
+    $display("TB_RESULT: PASS");
+    $finish;
+  end
+endmodule
+"""
+
+
+def generate_rsqrt(ms=None, spec_file="spec_rsqrt.json",
+                   tb_file="tb_rsqrt.v"):
+    """Write the derived inverse square root spec and testbench."""
+    ms = ms or load_model_spec()
+    spec = derive_rsqrt_spec(ms)
+    with open(os.path.join(ROOT, spec_file), "w") as f:
+        json.dump(spec, f, indent=2)
+    with open(os.path.join(ROOT, tb_file), "w") as f:
+        f.write(render_rsqrt_testbench(spec))
+    return spec
+
+
 def derive_requant_spec(ms):
     """model spec -> requantization spec.
 

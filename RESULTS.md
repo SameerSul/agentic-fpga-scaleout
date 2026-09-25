@@ -17,21 +17,22 @@ one. The remaining gap is listed at the bottom rather than glossed over.
 ### The full suite
 
 ```
-python3 tests.py            # 158 tests, all passing
+python3 tests.py            # 163 tests, all passing
 ```
 
 ### Spec to RTL, across the spec space
 
-`python3 sweep.py` drives thirty three cases through every stage: derivation,
+`python3 sweep.py` drives thirty nine cases through every stage: derivation,
 RTL, simulation, synthesis, timing closure, FPGA mapping, the profile
 fields the sizing model consumes, and a mutation sweep of the testbench
-generated at that width. All thirty three clean.
+generated at that width. All thirty nine clean.
 
 | case | cyc/unit | fmax | cells | DV |
 |---|---|---|---|---|
 | mac gpt2_124m, int8, acc28 | 1.00 | 177 MHz | 1408 | 8/8 |
 | exp Q4.8 to Q0.15 | 4.00 | 172 MHz | 2347 | 4/4 |
 | recip 26b to 17b | 4.00 | 223 MHz | 1562 | 4/4 |
+| rsqrt 28b to 17b | 4.00 | 174 MHz | 1351 | 4/4 |
 | requant acc28 to 8 | 7.00 | 102 MHz | 9274 | 5/5 |
 | mac int4 weights, acc24 | 1.00 | 187 MHz | 1383 | 8/8 |
 | mac int16, acc46 | 1.00 | 104 MHz | 4570 | 6/6 |
@@ -219,6 +220,7 @@ generic cell library.
 | CRC32 endpoint, 1 B/cyc | 90 (1%) | 125 MHz | **236.63 MHz** | 9 checks |
 | exponential | 350 (4%) | 100 MHz | **101.73 MHz** | 153 checks |
 | reciprocal | 184 (2%) | 100 MHz | **299.67 MHz** | 206 checks |
+| inverse square root | 155 (2%) | 100 MHz | **256.81 MHz** | 212 checks |
 | requantizer | 1924 (25%) | 100 MHz | 97.88 MHz | 173 checks |
 
 **The bitstream is verified, not just produced.** icepack emits the actual
@@ -283,11 +285,14 @@ These are the distance between this repo and a local LLM host.
    an x86 machine with Vivado for the Zynq and Artix parts.
 2. **The generated blocks are the arithmetic, not the whole engine.** The
    flow generates the multiply-accumulate unit, the requantizer between
-   matmuls, the exponential and the reciprocal that softmax needs, and
-   the CRC32 fabric endpoint. Softmax is therefore hardware apart from
-   the accumulation of the sum. It does not generate the normalisations,
-   the attention sequencing, the weight streaming controller or the
-   memory subsystem. In `generate.py` those run on the host, and the
+   matmuls, the exponential and the reciprocal that softmax needs, the
+   inverse square root that RMSNorm needs, and the CRC32 fabric
+   endpoint. Softmax is hardware apart from accumulating the sum, and so
+   is the transcendental part of RMSNorm. It does not generate the
+   attention sequencing, the weight streaming controller or the memory
+   subsystem. The committed checkpoint has no norm layer, so the inverse
+   square root is verified as a block but is not exercised by the decode
+   in generate.py. In `generate.py` those run on the host, and the
    output says so each run.
 3. **The model is small and its weights are its own.** Qwen3-0.6B is not
    loaded; there is no numeric stack here to load it with and no network
