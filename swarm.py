@@ -33,6 +33,13 @@ import json
 
 MAX_REVIEW_ROUNDS = 1      # internal revisions before handing to the tools
 REVIEW_ACCEPT = "ACCEPT"
+# The reviewer is off by default. Across every bench run recorded in
+# RESULTS.md it accepted the draft every single time, including on runs the
+# tools then rejected, so it has not once changed an outcome and it costs a
+# call on each retry. The role is kept because it is cheap to re-enable on a
+# block hard enough to need it, but it is not on the measured path until it
+# earns its place: SwarmAgent(use_reviewer=True).
+USE_REVIEWER = False
 
 
 def _fmt_feedback(history):
@@ -53,18 +60,34 @@ def debugger_prompt(spec, history, last_rtl):
 
 
 def writer_prompt(spec, history, last_rtl, diagnosis, objections):
+    """Build the writer's prompt with the tool output as the authority.
+
+    The ordering here is load bearing. An earlier version put the debugger
+    above the tool feedback and labelled it "fix this", while demoting the
+    tool output to "RAW TOOL FEEDBACK". That tells the writer to trust a
+    hypothesis over ground truth, and when the hypothesis was wrong the
+    writer chased it for every remaining iteration: measured over five runs
+    on the signed spec, the swarm converged 3/5 where a single agent seeing
+    only the tool output converged 5/5. The tools are the only authority.
+    The diagnosis is a hint, it comes last, and it is labelled fallible.
+    """
     parts = [RULES.format(top=spec["top_module"]),
              "", "SPEC:", json.dumps(spec, indent=2)]
     if last_rtl:
-        parts += ["", "YOUR PREVIOUS ATTEMPT (revise it):", last_rtl]
-    if diagnosis:
-        parts += ["", "DIAGNOSIS FROM THE DEBUGGER (fix this):", diagnosis]
-    if objections:
-        parts += ["", "THE REVIEWER REJECTED YOUR LAST DRAFT FOR THESE "
-                      "REASONS (address every one):", objections]
+        parts += ["", "YOUR PREVIOUS ATTEMPT (it failed, revise it):",
+                  last_rtl]
     if history:
-        parts += ["", "RAW TOOL FEEDBACK, most recent last:",
-                  _fmt_feedback(history)]
+        parts += ["", "TOOL FEEDBACK, most recent last (make these pass). "
+                      "This is ground truth:", _fmt_feedback(history)]
+    if objections:
+        parts += ["", "A REVIEWER RAISED THESE OBJECTIONS TO YOUR LAST "
+                      "DRAFT (address them where they agree with the tool "
+                      "feedback above):", objections]
+    if diagnosis:
+        parts += ["", "ONE ENGINEER'S HYPOTHESIS ABOUT THE CAUSE. It is a "
+                      "hint, not a finding, and it may be wrong. Where it "
+                      "conflicts with the tool feedback above, believe the "
+                      "tools and ignore this:", diagnosis]
     return "\n".join(parts)
 
 
@@ -108,7 +131,8 @@ class SwarmAgent:
     """Writer, reviewer and debugger over one backend. Drop-in for LLMAgent."""
 
     def __init__(self, choice=None, review_rounds=MAX_REVIEW_ROUNDS,
-                 use_reviewer=True, use_debugger=True, escalate=True):
+                 use_reviewer=USE_REVIEWER, use_debugger=True,
+                 escalate=True):
         self.backend, self.model = pick_backend(choice)
         self.review_rounds = review_rounds
         self.use_reviewer = use_reviewer

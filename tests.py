@@ -190,7 +190,7 @@ def _scripted_swarm(replies, escalate=True):
     a = SwarmAgent.__new__(SwarmAgent)
     a.backend, a.model = '_test', 'fake'
     a.review_rounds = swarm_mod.MAX_REVIEW_ROUNDS
-    a.use_reviewer = a.use_debugger = True
+    a.use_reviewer = a.use_debugger = True   # tests drive it explicitly
     a.escalate = escalate
     a.last_rtl = None
     a.calls = {'writer': 0, 'reviewer': 0, 'debugger': 0}
@@ -266,7 +266,16 @@ def test_swarm_offline():
     check('debugger is told not to write verilog', 'not write any Verilog'
           in sent[0] or 'Do not write any Verilog' in sent[0])
     check('diagnosis reaches the writer prompt',
-          'must be 28' in sent[1] and 'DIAGNOSIS' in sent[1])
+          'must be 28' in sent[1] and 'HYPOTHESIS' in sent[1])
+    # Ordering is the fix for a measured regression: a diagnosis presented
+    # as authoritative above the tool output sent the writer chasing a wrong
+    # cause for every remaining iteration.
+    check('tool feedback outranks the diagnosis in the writer prompt',
+          sent[1].index('TOOL FEEDBACK') < sent[1].index('HYPOTHESIS'))
+    check('the diagnosis is labelled fallible, not a finding',
+          'may be wrong' in sent[1] and 'believe the tools' in sent[1])
+    check('tool feedback is named as ground truth',
+          'ground truth' in sent[1])
     check('writer prompt still carries the spec and the hard rules',
           str(spec['parameters']['acc_width']) in sent[1]
           and 'Verilog-2005' in sent[1])
@@ -295,10 +304,19 @@ def test_swarm_offline():
           out3.startswith('module mac'))
 
     a4, sent4 = _scripted_swarm(['diagnosis here', rtl_a, 'ACCEPT'])
+    a4.use_reviewer = swarm_mod.USE_REVIEWER    # the shipped default
     a4.last_rtl = rtl_b
     a4.propose(spec, fb)
-    check('all three roles engage once the tools have rejected something',
-          a4.calls == {'writer': 1, 'reviewer': 1, 'debugger': 1})
+    check('debugger and writer engage once the tools reject something',
+          a4.calls == {'writer': 1, 'reviewer': 0, 'debugger': 1})
+    a5, _ = _scripted_swarm(['diagnosis here', rtl_a, 'ACCEPT'])
+    a5.use_reviewer = True
+    a5.last_rtl = rtl_b
+    a5.propose(spec, fb)
+    check('all three roles engage when the reviewer is switched on',
+          a5.calls == {'writer': 1, 'reviewer': 1, 'debugger': 1})
+    check('the reviewer is off by default, having never changed an outcome',
+          swarm_mod.USE_REVIEWER is False)
 
     check('swarm satisfies the agent interface the orchestrator calls',
           callable(getattr(SwarmAgent, 'propose')))

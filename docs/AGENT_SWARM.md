@@ -44,9 +44,42 @@ cost exactly what one agent costs on work that was never going to fail,
 which is most work, and spend the extra calls only where a single agent
 would have been stuck.
 
-The reviewer still earns its place, but on the retry path: catching a width
-mismatch by reading costs one call, catching it by simulating costs a whole
-iteration of sim, synthesis, timing and mapping.
+## The reviewer is off, and the diagnosis is not authoritative
+
+Two further things the measurements changed.
+
+**The reviewer never rejected anything.** Across every bench run recorded
+in RESULTS.md it replied ACCEPT to every draft it was shown, including
+drafts the tools then rejected. It has not once changed an outcome, and it
+costs a call on every retry. It is off by default. The role is kept, and
+re-enabling it is one argument, because a harder block may be where it
+finally earns its place. It is not on the measured path until it does.
+
+**The debugger was actively harmful, because of where its output sat.** The
+first version of the writer prompt put the diagnosis above the tool output
+under the heading "DIAGNOSIS FROM THE DEBUGGER (fix this)", and demoted the
+tool output to "RAW TOOL FEEDBACK". That tells the writer to trust a
+hypothesis over ground truth. When the hypothesis was wrong the writer
+chased it for every remaining iteration, and on the signed spec the swarm
+converged 3/5 where a single agent seeing only the tool output converged
+5/5. Two runs burned sixteen calls each and never passed simulation.
+
+The call arithmetic is what identified it: sixteen calls over six
+iterations is exactly one writer plus five rounds of debugger, writer and
+reviewer, with no reviewer rejections at all. So the reviewer was inert and
+the only functional difference from a single agent on the retry path was
+the diagnosis.
+
+The tool feedback now comes first and is labelled ground truth, with the
+same imperative the single-agent path uses. The diagnosis comes last and is
+labelled a hint that may be wrong, to be ignored where it conflicts with
+the tools. Three tests pin that ordering, because it is the kind of thing a
+later edit reverts without noticing.
+
+The general lesson is worth stating plainly: adding a role to an agent
+system is not free and is not automatically an improvement. A role that
+speaks with more authority than its evidence supports makes the system
+worse than not having it.
 
 ## What did not change
 
