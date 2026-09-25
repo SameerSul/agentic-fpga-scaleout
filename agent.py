@@ -19,6 +19,7 @@ FIX_LUT = "interpolate_the_fractional_part"
 FIX_NORM = "normalise_before_the_table"
 FIX_EVEN = "align_the_exponent_to_an_even_boundary"
 FIX_CLRCOL = "clear_the_accumulator_between_columns"
+FIX_MEMLAT = "delay_valid_for_the_memory_read"
 # One definition, in specgen, so the declared depth and the generated
 # depth cannot disagree.
 WIDE_ADD_BITS = specgen.WIDE_ADD_BITS
@@ -61,9 +62,17 @@ class RuleBasedAgent:
                 elif "clear" in m.get("test", "").lower():
                     fixes.add(FIX_CLEAR)
                 elif "col" in m:
-                    # The sequencer's only seeded bug: no clear between
-                    # columns, so each sums into the one before it.
-                    fixes.add(FIX_CLRCOL)
+                    # Which column failed says which bug it is, which is
+                    # the same inference a human makes here. A wrong
+                    # column zero means the very first product was
+                    # wrong, so the data was not there yet: the valid
+                    # was not delayed for the memory read. A correct
+                    # column zero with a wrong one after it means the
+                    # accumulator was never cleared between them.
+                    if m.get("col") == "0":
+                        fixes.add(FIX_MEMLAT)
+                    else:
+                        fixes.add(FIX_CLRCOL)
                 elif "expected_e" in m:
                     # The inverse square root's only seeded bug: the
                     # normalisation was aligned to an odd boundary.
@@ -102,9 +111,17 @@ class RuleBasedAgent:
         dep_w, col_w, addr_w = (p["depth_width"], p["col_width"],
                                 p["addr_width"])
         stages = p["mac_stages"]
+        mlat = p.get("mem_latency", 1)
         clr = ("      if (state == S_EMIT) mac_clear <= 1'b1;"
                if FIX_CLRCOL in fixes else
                "      // first cut: no clear between columns")
+        # Synchronous memory: the data for an address lands a cycle
+        # later, so valid has to follow it. The first cut drives valid
+        # with the address and multiplies whatever the memory held
+        # before, which is right only for the very first element by
+        # accident.
+        vsel = "vdly" if FIX_MEMLAT in fixes else "issue"
+        drain_n = stages + mlat
         return """module matvec (
   input                    clk,
   input                    rst_n,
@@ -113,7 +130,7 @@ class RuleBasedAgent:
   input      [{colwm}:0] cols,
   output reg [{depwm}:0] a_addr,
   output reg [{addrwm}:0] w_addr,
-  output reg               mac_valid,
+  output                   mac_valid,
   output reg               mac_clear,
   output reg               col_valid,
   output reg [{colwm}:0] col_index,
@@ -127,6 +144,14 @@ class RuleBasedAgent:
   reg [{depwm}:0] row;
   reg [{colwm}:0] col;
   reg [3:0] drain;
+  reg issue, vdly;
+  // A running base rather than col*depth. The multiply is the obvious
+  // way to write it and it put a 12 by 12 multiplier in the control
+  // path: the generic library hid that at 134 MHz and real place and
+  // route came back at 69.6 against a 100 MHz target. The base only
+  // ever advances by depth, so an adder does the same job.
+  reg [{addrwm}:0] col_base;
+  assign mac_valid = {vsel};
 
   always @(posedge clk) begin
     if (!rst_n) begin
@@ -136,13 +161,16 @@ class RuleBasedAgent:
       drain     <= 0;
       a_addr    <= 0;
       w_addr    <= 0;
-      mac_valid <= 1'b0;
+      col_base  <= 0;
+      issue     <= 1'b0;
+      vdly      <= 1'b0;
       mac_clear <= 1'b0;
       col_valid <= 1'b0;
       col_index <= 0;
       busy      <= 1'b0;
     end else begin
-      mac_valid <= 1'b0;
+      vdly      <= issue;
+      issue     <= 1'b0;
       mac_clear <= 1'b0;
       col_valid <= 1'b0;
       case (state)
@@ -151,21 +179,22 @@ class RuleBasedAgent:
             state  <= S_RUN;
             row    <= 0;
             col    <= 0;
-            busy   <= 1'b1;
-            a_addr <= 0;
-            w_addr <= 0;
-            mac_valid <= 1'b1;
+            busy     <= 1'b1;
+            a_addr   <= 0;
+            w_addr   <= 0;
+            col_base <= 0;
+            issue  <= 1'b1;
           end
         end
         S_RUN: begin
           if (row + 1 == depth) begin
             state <= S_DRAIN;
-            drain <= {stages};
+            drain <= {drain_n};
           end else begin
             row       <= row + 1;
             a_addr    <= row + 1;
             w_addr    <= w_addr + 1;
-            mac_valid <= 1'b1;
+            issue     <= 1'b1;
           end
         end
         S_DRAIN: begin
@@ -186,9 +215,10 @@ class RuleBasedAgent:
             col       <= col + 1;
             row       <= 0;
             a_addr    <= 0;
-            w_addr    <= (col + 1) * depth;
+            col_base  <= col_base + depth;
+            w_addr    <= col_base + depth;
             state     <= S_RUN;
-            mac_valid <= 1'b1;
+            issue     <= 1'b1;
           end
         end
       endcase
@@ -196,7 +226,7 @@ class RuleBasedAgent:
   end
 endmodule
 """.format(depwm=dep_w - 1, colwm=col_w - 1, addrwm=addr_w - 1,
-           stages=stages, clr=clr)
+           drain_n=drain_n, clr=clr, vsel=vsel)
 
     def render_rsqrt(self, spec, fixes):
         """Inverse square root by even normalisation, table, and a halved

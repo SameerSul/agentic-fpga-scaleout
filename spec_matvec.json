@@ -11,6 +11,7 @@
     "addr_width": 24,
     "mac_stages": 2,
     "max_depth": 3072,
+    "mem_latency": 1,
     "signed": true,
     "pipeline_stages": 1,
     "target_clock_mhz": 100
@@ -98,9 +99,10 @@
   "behavior": [
     "start begins a product of cols columns, each a reduction of depth elements.",
     "For each column the sequencer issues depth consecutive addresses with mac_valid high, a_addr walking 0..depth-1 and w_addr walking col*depth..col*depth+depth-1.",
-    "It then holds mac_valid low for 2 cycles, the MAC's own pipeline depth, before asserting col_valid for one cycle with col_index set.",
+    "mac_valid follows the address by one cycle, because the memory registers its read. Driving it in the same cycle as the address multiplies whatever the memory held before.",
+    "It then holds mac_valid low for 3 cycles, the read latency plus the MAC's pipeline depth, before asserting col_valid for one cycle with col_index set.",
     "mac_clear is asserted after col_valid so the next column starts from zero. Without it every column accumulates into the one before it.",
     "busy is high from start until the last column is flagged.",
-    "Memory reads are asynchronous: data is expected in the same cycle as the address."
+    "Memory reads are synchronous: data arrives one cycle after the address, as block RAM provides."
   ]
 }

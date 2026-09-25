@@ -13,12 +13,18 @@ module tb_matvec;
   wire mac_valid, mac_clear, col_valid, busy;
   wire [11:0] col_index;
 
-  reg signed [7:0] amem [0:8-1];
-  reg signed [7:0] wmem [0:32-1];
-  reg signed [27:0] expect_col [0:4-1];
+  reg signed [7:0] amem [0:68-1];
+  reg signed [7:0] wmem [0:4216-1];
+  reg signed [27:0] expect_col [0:62-1];
 
-  wire signed [7:0] a_data = amem[a_addr];
-  wire signed [7:0] w_data = wmem[w_addr];
+  // Block RAM: the read is registered, so data lands a cycle after the
+  // address. An asynchronous model here would hide an off-by-one in the
+  // sequencer's valid, which is the bug this block is most prone to.
+  reg signed [7:0] a_data, w_data;
+  always @(posedge clk) begin
+    a_data <= amem[a_addr];
+    w_data <= wmem[w_addr];
+  end
 
   wire signed [27:0] acc;
   wire mac_vout;
@@ -51,66 +57,89 @@ module tb_matvec;
   end
 
   initial begin
-    amem[0] = 8'sd67;
-    amem[1] = 8'sd42;
-    amem[2] = -8'sd10;
-    amem[3] = -8'sd43;
-    amem[4] = 8'sd69;
-    amem[5] = 8'sd17;
-    amem[6] = 8'sd13;
-    amem[7] = 8'sd68;
-    wmem[0] = -8'sd124;
-    wmem[1] = -8'sd1;
-    wmem[2] = -8'sd119;
-    wmem[3] = 8'sd96;
-    wmem[4] = -8'sd49;
-    wmem[5] = -8'sd52;
-    wmem[6] = 8'sd35;
-    wmem[7] = -8'sd43;
-    wmem[8] = 8'sd3;
-    wmem[9] = -8'sd98;
-    wmem[10] = -8'sd67;
-    wmem[11] = -8'sd112;
-    wmem[12] = 8'sd93;
-    wmem[13] = 8'sd16;
-    wmem[14] = -8'sd18;
-    wmem[15] = -8'sd91;
-    wmem[16] = 8'sd56;
-    wmem[17] = 8'sd115;
-    wmem[18] = -8'sd64;
-    wmem[19] = -8'sd119;
-    wmem[20] = -8'sd65;
-    wmem[21] = -8'sd78;
-    wmem[22] = -8'sd55;
-    wmem[23] = -8'sd37;
-    wmem[24] = -8'sd101;
-    wmem[25] = 8'sd8;
-    wmem[26] = 8'sd34;
-    wmem[27] = -8'sd13;
-    wmem[28] = -8'sd115;
-    wmem[29] = -8'sd35;
-    wmem[30] = 8'sd94;
-    wmem[31] = -8'sd99;
-    expect_col[0] = -28'sd18022;
-    expect_col[1] = 28'sd1838;
-    expect_col[2] = 28'sd5297;
-    expect_col[3] = -28'sd20252;
+    // Filled by formula, matching the Python golden exactly.
+    for (i = 0; i < 68; i = i + 1)
+      amem[i] = (i * 104729 + 7) % 251 - 125;
+    for (i = 0; i < 4216; i = i + 1)
+      wmem[i] = (i * 7919 + 13) % 251 - 125;
+    expect_col[0] = -28'sd12280;
+    expect_col[1] = -28'sd91261;
+    expect_col[2] = -28'sd31690;
+    expect_col[3] = -28'sd69256;
+    expect_col[4] = -28'sd24745;
+    expect_col[5] = 28'sd17005;
+    expect_col[6] = -28'sd12278;
+    expect_col[7] = 28'sd17424;
+    expect_col[8] = 28'sd50138;
+    expect_col[9] = 28'sd3034;
+    expect_col[10] = 28'sd49302;
+    expect_col[11] = 28'sd17509;
+    expect_col[12] = 28'sd20605;
+    expect_col[13] = 28'sd31231;
+    expect_col[14] = -28'sd11355;
+    expect_col[15] = -28'sd30598;
+    expect_col[16] = -28'sd68164;
+    expect_col[17] = -28'sd44988;
+    expect_col[18] = -28'sd7756;
+    expect_col[19] = -28'sd11186;
+    expect_col[20] = 28'sd11237;
+    expect_col[21] = 28'sd8560;
+    expect_col[22] = -28'sd9930;
+    expect_col[23] = 28'sd50394;
+    expect_col[24] = 28'sd31402;
+    expect_col[25] = 28'sd41275;
+    expect_col[26] = 28'sd32323;
+    expect_col[27] = -28'sd10263;
+    expect_col[28] = 28'sd30734;
+    expect_col[29] = -28'sd11350;
+    expect_col[30] = -28'sd43896;
+    expect_col[31] = -28'sd28752;
+    expect_col[32] = -28'sd92171;
+    expect_col[33] = 28'sd13835;
+    expect_col[34] = 28'sd9652;
+    expect_col[35] = -28'sd25655;
+    expect_col[36] = 28'sd16095;
+    expect_col[37] = 28'sd15426;
+    expect_col[38] = 28'sd42367;
+    expect_col[39] = 28'sd49228;
+    expect_col[40] = 28'sd2124;
+    expect_col[41] = 28'sd31826;
+    expect_col[42] = 28'sd15846;
+    expect_col[43] = 28'sd19695;
+    expect_col[44] = 28'sd7229;
+    expect_col[45] = -28'sd91079;
+    expect_col[46] = -28'sd31508;
+    expect_col[47] = -28'sd69074;
+    expect_col[48] = 28'sd6561;
+    expect_col[49] = 28'sd17187;
+    expect_col[50] = -28'sd12096;
+    expect_col[51] = 28'sd10327;
+    expect_col[52] = 28'sd50320;
+    expect_col[53] = 28'sd3216;
+    expect_col[54] = 28'sd49484;
+    expect_col[55] = 28'sd22209;
+    expect_col[56] = 28'sd20787;
+    expect_col[57] = 28'sd31413;
+    expect_col[58] = -28'sd11173;
+    expect_col[59] = -28'sd14101;
+    expect_col[60] = -28'sd67982;
+    expect_col[61] = -28'sd44806;
     testname = "matvec";
     repeat (3) @(negedge clk);
     rst_n = 1;
-    depth = 8;
-    cols = 4;
+    depth = 68;
+    cols = 62;
     @(negedge clk);
     start = 1;
     @(negedge clk);
     start = 0;
     // Generous bound: depth+drain per column, plus slack.
-    for (i = 0; i < 4 * (8 + 8) + 40; i = i + 1)
+    for (i = 0; i < 62 * (68 + 10) + 60; i = i + 1)
       @(negedge clk);
     checks = checks + 1;
-    if (seen !== 4) begin
+    if (seen !== 62) begin
       $display("TB_FAIL test=%0s expected_acc=%0d got_acc=%0d",
-               "column_count", 4, seen);
+               "column_count", 62, seen);
       $display("TB_RESULT: FAIL");
       $finish;
     end
@@ -122,7 +151,7 @@ module tb_matvec;
       $finish;
     end
     $display("TB_PROFILE columns=%0d span_cycles=%0d latency_cycles=%0d",
-             4, 4 * 8, 8);
+             62, 62 * 68, 68);
     $display("TB_PASS checks=%0d", checks);
     $display("TB_RESULT: PASS");
     $finish;

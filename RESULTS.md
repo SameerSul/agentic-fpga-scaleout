@@ -17,7 +17,7 @@ one. The remaining gap is listed at the bottom rather than glossed over.
 ### The full suite
 
 ```
-python3 tests.py            # 170 tests, all passing
+python3 tests.py            # 173 tests, all passing
 ```
 
 ### Spec to RTL, across the spec space
@@ -33,7 +33,7 @@ generated at that width. All forty five clean.
 | exp Q4.8 to Q0.15 | 4.00 | 172 MHz | 2347 | 4/4 |
 | recip 26b to 17b | 4.00 | 223 MHz | 1562 | 4/4 |
 | rsqrt 28b to 17b | 4.00 | 174 MHz | 1351 | 4/4 |
-| matvec sequencer | 68.0 | 135 MHz | 2815 | 4/4 |
+| matvec sequencer | 68.0 | 169 MHz | 1397 | 4/4 |
 | requant acc28 to 8 | 7.00 | 102 MHz | 9274 | 5/5 |
 | mac int4 weights, acc24 | 1.00 | 187 MHz | 1383 | 8/8 |
 | mac int16, acc46 | 1.00 | 104 MHz | 4570 | 6/6 |
@@ -228,6 +228,7 @@ generic cell library.
 | exponential | 350 (4%) | 100 MHz | **101.73 MHz** | 153 checks |
 | reciprocal | 184 (2%) | 100 MHz | **299.67 MHz** | 206 checks |
 | inverse square root | 155 (2%) | 100 MHz | **256.81 MHz** | 212 checks |
+| matvec sequencer | 231 (3%) | 100 MHz | **103.89 MHz** | 64 checks |
 | requantizer | 1924 (25%) | 100 MHz | 97.88 MHz | 173 checks |
 
 **The bitstream is verified, not just produced.** icepack emits the actual
@@ -290,8 +291,26 @@ Its testbench instantiates the real MAC rather than a model of one, so
 the flow gained a notion of an integration job: a job may name extra
 sources, which are compiled into both the simulation and every mutant.
 
-Two things the sweep found, both in the testbench rather than the
-design. The matrix was 8 by 4, which leaves the top half of the derived
+It drives a synchronous memory, because block RAM registers its read.
+An asynchronous model would hide the bug this block is most prone to,
+so the second seeded bug is driving valid in the same cycle as the
+address, which multiplies whatever the memory held before. The two bugs
+fail at different columns, and that is enough to tell them apart: a
+wrong column zero means the data was not there yet, a correct column
+zero with a wrong one after it means the accumulator was never cleared.
+The agent uses exactly that inference and converges in three
+iterations, fixing one bug, uncovering the second and fixing that. It
+is the only multi-bug convergence in the repo.
+
+Real place and route then caught something the generic library hid.
+Writing the column base as col*depth puts a 12 by 12 multiplier in the
+control path. The library reported 134 MHz and silicon came back at
+69.6 against a 100 MHz target. The base only ever advances by depth, so
+a running accumulate replaces it: 103.89 MHz, and the device LUT count
+went from 559 to 231.
+
+Two further things the sweep found, both in the testbench rather than
+the design. The matrix was 8 by 4, which leaves the top half of the derived
 address register always zero, so a mutation that halved it survived
 every vector. Enlarging the matrix fixed it for the 24-bit case and not
 for the 28-bit one, because a fixed size cannot track a derived width:
@@ -318,9 +337,10 @@ These are the distance between this repo and a local LLM host.
    endpoint, and the weight-streaming sequencer that drives the MAC
    through a matrix. Softmax is hardware apart from accumulating the
    sum, and so is the transcendental part of RMSNorm. It does not
-   generate the attention sequencing above the matmul level or the
-   memory subsystem, and the sequencer assumes asynchronous memory
-   reads rather than driving a real memory controller. In `generate.py` those run on the host, and the
+   generate the attention sequencing above the matmul level, nor a
+   memory controller: the sequencer issues addresses and expects a
+   registered read, which is what block RAM gives, but nothing
+   generates the RAM itself or the logic that fills it. In `generate.py` those run on the host, and the
    output says so each run.
 3. **The model is small and its weights are its own.** Qwen3-0.6B is not
    loaded; there is no numeric stack here to load it with and no network

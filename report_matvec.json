@@ -12,6 +12,7 @@
       "addr_width": 24,
       "mac_stages": 2,
       "max_depth": 3072,
+      "mem_latency": 1,
       "signed": true,
       "pipeline_stages": 1,
       "target_clock_mhz": 100
@@ -99,10 +100,11 @@
     "behavior": [
       "start begins a product of cols columns, each a reduction of depth elements.",
       "For each column the sequencer issues depth consecutive addresses with mac_valid high, a_addr walking 0..depth-1 and w_addr walking col*depth..col*depth+depth-1.",
-      "It then holds mac_valid low for 2 cycles, the MAC's own pipeline depth, before asserting col_valid for one cycle with col_index set.",
+      "mac_valid follows the address by one cycle, because the memory registers its read. Driving it in the same cycle as the address multiplies whatever the memory held before.",
+      "It then holds mac_valid low for 3 cycles, the read latency plus the MAC's pipeline depth, before asserting col_valid for one cycle with col_index set.",
       "mac_clear is asserted after col_valid so the next column starts from zero. Without it every column accumulates into the one before it.",
       "busy is high from start until the last column is flagged.",
-      "Memory reads are asynchronous: data is expected in the same cycle as the address."
+      "Memory reads are synchronous: data arrives one cycle after the address, as block RAM provides."
     ]
   },
   "tools": {
@@ -113,7 +115,7 @@
   },
   "agent": "RuleBasedAgent",
   "converged": true,
-  "iterations_used": 2,
+  "iterations_used": 3,
   "history": [
     {
       "iteration": 1,
@@ -125,9 +127,9 @@
         "mismatches": [
           {
             "test": "matvec",
-            "col": "1",
-            "expected_acc": "1838",
-            "got_acc": "-16184"
+            "col": "0",
+            "expected_acc": "-12280",
+            "got_acc": "-1024"
           }
         ]
       },
@@ -138,42 +140,65 @@
     {
       "iteration": 2,
       "fixes_applied": [
-        "clear_the_accumulator_between_columns"
+        "delay_valid_for_the_memory_read"
+      ],
+      "sim": {
+        "stage": "sim",
+        "status": "fail",
+        "checks": null,
+        "mismatches": [
+          {
+            "test": "matvec",
+            "col": "1",
+            "expected_acc": "-91261",
+            "got_acc": "-103541"
+          }
+        ]
+      },
+      "synth": null,
+      "timing": null,
+      "fpga": null
+    },
+    {
+      "iteration": 3,
+      "fixes_applied": [
+        "clear_the_accumulator_between_columns",
+        "delay_valid_for_the_memory_read"
       ],
       "sim": {
         "stage": "sim",
         "status": "pass",
-        "checks": 6,
+        "checks": 64,
         "mismatches": [],
         "throughput": {
-          "columns": 4,
-          "span_cycles": 32,
-          "latency_cycles": 8,
-          "units": 4,
-          "cycles_per_unit": 8.0
+          "columns": 62,
+          "span_cycles": 4216,
+          "latency_cycles": 68,
+          "units": 62,
+          "cycles_per_unit": 68.0
         }
       },
       "synth": {
         "stage": "synth",
         "status": "pass",
-        "cell_count": 2815,
-        "area": 5569.0
+        "cell_count": 2841,
+        "area": 5619.0
       },
       "timing": {
         "stage": "timing",
         "status": "pass",
         "method": "opensta",
         "clock_period_ns": 10.0,
-        "worst_slack_ns": 2.58
+        "worst_slack_ns": 2.54
       },
       "fpga": {
-        "luts": 176,
-        "ffs": 72,
+        "luts": 165,
+        "ffs": 73,
         "dsps": 1,
         "brams": 0,
         "urams": 0,
         "carry": 15,
-        "muxf": 27,
+        "muxf": 17,
         "status": "pass",
         "family": "xcup",
         "top": "matvec",
@@ -184,15 +209,15 @@
   ],
   "final_metrics": {
     "sim_pass": true,
-    "sim_checks": 6,
-    "cell_count": 2815,
-    "area": 5569.0,
+    "sim_checks": 64,
+    "cell_count": 2841,
+    "area": 5619.0,
     "timing": {
       "stage": "timing",
       "status": "pass",
       "method": "opensta",
       "clock_period_ns": 10.0,
-      "worst_slack_ns": 2.58
+      "worst_slack_ns": 2.54
     }
   }
 }

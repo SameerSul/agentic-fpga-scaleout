@@ -847,6 +847,10 @@ def derive_matvec_spec(ms):
             "data_width": dw, "acc_width": aw,
             "depth_width": dep_w, "col_width": col_w, "addr_width": addr_w,
             "mac_stages": stages, "max_depth": depth,
+            # Block RAM registers its read. Assuming an asynchronous one
+            # is assuming a LUT RAM big enough to hold a weight matrix,
+            # which does not exist on these parts.
+            "mem_latency": 1,
             "signed": True, "pipeline_stages": 1,
             "target_clock_mhz": 100,
         },
@@ -890,15 +894,18 @@ def derive_matvec_spec(ms):
             "For each column the sequencer issues depth consecutive "
             "addresses with mac_valid high, a_addr walking 0..depth-1 and "
             "w_addr walking col*depth..col*depth+depth-1.",
-            "It then holds mac_valid low for %d cycles, the MAC's own "
-            "pipeline depth, before asserting col_valid for one cycle "
-            "with col_index set." % stages,
+            "mac_valid follows the address by one cycle, because the "
+            "memory registers its read. Driving it in the same cycle as "
+            "the address multiplies whatever the memory held before.",
+            "It then holds mac_valid low for %d cycles, the read latency "
+            "plus the MAC's pipeline depth, before asserting col_valid "
+            "for one cycle with col_index set." % (stages + 1),
             "mac_clear is asserted after col_valid so the next column "
             "starts from zero. Without it every column accumulates into "
             "the one before it.",
             "busy is high from start until the last column is flagged.",
-            "Memory reads are asynchronous: data is expected in the same "
-            "cycle as the address.",
+            "Memory reads are synchronous: data arrives one cycle after "
+            "the address, as block RAM provides.",
         ],
     }
 
@@ -960,8 +967,14 @@ module tb_matvec;
   reg signed [{dwm}:0] wmem [0:{nmem}-1];
   reg signed [{awm}:0] expect_col [0:{cols}-1];
 
-  wire signed [{dwm}:0] a_data = amem[a_addr];
-  wire signed [{dwm}:0] w_data = wmem[w_addr];
+  // Block RAM: the read is registered, so data lands a cycle after the
+  // address. An asynchronous model here would hide an off-by-one in the
+  // sequencer's valid, which is the bug this block is most prone to.
+  reg signed [{dwm}:0] a_data, w_data;
+  always @(posedge clk) begin
+    a_data <= amem[a_addr];
+    w_data <= wmem[w_addr];
+  end
 
   wire signed [{awm}:0] acc;
   wire mac_vout;

@@ -776,6 +776,15 @@ def test_matvec_sequencer():
     p = spec['parameters']
     check('the drain count is taken from the MAC it drives',
           p['mac_stages'] == c['parameters']['pipeline_stages'])
+    check('the sequencer expects a registered memory read',
+          p['mem_latency'] == 1)
+    # A multiply in the control path is invisible in the generic library
+    # and costs half the clock on real silicon.
+    rtl = RuleBasedAgent().render_matvec(spec, {agent_mod.FIX_CLRCOL,
+                                                agent_mod.FIX_MEMLAT})
+    check('no multiply in the address path',
+          '*' not in rtl.replace('/*', '').replace('*/', '')
+          .replace('* ', '').split('always')[1])
     # A deeper MAC must change this block, not silently desynchronise it.
     deep = dict(ms, weight_bits=16, activation_bits=16)
     check('a deeper MAC changes the sequencer',
@@ -793,8 +802,10 @@ def test_matvec_sequencer():
             RuleBasedAgent().render_mac(c, {agent_mod.FIX_WIDTH,
                                             agent_mod.FIX_CLEAR}))
         results = {}
-        for label, fx in (('first_cut', set()),
-                          ('fixed', {agent_mod.FIX_CLRCOL})):
+        for label, fx in (('no_clear', {agent_mod.FIX_MEMLAT}),
+                          ('no_delay', {agent_mod.FIX_CLRCOL}),
+                          ('fixed', {agent_mod.FIX_CLRCOL,
+                                     agent_mod.FIX_MEMLAT})):
             open(os.path.join(work, 'mv.v'), 'w').write(
                 RuleBasedAgent().render_matvec(spec, fx))
             r = subprocess.run(['iverilog', '-g2005', '-o', 's.out',
@@ -809,7 +820,12 @@ def test_matvec_sequencer():
         # Column zero is right either way; the bug only shows from the
         # second column, which is why a one-column test would miss it.
         check('a missing inter-column clear is caught',
-              not results['first_cut'])
+              not results['no_clear'])
+        # Block RAM registers its read, so valid has to follow the
+        # address. Driving them together multiplies stale data, and it
+        # is wrong from the very first element rather than the second.
+        check('a valid not delayed for the memory read is caught',
+              not results['no_delay'])
     finally:
         shutil.rmtree(work, ignore_errors=True)
 

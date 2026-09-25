@@ -30,7 +30,8 @@ import sys
 
 import specgen
 from agent import (RuleBasedAgent, FIX_WIDTH, FIX_CLEAR,
-                   FIX_SATURATE, FIX_XOR, FIX_LUT, FIX_NORM, FIX_EVEN)
+                   FIX_SATURATE, FIX_XOR, FIX_LUT, FIX_NORM, FIX_EVEN,
+                   FIX_CLRCOL, FIX_MEMLAT)
 from chiplet_flow import ROOT, TARGET_LINK_GBPS
 
 WORK = os.path.join(ROOT, "build_bitstream")
@@ -47,6 +48,7 @@ TB_FOR = {
     "exp": lambda spec: specgen.render_exp_testbench(spec),
     "recip": lambda spec: specgen.render_recip_testbench(spec),
     "rsqrt": lambda spec: specgen.render_rsqrt_testbench(spec),
+    "matvec": lambda spec: specgen.render_matvec_testbench(spec),
 }
 
 BLOCKS = {
@@ -61,7 +63,12 @@ BLOCKS = {
               {FIX_NORM}),
     "rsqrt": ("rsqrt", lambda ms: specgen.derive_rsqrt_spec(ms),
               {FIX_EVEN}),
+    # The sequencer's testbench instantiates the MAC, so its bitstream
+    # check needs that source alongside the unpacked design.
+    "matvec": ("matvec", lambda ms: specgen.derive_matvec_spec(ms),
+               {FIX_CLRCOL, FIX_MEMLAT}),
 }
+EXTRA_SRC = {"matvec": "mac"}
 
 
 ICEBOX_PY = "/opt/homebrew/Cellar/icestorm/1.1/share/icestorm/python"
@@ -273,11 +280,19 @@ def main():
                                                      top + "_bits"))
     tb = "tb_block.v"
     open(os.path.join(WORK, tb), "w").write(TB_FOR[a.block](spec))
+    extra = []
+    if a.block in EXTRA_SRC:
+        dep = EXTRA_SRC[a.block]
+        dtop, dderive, dfixes = BLOCKS[dep]
+        open(os.path.join(WORK, "dep.v"), "w").write(
+            getattr(RuleBasedAgent(), "render_" + dep)(dderive(ms), dfixes))
+        extra = ["dep.v"]
     cells = os.path.join(
         subprocess.run(["yosys-config", "--datdir"], capture_output=True,
                        text=True).stdout.strip(), "ice40", "cells_sim.v")
-    rc, out = run(["iverilog", "-g2005", "-o", "bit.out", "-DNO_ICE40_DEFAULT_ASSIGNMENTS",
-                   tb, "unpacked.v", cells])
+    rc, out = run(["iverilog", "-g2005", "-o", "bit.out",
+                   "-DNO_ICE40_DEFAULT_ASSIGNMENTS",
+                   tb, "unpacked.v", cells] + extra)
     if rc:
         print("   could not compile the unpacked bitstream for simulation:")
         print("   " + out.strip().splitlines()[0][:160] if out.strip() else "")
