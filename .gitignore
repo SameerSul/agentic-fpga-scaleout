@@ -21,3 +21,4 @@ bench_headtohead.log
 bench_swarm_fixed.log
 bench_swarm_escalate.log
 bench_signed.log
+bench_signed_swarm_fixed.log

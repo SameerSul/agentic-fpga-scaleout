@@ -66,24 +66,58 @@ operands and a wrapping accumulator.
 ### Agent consistency
 
 Five runs each, fresh agent per run, same job and same gates
-(`python3 bench.py --agent <kind> --runs 5`).
+(`python3 bench.py --agent <kind> --runs 5`). Two spec generations are
+reported separately because the signed spec is the harder problem and the
+earlier numbers were measured before it existed.
 
-| agent | converged | iterations | model calls | cell spread |
+On the current signed spec:
+
+| agent | converged | median calls | cell spread | first pass clean |
 |---|---|---|---|---|
-| rules | 2/2 | 3 | n/a | 0% |
-| solo LLM | 5/5 | 1 | 1 | 0% |
-| swarm, all roles always on | 5/5 | 1 median | 2 median | 5% |
+| solo LLM | 5/5 | 1 | 3% | 3/5 |
+| swarm, before the prompt fix | **3/5** | 1 | 0% | 3/3 |
+| swarm, after the prompt fix | 5/5 | 1 | 2% | 4/5 |
 
-The always-on swarm is not free and did not pay for itself: the reviewer
-accepted every first draft the tools then passed. That measurement is why
-the roles now escalate, a lone writer first and the other roles only after
-the tools reject something.
+On the earlier unsigned spec, which is where escalation was measured:
 
-An earlier swarm arm scored 4/5. That run used a build in which the writer
-was re-prompted with the previous iteration's RTL rather than the draft the
-reviewer had objected to, so it was asked to fix code it could not see.
-With that fixed the same configuration scores 5/5, and the 4/5 is recorded
-here only so the number is not quoted as a property of the design.
+| agent | converged | median calls | cell spread |
+|---|---|---|---|
+| rules (deterministic, free) | 2/2 | n/a | 0% |
+| solo LLM | 5/5 | 1 | 0% |
+| swarm, all roles always on | 5/5 | 2 | 5% |
+| swarm, escalating | 5/5 | 1 | 1% |
+
+Three measurements changed the design, and each is worth more than the
+final number:
+
+1. **The always-on swarm did not pay for itself.** The reviewer accepted
+   every first draft the tools then passed, so it doubled the cost of runs
+   that were already fine. Moving the debugger and reviewer behind a tool
+   failure took the median from two calls to one and the cell spread from
+   5% to 1%.
+2. **The swarm was worse than one agent on the hard path.** 3/5 against
+   5/5, with two runs burning sixteen calls and never passing simulation.
+   The cause was prompt ordering: the diagnosis sat above the tool output
+   labelled "fix this" while the tool output was demoted to "RAW", so a
+   wrong hypothesis cost every remaining iteration. With the tools restored
+   as the authority the same configuration scores 5/5, and the one hard run
+   recovered in five iterations using the debugger, which is the case the
+   swarm exists for.
+3. **The reviewer has never changed an outcome.** It replied ACCEPT to
+   every draft it was ever shown, including drafts the tools then rejected.
+   It is off by default.
+
+An earlier unsigned-spec swarm arm scored 4/5. That build re-prompted the
+writer with the previous iteration's RTL rather than the draft the reviewer
+had objected to, so it was asked to fix code it could not see. Fixed, the
+same configuration scores 5/5. It is recorded so the 4/5 is not quoted as a
+property of the design.
+
+The honest summary is that on these two blocks a single agent is already
+enough, and the swarm's value is not demonstrated so much as its cost is
+now neutral. It converges as often, at the same median cost, and has a
+recovery path a single agent does not. That is insurance, not a win, and it
+should be described that way until a block hard enough to need it shows up.
 
 ### Defects the flow used to sign off on, and now cannot
 
