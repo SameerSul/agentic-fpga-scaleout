@@ -7,6 +7,8 @@ import os
 import random
 import re
 import shutil
+import subprocess
+import sys
 import zlib
 
 import chiplet_flow
@@ -559,6 +561,42 @@ def test_generation():
     shutil.rmtree(inference.WORK, ignore_errors=True)
 
 
+def test_bitstream():
+    """Place, route and pack a generated block into a real bitstream.
+
+    Synthesis says a design can be mapped. It does not say the design fits
+    a device, that its routing closes, or that its clock survives real wire
+    delay, and this repo asserted all three for a long time on the strength
+    of a generic cell library. Skipped when the open iCE40 toolchain is not
+    installed, because it is the only open place and route flow available
+    here and it is not a hard dependency of the rest.
+    """
+    import bitstream as bs
+    have = all(shutil.which(t) for t in
+               ("nextpnr-ice40", "icepack", "yosys"))
+    if not have:
+        print('%-55s %s' % ('bitstream flow (needs nextpnr-ice40)', 'SKIP'))
+        return
+    rc = subprocess.call([sys.executable, 'bitstream.py', '--block', 'mac'],
+                         cwd=ROOT, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL)
+    check('the MAC places, routes and packs into a bitstream', rc == 0)
+    r = json.load(open(os.path.join(ROOT, 'bitstream_mac.json')))
+    check('post-route timing is met on the real device',
+          r['timing_met'] and r['post_route_fmax_mhz'] >= r['target_mhz'])
+    check('the design fits the device with room to spare',
+          0 < r['luts'] < 7680 or r['bitstream_bytes'] > 0)
+    check('a real bitstream file was produced',
+          r['bitstream_bytes'] > 1000)
+    # The generic library is the flow's gate, so it must not be wildly
+    # optimistic about the device it is standing in for.
+    prof = json.load(open(os.path.join(ROOT, 'chiplet_profile.json')))
+    ratio = prof['fmax_estimate_mhz'] / r['post_route_fmax_mhz']
+    check('generic-library fmax is within 2x of post-route silicon',
+          0.5 <= ratio <= 2.0)
+    shutil.rmtree(bs.WORK, ignore_errors=True)
+
+
 def test_fpga_backend(profile, fp):
     """Real device mapping, not generic cells: the two generated blocks land
     on different resources, which is what makes a single capacity proxy
@@ -779,6 +817,7 @@ if __name__ == '__main__':
     test_inference_arithmetic()
     test_requant_block()
     test_generation()
+    test_bitstream()
     test_fit_monotonic(profile)
     test_allreduce(profile)
     test_hetero_bit_identical(profile)

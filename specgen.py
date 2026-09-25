@@ -126,10 +126,17 @@ def derive_chiplet_spec(ms):
     }
 
 
-# Widest add that closes in one stage in the generic cell library. Measured:
-# a 46-bit add leaves +0.26 ns at 100 MHz, a 64-bit add is 3.4 ns over, and
-# every wide add in the block violated, so this is a property of the library
-# (no carry chain primitive) rather than of one arrangement.
+# Widest add that closes in one stage in the generic cell library, which is
+# what the flow gates on. Measured: a 46-bit add leaves +0.26 ns at 100 MHz,
+# a 64-bit add is 3.4 ns over, and every wide add violated, so it is a
+# property of the library (no carry chain) rather than of one arrangement.
+#
+# Lowering it to 40 was tried, so that 46-bit adds split too. The generic
+# library liked it (102 -> 109 MHz) and the real device did not (97.9 ->
+# 93.5 MHz on an iCE40 HX8K). More pipeline stages mean more registers and
+# more routing pressure, and on a real fabric this block is routing bound
+# rather than logic bound. The two disagree in direction, so the cheaper
+# structure wins.
 WIDE_ADD_BITS = 48
 # Widest accumulator that can go into a partial product whole. Above this
 # the multiplicand itself is sliced, because a multiply by a small slice is

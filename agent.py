@@ -186,6 +186,10 @@ class RuleBasedAgent:
         emit_add("summed", cur[0], "hf_last", built)
         for b in built:
             add_stage(b)
+        # The saturate stays in the last stage. Precomputing the two
+        # range flags beside the shift was tried, so the last stage would
+        # be a small mux: it duplicates the barrel shifter three times and
+        # took the real device from 97.88 MHz to 58.78. Measured, reverted.
         reg("shifted")
         add_stage([("shifted", "summed >>> sh_last")])
         nstage = len(stages) + 1           # + the saturate stage

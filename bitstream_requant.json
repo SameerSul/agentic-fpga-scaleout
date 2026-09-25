@@ -1,0 +1,11 @@
+{
+  "block": "requant",
+  "spec": "requant8_gpt2_124m",
+  "device": "ice40-hx8k-ct256",
+  "target_mhz": 100,
+  "post_route_fmax_mhz": 97.88,
+  "timing_met": false,
+  "luts": 0,
+  "bitstream_bytes": 135100,
+  "icetime_mhz": null
+}

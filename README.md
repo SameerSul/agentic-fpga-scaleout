@@ -82,7 +82,7 @@ One convenient alignment: Ethernet's frame check sequence is CRC-32 with polynom
 
 ```
 python3 demo.py                    # end-to-end, all nine stages, writes results.json (about 30 s)
-python3 tests.py                   # 138-check suite (both flows, spec derivation, DV mutation, FPGA mapping, transports, sizing physics)
+python3 tests.py                   # 143-check suite (both flows, spec derivation, DV mutation, FPGA mapping, transports, sizing physics)
 python3 chiplet_flow.py            # just the two agentic RTL loops, writes both profiles
 python3 chiplet_flow.py --agent llm    # same loops with a real LLM writing the RTL (Ollama, API, or Claude CLI)
 python3 chiplet_flow.py --agent swarm  # three roles behind the same interface, escalating on tool failure
@@ -91,6 +91,7 @@ python3 specgen.py                 # just the model-to-chiplet derivation
 python3 sweep.py                   # every spec end to end: 6 model specs, 4 link rates, all gates plus DV
 python3 train_tiny.py              # one off: trains the small transformer, writes tiny_llm.json
 python3 generate.py                # decode that checkpoint through the generated hardware's arithmetic
+python3 bitstream.py --block mac   # place, route and pack a real iCE40 bitstream (needs nextpnr-ice40)
 python3 dv.py --rtl build/mac.v --tb tb_mac.v   # mutation-test a generated testbench
 python3 inference.py               # real quantized transformer dot products through the generated RTL
 python3 bench.py --agent swarm --runs 5         # convergence rate, iterations, model calls by role
@@ -338,7 +339,8 @@ The generated RTL is structurally its own: the MAC pipelines a combinational pro
 ## Honest simplifications
 
 `RESULTS.md` carries the measured state and, next to it, the list of what is
-not verified: no bitstream and no board, generated blocks that are the
+not verified: bitstreams that are real but for an iCE40 rather than the
+Xilinx boards the team owns, nothing yet loaded onto hardware, generated blocks that are the
 arithmetic of an inference engine rather than the whole of one, a committed
 checkpoint that is real but small, and a throughput figure that is a model
 checked against another model. Read that list before quoting any number here.

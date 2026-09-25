@@ -17,7 +17,7 @@ one. The remaining gap is listed at the bottom rather than glossed over.
 ### The full suite
 
 ```
-python3 tests.py            # 138 tests, all passing
+python3 tests.py            # 143 tests, all passing
 ```
 
 ### Spec to RTL, across the spec space
@@ -170,17 +170,64 @@ GPT-2 or Qwen and not for this. The useful lesson for the capstone is that
 a quantization scheme has to be validated at the target model's size, not
 at a size that happens to fit the test loop.
 
+## A real bitstream exists
+
+```
+python3 bitstream.py --block mac        # also requant, crc
+```
+
+yosys synth_ice40, then nextpnr-ice40 for place and route, then icepack.
+This is real place and route against a real device timing model, not a
+generic cell library.
+
+| block | LUTs of 7680 | target | post-route fmax | |
+|---|---|---|---|---|
+| MAC chiplet | 214 (2%) | 100 MHz | **178.19 MHz** | met |
+| CRC32 endpoint, 1 B/cyc | 90 (1%) | 125 MHz | **236.63 MHz** | met |
+| requantizer | 1924 (25%) | 100 MHz | 97.88 MHz | 2% short |
+
+The device is a Lattice iCE40 HX8K. That is **not** the part this project
+is aimed at: the boards are Xilinx, Vivado does not run on an ARM Mac, and
+nextpnr has no mainline Xilinx target, so the iCE40 is simply the only
+family with an open place and route flow installable here. What this
+proves is that the flow reaches a bitstream and that the generated RTL
+survives real place and route. It does not prove anything about the
+Artix-7 or Zynq parts the team owns.
+
+Two things the device taught that the generic library could not.
+
+**The library is optimistic, and not uniformly.** It gave the requantizer
+102 MHz where silicon gives 97.9. The gate in the flow is therefore
+slightly generous, which is why `tests.py` now checks the two stay within
+2x of each other rather than trusting either alone.
+
+**More pipelining is not always faster.** Splitting the 46-bit adds as
+well, so every wide add is two stages, improved the generic library from
+102 to 109 MHz and made the real device *worse*, 97.9 to 93.5. On a real
+fabric this block is routing bound, not logic bound: more registers means
+more routing pressure. Precomputing the saturation flags to shorten the
+last stage was worse still, 97.9 to 58.8, because it duplicates the barrel
+shifter three times. Both were tried, measured, and reverted, and the
+reasons are in the source so they are not tried again.
+
+The requantizer missing 100 MHz by 2% on an iCE40 is not treated as a
+design failure here. It is a 25%-utilised block on a small LUT4 fabric
+with no carry chains, and it runs once per dot product, so once per
+reduction depth, which is at least 64 MACs and usually thousands. It is
+recorded rather than engineered around, because the device it misses on is
+not a device this project uses.
+
 ## Not verified, and not claimed
 
 These are the distance between this repo and a local LLM host.
 
-1. **Nothing has run on a board.** There is no bitstream. Vivado does not
-   run on an ARM Mac, and no open place-and-route toolchain (nextpnr,
-   icepack, ecppack) is installed either, so place and route, real fmax and
-   real resource use are all unmeasured. Every timing number here is
-   OpenSTA against a generic standard cell library, not a device. That
-   library has no carry chain, which is why wide adds here cost far more
-   than they would on an FPGA.
+1. **Nothing has run on hardware.** Bitstreams exist and are placed,
+   routed and packed, but for an iCE40 HX8K, and nobody owns that board
+   here. Nothing has been loaded onto a device and clocked, so there is no
+   measurement from silicon in operation, only from the vendor timing
+   model. The Xilinx parts the team actually owns are still unreachable:
+   Vivado does not run on an ARM Mac and nextpnr has no mainline Xilinx
+   target.
 2. **The generated blocks are the arithmetic, not the whole engine.** The
    flow generates the multiply-accumulate unit, the requantizer between
    matmuls, and the CRC32 fabric endpoint. It does not generate softmax,
