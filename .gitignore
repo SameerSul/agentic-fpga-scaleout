@@ -3,11 +3,18 @@ build_dv/
 build_sweep/
 build_probe/
 build_tests/
+build_dbg/
+build_tp/
+build_infer/
+build_esc*/
 __pycache__/
 *.vcd
 
 # Consistency harness scratch: regenerated every run, not inputs.
 *_bench.json
 *_bench.v
+*_dbg.json
+*_dbg.v
 bench_headtohead.log
 bench_swarm_fixed.log
+bench_swarm_escalate.log
