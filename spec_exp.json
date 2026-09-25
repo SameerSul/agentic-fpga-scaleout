@@ -1,10 +1,10 @@
 {
-  "name": "exp16_gpt2_124m",
-  "description": "Fixed-point exponential for the attention softmax: Q7.8 signed input constrained to be non-positive, Q0.15 unsigned output, by a 256-entry table of 2**f and an arithmetic shift",
+  "name": "exp13_gpt2_124m",
+  "description": "Fixed-point exponential for the attention softmax: Q4.8 signed input constrained to be non-positive, Q0.15 unsigned output, by a 256-entry table of 2**f and an arithmetic shift",
   "top_module": "expu",
   "unit": "score",
   "parameters": {
-    "in_width": 16,
+    "in_width": 13,
     "in_frac": 8,
     "out_width": 16,
     "out_frac": 15,
@@ -35,9 +35,9 @@
     {
       "name": "x",
       "dir": "input",
-      "width": 16,
+      "width": 13,
       "signed": true,
-      "desc": "score minus the row maximum, Q7.8, non-positive"
+      "desc": "score minus the row maximum, Q4.8, non-positive"
     },
     {
       "name": "valid_in",

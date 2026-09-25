@@ -1,11 +1,11 @@
 {
   "spec": {
-    "name": "exp16_gpt2_124m",
-    "description": "Fixed-point exponential for the attention softmax: Q7.8 signed input constrained to be non-positive, Q0.15 unsigned output, by a 256-entry table of 2**f and an arithmetic shift",
+    "name": "exp13_gpt2_124m",
+    "description": "Fixed-point exponential for the attention softmax: Q4.8 signed input constrained to be non-positive, Q0.15 unsigned output, by a 256-entry table of 2**f and an arithmetic shift",
     "top_module": "expu",
     "unit": "score",
     "parameters": {
-      "in_width": 16,
+      "in_width": 13,
       "in_frac": 8,
       "out_width": 16,
       "out_frac": 15,
@@ -36,9 +36,9 @@
       {
         "name": "x",
         "dir": "input",
-        "width": 16,
+        "width": 13,
         "signed": true,
-        "desc": "score minus the row maximum, Q7.8, non-positive"
+        "desc": "score minus the row maximum, Q4.8, non-positive"
       },
       {
         "name": "valid_in",
@@ -75,8 +75,8 @@
     "sta": "/Users/ssuleman/.local/bin/sta"
   },
   "agent": "RuleBasedAgent",
-  "converged": true,
-  "iterations_used": 2,
+  "converged": false,
+  "iterations_used": 3,
   "history": [
     {
       "iteration": 1,
@@ -84,16 +84,16 @@
       "sim": {
         "stage": "sim",
         "status": "fail",
-        "checks": null,
-        "mismatches": [
-          {
-            "test": "exp",
-            "x": "-1",
-            "expected_y": "32591",
-            "got_y": "16384",
-            "vout": "1"
-          }
-        ]
+        "phase": "compile",
+        "errors": [
+          "/Users/ssuleman/Desktop/ML4PD Projects/capstone-prototypes/agentic-fpga-scaleout/tb_expu.v:37: error: Unable to bind wire/reg/memory `k' in `tb_expu.drive'",
+          "/Users/ssuleman/Desktop/ML4PD Projects/capstone-prototypes/agentic-fpga-scaleout/tb_expu.v:37: error: Unable to bind wire/reg/memory `wantk' in `tb_expu.drive'",
+          "/Users/ssuleman/Desktop/ML4PD Projects/capstone-prototypes/agentic-fpga-scaleout/tb_expu.v:37: error: Unable to elaborate condition expression.",
+          "/Users/ssuleman/Desktop/ML4PD Projects/capstone-prototypes/agentic-fpga-scaleout/tb_expu.v:22: error: Unable to bind wire/reg/memory `k' in `tb_expu.expect_quiet'",
+          "/Users/ssuleman/Desktop/ML4PD Projects/capstone-prototypes/agentic-fpga-scaleout/tb_expu.v:22: error: Unable to elaborate condition expression.",
+          "5 error(s) during elaboration."
+        ],
+        "mismatches": []
       },
       "synth": null,
       "timing": null,
@@ -101,62 +101,52 @@
     },
     {
       "iteration": 2,
-      "fixes_applied": [
-        "interpolate_the_fractional_part"
-      ],
+      "fixes_applied": [],
       "sim": {
         "stage": "sim",
-        "status": "pass",
-        "checks": 153,
-        "mismatches": [],
-        "throughput": {
-          "scores": 151,
-          "span_cycles": 604,
-          "latency_cycles": 3,
-          "units": 151,
-          "cycles_per_unit": 4.0
-        }
+        "status": "fail",
+        "phase": "compile",
+        "errors": [
+          "/Users/ssuleman/Desktop/ML4PD Projects/capstone-prototypes/agentic-fpga-scaleout/tb_expu.v:37: error: Unable to bind wire/reg/memory `k' in `tb_expu.drive'",
+          "/Users/ssuleman/Desktop/ML4PD Projects/capstone-prototypes/agentic-fpga-scaleout/tb_expu.v:37: error: Unable to bind wire/reg/memory `wantk' in `tb_expu.drive'",
+          "/Users/ssuleman/Desktop/ML4PD Projects/capstone-prototypes/agentic-fpga-scaleout/tb_expu.v:37: error: Unable to elaborate condition expression.",
+          "/Users/ssuleman/Desktop/ML4PD Projects/capstone-prototypes/agentic-fpga-scaleout/tb_expu.v:22: error: Unable to bind wire/reg/memory `k' in `tb_expu.expect_quiet'",
+          "/Users/ssuleman/Desktop/ML4PD Projects/capstone-prototypes/agentic-fpga-scaleout/tb_expu.v:22: error: Unable to elaborate condition expression.",
+          "5 error(s) during elaboration."
+        ],
+        "mismatches": []
       },
-      "synth": {
-        "stage": "synth",
-        "status": "pass",
-        "cell_count": 2897,
-        "area": 5750.0
+      "synth": null,
+      "timing": null,
+      "fpga": null
+    },
+    {
+      "iteration": 3,
+      "fixes_applied": [],
+      "sim": {
+        "stage": "sim",
+        "status": "fail",
+        "phase": "compile",
+        "errors": [
+          "/Users/ssuleman/Desktop/ML4PD Projects/capstone-prototypes/agentic-fpga-scaleout/tb_expu.v:37: error: Unable to bind wire/reg/memory `k' in `tb_expu.drive'",
+          "/Users/ssuleman/Desktop/ML4PD Projects/capstone-prototypes/agentic-fpga-scaleout/tb_expu.v:37: error: Unable to bind wire/reg/memory `wantk' in `tb_expu.drive'",
+          "/Users/ssuleman/Desktop/ML4PD Projects/capstone-prototypes/agentic-fpga-scaleout/tb_expu.v:37: error: Unable to elaborate condition expression.",
+          "/Users/ssuleman/Desktop/ML4PD Projects/capstone-prototypes/agentic-fpga-scaleout/tb_expu.v:22: error: Unable to bind wire/reg/memory `k' in `tb_expu.expect_quiet'",
+          "/Users/ssuleman/Desktop/ML4PD Projects/capstone-prototypes/agentic-fpga-scaleout/tb_expu.v:22: error: Unable to elaborate condition expression.",
+          "5 error(s) during elaboration."
+        ],
+        "mismatches": []
       },
-      "timing": {
-        "stage": "timing",
-        "status": "pass",
-        "method": "opensta",
-        "clock_period_ns": 10.0,
-        "worst_slack_ns": 3.38
-      },
-      "fpga": {
-        "luts": 160,
-        "ffs": 59,
-        "dsps": 1,
-        "brams": 0,
-        "urams": 0,
-        "carry": 11,
-        "muxf": 52,
-        "status": "pass",
-        "family": "xcup",
-        "top": "expu",
-        "lint": [],
-        "stage": "fpga"
-      }
+      "synth": null,
+      "timing": null,
+      "fpga": null
     }
   ],
   "final_metrics": {
-    "sim_pass": true,
-    "sim_checks": 153,
-    "cell_count": 2897,
-    "area": 5750.0,
-    "timing": {
-      "stage": "timing",
-      "status": "pass",
-      "method": "opensta",
-      "clock_period_ns": 10.0,
-      "worst_slack_ns": 3.38
-    }
+    "sim_pass": false,
+    "sim_checks": null,
+    "cell_count": null,
+    "area": null,
+    "timing": null
   }
 }

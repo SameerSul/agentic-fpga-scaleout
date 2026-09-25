@@ -337,7 +337,7 @@ module tb_expu;
   task expect_quiet;
     begin
       checks = checks + 1;
-      if (valid_out !== 1'b0 || y !== 0 || k !== 0) begin
+      if (valid_out !== 1'b0 || y !== 0) begin
         $display("TB_FAIL test=reset_init expected_y=0 got_y=%0d vout=%b",
                  y, valid_out);
         $display("TB_RESULT: FAIL");
@@ -352,9 +352,9 @@ module tb_expu;
       @(negedge clk); valid_in = 0;
       repeat ({settle}) @(negedge clk);
       checks = checks + 1;
-      if (y !== want || k !== wantk || valid_out !== 1'b1) begin
-        $display("TB_FAIL test=%0s x=%0d expected_y=%0d got_y=%0d expected_k=%0d got_k=%0d vout=%b",
-                 testname, xi, want, y, wantk, k, valid_out);
+      if (y !== want || valid_out !== 1'b1) begin
+        $display("TB_FAIL test=%0s x=%0d expected_y=%0d got_y=%0d vout=%b",
+                 testname, xi, want, y, valid_out);
         $display("TB_RESULT: FAIL");
         $finish;
       end
