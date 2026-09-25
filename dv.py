@@ -142,13 +142,13 @@ def run(cmd, cwd, timeout=60):
         return 124, "timeout"
 
 
-def evaluate(name, src, tb_path, top):
+def evaluate(name, src, tb_path, top, deps=()):
     os.makedirs(DVDIR, exist_ok=True)
     rtl = os.path.join(DVDIR, "mutant.v")
     with open(rtl, "w") as f:
         f.write(src)
     rc, out = run(["iverilog", "-g2005", "-o", "mutant.out", tb_path,
-                   "mutant.v"], DVDIR)
+                   "mutant.v"] + list(deps), DVDIR)
     if rc != 0:
         return "compile", ""
     rc, out = run(["vvp", "mutant.out"], DVDIR)

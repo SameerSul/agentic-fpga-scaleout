@@ -817,6 +817,237 @@ def generate_rsqrt(ms=None, spec_file="spec_rsqrt.json",
     return spec
 
 
+def derive_matvec_spec(ms):
+    """model spec -> weight-streaming sequencer spec.
+
+    Every block so far computes. This one sequences: it walks a weight
+    matrix column by column out of memory, feeds the MAC unit, waits out
+    that unit's pipeline, and signals when each column's accumulator
+    holds a finished dot product. It is the first generated block whose
+    correctness depends on another generated block's latency, which is
+    what makes a set of verified units into something that runs.
+    """
+    c = derive_chiplet_spec(ms)
+    dw = c["parameters"]["data_width"]
+    aw = c["parameters"]["acc_width"]
+    stages = c["parameters"]["pipeline_stages"]
+    depth = max(ms["d_model"], ms["d_ff"])
+    dep_w = max(4, depth.bit_length())
+    col_w = dep_w
+    addr_w = dep_w * 2
+    return {
+        "name": "matvec_%s" % ms["name"],
+        "description": "Weight-streaming sequencer for the MAC chiplet: "
+                       "walks a matrix column by column, drives the MAC, "
+                       "drains its %d-stage pipeline and flags each "
+                       "finished column" % stages,
+        "top_module": "matvec",
+        "unit": "column",
+        "parameters": {
+            "data_width": dw, "acc_width": aw,
+            "depth_width": dep_w, "col_width": col_w, "addr_width": addr_w,
+            "mac_stages": stages, "max_depth": depth,
+            "signed": True, "pipeline_stages": 1,
+            "target_clock_mhz": 100,
+        },
+        "derivation": {
+            "model": ms["name"],
+            "reduction_depth": depth,
+            "mac_pipeline_stages": stages,
+            "rule": "address widths from the longest reduction; the drain "
+                    "count is the MAC's own pipeline depth, so a change "
+                    "there changes this block",
+        },
+        "ports": [
+            {"name": "clk", "dir": "input", "width": 1,
+             "desc": "clock, rising edge"},
+            {"name": "rst_n", "dir": "input", "width": 1,
+             "desc": "active-low synchronous reset"},
+            {"name": "start", "dir": "input", "width": 1,
+             "desc": "begin a matrix-vector product"},
+            {"name": "depth", "dir": "input", "width": dep_w,
+             "desc": "reduction length, elements per column"},
+            {"name": "cols", "dir": "input", "width": col_w,
+             "desc": "number of output columns"},
+            {"name": "a_addr", "dir": "output", "width": dep_w,
+             "desc": "activation index being read"},
+            {"name": "w_addr", "dir": "output", "width": addr_w,
+             "desc": "weight index, column major: col*depth + row"},
+            {"name": "mac_valid", "dir": "output", "width": 1,
+             "desc": "drive the MAC this cycle"},
+            {"name": "mac_clear", "dir": "output", "width": 1,
+             "desc": "clear the MAC accumulator before the next column"},
+            {"name": "col_valid", "dir": "output", "width": 1,
+             "desc": "the MAC accumulator holds a finished column"},
+            {"name": "col_index", "dir": "output", "width": col_w,
+             "desc": "which column col_valid refers to"},
+            {"name": "busy", "dir": "output", "width": 1,
+             "desc": "a product is in progress"},
+        ],
+        "behavior": [
+            "start begins a product of cols columns, each a reduction of "
+            "depth elements.",
+            "For each column the sequencer issues depth consecutive "
+            "addresses with mac_valid high, a_addr walking 0..depth-1 and "
+            "w_addr walking col*depth..col*depth+depth-1.",
+            "It then holds mac_valid low for %d cycles, the MAC's own "
+            "pipeline depth, before asserting col_valid for one cycle "
+            "with col_index set." % stages,
+            "mac_clear is asserted after col_valid so the next column "
+            "starts from zero. Without it every column accumulates into "
+            "the one before it.",
+            "busy is high from start until the last column is flagged.",
+            "Memory reads are asynchronous: data is expected in the same "
+            "cycle as the address.",
+        ],
+    }
+
+
+def render_matvec_testbench(spec):
+    """Integration testbench: the sequencer driving the real MAC.
+
+    The matrix is large enough that the derived address width is
+    actually used. A small one leaves the top half of w_addr always
+    zero, and mutation testing showed a halved address register
+    surviving every vector because of it. Memory is filled by a formula
+    rather than by literals so the file stays readable at this size.
+    """
+    p = spec["parameters"]
+    dw, aw = p["data_width"], p["acc_width"]
+    dep_w, col_w, addr_w = (p["depth_width"], p["col_width"],
+                            p["addr_width"])
+    # The matrix has to be big enough that the top half of w_addr is
+    # used, or a halved address register is invisible. That threshold
+    # comes from the derived width, so the matrix size has to follow it
+    # rather than being a fixed number that happens to suit one spec.
+    depth = 68
+    cols = (1 << (addr_w // 2)) // depth + 2
+    m = min(251, (1 << dw) - 5)
+    half = m // 2
+
+    def act(i):
+        return (i * 104729 + 7) % m - half
+
+    def wt(i):
+        return (i * 7919 + 13) % m - half
+
+    golden = [sum(act(r) * wt(c * depth + r) for r in range(depth))
+              for c in range(cols)]
+    init = "\n".join("    expect_col[%d] = %s;" % (i, _slit(v, aw))
+                      for i, v in enumerate(golden))
+    return MATVEC_TB.format(
+        dwm=dw - 1, awm=aw - 1, depwm=dep_w - 1, colwm=col_w - 1,
+        addrwm=addr_w - 1, depth=depth, cols=cols, init=init,
+        nmem=depth * cols, m=m, half=half)
+
+
+MATVEC_TB = """`timescale 1ns/1ps
+// GENERATED by specgen.py: do not edit by hand.
+// Integration testbench: the weight-streaming sequencer driving the real
+// generated MAC. Golden dot products are computed in Python, so this
+// checks the pair against the arithmetic the model needs rather than
+// against either block's own idea of itself.
+module tb_matvec;
+  reg clk = 0, rst_n = 0, start = 0;
+  reg  [{depwm}:0] depth = 0;
+  reg  [{colwm}:0] cols = 0;
+  wire [{depwm}:0] a_addr;
+  wire [{addrwm}:0] w_addr;
+  wire mac_valid, mac_clear, col_valid, busy;
+  wire [{colwm}:0] col_index;
+
+  reg signed [{dwm}:0] amem [0:{depth}-1];
+  reg signed [{dwm}:0] wmem [0:{nmem}-1];
+  reg signed [{awm}:0] expect_col [0:{cols}-1];
+
+  wire signed [{dwm}:0] a_data = amem[a_addr];
+  wire signed [{dwm}:0] w_data = wmem[w_addr];
+
+  wire signed [{awm}:0] acc;
+  wire mac_vout;
+  integer checks = 0, seen = 0, i;
+  reg [255:0] testname;
+
+  matvec seq (.clk(clk), .rst_n(rst_n), .start(start), .depth(depth),
+              .cols(cols), .a_addr(a_addr), .w_addr(w_addr),
+              .mac_valid(mac_valid), .mac_clear(mac_clear),
+              .col_valid(col_valid), .col_index(col_index), .busy(busy));
+
+  mac dut (.clk(clk), .rst_n(rst_n), .clear(mac_clear),
+           .a(a_data), .b(w_data), .valid_in(mac_valid),
+           .acc(acc), .valid_out(mac_vout));
+
+  always #5 clk = ~clk;
+
+  // Every flagged column is checked the moment it is flagged.
+  always @(posedge clk) begin
+    if (rst_n && col_valid) begin
+      checks = checks + 1;
+      seen = seen + 1;
+      if (acc !== expect_col[col_index]) begin
+        $display("TB_FAIL test=%0s col=%0d expected_acc=%0d got_acc=%0d",
+                 testname, col_index, expect_col[col_index], acc);
+        $display("TB_RESULT: FAIL");
+        $finish;
+      end
+    end
+  end
+
+  initial begin
+    // Filled by formula, matching the Python golden exactly.
+    for (i = 0; i < {depth}; i = i + 1)
+      amem[i] = (i * 104729 + 7) % {m} - {half};
+    for (i = 0; i < {nmem}; i = i + 1)
+      wmem[i] = (i * 7919 + 13) % {m} - {half};
+{init}
+    testname = "matvec";
+    repeat (3) @(negedge clk);
+    rst_n = 1;
+    depth = {depth};
+    cols = {cols};
+    @(negedge clk);
+    start = 1;
+    @(negedge clk);
+    start = 0;
+    // Generous bound: depth+drain per column, plus slack.
+    for (i = 0; i < {cols} * ({depth} + 10) + 60; i = i + 1)
+      @(negedge clk);
+    checks = checks + 1;
+    if (seen !== {cols}) begin
+      $display("TB_FAIL test=%0s expected_acc=%0d got_acc=%0d",
+               "column_count", {cols}, seen);
+      $display("TB_RESULT: FAIL");
+      $finish;
+    end
+    checks = checks + 1;
+    if (busy !== 1'b0) begin
+      $display("TB_FAIL test=%0s expected_acc=0 got_acc=1",
+               "busy_deasserts");
+      $display("TB_RESULT: FAIL");
+      $finish;
+    end
+    $display("TB_PROFILE columns=%0d span_cycles=%0d latency_cycles=%0d",
+             {cols}, {cols} * {depth}, {depth});
+    $display("TB_PASS checks=%0d", checks);
+    $display("TB_RESULT: PASS");
+    $finish;
+  end
+endmodule
+"""
+
+
+def generate_matvec(ms=None, spec_file="spec_matvec.json",
+                    tb_file="tb_matvec.v"):
+    """Write the derived sequencer spec and its integration testbench."""
+    ms = ms or load_model_spec()
+    spec = derive_matvec_spec(ms)
+    with open(os.path.join(ROOT, spec_file), "w") as f:
+        json.dump(spec, f, indent=2)
+    with open(os.path.join(ROOT, tb_file), "w") as f:
+        f.write(render_matvec_testbench(spec))
+    return spec
+
+
 def derive_requant_spec(ms):
     """model spec -> requantization spec.
 

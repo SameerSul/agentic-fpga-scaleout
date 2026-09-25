@@ -766,6 +766,54 @@ def test_rsqrt_block():
     shutil.rmtree(inference.WORK, ignore_errors=True)
 
 
+def test_matvec_sequencer():
+    """The first generated block that sequences another rather than
+    computing. Its correctness depends on the MAC's latency, so it is
+    checked driving the real MAC, not a model of one."""
+    ms = load_model_spec()
+    spec = specgen_mod.derive_matvec_spec(ms)
+    c = derive_chiplet_spec(ms)
+    p = spec['parameters']
+    check('the drain count is taken from the MAC it drives',
+          p['mac_stages'] == c['parameters']['pipeline_stages'])
+    # A deeper MAC must change this block, not silently desynchronise it.
+    deep = dict(ms, weight_bits=16, activation_bits=16)
+    check('a deeper MAC changes the sequencer',
+          specgen_mod.derive_matvec_spec(deep)['parameters']['mac_stages']
+          == derive_chiplet_spec(deep)['parameters']['pipeline_stages']
+          != p['mac_stages'])
+
+    work = os.path.join(ROOT, 'build_seqtest')
+    shutil.rmtree(work, ignore_errors=True)
+    os.makedirs(work)
+    try:
+        open(os.path.join(work, 'tb.v'), 'w').write(
+            specgen_mod.render_matvec_testbench(spec))
+        open(os.path.join(work, 'mac.v'), 'w').write(
+            RuleBasedAgent().render_mac(c, {agent_mod.FIX_WIDTH,
+                                            agent_mod.FIX_CLEAR}))
+        results = {}
+        for label, fx in (('first_cut', set()),
+                          ('fixed', {agent_mod.FIX_CLRCOL})):
+            open(os.path.join(work, 'mv.v'), 'w').write(
+                RuleBasedAgent().render_matvec(spec, fx))
+            r = subprocess.run(['iverilog', '-g2005', '-o', 's.out',
+                                'tb.v', 'mv.v', 'mac.v'], cwd=work,
+                               capture_output=True, text=True)
+            assert r.returncode == 0, r.stdout + r.stderr
+            r = subprocess.run(['vvp', 's.out'], cwd=work,
+                               capture_output=True, text=True, timeout=900)
+            results[label] = 'TB_RESULT: PASS' in r.stdout
+        check('the sequencer and the real MAC compute the matrix product',
+              results['fixed'])
+        # Column zero is right either way; the bug only shows from the
+        # second column, which is why a one-column test would miss it.
+        check('a missing inter-column clear is caught',
+              not results['first_cut'])
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
 def test_fpga_backend(profile, fp):
     """Real device mapping, not generic cells: the two generated blocks land
     on different resources, which is what makes a single capacity proxy
@@ -988,6 +1036,7 @@ if __name__ == '__main__':
     test_exp_block()
     test_recip_block()
     test_rsqrt_block()
+    test_matvec_sequencer()
     test_generation()
     test_bitstream()
     test_fit_monotonic(profile)

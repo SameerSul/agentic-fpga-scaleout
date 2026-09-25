@@ -42,6 +42,14 @@ FABRIC_JOB = {
     "profile_file": "fabric_profile.json", "report_file": "report_crc.json",
     "derive_from_link": True,
 }
+MATVEC_JOB = {
+    "spec_file": "spec_matvec.json", "tb_file": "tb_matvec.v",
+    "rtl_file": "matvec.v", "profile_file": "matvec_profile.json",
+    "report_file": "report_matvec.json",
+    "derive_from_model": "matvec",
+    # The sequencer is checked driving the real MAC, not a model of it.
+    "extra_sources": ("mac_dep.v",),
+}
 RSQRT_JOB = {
     "spec_file": "spec_rsqrt.json", "tb_file": "tb_rsqrt.v",
     "rtl_file": "rsqrt.v", "profile_file": "rsqrt_profile.json",
@@ -111,9 +119,17 @@ def _parse_kv(line):
 
 
 def stage_sim(job, rtl_path):
+    """Compile and run the job's testbench against the proposed RTL.
+
+    A job may name extra sources. An integration testbench instantiates
+    more than the block under test, and the point of one is to check a
+    block against another generated block rather than against a model of
+    it, so those have to be compiled in.
+    """
     sim = os.path.join(BUILD, "sim.out")
-    rc, out = run(["iverilog", "-g2005", "-o", sim,
-                   os.path.join(ROOT, job["tb_file"]), rtl_path])
+    srcs = [os.path.join(ROOT, job["tb_file"]), rtl_path]
+    srcs += [os.path.join(BUILD, f) for f in job.get("extra_sources", ())]
+    rc, out = run(["iverilog", "-g2005", "-o", sim] + srcs)
     if rc != 0:
         return {"stage": "sim", "status": "fail", "phase": "compile",
                 "errors": out.strip().splitlines()[:10], "mismatches": []}
@@ -320,6 +336,9 @@ def derive_profile(spec, final):
         prof["chiplet"] = spec["name"]
         prof["data_width"] = spec["parameters"]["data_width"]
         prof["acc_width"] = spec["parameters"]["acc_width"]
+    elif unit == "column":
+        prof["sequencer"] = spec["name"]
+        prof["mac_stages"] = spec["parameters"]["mac_stages"]
     elif unit == "row":
         prof["row_unit"] = spec["name"]
         if "shift_bias" in spec["parameters"]:
@@ -390,7 +409,18 @@ def run_flow(job=None, verbose=True, agent=None, max_iters=None):
     say = print if verbose else (lambda *a, **k: None)
     os.makedirs(BUILD, exist_ok=True)
     shutil.copy(LIB, BUILD)
-    if job.get("derive_from_model") == "rsqrt":
+    if job.get("derive_from_model") == "matvec":
+        specgen.generate_matvec(spec_file=job["spec_file"],
+                                tb_file=job["tb_file"])
+        # Render the block it drives, from the same model spec, with the
+        # deterministic agent so the dependency is reproducible.
+        from agent import RuleBasedAgent, FIX_WIDTH, FIX_CLEAR
+        os.makedirs(BUILD, exist_ok=True)
+        with open(os.path.join(BUILD, "mac_dep.v"), "w") as f:
+            f.write(RuleBasedAgent().render_mac(
+                specgen.derive_chiplet_spec(specgen.load_model_spec()),
+                {FIX_WIDTH, FIX_CLEAR}))
+    elif job.get("derive_from_model") == "rsqrt":
         specgen.generate_rsqrt(spec_file=job["spec_file"],
                                tb_file=job["tb_file"])
     elif job.get("derive_from_model") == "recip":

@@ -18,6 +18,7 @@ FIX_SATURATE = "saturate_instead_of_wrap"
 FIX_LUT = "interpolate_the_fractional_part"
 FIX_NORM = "normalise_before_the_table"
 FIX_EVEN = "align_the_exponent_to_an_even_boundary"
+FIX_CLRCOL = "clear_the_accumulator_between_columns"
 # One definition, in specgen, so the declared depth and the generated
 # depth cannot disagree.
 WIDE_ADD_BITS = specgen.WIDE_ADD_BITS
@@ -40,6 +41,8 @@ class RuleBasedAgent:
             return self.render_recip(spec, fixes), sorted(fixes)
         if spec["top_module"] == "rsqrt":
             return self.render_rsqrt(spec, fixes), sorted(fixes)
+        if spec["top_module"] == "matvec":
+            return self.render_matvec(spec, fixes), sorted(fixes)
         return self.render_mac(spec, fixes), sorted(fixes)
 
     def diagnose(self, spec, history):
@@ -57,6 +60,10 @@ class RuleBasedAgent:
                     fixes.add(FIX_XOR)
                 elif "clear" in m.get("test", "").lower():
                     fixes.add(FIX_CLEAR)
+                elif "col" in m:
+                    # The sequencer's only seeded bug: no clear between
+                    # columns, so each sums into the one before it.
+                    fixes.add(FIX_CLRCOL)
                 elif "expected_e" in m:
                     # The inverse square root's only seeded bug: the
                     # normalisation was aligned to an odd boundary.
@@ -76,6 +83,120 @@ class RuleBasedAgent:
                 elif m.get("got_acc") != m.get("expected_acc"):
                     fixes.add(FIX_WIDTH)
         return fixes
+
+    def render_matvec(self, spec, fixes):
+        """Weight-streaming sequencer for the MAC chiplet.
+
+        Walks a matrix column by column, drives the MAC for depth cycles,
+        waits out that unit's pipeline, and flags the finished column.
+        The drain count is the MAC's own latency, taken from the spec, so
+        a change to the MAC's pipeline changes this block rather than
+        silently desynchronising it.
+
+        The seeded first-cut bug is forgetting to clear the accumulator
+        between columns, so every column sums into the one before it.
+        Column zero is then correct and every later column is wrong,
+        which is the shape of bug that survives a one-column test.
+        """
+        p = spec["parameters"]
+        dep_w, col_w, addr_w = (p["depth_width"], p["col_width"],
+                                p["addr_width"])
+        stages = p["mac_stages"]
+        clr = ("      if (state == S_EMIT) mac_clear <= 1'b1;"
+               if FIX_CLRCOL in fixes else
+               "      // first cut: no clear between columns")
+        return """module matvec (
+  input                    clk,
+  input                    rst_n,
+  input                    start,
+  input      [{depwm}:0] depth,
+  input      [{colwm}:0] cols,
+  output reg [{depwm}:0] a_addr,
+  output reg [{addrwm}:0] w_addr,
+  output reg               mac_valid,
+  output reg               mac_clear,
+  output reg               col_valid,
+  output reg [{colwm}:0] col_index,
+  output reg               busy
+);
+  // Memory reads are asynchronous: data is expected in the same cycle as
+  // the address, which is what a LUT RAM gives and what keeps the
+  // address and the MAC's valid in step without another pipeline stage.
+  localparam S_IDLE = 2'd0, S_RUN = 2'd1, S_DRAIN = 2'd2, S_EMIT = 2'd3;
+  reg [1:0] state;
+  reg [{depwm}:0] row;
+  reg [{colwm}:0] col;
+  reg [3:0] drain;
+
+  always @(posedge clk) begin
+    if (!rst_n) begin
+      state     <= S_IDLE;
+      row       <= 0;
+      col       <= 0;
+      drain     <= 0;
+      a_addr    <= 0;
+      w_addr    <= 0;
+      mac_valid <= 1'b0;
+      mac_clear <= 1'b0;
+      col_valid <= 1'b0;
+      col_index <= 0;
+      busy      <= 1'b0;
+    end else begin
+      mac_valid <= 1'b0;
+      mac_clear <= 1'b0;
+      col_valid <= 1'b0;
+      case (state)
+        S_IDLE: begin
+          if (start && depth != 0 && cols != 0) begin
+            state  <= S_RUN;
+            row    <= 0;
+            col    <= 0;
+            busy   <= 1'b1;
+            a_addr <= 0;
+            w_addr <= 0;
+            mac_valid <= 1'b1;
+          end
+        end
+        S_RUN: begin
+          if (row + 1 == depth) begin
+            state <= S_DRAIN;
+            drain <= {stages};
+          end else begin
+            row       <= row + 1;
+            a_addr    <= row + 1;
+            w_addr    <= w_addr + 1;
+            mac_valid <= 1'b1;
+          end
+        end
+        S_DRAIN: begin
+          if (drain == 0) begin
+            state     <= S_EMIT;
+            col_valid <= 1'b1;
+            col_index <= col;
+          end else begin
+            drain <= drain - 1;
+          end
+        end
+        S_EMIT: begin
+{clr}
+          if (col + 1 == cols) begin
+            state <= S_IDLE;
+            busy  <= 1'b0;
+          end else begin
+            col       <= col + 1;
+            row       <= 0;
+            a_addr    <= 0;
+            w_addr    <= (col + 1) * depth;
+            state     <= S_RUN;
+            mac_valid <= 1'b1;
+          end
+        end
+      endcase
+    end
+  end
+endmodule
+""".format(depwm=dep_w - 1, colwm=col_w - 1, addrwm=addr_w - 1,
+           stages=stages, clr=clr)
 
     def render_rsqrt(self, spec, fixes):
         """Inverse square root by even normalisation, table, and a halved

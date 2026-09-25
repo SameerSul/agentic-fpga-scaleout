@@ -1,0 +1,32 @@
+{
+  "block": "matvec_gpt2_124m",
+  "top_module": "matvec",
+  "unit": "column",
+  "cycles_per_column": 8.0,
+  "latency_cycles": 8,
+  "cell_count": 2815,
+  "area": 5569.0,
+  "fmax_estimate_mhz": 134.77088948787062,
+  "fmax_method": "opensta_slack",
+  "target_clock_mhz": 100,
+  "sim_checks_passed": 6,
+  "fpga": {
+    "family": "xcup",
+    "luts": 176,
+    "ffs": 72,
+    "dsps": 1,
+    "brams": 0,
+    "urams": 0,
+    "carry": 15,
+    "muxf": 27
+  },
+  "derivation": {
+    "model": "gpt2_124m",
+    "reduction_depth": 3072,
+    "mac_pipeline_stages": 2,
+    "rule": "address widths from the longest reduction; the drain count is the MAC's own pipeline depth, so a change there changes this block"
+  },
+  "sequencer": "matvec_gpt2_124m",
+  "mac_stages": 2,
+  "agent": "RuleBasedAgent"
+}

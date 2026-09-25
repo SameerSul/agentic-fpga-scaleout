@@ -1,0 +1,106 @@
+{
+  "name": "matvec_gpt2_124m",
+  "description": "Weight-streaming sequencer for the MAC chiplet: walks a matrix column by column, drives the MAC, drains its 2-stage pipeline and flags each finished column",
+  "top_module": "matvec",
+  "unit": "column",
+  "parameters": {
+    "data_width": 8,
+    "acc_width": 28,
+    "depth_width": 12,
+    "col_width": 12,
+    "addr_width": 24,
+    "mac_stages": 2,
+    "max_depth": 3072,
+    "signed": true,
+    "pipeline_stages": 1,
+    "target_clock_mhz": 100
+  },
+  "derivation": {
+    "model": "gpt2_124m",
+    "reduction_depth": 3072,
+    "mac_pipeline_stages": 2,
+    "rule": "address widths from the longest reduction; the drain count is the MAC's own pipeline depth, so a change there changes this block"
+  },
+  "ports": [
+    {
+      "name": "clk",
+      "dir": "input",
+      "width": 1,
+      "desc": "clock, rising edge"
+    },
+    {
+      "name": "rst_n",
+      "dir": "input",
+      "width": 1,
+      "desc": "active-low synchronous reset"
+    },
+    {
+      "name": "start",
+      "dir": "input",
+      "width": 1,
+      "desc": "begin a matrix-vector product"
+    },
+    {
+      "name": "depth",
+      "dir": "input",
+      "width": 12,
+      "desc": "reduction length, elements per column"
+    },
+    {
+      "name": "cols",
+      "dir": "input",
+      "width": 12,
+      "desc": "number of output columns"
+    },
+    {
+      "name": "a_addr",
+      "dir": "output",
+      "width": 12,
+      "desc": "activation index being read"
+    },
+    {
+      "name": "w_addr",
+      "dir": "output",
+      "width": 24,
+      "desc": "weight index, column major: col*depth + row"
+    },
+    {
+      "name": "mac_valid",
+      "dir": "output",
+      "width": 1,
+      "desc": "drive the MAC this cycle"
+    },
+    {
+      "name": "mac_clear",
+      "dir": "output",
+      "width": 1,
+      "desc": "clear the MAC accumulator before the next column"
+    },
+    {
+      "name": "col_valid",
+      "dir": "output",
+      "width": 1,
+      "desc": "the MAC accumulator holds a finished column"
+    },
+    {
+      "name": "col_index",
+      "dir": "output",
+      "width": 12,
+      "desc": "which column col_valid refers to"
+    },
+    {
+      "name": "busy",
+      "dir": "output",
+      "width": 1,
+      "desc": "a product is in progress"
+    }
+  ],
+  "behavior": [
+    "start begins a product of cols columns, each a reduction of depth elements.",
+    "For each column the sequencer issues depth consecutive addresses with mac_valid high, a_addr walking 0..depth-1 and w_addr walking col*depth..col*depth+depth-1.",
+    "It then holds mac_valid low for 2 cycles, the MAC's own pipeline depth, before asserting col_valid for one cycle with col_index set.",
+    "mac_clear is asserted after col_valid so the next column starts from zero. Without it every column accumulates into the one before it.",
+    "busy is high from start until the last column is flagged.",
+    "Memory reads are asynchronous: data is expected in the same cycle as the address."
+  ]
+}

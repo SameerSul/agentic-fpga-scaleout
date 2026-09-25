@@ -105,7 +105,7 @@ def check_profile(spec, profile, unit, timing=None):
         per, unit, fmax, profile["cell_count"])
 
 
-def run_dv(rtl_path, tb_path):
+def run_dv(rtl_path, tb_path, extra=()):
     """Mutation-test the generated testbench. Returns (ok, detail)."""
     src = open(rtl_path).read()
     mods = re.findall(r"^\s*module\s+([A-Za-z_]\w*)", src, re.M)
@@ -113,8 +113,11 @@ def run_dv(rtl_path, tb_path):
         return False, "no module found"
     top = mods[0]
     os.makedirs(dv.DVDIR, exist_ok=True)
+    # An integration testbench instantiates blocks besides the one under
+    # test, so those have to be compiled alongside every mutant too.
+    deps = [os.path.join(BUILD, f) for f in extra]
     try:
-        if dv.evaluate("base", src, tb_path, top)[0] != "SURVIVED":
+        if dv.evaluate("base", src, tb_path, top, deps)[0] != "SURVIVED":
             return False, "baseline fails its own testbench"
         killed, survived, skipped = 0, [], 0
         for name, fn, _ in dv.OPS:
@@ -122,7 +125,7 @@ def run_dv(rtl_path, tb_path):
             if mutant == src:
                 skipped += 1
                 continue
-            v = dv.evaluate(name, mutant, tb_path, top)[0]
+            v = dv.evaluate(name, mutant, tb_path, top, deps)[0]
             if v == "killed":
                 killed += 1
             elif v == "SURVIVED":
@@ -139,12 +142,14 @@ def run_dv(rtl_path, tb_path):
         shutil.rmtree(dv.DVDIR, ignore_errors=True)
 
 
-def one_case(label, spec, unit, agent_kind, do_dv):
+def one_case(label, spec, unit, agent_kind, do_dv, extra=()):
     """Run one spec all the way through and return a per-stage verdict."""
     res = dict.fromkeys(COLS, "")
     res["case"] = label
     res["derived"] = "ok"
-    report, profile = run_flow(JOB, verbose=False, agent=make_agent(agent_kind))
+    job = dict(JOB, extra_sources=extra) if extra else JOB
+    report, profile = run_flow(job, verbose=False,
+                               agent=make_agent(agent_kind))
     last = (report["history"] or [{}])[-1]
     res["rtl"] = "ok" if report["history"] else "FAIL"
     for st in ("sim", "synth", "timing", "fpga"):
@@ -160,7 +165,7 @@ def one_case(label, spec, unit, agent_kind, do_dv):
         res["dv"] = "skip"
         return res, detail
     dok, ddetail = run_dv(os.path.join(BUILD, JOB["rtl_file"]),
-                          os.path.join(ROOT, JOB["tb_file"]))
+                          os.path.join(ROOT, JOB["tb_file"]), extra)
     res["dv"] = "ok" if dok else "FAIL"
     return res, "%s | dv %s" % (detail, ddetail)
 
@@ -171,7 +176,8 @@ def main():
                     choices=["rules", "llm", "swarm"])
     ap.add_argument("--only", default="all",
                     choices=["all", "both", "chiplet", "requant", "exp",
-                             "recip", "rsqrt", "endpoint"])
+                             "recip", "rsqrt", "matvec",
+                             "endpoint"])
     ap.add_argument("--skip-dv", action="store_true")
     a = ap.parse_args()
     do_dv = not a.skip_dv
@@ -248,6 +254,29 @@ def main():
             label = "rsqrt %s %db->%db" % (ms["name"], p["in_width"],
                                            p["out_width"])
             r, d = one_case(label, spec, "row", a.agent, do_dv)
+            rows.append(r)
+            details.append((label, d))
+            if any(r[c] not in ("ok", "skip", "-") for c in COLS):
+                failures.append(label)
+
+    if a.only in ("all", "matvec"):
+        # The sequencer's testbench instantiates the MAC, so the job
+        # carries an extra source and one_case has to pass it through.
+        base = specgen.load_model_spec()
+        for ms in _models(base):
+            spec = specgen.generate_matvec(ms, spec_file=JOB["spec_file"],
+                                           tb_file=JOB["tb_file"])
+            from agent import RuleBasedAgent, FIX_WIDTH, FIX_CLEAR
+            os.makedirs(BUILD, exist_ok=True)
+            with open(os.path.join(BUILD, "mac_dep.v"), "w") as f:
+                f.write(RuleBasedAgent().render_mac(
+                    specgen.derive_chiplet_spec(ms),
+                    {FIX_WIDTH, FIX_CLEAR}))
+            p = spec["parameters"]
+            label = "matvec %s d%d mac%ds" % (ms["name"], p["depth_width"],
+                                              p["mac_stages"])
+            r, d = one_case(label, spec, "column", a.agent, do_dv,
+                            extra=("mac_dep.v",))
             rows.append(r)
             details.append((label, d))
             if any(r[c] not in ("ok", "skip", "-") for c in COLS):

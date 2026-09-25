@@ -17,15 +17,15 @@ one. The remaining gap is listed at the bottom rather than glossed over.
 ### The full suite
 
 ```
-python3 tests.py            # 166 tests, all passing
+python3 tests.py            # 170 tests, all passing
 ```
 
 ### Spec to RTL, across the spec space
 
-`python3 sweep.py` drives thirty nine cases through every stage: derivation,
+`python3 sweep.py` drives forty five cases through every stage: derivation,
 RTL, simulation, synthesis, timing closure, FPGA mapping, the profile
 fields the sizing model consumes, and a mutation sweep of the testbench
-generated at that width. All thirty nine clean.
+generated at that width. All forty five clean.
 
 | case | cyc/unit | fmax | cells | DV |
 |---|---|---|---|---|
@@ -33,6 +33,7 @@ generated at that width. All thirty nine clean.
 | exp Q4.8 to Q0.15 | 4.00 | 172 MHz | 2347 | 4/4 |
 | recip 26b to 17b | 4.00 | 223 MHz | 1562 | 4/4 |
 | rsqrt 28b to 17b | 4.00 | 174 MHz | 1351 | 4/4 |
+| matvec sequencer | 68.0 | 135 MHz | 2815 | 4/4 |
 | requant acc28 to 8 | 7.00 | 102 MHz | 9274 | 5/5 |
 | mac int4 weights, acc24 | 1.00 | 187 MHz | 1383 | 8/8 |
 | mac int16, acc46 | 1.00 | 104 MHz | 4570 | 6/6 |
@@ -276,6 +277,27 @@ reduction depth, which is at least 64 MACs and usually thousands. It is
 recorded rather than engineered around, because the device it misses on is
 not a device this project uses.
 
+## The first block that sequences another
+
+`matvec` walks a weight matrix column by column, drives the MAC unit,
+waits out that unit's pipeline and flags each finished column. It is the
+first generated block whose correctness depends on another generated
+block's latency: the drain count comes from the MAC's own
+pipeline_stages, so a deeper MAC changes this block rather than
+silently desynchronising from it, and a test pins that.
+
+Its testbench instantiates the real MAC rather than a model of one, so
+the flow gained a notion of an integration job: a job may name extra
+sources, which are compiled into both the simulation and every mutant.
+
+Two things the sweep found, both in the testbench rather than the
+design. The matrix was 8 by 4, which leaves the top half of the derived
+address register always zero, so a mutation that halved it survived
+every vector. Enlarging the matrix fixed it for the 24-bit case and not
+for the 28-bit one, because a fixed size cannot track a derived width:
+the matrix is now sized from the address width, and the memory is filled
+by a formula so the file stays readable at four figures of entries.
+
 ## Not verified, and not claimed
 
 These are the distance between this repo and a local LLM host.
@@ -293,10 +315,12 @@ These are the distance between this repo and a local LLM host.
    flow generates the multiply-accumulate unit, the requantizer between
    matmuls, the exponential and the reciprocal that softmax needs, the
    inverse square root that RMSNorm needs, and the CRC32 fabric
-   endpoint. Softmax is hardware apart from accumulating the sum, and so
-   is the transcendental part of RMSNorm. It does not generate the
-   attention sequencing, the weight streaming controller or the memory
-   subsystem. In `generate.py` those run on the host, and the
+   endpoint, and the weight-streaming sequencer that drives the MAC
+   through a matrix. Softmax is hardware apart from accumulating the
+   sum, and so is the transcendental part of RMSNorm. It does not
+   generate the attention sequencing above the matmul level or the
+   memory subsystem, and the sequencer assumes asynchronous memory
+   reads rather than driving a real memory controller. In `generate.py` those run on the host, and the
    output says so each run.
 3. **The model is small and its weights are its own.** Qwen3-0.6B is not
    loaded; there is no numeric stack here to load it with and no network
