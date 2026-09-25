@@ -1,7 +1,7 @@
 {
   "spec": {
     "name": "crc32_endpoint_16B",
-    "description": "Fabric endpoint CRC32 datapath, 16 byte(s) per cycle, zlib/Ethernet compatible (reflected polynomial 0xEDB88320), sized for a 10 Gbps link",
+    "description": "Fabric endpoint CRC32 datapath, 16 byte(s) per cycle, serial next-state form, zlib/Ethernet compatible (reflected polynomial 0xEDB88320), sized for a 10 Gbps link",
     "top_module": "crc32",
     "unit": "byte",
     "parameters": {
@@ -9,6 +9,7 @@
       "crc_width": 32,
       "bytes_per_cycle": 16,
       "target_clock_mhz": 78.125,
+      "architecture": "serial",
       "polynomial": "0xEDB88320 reflected form of 0x04C11DB7"
     },
     "derivation": {
@@ -18,14 +19,26 @@
       "options_for_rate": [
         [
           8,
-          156.25
+          156.25,
+          "serial"
         ],
         [
           16,
-          78.125
+          78.125,
+          "serial"
+        ],
+        [
+          8,
+          156.25,
+          "matrix"
+        ],
+        [
+          16,
+          78.125,
+          "matrix"
         ]
       ],
-      "rule": "standard Ethernet MAC datapath whose bytes_per_cycle * 8 * core_clock sustains the link rate; wider and slower options are tried when timing does not close",
+      "rule": "standard Ethernet MAC datapath whose bytes_per_cycle * 8 * core_clock sustains the link rate; wider and slower options, then the flat XOR form, are tried when timing does not close",
       "sustains_gbps": 10.0
     },
     "ports": [
@@ -98,7 +111,7 @@
         "checks": null,
         "mismatches": [
           {
-            "test": "zero_word",
+            "test": "reset_init",
             "expected_crc": "3971697493",
             "got_crc": "323269802"
           }
@@ -116,7 +129,7 @@
       "sim": {
         "stage": "sim",
         "status": "pass",
-        "checks": 5,
+        "checks": 9,
         "mismatches": [],
         "throughput": {
           "bytes": 4096,
@@ -157,7 +170,7 @@
   ],
   "final_metrics": {
     "sim_pass": true,
-    "sim_checks": 5,
+    "sim_checks": 9,
     "cell_count": 7333,
     "area": 14728.0,
     "timing": {

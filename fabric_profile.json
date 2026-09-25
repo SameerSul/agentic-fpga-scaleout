@@ -9,7 +9,7 @@
   "fmax_estimate_mhz": 85.47008547008546,
   "fmax_method": "opensta_slack",
   "target_clock_mhz": 78.125,
-  "sim_checks_passed": 5,
+  "sim_checks_passed": 9,
   "fpga": {
     "family": "xcup",
     "luts": 1004,

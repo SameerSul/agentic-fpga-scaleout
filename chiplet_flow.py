@@ -21,7 +21,9 @@ import fpga
 import specgen
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
-BUILD = os.path.join(ROOT, "build")
+# Overridable so independent flows (the sweep, a test run, a bench) can
+# work in parallel without fighting over one scratch directory.
+BUILD = os.path.join(ROOT, os.environ.get("CHIPLET_BUILD_DIR", "build"))
 LIB = os.path.join(ROOT, "cells.lib")
 MAX_ITERS = 5
 # Fallback delay per logic level for the gate-depth timing proxy, ns. Roughly

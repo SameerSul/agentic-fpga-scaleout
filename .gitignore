@@ -2,6 +2,7 @@ build/
 build_dv/
 build_sweep/
 build_probe/
+build_tests/
 __pycache__/
 *.vcd
 
