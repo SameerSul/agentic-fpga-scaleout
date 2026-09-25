@@ -1,3 +1,8 @@
 build/
 __pycache__/
 *.vcd
+
+# Consistency harness scratch: regenerated every run, not inputs.
+*_bench.json
+*_bench.v
+bench_headtohead.log

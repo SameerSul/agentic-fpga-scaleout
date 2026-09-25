@@ -1,0 +1,10 @@
+[
+  {
+    "converged": true,
+    "iterations": 2,
+    "calls": 5,
+    "seconds": 303.6143879890442,
+    "failed_at": null,
+    "cells": 1030
+  }
+]

@@ -44,6 +44,20 @@ module tb_crc;
     end
   endtask
 
+  // valid_out must be low. Used after reset and between frames, and as the
+  // settling check that makes wrong-edge clocking observable.
+  task expect_quiet(input [127:0] why);
+    begin
+      checks = checks + 1;
+      if (valid_out !== 1'b0) begin
+        $display("TB_FAIL test=%0s expected_vout=0 got_vout=%b",
+                 why, valid_out);
+        $display("TB_RESULT: FAIL");
+        $finish;
+      end
+    end
+  endtask
+
   task expect_crc(input [31:0] want);
     begin
       @(negedge clk); valid_in = 0;
@@ -61,6 +75,26 @@ module tb_crc;
     repeat (3) @(negedge clk);
     rst_n = 1;
     @(negedge clk);
+
+    testname = "reset_init";
+    expect_quiet(testname);
+    word(128'h00000000000000000000000000000000);
+    expect_crc(32'hecbb4b55);
+
+    testname = "edge_discipline";
+    start_frame;
+    @(negedge clk); data = 128'h00000000000000000000000000000000; valid_in = 1;
+    #1;
+    expect_quiet(testname);
+    @(posedge clk); #1;
+    checks = checks + 1;
+    if (crc_out !== 32'hecbb4b55 || valid_out !== 1'b1) begin
+      $display("TB_FAIL test=%0s expected_crc=%0d got_crc=%0d expected_vout=1 got_vout=%b",
+               testname, 32'hecbb4b55, crc_out, valid_out);
+      $display("TB_RESULT: FAIL");
+      $finish;
+    end
+    @(negedge clk); valid_in = 0;
 
     testname = "zero_word";
     start_frame;

@@ -13,7 +13,7 @@ specgen.py before every run, so the hardware always tracks the model.
 
 The proposing agent is pluggable: the deterministic RuleBasedAgent by
 default, or a real LLM (llm_agent.py) with --agent llm or CHIPLET_AGENT=llm.
-Run: python3 chiplet_flow.py [--agent rules|llm]"""
+Run: python3 chiplet_flow.py [--agent rules|llm|swarm]"""
 import json, os, re, shutil, subprocess, sys
 
 from agent import RuleBasedAgent
@@ -49,15 +49,19 @@ TARGET_LINK_GBPS = float(os.environ.get("CHIPLET_LINK_GBPS", 10.0))
 
 
 def make_agent(kind=None):
-    """Agent factory: 'rules' (default) or 'llm'. One fresh instance per
-    flow run so an LLM agent's attempt memory never leaks between blocks."""
+    """Agent factory: 'rules' (default), 'llm' or 'swarm'. One fresh instance
+    per flow run so an agent's attempt memory never leaks between blocks."""
     kind = kind or os.environ.get("CHIPLET_AGENT", "rules")
     if kind == "rules":
         return RuleBasedAgent()
     if kind == "llm":
         from llm_agent import LLMAgent
         return LLMAgent()
-    raise SystemExit("unknown agent %r, expected 'rules' or 'llm'" % kind)
+    if kind == "swarm":
+        from swarm import SwarmAgent
+        return SwarmAgent()
+    raise SystemExit(
+        "unknown agent %r, expected 'rules', 'llm' or 'swarm'" % kind)
 
 
 def run(cmd, timeout=120):
@@ -414,7 +418,7 @@ def main(argv=None):
     kind = argv[argv.index("--agent") + 1] if "--agent" in argv else None
     # LLM first cuts are less predictable than the seeded bugs; allow more
     # feedback iterations before giving up.
-    iters = 8 if (kind or os.environ.get("CHIPLET_AGENT")) == "llm" else None
+    iters = 8 if (kind or os.environ.get("CHIPLET_AGENT")) in ("llm", "swarm") else None
     r1, _ = run_flow(CHIPLET_JOB, verbose=True,
                      agent=make_agent(kind), max_iters=iters)
     print()

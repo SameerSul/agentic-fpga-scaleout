@@ -5,11 +5,17 @@ references. Pure Python 3 stdlib."""
 import math
 import os
 import random
+import re
+import shutil
 import zlib
 
 from chiplet_flow import (run_flow, run_endpoint_flow, make_agent, ROOT)
 from agent import RuleBasedAgent
-from llm_agent import build_prompt, extract_verilog, condense_feedback
+from llm_agent import (build_prompt, extract_verilog, condense_feedback,
+                       CALLERS)
+import swarm as swarm_mod
+from swarm import SwarmAgent, parse_review
+import dv
 from specgen import (derive_chiplet_spec, derive_endpoint_spec,
                      endpoint_options, generate)
 from boards import BOARDS, fit, TRANSPORTS
@@ -164,6 +170,151 @@ def test_llm_agent_offline():
     check('verilog extraction strips fences and surrounding prose',
           extract_verilog(fenced) == 'module mac (input clk);\nendmodule\n'
           and extract_verilog(bare) == 'module mac (input clk);\nendmodule\n')
+
+
+def _scripted_swarm(replies):
+    """A SwarmAgent wired to a canned reply list instead of a model, so the
+    orchestration logic is testable with no network and no cost. Returns the
+    agent and the list of prompts it sent, in order."""
+    sent = []
+    queue = list(replies)
+
+    def fake(prompt, model):
+        sent.append(prompt)
+        return queue.pop(0) if queue else 'ACCEPT'
+
+    CALLERS['_test'] = fake
+    a = SwarmAgent.__new__(SwarmAgent)
+    a.backend, a.model = '_test', 'fake'
+    a.review_rounds = swarm_mod.MAX_REVIEW_ROUNDS
+    a.use_reviewer = a.use_debugger = True
+    a.last_rtl = None
+    a.calls = {'writer': 0, 'reviewer': 0, 'debugger': 0}
+    a.log = []
+    return a, sent
+
+
+def test_swarm_offline():
+    """The swarm's orchestration, with the model stubbed out: who gets called
+    and when, what each role is shown, and that no single role can wedge the
+    run. The tools stay the judge, so the failure mode that matters is a role
+    blocking or starving a design the tools would have accepted."""
+    for text, want_ok in [('ACCEPT', True), ('  accept.  ', True),
+                          ('ACCEPT - looks correct', True), ('', True),
+                          ('   \n  ', True), ('ok', True)]:
+        check('review %r reads as acceptance' % text[:14],
+              parse_review(text)[0] is want_ok)
+    ok, obj = parse_review('- acc is 16 bits, spec says 28\n- clear is missing')
+    check('reviewer objections are parsed into actionable lines',
+          not ok and '28' in obj and len(obj.splitlines()) == 2)
+    check('objection list is capped at four lines',
+          len(parse_review('\n'.join('defect number %d here' % i
+                                     for i in range(9)))[1].splitlines()) == 4)
+
+    ms = load_model_spec()
+    spec = derive_chiplet_spec(ms)
+    rtl_a = 'module mac (input clk);\nendmodule'
+    rtl_b = 'module mac (input clk, input rst);\nendmodule'
+
+    # First call of a run: no feedback yet, so there is nothing to debug.
+    a, sent = _scripted_swarm([rtl_a, 'ACCEPT'])
+    out, notes = a.propose(spec, [])
+    check('no debugger call before any tool has run',
+          a.calls['debugger'] == 0 and a.calls['writer'] == 1)
+    check('accepted draft is returned unchanged', out.startswith('module mac'))
+    check('notes record which roles ran',
+          'writer' in notes[1] and 'reviewer:accept' in notes[1])
+
+    # A rejection must cost exactly one rewrite and must show the writer the
+    # draft the objections are about, not some older attempt.
+    a, sent = _scripted_swarm([rtl_a, 'acc is truncated to 16 bits', rtl_b])
+    out, notes = a.propose(spec, [])
+    check('rejection triggers exactly one rewrite',
+          a.calls['writer'] == 2 and a.calls['reviewer'] == 1)
+    check('rewrite prompt shows the rejected draft and the objection',
+          'input clk);' in sent[2] and 'truncated to 16 bits' in sent[2])
+    check('revised draft is what gets handed to the tools', 'rst' in out)
+    check('revision is not re-reviewed past the round cap',
+          'reviewer:reject' in notes[1] and a.calls['reviewer'] == 1)
+
+    # With tool feedback present the debugger runs first and its diagnosis
+    # has to reach the writer, otherwise the extra call bought nothing.
+    fb = [{'stage': 'sim', 'status': 'fail', 'iteration': 1,
+           'mismatches': [{'test': 'wide_product', 'expected_acc': '65328',
+                           'got_acc': '304'}]}]
+    a, sent = _scripted_swarm(['acc_out is 16 bits wide, must be 28',
+                               rtl_b, 'ACCEPT'])
+    a.last_rtl = rtl_a
+    out, notes = a.propose(spec, fb)
+    check('debugger runs first when tools have reported a failure',
+          a.calls['debugger'] == 1 and 'wide_product' in sent[0])
+    check('debugger is told not to write verilog', 'not write any Verilog'
+          in sent[0] or 'Do not write any Verilog' in sent[0])
+    check('diagnosis reaches the writer prompt',
+          'must be 28' in sent[1] and 'DIAGNOSIS' in sent[1])
+    check('writer prompt still carries the spec and the hard rules',
+          str(spec['parameters']['acc_width']) in sent[1]
+          and 'Verilog-2005' in sent[1])
+
+    # Degradation: any role can die without taking the run with it.
+    def dies_on(marker):
+        def caller(prompt, model):
+            if marker in prompt:
+                raise RuntimeError('role down')
+            return rtl_a
+        return caller
+
+    a2, _ = _scripted_swarm([rtl_a])
+    CALLERS['_test2'] = dies_on('reviewing Verilog')
+    a2.backend = '_test2'
+    out2, notes2 = a2.propose(spec, [])
+    check('a dead reviewer cannot block a design the tools would accept',
+          out2.startswith('module mac'))
+
+    a3, _ = _scripted_swarm([rtl_a])
+    CALLERS['_test3'] = dies_on('debug engineer')
+    a3.backend = '_test3'
+    a3.last_rtl = rtl_a
+    out3, _ = a3.propose(spec, fb)
+    check('a dead debugger still yields RTL for the tools to judge',
+          out3.startswith('module mac'))
+
+    check('swarm satisfies the agent interface the orchestrator calls',
+          callable(getattr(SwarmAgent, 'propose')))
+    for k in ('_test', '_test2', '_test3'):
+        CALLERS.pop(k, None)
+
+
+def test_dv_mutation(fp):
+    """Mutation testing of the generated testbenches. Convergence only says
+    the RTL passed its DV; it says nothing about whether that DV could have
+    failed. Every operator that changes behaviour must be killed, because a
+    survivor is a defect class the flow would sign off on. Survivors are put
+    to yosys for an equivalence proof first, so a mutant that cannot change
+    behaviour is never counted against the testbench."""
+    for rtl, tb, label in ((os.path.join('build', 'mac.v'), 'tb_mac.v',
+                            'chiplet'),
+                           (os.path.join('build', 'crc.v'), 'tb_crc.v',
+                            'endpoint')):
+        src = open(os.path.join(ROOT, rtl)).read()
+        tbp = os.path.join(ROOT, tb)
+        os.makedirs(dv.DVDIR, exist_ok=True)
+        top = re.findall(r'^\s*module\s+([A-Za-z_]\w*)', src, re.M)[0]
+        check('%s baseline passes its own testbench' % label,
+              dv.evaluate('base', src, tbp, top)[0] == 'SURVIVED')
+        survivors = []
+        for name, fn, _ in dv.OPS:
+            mutant = fn(src)
+            if mutant == src:
+                continue
+            verdict = dv.evaluate(name, mutant, tbp, top)[0]
+            if verdict == 'SURVIVED' and not dv.prove_equivalent(src, mutant,
+                                                                 top):
+                survivors.append(name)
+        check('%s DV kills every behaviour-changing mutant%s'
+              % (label, '' if not survivors else ' (survived: %s)'
+                 % ','.join(survivors)), not survivors)
+        shutil.rmtree(dv.DVDIR, ignore_errors=True)
 
 
 def test_fpga_backend(profile, fp):
@@ -381,10 +532,12 @@ if __name__ == '__main__':
     test_specgen(profile)
     test_model_driven_flow(profile)
     test_llm_agent_offline()
+    test_swarm_offline()
     test_fit_monotonic(profile)
     test_allreduce(profile)
     test_hetero_bit_identical(profile)
     fp = test_fabric_flow()
+    test_dv_mutation(fp)
     test_fpga_backend(profile, fp)
     test_endpoint_derivation(fp)
     test_transports(profile, fp)

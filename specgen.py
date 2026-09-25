@@ -351,7 +351,38 @@ def render_crc_testbench(spec):
         ("two_words", bytes(rng.randrange(256) for _ in range(2 * w))),
         ("eight_words", bytes(rng.randrange(256) for _ in range(8 * w))),
     ]
+    zero_lit = _word_literal(bytes(w), w)
+    zero_crc = crc32_bytes(bytes(w))
     body = []
+    # Reset alone has to initialise the CRC state. Every other test opens
+    # with start_frame, whose clear reinitialises the same register, so
+    # without this section a design with a dead reset branch passes.
+    body.append('    testname = "reset_init";')
+    body.append("    expect_quiet(testname);")
+    body.append("    word(%s);" % zero_lit)
+    body.append("    expect_crc(32'h%08x);" % zero_crc)
+    body.append("")
+    # Outputs must not move until the rising edge. At frame granularity a
+    # block clocked on the wrong edge is only a half cycle shift and is
+    # invisible, so the settling point is checked explicitly.
+    body.append('    testname = "edge_discipline";')
+    body.append("    start_frame;")
+    body.append("    @(negedge clk); data = %s; valid_in = 1;" % zero_lit)
+    body.append("    #1;")
+    body.append("    expect_quiet(testname);")
+    body.append("    @(posedge clk); #1;")
+    body.append("    checks = checks + 1;")
+    body.append("    if (crc_out !== 32'h%08x || valid_out !== 1'b1) begin"
+                % zero_crc)
+    body.append('      $display("TB_FAIL test=%0s expected_crc=%0d '
+                'got_crc=%0d expected_vout=1 got_vout=%b",')
+    body.append("               testname, 32'h%08x, crc_out, valid_out);"
+                % zero_crc)
+    body.append('      $display("TB_RESULT: FAIL");')
+    body.append("      $finish;")
+    body.append("    end")
+    body.append("    @(negedge clk); valid_in = 0;")
+    body.append("")
     for name, payload in cases:
         body.append('    testname = "%s";' % name)
         body.append("    start_frame;")
@@ -412,6 +443,20 @@ module tb_crc;
   task word(input [{dm}:0] d);
     begin
       @(negedge clk); data = d; valid_in = 1;
+    end
+  endtask
+
+  // valid_out must be low. Used after reset and between frames, and as the
+  // settling check that makes wrong-edge clocking observable.
+  task expect_quiet(input [127:0] why);
+    begin
+      checks = checks + 1;
+      if (valid_out !== 1'b0) begin
+        $display("TB_FAIL test=%0s expected_vout=0 got_vout=%b",
+                 why, valid_out);
+        $display("TB_RESULT: FAIL");
+        $finish;
+      end
     end
   endtask
 
