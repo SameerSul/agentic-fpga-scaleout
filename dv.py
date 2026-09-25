@@ -101,7 +101,7 @@ OPS = [
 ]
 
 
-def survivor_verdict(orig, mutant, top):
+def survivor_verdict(orig, mutant, top, extra=()):
     """Classify a survivor: equivalent, a hole, or not provable in time.
 
     The third case is real and has to be said rather than folded into
@@ -110,7 +110,7 @@ def survivor_verdict(orig, mutant, top):
     call that a DV hole would be to invent a defect; to call it
     equivalent would be to assume one away.
     """
-    if prove_equivalent(orig, mutant, top):
+    if prove_equivalent(orig, mutant, top, extra):
         return "equivalent"
     return "unproven" if _last_equiv_timed_out[0] else "hole"
 
@@ -118,7 +118,7 @@ def survivor_verdict(orig, mutant, top):
 _last_equiv_timed_out = [False]
 
 
-def prove_equivalent(orig, mutant, top):
+def prove_equivalent(orig, mutant, top, extra=()):
     """Ask yosys whether the mutant is sequentially equivalent to the
     original. Only a proof reclassifies a survivor; anything inconclusive
     leaves it counted as a hole, because the honest default is to assume the
@@ -129,19 +129,28 @@ def prove_equivalent(orig, mutant, top):
         f.write(orig)
     with open(os.path.join(DVDIR, "gate.v"), "w") as f:
         f.write(mutant)
+    # A block that instantiates others cannot be elaborated without
+    # them. Without this the proof fails for want of a module rather
+    # than for want of equivalence, and every mutant of a composite
+    # block is misreported as a DV hole.
+    deps = ""
+    for i, src in enumerate(extra):
+        name = "eqdep%d.v" % i
+        shutil.copy(src, os.path.join(DVDIR, name))
+        deps += " " + name
     # memory_map turns an inferred ROM into plain logic. Without it a
     # design with a lookup table cannot be proven at all: the SAT solver
     # reports "no SAT model available" for the $mem cell and every mutant
     # in such a design is misreported as a surviving DV hole.
-    script = ("read_verilog gold.v; prep -top {t} -flatten; memory_map; "
-              "opt -full; design -stash gold; read_verilog gate.v; "
+    script = ("read_verilog gold.v{d}; prep -top {t} -flatten; memory_map; "
+              "opt -full; design -stash gold; read_verilog gate.v{d}; "
               "prep -top {t} -flatten; memory_map; opt -full; "
               "design -stash gate; "
               "design -copy-from gold -as gold {t}; "
               "design -copy-from gate -as gate {t}; "
               "equiv_make gold gate equiv; prep -top equiv; "
               "equiv_simple; equiv_induct; equiv_status -assert"
-              ).format(t=top)
+              ).format(t=top, d=deps)
     rc, out = run(["yosys", "-p", script], DVDIR, timeout=90)
     # Both conditions: equiv_status -assert sets the exit code, and the
     # message confirms cells were actually compared rather than the

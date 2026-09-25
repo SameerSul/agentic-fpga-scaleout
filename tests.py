@@ -948,6 +948,75 @@ def test_softmax_sequencer():
           is not None)
 
 
+def test_mlp_layer():
+    """A layer rather than an operation: two matmuls with a requantize
+    and a rectify between, over a two-bank activation buffer. This is
+    the block that routes one matmul's outputs into the next one's
+    inputs, which nothing did before it."""
+    ms = load_model_spec()
+    spec = specgen_mod.derive_mlp_spec(ms)
+    p = spec['parameters']
+    rq = specgen_mod.derive_requant_spec(ms)
+    check('the requantizer depth is taken from that block',
+          p['requant_stages'] == rq['parameters']['pipeline_stages'])
+
+    work = os.path.join(ROOT, 'build_mlptest')
+    shutil.rmtree(work, ignore_errors=True)
+    os.makedirs(work)
+    try:
+        rr = RuleBasedAgent()
+        open(os.path.join(work, 'tb.v'), 'w').write(
+            specgen_mod.render_mlp_testbench(spec))
+        open(os.path.join(work, 'mac.v'), 'w').write(
+            rr.render_mac(derive_chiplet_spec(ms),
+                          {agent_mod.FIX_WIDTH, agent_mod.FIX_CLEAR}))
+        open(os.path.join(work, 'mv.v'), 'w').write(
+            rr.render_matvec(specgen_mod.derive_matvec_spec(ms),
+                             {agent_mod.FIX_CLRCOL, agent_mod.FIX_MEMLAT}))
+        open(os.path.join(work, 'rq.v'), 'w').write(
+            rr.render_requant(rq, {agent_mod.FIX_SATURATE}))
+        res = {}
+        for label, fx in (('unchained', set()),
+                          ('fixed', {agent_mod.FIX_CHAIN})):
+            open(os.path.join(work, 'mlp.v'), 'w').write(
+                rr.render_mlp(spec, fx))
+            r = subprocess.run(['iverilog', '-g2005', '-o', 's.out',
+                                'tb.v', 'mlp.v', 'mv.v', 'mac.v', 'rq.v'],
+                               cwd=work, capture_output=True, text=True)
+            assert r.returncode == 0, r.stdout + r.stderr
+            r = subprocess.run(['vvp', 's.out'], cwd=work,
+                               capture_output=True, text=True, timeout=900)
+            res[label] = 'TB_RESULT: PASS' in r.stdout
+        check('the layer computes two chained matmuls with relu',
+              res['fixed'])
+        # The two numbers are equal by construction, so the design looks
+        # right; it only diverges when a caller passes them inconsistently.
+        check('a second reduction length not chained to the first is caught',
+              not res['unchained'])
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+    # Equivalence proving has to see a composite block's hierarchy, or it
+    # fails for want of a module and every mutant reads as a DV hole.
+    import inspect
+    check('equivalence proving accepts dependencies',
+          'extra' in inspect.signature(dv.prove_equivalent).parameters)
+
+
+def test_requant_golden_is_shared():
+    """One model of requantization, used by the requantizer's own
+    testbench and by the layer that sequences it, so the two cannot
+    disagree about what it means."""
+    for acc, sc, sh in ((1000, 4096, 12), (-1000, 4096, 12),
+                        (1 << 20, 4096, 12), (-(1 << 20), 4096, 12)):
+        q, sat = specgen_mod.requant_golden(acc, sc, sh, 8)
+        check('requant(%d) stays in range%s' % (acc, ' (saturated)' if sat
+                                                else ''),
+              -128 <= q <= 127)
+    check('requantization rounds to nearest, not toward zero',
+          specgen_mod.requant_golden(3, 1 << 11, 12, 8)[0] == 2)
+
+
 def test_fpga_backend(profile, fp):
     """Real device mapping, not generic cells: the two generated blocks land
     on different resources, which is what makes a single capacity proxy
@@ -1173,6 +1242,8 @@ if __name__ == '__main__':
     test_matvec_sequencer()
     test_wmem_subsystem()
     test_softmax_sequencer()
+    test_mlp_layer()
+    test_requant_golden_is_shared()
     test_generation()
     test_bitstream()
     test_fit_monotonic(profile)

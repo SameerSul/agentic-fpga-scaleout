@@ -1,0 +1,237 @@
+{
+  "spec": {
+    "name": "mlp_gpt2_124m",
+    "description": "MLP layer sequencer: two matmuls with a requantize and rectify between them, over a two-bank activation buffer of 64 each",
+    "top_module": "mlp",
+    "unit": "layer",
+    "parameters": {
+      "data_width": 8,
+      "acc_width": 28,
+      "bank": 64,
+      "bank_width": 6,
+      "depth_width": 12,
+      "col_width": 12,
+      "addr_width": 24,
+      "scale_width": 18,
+      "shift_width": 7,
+      "requant_stages": 6,
+      "signed": true,
+      "pipeline_stages": 1,
+      "target_clock_mhz": 100
+    },
+    "derivation": {
+      "model": "gpt2_124m",
+      "rule": "the activation bank is one tile; the matmul and requantizer formats come from those blocks, so a change to either changes this one"
+    },
+    "ports": [
+      {
+        "name": "clk",
+        "dir": "input",
+        "width": 1,
+        "desc": "clock, rising edge"
+      },
+      {
+        "name": "rst_n",
+        "dir": "input",
+        "width": 1,
+        "desc": "active-low synchronous reset"
+      },
+      {
+        "name": "load_valid",
+        "dir": "input",
+        "width": 1,
+        "desc": "write an input activation into bank zero"
+      },
+      {
+        "name": "load_data",
+        "dir": "input",
+        "width": 8,
+        "signed": true,
+        "desc": "input activation"
+      },
+      {
+        "name": "start",
+        "dir": "input",
+        "width": 1,
+        "desc": "run the layer"
+      },
+      {
+        "name": "depth1",
+        "dir": "input",
+        "width": 12,
+        "desc": "reduction length of the first matmul"
+      },
+      {
+        "name": "cols1",
+        "dir": "input",
+        "width": 12,
+        "desc": "outputs of the first matmul"
+      },
+      {
+        "name": "cols2",
+        "dir": "input",
+        "width": 12,
+        "desc": "outputs of the second matmul"
+      },
+      {
+        "name": "scale1",
+        "dir": "input",
+        "width": 18,
+        "desc": "requantizer scale for the first matmul"
+      },
+      {
+        "name": "shift1",
+        "dir": "input",
+        "width": 7,
+        "desc": "requantizer shift for the first matmul"
+      },
+      {
+        "name": "scale2",
+        "dir": "input",
+        "width": 18,
+        "desc": "requantizer scale for the second matmul"
+      },
+      {
+        "name": "shift2",
+        "dir": "input",
+        "width": 7,
+        "desc": "requantizer shift for the second matmul"
+      },
+      {
+        "name": "w_addr",
+        "dir": "output",
+        "width": 24,
+        "desc": "weight address, into the weight memory"
+      },
+      {
+        "name": "w_data",
+        "dir": "input",
+        "width": 8,
+        "signed": true,
+        "desc": "weight, registered read"
+      },
+      {
+        "name": "o_valid",
+        "dir": "output",
+        "width": 1,
+        "desc": "a layer output is on o_data"
+      },
+      {
+        "name": "o_index",
+        "dir": "output",
+        "width": 6,
+        "desc": "which output"
+      },
+      {
+        "name": "o_data",
+        "dir": "output",
+        "width": 8,
+        "signed": true,
+        "desc": "layer output activation"
+      },
+      {
+        "name": "busy",
+        "dir": "output",
+        "width": 1,
+        "desc": "a layer is in progress"
+      }
+    ],
+    "behavior": [
+      "load_valid writes input activations into bank zero in order.",
+      "start runs the first matmul over bank zero, requantizes each column with scale1 and shift1, rectifies it and writes it to bank one.",
+      "It then runs the second matmul over bank one, requantizes with scale2 and shift2, and emits each result on o_data.",
+      "The second matmul's reduction length is the first one's column count, because that is what the first matmul produced. Taking it from an input instead would let the two disagree.",
+      "The weight address continues across both matmuls, so the second matrix follows the first in memory."
+    ]
+  },
+  "tools": {
+    "iverilog": "/opt/homebrew/bin/iverilog",
+    "vvp": "/opt/homebrew/bin/vvp",
+    "yosys": "/opt/homebrew/bin/yosys",
+    "sta": "/Users/ssuleman/.local/bin/sta"
+  },
+  "agent": "RuleBasedAgent",
+  "converged": true,
+  "iterations_used": 2,
+  "history": [
+    {
+      "iteration": 1,
+      "fixes_applied": [],
+      "sim": {
+        "stage": "sim",
+        "status": "fail",
+        "checks": null,
+        "mismatches": [
+          {
+            "test": "layer",
+            "out": "0",
+            "expected_y": "-128",
+            "got_y": "x"
+          }
+        ]
+      },
+      "synth": null,
+      "timing": null,
+      "fpga": null
+    },
+    {
+      "iteration": 2,
+      "fixes_applied": [
+        "take_the_second_depth_from_the_first_count"
+      ],
+      "sim": {
+        "stage": "sim",
+        "status": "pass",
+        "checks": 6,
+        "mismatches": [],
+        "throughput": {
+          "layers": 1,
+          "span_cycles": 78,
+          "latency_cycles": 16,
+          "units": 1,
+          "cycles_per_unit": 78.0
+        }
+      },
+      "synth": {
+        "stage": "synth",
+        "status": "pass",
+        "cell_count": 9275,
+        "area": 19073.0
+      },
+      "timing": {
+        "stage": "timing",
+        "status": "pass",
+        "method": "opensta",
+        "clock_period_ns": 10.0,
+        "worst_slack_ns": 0.22
+      },
+      "fpga": {
+        "luts": 3786,
+        "ffs": 3469,
+        "dsps": 15,
+        "brams": 0,
+        "urams": 0,
+        "carry": 164,
+        "muxf": 678,
+        "status": "pass",
+        "family": "xcup",
+        "top": "mlp",
+        "lint": [],
+        "stage": "fpga"
+      }
+    }
+  ],
+  "final_metrics": {
+    "sim_pass": true,
+    "sim_checks": 6,
+    "cell_count": 9275,
+    "area": 19073.0,
+    "timing": {
+      "stage": "timing",
+      "status": "pass",
+      "method": "opensta",
+      "clock_period_ns": 10.0,
+      "worst_slack_ns": 0.22
+    }
+  }
+}

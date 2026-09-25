@@ -129,7 +129,7 @@ def run_dv(rtl_path, tb_path, extra=()):
             if v == "killed":
                 killed += 1
             elif v == "SURVIVED":
-                verdict = dv.survivor_verdict(src, mutant, top)
+                verdict = dv.survivor_verdict(src, mutant, top, deps)
                 if verdict == "equivalent":
                     skipped += 1
                 elif verdict == "unproven":
@@ -184,7 +184,8 @@ def main():
     ap.add_argument("--only", default="all",
                     choices=["all", "both", "chiplet", "requant", "exp",
                              "recip", "rsqrt", "matvec",
-                             "wmem", "softmax", "endpoint"])
+                             "wmem", "softmax", "mlp",
+                             "endpoint"])
     ap.add_argument("--skip-dv", action="store_true")
     a = ap.parse_args()
     do_dv = not a.skip_dv
@@ -332,6 +333,35 @@ def main():
             label = "softmax %s cap%d" % (ms["name"], p["capacity"])
             r, d = one_case(label, spec, "row", a.agent, do_dv,
                             extra=("expu_dep.v", "recip_dep.v"))
+            rows.append(r)
+            details.append((label, d))
+            if any(r[c] not in ("ok", "skip", "-") for c in COLS):
+                failures.append(label)
+
+    if a.only in ("all", "mlp"):
+        base = specgen.load_model_spec()
+        for ms in _models(base):
+            spec = specgen.generate_mlp(ms, spec_file=JOB["spec_file"],
+                                        tb_file=JOB["tb_file"])
+            from agent import (RuleBasedAgent, FIX_WIDTH, FIX_CLEAR,
+                               FIX_CLRCOL, FIX_MEMLAT, FIX_SATURATE)
+            os.makedirs(BUILD, exist_ok=True)
+            rr = RuleBasedAgent()
+            for fn, src in (
+                    ("mac_dep.v", rr.render_mac(
+                        specgen.derive_chiplet_spec(ms),
+                        {FIX_WIDTH, FIX_CLEAR})),
+                    ("mv_dep.v", rr.render_matvec(
+                        specgen.derive_matvec_spec(ms),
+                        {FIX_CLRCOL, FIX_MEMLAT})),
+                    ("rq_dep.v", rr.render_requant(
+                        specgen.derive_requant_spec(ms), {FIX_SATURATE}))):
+                with open(os.path.join(BUILD, fn), "w") as f:
+                    f.write(src)
+            p = spec["parameters"]
+            label = "mlp %s bank%d" % (ms["name"], p["bank"])
+            r, d = one_case(label, spec, "layer", a.agent, do_dv,
+                            extra=("mv_dep.v", "mac_dep.v", "rq_dep.v"))
             rows.append(r)
             details.append((label, d))
             if any(r[c] not in ("ok", "skip", "-") for c in COLS):

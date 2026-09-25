@@ -17,15 +17,15 @@ one. The remaining gap is listed at the bottom rather than glossed over.
 ### The full suite
 
 ```
-python3 tests.py            # 188 tests, all passing
+python3 tests.py            # 197 tests, all passing
 ```
 
 ### Spec to RTL, across the spec space
 
-`python3 sweep.py` drives fifty seven cases through every stage: derivation,
+`python3 sweep.py` drives sixty three cases through every stage: derivation,
 RTL, simulation, synthesis, timing closure, FPGA mapping, the profile
 fields the sizing model consumes, and a mutation sweep of the testbench
-generated at that width. All fifty seven clean.
+generated at that width. All sixty three clean.
 
 | case | cyc/unit | fmax | cells | DV |
 |---|---|---|---|---|
@@ -36,6 +36,7 @@ generated at that width. All fifty seven clean.
 | matvec sequencer | 68.0 | 169 MHz | 1397 | 4/4 |
 | wmem tile + loader | 1024 | 333 MHz | 61712 | 5/5 |
 | softmax sequencer | 64.0 | 106 MHz | 1546 | 6/6 |
+| mlp layer | 78.0 | 102 MHz | 9275 | 3/3 |
 | requant acc28 to 8 | 7.00 | 102 MHz | 9274 | 5/5 |
 | mac int4 weights, acc24 | 1.00 | 187 MHz | 1383 | 8/8 |
 | mac int16, acc46 | 1.00 | 104 MHz | 4570 | 6/6 |
@@ -371,13 +372,13 @@ These are the distance between this repo and a local LLM host.
    matmuls, the exponential and the reciprocal that softmax needs, the
    inverse square root that RMSNorm needs, and the CRC32 fabric
    endpoint, the weight-streaming sequencer that drives the MAC through
-   a matrix, the weight tile and its loader, and softmax as a single
-   sequenced block. Softmax is hardware apart from accumulating the
+   a matrix, the weight tile and its loader, softmax as a single
+   sequenced block, and an MLP layer that drives two matmuls in order
+   and routes the activations between them. Softmax is hardware apart from accumulating the
    sum, and so is the transcendental part of RMSNorm. It does not
-   generate the attention sequencing above the matmul level: nothing
-   drives several matmuls in order and routes activations between them.
-   The weight tile holds 1024 entries, so a real matrix needs tiling
-   logic that does not exist yet. In `generate.py` those run on the host, and the
+   generate attention itself, though its parts now exist. The weight
+   tile holds 1024 entries and the activation bank 64, so a real matrix
+   needs tiling logic that does not exist yet. In `generate.py` those run on the host, and the
    output says so each run.
 3. **The model is small and its weights are its own.** Qwen3-0.6B is not
    loaded; there is no numeric stack here to load it with and no network

@@ -32,7 +32,7 @@ import specgen
 from agent import (RuleBasedAgent, FIX_WIDTH, FIX_CLEAR,
                    FIX_SATURATE, FIX_XOR, FIX_LUT, FIX_NORM, FIX_EVEN,
                    FIX_CLRCOL, FIX_MEMLAT, FIX_REGRD,
-                   FIX_SUBMAX)
+                   FIX_SUBMAX, FIX_CHAIN)
 from chiplet_flow import ROOT, TARGET_LINK_GBPS
 
 WORK = os.path.join(ROOT, "build_bitstream")
@@ -52,6 +52,7 @@ TB_FOR = {
     "matvec": lambda spec: specgen.render_matvec_testbench(spec),
     "wmem": lambda spec: specgen.render_wmem_testbench(spec),
     "softmax": lambda spec: specgen.render_softmax_testbench(spec),
+    "mlp": lambda spec: specgen.render_mlp_testbench(spec),
 }
 
 BLOCKS = {
@@ -74,11 +75,13 @@ BLOCKS = {
              {FIX_REGRD}),
     "softmax": ("softmax", lambda ms: specgen.derive_softmax_spec(ms),
                 {FIX_SUBMAX}),
+    "mlp": ("mlp", lambda ms: specgen.derive_mlp_spec(ms), {FIX_CHAIN}),
 }
 # Blocks whose testbench instantiates other generated blocks. Those are
 # rendered and compiled alongside the unpacked bitstream.
 EXTRA_SRC = {"matvec": ("mac",), "wmem": ("mac", "matvec"),
-             "softmax": ("exp", "recip")}
+             "softmax": ("exp", "recip"),
+             "mlp": ("matvec", "mac", "requant")}
 
 
 ICEBOX_PY = "/opt/homebrew/Cellar/icestorm/1.1/share/icestorm/python"

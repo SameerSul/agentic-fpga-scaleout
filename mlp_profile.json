@@ -1,0 +1,30 @@
+{
+  "block": "mlp_gpt2_124m",
+  "top_module": "mlp",
+  "unit": "layer",
+  "cycles_per_layer": 78.0,
+  "latency_cycles": 16,
+  "cell_count": 9275,
+  "area": 19073.0,
+  "fmax_estimate_mhz": 102.24948875255625,
+  "fmax_method": "opensta_slack",
+  "target_clock_mhz": 100,
+  "sim_checks_passed": 6,
+  "fpga": {
+    "family": "xcup",
+    "luts": 3786,
+    "ffs": 3469,
+    "dsps": 15,
+    "brams": 0,
+    "urams": 0,
+    "carry": 164,
+    "muxf": 678
+  },
+  "derivation": {
+    "model": "gpt2_124m",
+    "rule": "the activation bank is one tile; the matmul and requantizer formats come from those blocks, so a change to either changes this one"
+  },
+  "layer": "mlp_gpt2_124m",
+  "bank": 64,
+  "agent": "RuleBasedAgent"
+}

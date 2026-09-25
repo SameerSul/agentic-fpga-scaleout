@@ -22,6 +22,7 @@ FIX_CLRCOL = "clear_the_accumulator_between_columns"
 FIX_MEMLAT = "delay_valid_for_the_memory_read"
 FIX_REGRD = "register_the_read_port"
 FIX_SUBMAX = "subtract_the_row_maximum"
+FIX_CHAIN = "take_the_second_depth_from_the_first_count"
 # One definition, in specgen, so the declared depth and the generated
 # depth cannot disagree.
 WIDE_ADD_BITS = specgen.WIDE_ADD_BITS
@@ -50,6 +51,8 @@ class RuleBasedAgent:
             return self.render_wmem(spec, fixes), sorted(fixes)
         if spec["top_module"] == "softmax":
             return self.render_softmax(spec, fixes), sorted(fixes)
+        if spec["top_module"] == "mlp":
+            return self.render_mlp(spec, fixes), sorted(fixes)
         return self.render_mac(spec, fixes), sorted(fixes)
 
     def diagnose(self, spec, history):
@@ -67,6 +70,11 @@ class RuleBasedAgent:
                     fixes.add(FIX_XOR)
                 elif "clear" in m.get("test", "").lower():
                     fixes.add(FIX_CLEAR)
+                elif "expected_y" in m and "out" in m:
+                    # The layer's only seeded bug: the second matmul's
+                    # reduction length came from an input rather than
+                    # from what the first matmul produced.
+                    fixes.add(FIX_CHAIN)
                 elif "expected_w" in m:
                     # The sequencer's only seeded bug: raw scores fed to
                     # the exponential instead of score minus the row max.
@@ -107,6 +115,189 @@ class RuleBasedAgent:
                 elif m.get("got_acc") != m.get("expected_acc"):
                     fixes.add(FIX_WIDTH)
         return fixes
+
+    def render_mlp(self, spec, fixes):
+        """MLP layer: two matmuls with a requantize and rectify between.
+
+        It owns the activation buffer and drives the matmul sequencer
+        and the requantizer, which is the routing that was missing: the
+        first matmul's outputs become the second's inputs, in the other
+        bank.
+
+        The seeded first-cut bug takes the second matmul's reduction
+        length from an input instead of from the first matmul's column
+        count. Those are the same number by construction, so the design
+        looks right and works whenever a caller happens to pass
+        consistent values.
+        """
+        p = spec["parameters"]
+        dw, aw = p["data_width"], p["acc_width"]
+        bw, bank = p["bank_width"], p["bank"]
+        mw, sw = p["scale_width"], p["shift_width"]
+        dep_w, col_w, addr_w = (p["depth_width"], p["col_width"],
+                                p["addr_width"])
+        d2 = "cols1_r" if FIX_CHAIN in fixes else "depth1"
+        return """module mlp (
+  input                    clk,
+  input                    rst_n,
+  input                    load_valid,
+  input      signed [{dwm}:0] load_data,
+  input                    start,
+  input      [{depwm}:0] depth1,
+  input      [{colwm}:0] cols1,
+  input      [{colwm}:0] cols2,
+  input      [{mwm}:0] scale1,
+  input      [{swm}:0] shift1,
+  input      [{mwm}:0] scale2,
+  input      [{swm}:0] shift2,
+  output     [{addrwm}:0] w_addr,
+  input      signed [{dwm}:0] w_data,
+  output reg               o_valid,
+  output reg [{bwm}:0] o_index,
+  output reg signed [{dwm}:0] o_data,
+  output reg               busy
+);
+  // Two banks of activations. The first matmul reads bank zero and
+  // writes bank one; the second reads bank one. That alternation is
+  // the routing this block exists to do.
+  reg signed [{dwm}:0] act [0:{bank2m}];
+  reg [{bwm}:0] wptr;
+  reg bank;
+
+  reg [1:0] st;
+  localparam S_IDLE = 2'd0, S_M1 = 2'd1, S_M2 = 2'd2, S_DONE = 2'd3;
+
+  reg  mv_start;
+  reg  [{depwm}:0] mv_depth;
+  reg  [{colwm}:0] mv_cols;
+  wire [{depwm}:0] mv_a_addr;
+  wire [{addrwm}:0] mv_w_addr;
+  wire mv_valid, mv_clear, mv_colv, mv_busy;
+  wire [{colwm}:0] mv_coli;
+  reg  [{addrwm}:0] w_base;
+  reg  [{colwm}:0] cols1_r;
+
+  assign w_addr = w_base + mv_w_addr;
+
+  // The activation the matmul is reading, from whichever bank is the
+  // source for the current matmul.
+  reg signed [{dwm}:0] a_data;
+  always @(posedge clk)
+    a_data <= act[{{bank, mv_a_addr[{bwm}:0]}}];
+
+  matvec mv (.clk(clk), .rst_n(rst_n), .start(mv_start),
+             .depth(mv_depth), .cols(mv_cols), .a_addr(mv_a_addr),
+             .w_addr(mv_w_addr), .mac_valid(mv_valid),
+             .mac_clear(mv_clear), .col_valid(mv_colv),
+             .col_index(mv_coli), .busy(mv_busy));
+
+  wire signed [{awm}:0] acc;
+  wire mac_vout;
+  mac mc (.clk(clk), .rst_n(rst_n), .clear(mv_clear), .a(a_data),
+          .b(w_data), .valid_in(mv_valid), .acc(acc),
+          .valid_out(mac_vout));
+
+  reg  rq_vin;
+  reg  signed [{awm}:0] rq_acc;
+  reg  [{bwm}:0] rq_idx;
+  wire signed [{dwm}:0] rq_q;
+  wire rq_sat, rq_vout;
+  reg  [{mwm}:0] rq_scale;
+  reg  [{swm}:0] rq_shift;
+  requant rq (.clk(clk), .rst_n(rst_n), .acc_in(rq_acc),
+              .scale(rq_scale), .shift(rq_shift), .valid_in(rq_vin),
+              .q_out(rq_q), .sat(rq_sat), .valid_out(rq_vout));
+
+  // The requantizer's index has to travel with its data, so it is
+  // pushed through a shift register of the same depth.
+  reg [{bwm}:0] idx_pipe [0:{rqsm}];
+  integer k;
+  // Outstanding requantizations. The requantizer is several stages
+  // deep, so "the matmul has finished" is not "the results have
+  // landed": advancing on the former writes the first matmul's last
+  // outputs after the second has already read that bank.
+  reg [7:0] outst;
+  // "Not busy" is true before a matmul has started as well as after it
+  // has finished, so completion has to mean "it ran and then stopped".
+  reg ran;
+
+  always @(posedge clk) begin
+    if (!rst_n) begin
+      wptr <= 0; bank <= 1'b0; st <= S_IDLE; mv_start <= 1'b0;
+      mv_depth <= 0; mv_cols <= 0; w_base <= 0; cols1_r <= 0;
+      rq_vin <= 1'b0; rq_acc <= 0; rq_idx <= 0; rq_scale <= 0;
+      rq_shift <= 0; o_valid <= 1'b0; o_index <= 0; o_data <= 0;
+      busy <= 1'b0; outst <= 0; ran <= 1'b0;
+      for (k = 0; k <= {rqsm}; k = k + 1) idx_pipe[k] <= 0;
+    end else begin
+      mv_start <= 1'b0;
+      rq_vin   <= 1'b0;
+      o_valid  <= 1'b0;
+      idx_pipe[0] <= rq_idx;
+      for (k = 1; k <= {rqsm}; k = k + 1)
+        idx_pipe[k] <= idx_pipe[k-1];
+
+      if (mv_busy) ran <= 1'b1;
+
+      case ({{mv_colv, rq_vout}})
+        2'b10: outst <= outst + 1;
+        2'b01: outst <= outst - 1;
+        default: ;
+      endcase
+
+      if (load_valid && !busy) begin
+        act[{{1'b0, wptr}}] <= load_data;
+        wptr <= wptr + 1;
+      end
+
+      // Every finished column goes straight into the requantizer.
+      if (mv_colv) begin
+        rq_acc   <= acc;
+        rq_idx   <= mv_coli[{bwm}:0];
+        rq_vin   <= 1'b1;
+        rq_scale <= (st == S_M1) ? scale1 : scale2;
+        rq_shift <= (st == S_M1) ? shift1 : shift2;
+      end
+
+      case (st)
+        S_IDLE: if (start) begin
+          st <= S_M1; busy <= 1'b1; bank <= 1'b0; ran <= 1'b0;
+          mv_depth <= depth1; mv_cols <= cols1; cols1_r <= cols1;
+          w_base <= 0; mv_start <= 1'b1;
+        end
+        S_M1: begin
+          // Rectify here: a negative activation after requantization is
+          // clamped, which is what makes this an MLP rather than two
+          // bare matmuls.
+          if (rq_vout)
+            act[{{1'b1, idx_pipe[{rqsm}]}}] <=
+                (rq_q[{dwm}] ? {dw}'sd0 : rq_q);
+          if (ran && !mv_busy && outst == 0 && !mv_colv) begin
+            st <= S_M2; bank <= 1'b1; ran <= 1'b0;
+            mv_depth <= {d2};
+            mv_cols  <= cols2;
+            w_base   <= w_base + (depth1 * cols1);
+            mv_start <= 1'b1;
+          end
+        end
+        S_M2: begin
+          if (rq_vout) begin
+            o_valid <= 1'b1;
+            o_index <= idx_pipe[{rqsm}];
+            o_data  <= rq_q;
+          end
+          if (ran && !mv_busy && outst == 0 && !mv_colv) begin
+            st <= S_IDLE; busy <= 1'b0; wptr <= 0; ran <= 1'b0;
+          end
+        end
+        default: st <= S_IDLE;
+      endcase
+    end
+  end
+endmodule
+""".format(dwm=dw - 1, dw=dw, awm=aw - 1, bwm=bw - 1, bank2m=2 * bank - 1,
+           mwm=mw - 1, swm=sw - 1, depwm=dep_w - 1, colwm=col_w - 1,
+           addrwm=addr_w - 1, rqsm=p["requant_stages"] - 1, d2=d2)
 
     def render_softmax(self, spec, fixes):
         """Softmax sequencer: max pass, exponential pass, one reciprocal,

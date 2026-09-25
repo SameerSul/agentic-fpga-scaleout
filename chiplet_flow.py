@@ -42,6 +42,13 @@ FABRIC_JOB = {
     "profile_file": "fabric_profile.json", "report_file": "report_crc.json",
     "derive_from_link": True,
 }
+MLP_JOB = {
+    "spec_file": "spec_mlp.json", "tb_file": "tb_mlp.v",
+    "rtl_file": "mlp.v", "profile_file": "mlp_profile.json",
+    "report_file": "report_mlp.json",
+    "derive_from_model": "mlp",
+    "extra_sources": ("mv_dep.v", "mac_dep.v", "rq_dep.v"),
+}
 SOFTMAX_JOB = {
     "spec_file": "spec_softmax.json", "tb_file": "tb_softmax.v",
     "rtl_file": "softmax.v", "profile_file": "softmax_profile.json",
@@ -362,6 +369,9 @@ def derive_profile(spec, final):
         prof["chiplet"] = spec["name"]
         prof["data_width"] = spec["parameters"]["data_width"]
         prof["acc_width"] = spec["parameters"]["acc_width"]
+    elif unit == "layer":
+        prof["layer"] = spec["name"]
+        prof["bank"] = spec["parameters"]["bank"]
     elif unit == "tile":
         prof["memory"] = spec["name"]
         prof["capacity"] = spec["parameters"]["capacity"]
@@ -438,7 +448,26 @@ def run_flow(job=None, verbose=True, agent=None, max_iters=None):
     say = print if verbose else (lambda *a, **k: None)
     os.makedirs(BUILD, exist_ok=True)
     shutil.copy(LIB, BUILD)
-    if job.get("derive_from_model") == "softmax":
+    if job.get("derive_from_model") == "mlp":
+        specgen.generate_mlp(spec_file=job["spec_file"],
+                             tb_file=job["tb_file"])
+        from agent import (RuleBasedAgent, FIX_WIDTH, FIX_CLEAR,
+                           FIX_CLRCOL, FIX_MEMLAT, FIX_SATURATE)
+        os.makedirs(BUILD, exist_ok=True)
+        _ms = specgen.load_model_spec()
+        _r = RuleBasedAgent()
+        for _fn, _src in (
+                ("mac_dep.v", _r.render_mac(
+                    specgen.derive_chiplet_spec(_ms),
+                    {FIX_WIDTH, FIX_CLEAR})),
+                ("mv_dep.v", _r.render_matvec(
+                    specgen.derive_matvec_spec(_ms),
+                    {FIX_CLRCOL, FIX_MEMLAT})),
+                ("rq_dep.v", _r.render_requant(
+                    specgen.derive_requant_spec(_ms), {FIX_SATURATE}))):
+            with open(os.path.join(BUILD, _fn), "w") as f:
+                f.write(_src)
+    elif job.get("derive_from_model") == "softmax":
         specgen.generate_softmax(spec_file=job["spec_file"],
                                  tb_file=job["tb_file"])
         from agent import RuleBasedAgent, FIX_LUT, FIX_NORM

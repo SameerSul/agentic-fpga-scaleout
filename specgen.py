@@ -1578,6 +1578,257 @@ def generate_softmax(ms=None, spec_file="spec_softmax.json",
     return spec
 
 
+def requant_golden(acc, scale, sh, out_width):
+    """Scale, round to nearest, saturate. Shared by the requantizer's own
+    testbench and by anything that sequences it, so the two cannot
+    disagree about what requantization means."""
+    hi = (1 << (out_width - 1)) - 1
+    lo = -(1 << (out_width - 1))
+    prod = acc * scale
+    r = (prod + (1 << (sh - 1))) >> sh if sh > 0 else prod
+    if r > hi:
+        return hi, 1
+    if r < lo:
+        return lo, 1
+    return r, 0
+
+
+def derive_mlp_spec(ms):
+    """model spec -> MLP layer sequencer spec.
+
+    The blocks so far do one operation each. This drives two matmuls in
+    order and routes the activations between them: the first result is
+    requantized, rectified and written to the other bank of an
+    activation buffer, which the second matmul then reads. That routing
+    is the thing that was missing, and it is what makes a layer out of a
+    matmul.
+    """
+    c = derive_chiplet_spec(ms)
+    mv = derive_matvec_spec(ms)
+    rq = derive_requant_spec(ms)
+    dw = c["parameters"]["data_width"]
+    aw = c["parameters"]["acc_width"]
+    bank = 64                       # activations per bank, one tile
+    bw = (bank - 1).bit_length()
+    return {
+        "name": "mlp_%s" % ms["name"],
+        "description": "MLP layer sequencer: two matmuls with a "
+                       "requantize and rectify between them, over a "
+                       "two-bank activation buffer of %d each" % bank,
+        "top_module": "mlp",
+        "unit": "layer",
+        "parameters": {
+            "data_width": dw, "acc_width": aw, "bank": bank,
+            "bank_width": bw,
+            "depth_width": mv["parameters"]["depth_width"],
+            "col_width": mv["parameters"]["col_width"],
+            "addr_width": mv["parameters"]["addr_width"],
+            "scale_width": rq["parameters"]["scale_width"],
+            "shift_width": rq["parameters"]["shift_width"],
+            "requant_stages": rq["parameters"]["pipeline_stages"],
+            "signed": True, "pipeline_stages": 1,
+            "target_clock_mhz": 100,
+        },
+        "derivation": {
+            "model": ms["name"],
+            "rule": "the activation bank is one tile; the matmul and "
+                    "requantizer formats come from those blocks, so a "
+                    "change to either changes this one",
+        },
+        "ports": [
+            {"name": "clk", "dir": "input", "width": 1,
+             "desc": "clock, rising edge"},
+            {"name": "rst_n", "dir": "input", "width": 1,
+             "desc": "active-low synchronous reset"},
+            {"name": "load_valid", "dir": "input", "width": 1,
+             "desc": "write an input activation into bank zero"},
+            {"name": "load_data", "dir": "input", "width": dw,
+             "signed": True, "desc": "input activation"},
+            {"name": "start", "dir": "input", "width": 1,
+             "desc": "run the layer"},
+            {"name": "depth1", "dir": "input",
+             "width": mv["parameters"]["depth_width"],
+             "desc": "reduction length of the first matmul"},
+            {"name": "cols1", "dir": "input",
+             "width": mv["parameters"]["col_width"],
+             "desc": "outputs of the first matmul"},
+            {"name": "cols2", "dir": "input",
+             "width": mv["parameters"]["col_width"],
+             "desc": "outputs of the second matmul"},
+            {"name": "scale1", "dir": "input",
+             "width": rq["parameters"]["scale_width"],
+             "desc": "requantizer scale for the first matmul"},
+            {"name": "shift1", "dir": "input",
+             "width": rq["parameters"]["shift_width"],
+             "desc": "requantizer shift for the first matmul"},
+            {"name": "scale2", "dir": "input",
+             "width": rq["parameters"]["scale_width"],
+             "desc": "requantizer scale for the second matmul"},
+            {"name": "shift2", "dir": "input",
+             "width": rq["parameters"]["shift_width"],
+             "desc": "requantizer shift for the second matmul"},
+            {"name": "w_addr", "dir": "output",
+             "width": mv["parameters"]["addr_width"],
+             "desc": "weight address, into the weight memory"},
+            {"name": "w_data", "dir": "input", "width": dw, "signed": True,
+             "desc": "weight, registered read"},
+            {"name": "o_valid", "dir": "output", "width": 1,
+             "desc": "a layer output is on o_data"},
+            {"name": "o_index", "dir": "output", "width": bw,
+             "desc": "which output"},
+            {"name": "o_data", "dir": "output", "width": dw, "signed": True,
+             "desc": "layer output activation"},
+            {"name": "busy", "dir": "output", "width": 1,
+             "desc": "a layer is in progress"},
+        ],
+        "behavior": [
+            "load_valid writes input activations into bank zero in order.",
+            "start runs the first matmul over bank zero, requantizes each "
+            "column with scale1 and shift1, rectifies it and writes it to "
+            "bank one.",
+            "It then runs the second matmul over bank one, requantizes "
+            "with scale2 and shift2, and emits each result on o_data.",
+            "The second matmul's reduction length is the first one's "
+            "column count, because that is what the first matmul "
+            "produced. Taking it from an input instead would let the two "
+            "disagree.",
+            "The weight address continues across both matmuls, so the "
+            "second matrix follows the first in memory.",
+        ],
+    }
+
+
+def render_mlp_testbench(spec):
+    """Testbench for the layer: the sequencer with the real matmul
+    sequencer, the real MAC and the real requantizer under it."""
+    p = spec["parameters"]
+    dw, aw = p["data_width"], p["acc_width"]
+    mw, sw = p["scale_width"], p["shift_width"]
+    d1, c1, c2 = 8, 6, 5
+    m = (1 << dw) - 5
+    half = m // 2
+    rnd = random.Random(61)
+    acts = [rnd.randrange(-half, half) for _ in range(d1)]
+    w1 = [rnd.randrange(-half, half) for _ in range(d1 * c1)]
+    w2 = [rnd.randrange(-half, half) for _ in range(c1 * c2)]
+    sh = 12
+    sc = 1 << (sh - 4)              # a gentle scale, mostly in range
+    h_acc = [sum(acts[r] * w1[c * d1 + r] for r in range(d1))
+             for c in range(c1)]
+    h = [max(0, requant_golden(v, sc, sh, dw)[0]) for v in h_acc]
+    y_acc = [sum(h[r] * w2[c * c1 + r] for r in range(c1))
+             for c in range(c2)]
+    y = [requant_golden(v, sc, sh, dw)[0] for v in y_acc]
+    init = "\n".join(
+        ["    acts[%d] = %s;" % (i, _slit(v, dw))
+         for i, v in enumerate(acts)]
+        + ["    wmem_tb[%d] = %s;" % (i, _slit(v, dw))
+           for i, v in enumerate(w1 + w2)]
+        + ["    expect_y[%d] = %s;" % (i, _slit(v, dw))
+           for i, v in enumerate(y)])
+    return MLP_TB.format(
+        dwm=dw - 1, awm=aw - 1, mwm=mw - 1, swm=sw - 1,
+        bwm=p["bank_width"] - 1, depwm=p["depth_width"] - 1,
+        colwm=p["col_width"] - 1, addrwm=p["addr_width"] - 1,
+        d1=d1, c1=c1, c2=c2, nw=len(w1 + w2), sc=sc, sh=sh, init=init)
+
+
+MLP_TB = """`timescale 1ns/1ps
+// GENERATED by specgen.py: do not edit by hand.
+// Testbench for the MLP layer sequencer, with the real matmul
+// sequencer, the real MAC and the real requantizer under it. Golden
+// values come from the shared requantization model, so the layer is
+// checked against the arithmetic its parts are specified to do.
+module tb_mlp;
+  reg clk = 0, rst_n = 0, start = 0, load_valid = 0;
+  reg signed [{dwm}:0] load_data = 0;
+  reg [{depwm}:0] depth1 = 0;
+  reg [{colwm}:0] cols1 = 0, cols2 = 0;
+  reg [{mwm}:0] scale1 = 0, scale2 = 0;
+  reg [{swm}:0] shift1 = 0, shift2 = 0;
+  wire [{addrwm}:0] w_addr;
+  wire o_valid, busy;
+  wire [{bwm}:0] o_index;
+  wire signed [{dwm}:0] o_data;
+
+  reg signed [{dwm}:0] acts [0:{d1}-1];
+  reg signed [{dwm}:0] wmem_tb [0:{nw}-1];
+  reg signed [{dwm}:0] expect_y [0:{c2}-1];
+  reg signed [{dwm}:0] w_data;
+  integer checks = 0, seen = 0, i;
+  reg [255:0] testname;
+
+  always @(posedge clk) w_data <= wmem_tb[w_addr];
+
+  mlp dut (.clk(clk), .rst_n(rst_n), .load_valid(load_valid),
+           .load_data(load_data), .start(start), .depth1(depth1),
+           .cols1(cols1), .cols2(cols2), .scale1(scale1),
+           .shift1(shift1), .scale2(scale2), .shift2(shift2),
+           .w_addr(w_addr), .w_data(w_data), .o_valid(o_valid),
+           .o_index(o_index), .o_data(o_data), .busy(busy));
+
+  always #5 clk = ~clk;
+
+  always @(posedge clk) begin
+    if (rst_n && o_valid) begin
+      checks = checks + 1;
+      seen = seen + 1;
+      if (o_data !== expect_y[o_index]) begin
+        $display("TB_FAIL test=%0s out=%0d expected_y=%0d got_y=%0d",
+                 testname, o_index, expect_y[o_index], o_data);
+        $display("TB_RESULT: FAIL");
+        $finish;
+      end
+    end
+  end
+
+  initial begin
+{init}
+    testname = "layer";
+    repeat (3) @(negedge clk);
+    rst_n = 1;
+    @(negedge clk);
+    for (i = 0; i < {d1}; i = i + 1) begin
+      load_data = acts[i]; load_valid = 1;
+      @(negedge clk);
+    end
+    load_valid = 0;
+    depth1 = {d1}; cols1 = {c1}; cols2 = {c2};
+    scale1 = {sc}; shift1 = {sh}; scale2 = {sc}; shift2 = {sh};
+    @(negedge clk);
+    start = 1;
+    @(negedge clk);
+    start = 0;
+    while (busy) @(negedge clk);
+    repeat (8) @(negedge clk);
+    checks = checks + 1;
+    if (seen !== {c2}) begin
+      $display("TB_FAIL test=%0s out=0 expected_y=%0d got_y=%0d",
+               "output_count", {c2}, seen);
+      $display("TB_RESULT: FAIL");
+      $finish;
+    end
+    $display("TB_PROFILE layers=%0d span_cycles=%0d latency_cycles=%0d",
+             1, {d1} * {c1} + {c1} * {c2}, 16);
+    $display("TB_PASS checks=%0d", checks);
+    $display("TB_RESULT: PASS");
+    $finish;
+  end
+endmodule
+"""
+
+
+def generate_mlp(ms=None, spec_file="spec_mlp.json", tb_file="tb_mlp.v"):
+    """Write the derived MLP layer spec and testbench."""
+    ms = ms or load_model_spec()
+    spec = derive_mlp_spec(ms)
+    with open(os.path.join(ROOT, spec_file), "w") as f:
+        json.dump(spec, f, indent=2)
+    with open(os.path.join(ROOT, tb_file), "w") as f:
+        f.write(render_mlp_testbench(spec))
+    return spec
+
+
 def derive_requant_spec(ms):
     """model spec -> requantization spec.
 
@@ -1684,15 +1935,7 @@ def render_requant_testbench(spec):
     rnd = random.Random(7)
 
     def golden(acc, scale, sh):
-        prod = acc * scale
-        # Round to nearest via a half-LSB bias, then arithmetic shift.
-        r = (prod + (1 << (sh - 1))) >> sh if sh > 0 else prod
-        sat = 0
-        if r > hi:
-            r, sat = hi, 1
-        elif r < lo:
-            r, sat = lo, 1
-        return r, sat
+        return requant_golden(acc, scale, sh, dw)
 
     cases = []
     # Directed: zero, the saturation edges in both directions, and the

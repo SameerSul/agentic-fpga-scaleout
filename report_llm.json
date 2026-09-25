@@ -1,0 +1,157 @@
+{
+  "spec": {
+    "name": "mac8_gpt2_124m",
+    "description": "8-bit pipelined multiply-accumulate unit derived from gpt2_124m: datapath from the model quantization, accumulator sized for its longest reduction",
+    "top_module": "mac",
+    "parameters": {
+      "data_width": 8,
+      "acc_width": 28,
+      "signed": true,
+      "pipeline_stages": 2,
+      "target_clock_mhz": 100
+    },
+    "derivation": {
+      "model": "gpt2_124m",
+      "weight_bits": 8,
+      "activation_bits": 8,
+      "reduction_depth": 3072,
+      "guard_bits": 12,
+      "signed": true,
+      "rule": "acc_width = weight_bits + activation_bits + ceil(log2(max(d_model, d_ff)))",
+      "signedness_rule": "symmetric quantization is two's complement signed, so operands, product and accumulator are all signed",
+      "pipeline_stages": 2,
+      "pipeline_rule": "2 stages up to an 8-bit datapath, 3 above it: the signed multiply is the critical path and splitting it into half-width partial products buys the clock back for one cycle of latency"
+    },
+    "ports": [
+      {
+        "name": "clk",
+        "dir": "input",
+        "width": 1,
+        "desc": "clock, rising edge"
+      },
+      {
+        "name": "rst_n",
+        "dir": "input",
+        "width": 1,
+        "desc": "active-low synchronous reset"
+      },
+      {
+        "name": "clear",
+        "dir": "input",
+        "width": 1,
+        "desc": "synchronous accumulator clear"
+      },
+      {
+        "name": "a",
+        "dir": "input",
+        "width": 8,
+        "signed": true,
+        "desc": "multiplicand (activation), signed two's complement"
+      },
+      {
+        "name": "b",
+        "dir": "input",
+        "width": 8,
+        "signed": true,
+        "desc": "multiplier (weight), signed two's complement"
+      },
+      {
+        "name": "valid_in",
+        "dir": "input",
+        "width": 1,
+        "desc": "input operands valid"
+      },
+      {
+        "name": "acc",
+        "dir": "output",
+        "width": 28,
+        "signed": true,
+        "desc": "accumulator value, signed two's complement"
+      },
+      {
+        "name": "valid_out",
+        "dir": "output",
+        "width": 1,
+        "desc": "acc updated this cycle"
+      }
+    ],
+    "behavior": [
+      "Stage 1 registers the full 16-bit product a*b and the valid flag.",
+      "The final stage adds the registered product into the 28-bit accumulator when the piped valid is set.",
+      "clear synchronously zeroes acc and valid_out, taking priority over accumulation.",
+      "Latency from valid_in to valid_out is 2 cycles.",
+      "28 accumulator bits = 16 product bits + 12 guard bits, enough for a 3072-deep dot product with no overflow.",
+      "Operands, product and accumulator are signed two's complement. The multiply must be a signed multiply and the product must be sign-extended into the accumulator."
+    ]
+  },
+  "tools": {
+    "iverilog": "/opt/homebrew/bin/iverilog",
+    "vvp": "/opt/homebrew/bin/vvp",
+    "yosys": "/opt/homebrew/bin/yosys",
+    "sta": "/Users/ssuleman/.local/bin/sta"
+  },
+  "agent": "LLMAgent",
+  "converged": true,
+  "iterations_used": 1,
+  "history": [
+    {
+      "iteration": 1,
+      "fixes_applied": [
+        "llm:haiku@claude-cli#1"
+      ],
+      "sim": {
+        "stage": "sim",
+        "status": "pass",
+        "checks": 613,
+        "mismatches": [],
+        "throughput": {
+          "macs": 256,
+          "span_cycles": 256,
+          "latency_cycles": 4,
+          "units": 256,
+          "cycles_per_unit": 1.0
+        }
+      },
+      "synth": {
+        "stage": "synth",
+        "status": "pass",
+        "cell_count": 1408,
+        "area": 2763.0
+      },
+      "timing": {
+        "stage": "timing",
+        "status": "pass",
+        "method": "opensta",
+        "clock_period_ns": 10.0,
+        "worst_slack_ns": 4.36
+      },
+      "fpga": {
+        "luts": 46,
+        "ffs": 46,
+        "dsps": 1,
+        "brams": 0,
+        "urams": 0,
+        "carry": 7,
+        "muxf": 0,
+        "status": "pass",
+        "family": "xcup",
+        "top": "mac",
+        "lint": [],
+        "stage": "fpga"
+      }
+    }
+  ],
+  "final_metrics": {
+    "sim_pass": true,
+    "sim_checks": 613,
+    "cell_count": 1408,
+    "area": 2763.0,
+    "timing": {
+      "stage": "timing",
+      "status": "pass",
+      "method": "opensta",
+      "clock_period_ns": 10.0,
+      "worst_slack_ns": 4.36
+    }
+  }
+}
