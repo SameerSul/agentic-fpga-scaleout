@@ -61,6 +61,7 @@ One convenient alignment: Ethernet's frame check sequence is CRC-32 with polynom
 | Component | What it models | Real hardware target |
 |---|---|---|
 | `model_spec.json` + `sizing.py` | per-token MACs, weight bytes (batch-1 identity: one byte moved per MAC at int8), KV cache traffic, and all-reduce bytes from the transformer shapes; per block, compute overlaps memory (max of the two), then the ring term is added, per candidate board count | capacity planning for LLM serving on a scaleout fabric, including the memory wall and SRAM residency |
+| `sweep.py` + `dv.py` + `inference.py` | the verification layer: every spec through every gate, mutation testing of the generated testbenches, and co-simulation proving the generated RTL computes the model's arithmetic. See RESULTS.md | signoff: proving the flow works for specs nobody tuned it for, and that the DV can actually fail |
 | `specgen.py` | derives the chiplet spec and its testbench from the model: datapath width from the quantization, accumulator width from the longest reduction | the architecture step: choosing the datapath the model actually needs before any RTL is written |
 | `chiplet_flow.py` + `agent.py` / `llm_agent.py` | agent proposes RTL, tools verify, parsed failures feed back until signoff; the same loop runs both the derived chiplet and the fabric endpoint, with a deterministic rule-based agent by default and a real LLM behind the same interface (`--agent llm`) | the LLM-driven RTL generation loop on production verification and synthesis flows |
 | generated `tb_mac.v` / `tb_crc.v` | golden-model checking plus a throughput burst that measures cycles per unit, at whatever widths the derivation chose | a full UVM environment plus performance characterization on the real testbench |
@@ -81,10 +82,16 @@ One convenient alignment: Ethernet's frame check sequence is CRC-32 with polynom
 
 ```
 python3 demo.py                    # end-to-end, all nine stages, writes results.json (about 30 s)
-python3 tests.py                   # 66-check suite (both flows, a 4-bit model variant, FPGA mapping, transports, sizing physics)
+python3 tests.py                   # 120-check suite (both flows, spec derivation, DV mutation, FPGA mapping, transports, sizing physics)
 python3 chiplet_flow.py            # just the two agentic RTL loops, writes both profiles
-python3 chiplet_flow.py --agent llm  # same loops with a real LLM writing the RTL (Ollama, API, or Claude CLI)
+python3 chiplet_flow.py --agent llm    # same loops with a real LLM writing the RTL (Ollama, API, or Claude CLI)
+python3 chiplet_flow.py --agent swarm  # three roles behind the same interface, escalating on tool failure
 python3 specgen.py                 # just the model-to-chiplet derivation
+
+python3 sweep.py                   # every spec end to end: 6 model specs, 4 link rates, all gates plus DV
+python3 dv.py --rtl build/mac.v --tb tb_mac.v   # mutation-test a generated testbench
+python3 inference.py               # real quantized transformer dot products through the generated RTL
+python3 bench.py --agent swarm --runs 5         # convergence rate, iterations, model calls by role
 CHIPLET_LINK_GBPS=25 python3 chiplet_flow.py   # derive the endpoint for a different link rate
 CHIPLET_FPGA_FAMILY=xc7 python3 chiplet_flow.py  # map to 7-series instead of UltraScale+
 ```
@@ -327,6 +334,13 @@ CONVERGED in 1 iteration(s)
 The generated RTL is structurally its own: the MAC pipelines a combinational product wire with explicit valid handling, and the CRC unrolls the 32 iterations with a generate loop instead of a function, which synthesized 13% smaller than the rule-based render (1756 vs 2016 cells) and timed faster (267 vs 251 MHz, an 8.56 Gbps endpoint). Both cleared every golden-vector check, the seeded-bug traps included (full-width product, synchronous clear priority, CRC final inversion), on the first attempt. The committed profiles remain the rule-based ones so the repo is reproducible without a network; rerun with `--agent llm` to regenerate these. Because the chiplet spec itself is generated from the model, pointing the pipeline at a different LLM workload is a one-file change to `model_spec.json`: the derivation produces a different spec and testbench, the agent produces different RTL, and the measured profile produces a different fit, link rate, and sizing answer with no code changes anywhere downstream. The derivation step (`specgen.py`) is likewise where an LLM architecture agent would slot in next, proposing datapath structure from the model rather than applying closed-form width rules.
 
 ## Honest simplifications
+
+`RESULTS.md` carries the measured state and, next to it, the list of what is
+not verified: no bitstream and no board, generated blocks that are a MAC and
+a fabric endpoint rather than a whole inference engine, no real checkpoint or
+tokenizer, and a throughput figure that is a model checked against another
+model. Read that list before quoting any number here.
+
 
 - FPGA resources come from yosys `synth_xilinx`, which is real technology mapping but not place-and-route: there is no routing congestion, no floorplan, and no post-route timing. Vivado would give different and more pessimistic numbers, and yosys's own DSP inference varies by family (the 7-series mapping absorbs the accumulator into the DSP48E1, the UltraScale+ one does not).
 - fmax still comes from OpenSTA against the toy generic liberty, so it is an ASIC-flavored number used as an FPGA clock estimate. A real FPGA fmax needs Vivado timing; the endpoint datapath search is therefore honest about *relative* timing pressure rather than absolute megahertz.
