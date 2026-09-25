@@ -62,14 +62,32 @@ class Tiny:
         self.wq, self.wk, self.wv, self.wo = (mat(d, d) for _ in range(4))
         self.w1, self.w2 = mat(d, f), mat(f, d)
         self.head = mat(d, vocab)
+        # RMSNorm gains, one per position in the residual stream, before
+        # attention and before the MLP. This is what the target model
+        # family normalises with, and it is what exercises the generated
+        # inverse square root.
+        self.g1 = [[V(1.0) for _ in range(d)]]
+        self.g2 = [[V(1.0) for _ in range(d)]]
 
     def params(self):
         out = []
         for m in (self.tok, self.pos, self.wq, self.wk, self.wv, self.wo,
-                  self.w1, self.w2, self.head):
+                  self.w1, self.w2, self.head, self.g1, self.g2):
             for row in m:
                 out.extend(row)
         return out
+
+    def rmsnorm(self, v, g):
+        """x / sqrt(mean(x^2) + eps) * g, the normalisation the target
+        models use. No mean subtraction, which is what makes it cheaper
+        than LayerNorm and why only the inverse square root needs
+        hardware."""
+        n = len(v)
+        ss = v[0] * v[0]
+        for u in v[1:]:
+            ss = ss + u * u
+        inv = (ss * (1.0 / n) + V(1e-6)) ** -0.5
+        return [v[i] * inv * g[0][i] for i in range(n)]
 
     @staticmethod
     def mv(x, w):
@@ -86,9 +104,10 @@ class Tiny:
         n, D = len(ids), self.d
         h = [[self.tok[t][j] + self.pos[i][j] for j in range(D)]
              for i, t in enumerate(ids)]
-        q = [self.mv(v, self.wq) for v in h]
-        k = [self.mv(v, self.wk) for v in h]
-        val = [self.mv(v, self.wv) for v in h]
+        hn = [self.rmsnorm(v, self.g1) for v in h]
+        q = [self.mv(v, self.wq) for v in hn]
+        k = [self.mv(v, self.wk) for v in hn]
+        val = [self.mv(v, self.wv) for v in hn]
         scale = 1.0 / math.sqrt(D)
         ctx = []
         for i in range(n):
@@ -107,7 +126,8 @@ class Tiny:
         a = [self.mv(c, self.wo) for c in ctx]
         h = [[h[i][j] + a[i][j] for j in range(D)] for i in range(n)]
         for i in range(n):
-            m1 = [u.relu() for u in self.mv(h[i], self.w1)]
+            hn2 = self.rmsnorm(h[i], self.g2)
+            m1 = [u.relu() for u in self.mv(hn2, self.w1)]
             m2 = self.mv(m1, self.w2)
             h[i] = [h[i][j] + m2[j] for j in range(D)]
         return [self.mv(h[i], self.head) for i in range(n)]
@@ -169,7 +189,7 @@ def main():
         "weights": {
             name: [[c.d for c in row] for row in getattr(model, name)]
             for name in ("tok", "pos", "wq", "wk", "wv", "wo", "w1", "w2",
-                         "head")
+                         "head", "g1", "g2")
         },
     }
     with open(a.out, "w") as f:

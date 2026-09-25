@@ -27,10 +27,10 @@ import sys
 
 import specgen
 from agent import (RuleBasedAgent, FIX_WIDTH, FIX_CLEAR,
-                   FIX_SATURATE, FIX_LUT, FIX_NORM)
+                   FIX_SATURATE, FIX_LUT, FIX_NORM, FIX_EVEN)
 from inference import (MacModel, RequantModel, quantize, run_cosim,
                        run_requant_cosim, run_exp_cosim,
-                       run_recip_cosim, WORK)
+                       run_recip_cosim, run_rsqrt_cosim, WORK)
 from train_tiny import CKPT
 
 
@@ -61,7 +61,8 @@ def qmat(m, bits):
 class HwModel:
     """The checkpoint, executed the way the hardware would execute it."""
 
-    def __init__(self, ck, dw, aw, rq, espec=None, rspec=None):
+    def __init__(self, ck, dw, aw, rq, espec=None, rspec=None,
+                 rsspec=None):
         self.d = ck["d_model"]
         self.f = ck["d_ff"]
         self.seq = ck["seq"]
@@ -79,9 +80,13 @@ class HwModel:
         self.rqs = []                # (acc, scale, shift)
         self.exps = []               # (x,) for the exponential unit
         self.recips = []             # (x,) for the reciprocal unit
+        self.rsqrts = []             # (x,) for the inverse square root
         self.dw = dw
+        self.gains = {n: ck["weights"][n][0] for n in ("g1", "g2")
+                      if n in ck["weights"]}
         self.espec = espec
         self.rspec = rspec
+        self.rsspec = rsspec
 
     def matvec(self, x, name, keep=1):
         """Returns (accumulators, per-column weight scales)."""
@@ -111,9 +116,11 @@ class HwModel:
         hs = [[self.tok[t][j] + self.pos[i][j] for j in range(D)]
               for i, t in enumerate(ids)]
         hq = [self.qact(h) for h in hs]
-        qs = [self.project(h, "wq") for h in hq]
-        ks = [self.project(h, "wk") for h in hq]
-        vs = [self.project(h, "wv") for h in hq]
+        g1 = self.gains.get("g1")
+        hn = [self.rmsnorm(h, g1) for h in hq]
+        qs = [self.project(h, "wq") for h in hn]
+        ks = [self.project(h, "wk") for h in hn]
+        vs = [self.project(h, "wv") for h in hn]
 
         i = n - 1                     # only the last position is decoded
         sc = 1.0 / math.sqrt(D)
@@ -129,12 +136,36 @@ class HwModel:
                for t in range(D)]
         att = self.project(self.qact(ctx), "wo")
         res = self.add(hq[i], att)
-        h1q, h1s = self.project(res, "w1")
+        h1q, h1s = self.project(self.rmsnorm(res, self.gains.get("g2")),
+                                "w1")
         h1 = ([max(0, u) for u in h1q], h1s)
         h2 = self.project(h1, "w2")
         res2 = self.add(res, h2)
         logits, ls = self.project(res2, "head")
         return [v * ls for v in logits]
+
+    def rmsnorm(self, act, gain):
+        """RMSNorm through the generated units.
+
+        The sum of squares is the MAC unit, the mean is a shift, and the
+        inverse square root is its own block. Without this the decode
+        never exercised that block, so it was verified on its own and
+        unused, which is a weaker claim than it looks.
+        """
+        q, sc = act
+        if self.rsspec is None or gain is None:
+            return act
+        p = self.rsspec["parameters"]
+        ss = 0
+        for v in q:
+            ss += v * v                      # the MAC unit's accumulate
+        mean = ss // len(q)                  # a shift when len is a power of two
+        mean = max(1, min((1 << p["in_width"]) - 1, mean))
+        self.rsqrts.append(mean)
+        m, e = specgen.rsqrt_golden(mean, p)
+        # value = code * sc; normalised = value / (rms * sc) = code / rms
+        inv = specgen.rsqrt_apply(1 << 20, m, e, p) / float(1 << 20)
+        return self.qact([v * inv * gain[i] for i, v in enumerate(q)])
 
     def normalise(self, ex):
         """Turn exponentials into weights using the reciprocal unit.
@@ -218,8 +249,10 @@ def _float_model(ck):
     m.d, m.f, m.seq = ck["d_model"], ck["d_ff"], ck["seq"]
     m.vocab = len(ck["chars"])
     w = ck["weights"]
-    for name in ("tok", "pos", "wq", "wk", "wv", "wo", "w1", "w2", "head"):
-        setattr(m, name, [[V(c) for c in row] for row in w[name]])
+    for name in ("tok", "pos", "wq", "wk", "wv", "wo", "w1", "w2", "head",
+                 "g1", "g2"):
+        if name in w:
+            setattr(m, name, [[V(c) for c in row] for row in w[name]])
     return m
 
 
@@ -291,8 +324,9 @@ def main():
 
     espec = specgen.derive_exp_spec(ms)
     rcspec = specgen.derive_recip_spec(ms)
+    rsspec = specgen.derive_rsqrt_spec(ms)
     rq = RequantModel(rp["out_width"], rp["scale_width"], rp["shift_width"])
-    hw = HwModel(ck, dw, aw, rq, espec, rcspec)
+    hw = HwModel(ck, dw, aw, rq, espec, rcspec, rsspec)
 
     ids = [hw.stoi[c] for c in a.prompt if c in hw.stoi]
     if not ids:
@@ -370,15 +404,26 @@ def main():
                     x, rcspec["parameters"])]
         print("  recip:     %d/%d reciprocals bit exact"
               % (len(rcs) - len(bad4), len(rcs)))
-    if bad or bad2 or bad3 or bad4:
+    rnd.shuffle(hw.rsqrts)
+    rss = hw.rsqrts[:a.cosim]
+    bad5 = []
+    if rss:
+        srl = RuleBasedAgent().render_rsqrt(rsspec, {FIX_EVEN})
+        got5 = run_rsqrt_cosim(rsspec, rss, srl)
+        bad5 = [i for i, x in enumerate(rss)
+                if got5.get(i) != specgen.rsqrt_golden(
+                    x, rsspec["parameters"])]
+        print("  rsqrt:     %d/%d inverse square roots bit exact"
+              % (len(rss) - len(bad5), len(rss)))
+    if bad or bad2 or bad3 or bad4 or bad5:
         print("\nMISMATCH: the text above is not what the hardware produces")
         return 1
-    print("\nEvery dot product, requantization, exponential and "
-          "reciprocal in this\ndecode is arithmetic the generated RTL "
-          "reproduces exactly, so the text is\nwhat the hardware would "
-          "emit. The softmax sum is plain accumulation; the\n"
-          "normalisations, attention sequencing, weight streaming and "
-          "argmax ran on\nthe host, and no RTL exists for those yet.")
+    print("\nEvery dot product, requantization, exponential, reciprocal "
+          "and inverse\nsquare root in this decode is arithmetic the "
+          "generated RTL reproduces\nexactly, so the text is what the "
+          "hardware would emit. The sums are plain\naccumulation; the "
+          "attention sequencing, weight streaming and argmax ran on\n"
+          "the host, and no RTL exists for those yet.")
     return 0
 
 

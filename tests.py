@@ -532,7 +532,9 @@ def test_generation():
     rp = rspec['parameters']
     rq = inference.RequantModel(rp['out_width'], rp['scale_width'],
                                 rp['shift_width'])
-    hw = gen.HwModel(ck, dw, aw, rq)
+    hw = gen.HwModel(ck, dw, aw, rq, specgen_mod.derive_exp_spec(ms),
+                     specgen_mod.derive_recip_spec(ms),
+                     specgen_mod.derive_rsqrt_spec(ms))
     ids = [hw.stoi[c] for c in 'the ' if c in hw.stoi]
     out = list(ids)
     for _ in range(12):
@@ -547,6 +549,8 @@ def test_generation():
     check('no accumulator overflow during a decode', hw.mac.overflows == 0)
     check('the decode exercised both blocks',
           len(hw.dots) > 100 and len(hw.rqs) > 100)
+    check('the checkpoint has the norm gains the decode needs',
+          'g1' in ck['weights'] and 'g2' in ck['weights'])
 
     # The bug this pins: activations carry a scale, and adding two int8
     # vectors with different scales adds numbers in different units. It
@@ -572,6 +576,18 @@ def test_generation():
     check('the decode\'s dot products match the generated RTL',
           all(got.get(i) == inference.MacModel(dw, aw).dot(xs, ws)
               for i, (xs, ws) in enumerate(sample)))
+    # Every generated arithmetic block is on the decode path, not just
+    # verified on its own. A block nothing calls is a weaker claim.
+    check('the decode exercises the exponential, reciprocal and rsqrt',
+          len(hw.exps) > 0 and len(hw.recips) > 0 and len(hw.rsqrts) > 0)
+    rsspec = specgen_mod.derive_rsqrt_spec(ms)
+    rs = hw.rsqrts[:3]
+    got_rs = inference.run_rsqrt_cosim(
+        rsspec, rs, RuleBasedAgent().render_rsqrt(rsspec,
+                                                  {agent_mod.FIX_EVEN}))
+    check('the decode\'s inverse square roots match the generated RTL',
+          all(got_rs.get(i) == specgen_mod.rsqrt_golden(
+              x, rsspec['parameters']) for i, x in enumerate(rs)))
     shutil.rmtree(inference.WORK, ignore_errors=True)
 
 

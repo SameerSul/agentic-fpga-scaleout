@@ -17,7 +17,7 @@ one. The remaining gap is listed at the bottom rather than glossed over.
 ### The full suite
 
 ```
-python3 tests.py            # 163 tests, all passing
+python3 tests.py            # 166 tests, all passing
 ```
 
 ### Spec to RTL, across the spec space
@@ -167,13 +167,19 @@ Two things are worth reading off that.
 The text is what the hardware would emit, not what a float model emits.
 Nothing in the decode's arithmetic is unverified against RTL.
 
-And int8 costs this model essentially nothing, once the pipeline is
+And int8 costs this model nothing measurable, once the pipeline is
 correct:
 
 | measure | agreement with float |
 |---|---|
 | teacher-forced next token | **100%** (48/48) |
-| free-running decode | 100% at 16 tokens, 68% at 28 |
+| free-running decode | **100%** |
+
+The checkpoint carries RMSNorm, which is what the target model family
+normalises with. Adding it took training loss from 0.23 to 0.11 and the
+free-running agreement to 100%, and it is what puts the inverse square
+root on the decode path: before it, that block was verified on its own
+and called by nothing, which is a weaker claim than it looks.
 
 That is a correction, not a result. This file previously reported that
 int8 cost the model 75% of its characters, and drew a lesson from it about
@@ -290,9 +296,7 @@ These are the distance between this repo and a local LLM host.
    endpoint. Softmax is hardware apart from accumulating the sum, and so
    is the transcendental part of RMSNorm. It does not generate the
    attention sequencing, the weight streaming controller or the memory
-   subsystem. The committed checkpoint has no norm layer, so the inverse
-   square root is verified as a block but is not exercised by the decode
-   in generate.py. In `generate.py` those run on the host, and the
+   subsystem. In `generate.py` those run on the host, and the
    output says so each run.
 3. **The model is small and its weights are its own.** Qwen3-0.6B is not
    loaded; there is no numeric stack here to load it with and no network
