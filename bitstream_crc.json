@@ -3,9 +3,10 @@
   "spec": "crc32_endpoint_1B",
   "device": "ice40-hx8k-ct256",
   "target_mhz": 125.0,
-  "post_route_fmax_mhz": 236.63,
+  "post_route_fmax_mhz": 209.07,
   "timing_met": true,
   "luts": 0,
   "bitstream_bytes": 135100,
+  "bitstream_verified": true,
   "icetime_mhz": null
 }

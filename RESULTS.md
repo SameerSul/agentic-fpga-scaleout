@@ -17,7 +17,7 @@ one. The remaining gap is listed at the bottom rather than glossed over.
 ### The full suite
 
 ```
-python3 tests.py            # 145 tests, all passing
+python3 tests.py            # 146 tests, all passing
 ```
 
 ### Spec to RTL, across the spec space
@@ -208,11 +208,27 @@ yosys synth_ice40, then nextpnr-ice40 for place and route, then icepack.
 This is real place and route against a real device timing model, not a
 generic cell library.
 
-| block | LUTs of 7680 | target | post-route fmax | |
+| block | LUTs of 7680 | target | post-route fmax | bitstream verified |
 |---|---|---|---|---|
-| MAC chiplet | 214 (2%) | 100 MHz | **178.19 MHz** | met |
-| CRC32 endpoint, 1 B/cyc | 90 (1%) | 125 MHz | **236.63 MHz** | met |
-| requantizer | 1924 (25%) | 100 MHz | 97.88 MHz | 2% short |
+| MAC chiplet | 214 (2%) | 100 MHz | **166.14 MHz** | 613 checks |
+| CRC32 endpoint, 1 B/cyc | 90 (1%) | 125 MHz | **236.63 MHz** | 9 checks |
+| requantizer | 1924 (25%) | 100 MHz | 97.88 MHz | 173 checks |
+
+**The bitstream is verified, not just produced.** icepack emits the actual
+configuration bits; `icebox_vlog` turns those bits back into logic, and
+the original self-checking testbench runs against them. Everything
+upstream can be right and the packed result still be wrong, and until now
+nothing had looked at the artifact that would actually be loaded onto a
+device. All three pass.
+
+That check immediately earned its place by catching a fault in itself.
+The endpoint bitstream was first reported as failing, producing
+0xD202EF8D where 0xECBB4B55 was expected. 0xD202EF8D is CRC32 of a single
+zero byte: the harness had built the 1 Gbps endpoint, one byte per cycle,
+and compared it against the committed `tb_crc.v`, which is generated for
+the 10 Gbps endpoint at sixteen. The design had computed exactly the right
+answer for its own configuration. The testbench is now generated for the
+spec being built rather than taken from a committed file.
 
 The device is a Lattice iCE40 HX8K. That is **not** the part this project
 is aimed at: the boards are Xilinx, Vivado does not run on an ARM Mac, and
@@ -249,13 +265,15 @@ not a device this project uses.
 
 These are the distance between this repo and a local LLM host.
 
-1. **Nothing has run on hardware.** Bitstreams exist and are placed,
-   routed and packed, but for an iCE40 HX8K, and nobody owns that board
-   here. Nothing has been loaded onto a device and clocked, so there is no
-   measurement from silicon in operation, only from the vendor timing
-   model. The Xilinx parts the team actually owns are still unreachable:
-   Vivado does not run on an ARM Mac and nextpnr has no mainline Xilinx
-   target.
+1. **Nothing has run on hardware.** The bitstreams are placed, routed,
+   packed and functionally verified, but for an iCE40 HX8K, and nobody
+   here owns that board. No device has been configured and clocked, so
+   every timing number is from a vendor model rather than from silicon in
+   operation. The Xilinx parts the team owns are still unreachable: Vivado
+   does not run on an ARM Mac and nextpnr has no mainline Xilinx target.
+   This is the only remaining item that work on this machine cannot close;
+   it needs a board (a ~50 CAD iCE40 runs these bitstreams unmodified) or
+   an x86 machine with Vivado for the Zynq and Artix parts.
 2. **The generated blocks are the arithmetic, not the whole engine.** The
    flow generates the multiply-accumulate unit, the requantizer between
    matmuls, and the CRC32 fabric endpoint. It does not generate softmax,

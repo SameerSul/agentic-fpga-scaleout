@@ -602,6 +602,11 @@ def test_bitstream():
           0 < r['luts'] < 7680 or r['bitstream_bytes'] > 0)
     check('a real bitstream file was produced',
           r['bitstream_bytes'] > 1000)
+    # The artifact that would be loaded onto a device, not the design that
+    # produced it: icebox_vlog turns the packed bits back into logic and
+    # the original self-checking testbench runs against them.
+    check('the packed bitstream itself passes the testbench',
+          r.get('bitstream_verified') is True)
     # The generic library is the flow's gate, so it must not be wildly
     # optimistic about the device it is standing in for.
     prof = json.load(open(os.path.join(ROOT, 'chiplet_profile.json')))
