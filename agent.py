@@ -9,6 +9,8 @@ specgen.py derives from the model, at whatever data and accumulator widths
 the derivation chose). Each carries its own seeded first-cut bugs so the demo
 shows the feedback loop converging on both."""
 
+import specgen
+
 FIX_WIDTH = "widen_product_register"
 FIX_CLEAR = "implement_sync_clear"
 FIX_XOR = "apply_final_inversion"
@@ -85,7 +87,75 @@ class RuleBasedAgent:
 endmodule
 """.format(d=dw - 1, a=aw - 1, p=pw - 1, logic=acc_logic)
 
+    def render_crc_matrix(self, spec, fixes):
+        """CRC32 next state as one XOR reduction per output bit.
+
+        The step function is linear over GF(2), so the next state is the XOR
+        of a fixed set of current-state and input bits. Written this way the
+        combinational depth is logarithmic in the datapath width rather than
+        linear in it, which is the difference between an endpoint that meets
+        its clock at 32 bytes per cycle and one that misses by 11 ns. The
+        selection matrices come from specgen, which derives them from the
+        same polynomial the golden vectors use.
+        """
+        w = spec["parameters"]["bytes_per_cycle"]
+        A, B = specgen.crc_matrix(w)
+        out_expr = "nxt ^ 32'hFFFFFFFF" if FIX_XOR in fixes else "nxt"
+        lines = []
+        for i in range(32):
+            terms = ["state[%d]" % j for j in range(32) if (A[j] >> i) & 1]
+            terms += ["data[%d]" % k for k in range(8 * w) if (B[k] >> i) & 1]
+            if not terms:
+                lines.append("  assign nxt[%d] = 1'b0;" % i)
+                continue
+            body, cur = [], "  assign nxt[%d] = ^{" % i
+            for t in terms:
+                piece = t + ", "
+                if len(cur) + len(piece) > 76:
+                    body.append(cur)
+                    cur = "      "
+                cur += piece
+            body.append(cur.rstrip(", ") + "};")
+            lines.extend(body)
+        return """module crc32 (
+  input              clk,
+  input              rst_n,
+  input              clear,
+  input      [{dm}:0] data,
+  input              valid_in,
+  output reg [31:0]  crc_out,
+  output reg         valid_out
+);
+  // zlib/Ethernet CRC32, reflected polynomial 0xEDB88320, {w} byte(s) per
+  // cycle, bytes consumed LSB-first. Next state is a GF(2) linear function
+  // of the state and the input word, so each bit is a single XOR reduction
+  // and the depth is logarithmic in the width rather than linear in it.
+  reg  [31:0] state;
+  wire [31:0] nxt;
+{assigns}
+
+  always @(posedge clk) begin
+    if (!rst_n) begin
+      state     <= 32'hFFFFFFFF;
+      crc_out   <= 32'd0;
+      valid_out <= 1'b0;
+    end else if (clear) begin
+      state     <= 32'hFFFFFFFF;
+      valid_out <= 1'b0;
+    end else if (valid_in) begin
+      state     <= nxt;
+      crc_out   <= {out};
+      valid_out <= 1'b1;
+    end else begin
+      valid_out <= 1'b0;
+    end
+  end
+endmodule
+""".format(out=out_expr, w=w, dm=8 * w - 1, assigns="\n".join(lines))
+
     def render_crc(self, spec, fixes):
+        if spec["parameters"].get("architecture") == "matrix":
+            return self.render_crc_matrix(spec, fixes)
         # Width-generic: the endpoint consumes bytes_per_cycle bytes per
         # clock, derived from the link rate it has to keep up with, so the
         # same agent covers a 1-byte 1GbE endpoint and a 16-byte 25GbE one.

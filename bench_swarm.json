@@ -1,0 +1,79 @@
+[
+  {
+    "converged": true,
+    "iterations": 1,
+    "calls": 2,
+    "roles": {
+      "writer": 1,
+      "reviewer": 1,
+      "debugger": 0
+    },
+    "seconds": 136.5978012084961,
+    "failed_at": null,
+    "stumbles": [],
+    "cells": 1058
+  },
+  {
+    "converged": false,
+    "iterations": 6,
+    "calls": 20,
+    "roles": {
+      "writer": 9,
+      "reviewer": 6,
+      "debugger": 5
+    },
+    "seconds": 1715.614394903183,
+    "failed_at": "sim",
+    "stumbles": [
+      "sim",
+      "sim",
+      "sim",
+      "sim",
+      "sim",
+      "sim"
+    ],
+    "cells": null
+  },
+  {
+    "converged": true,
+    "iterations": 1,
+    "calls": 2,
+    "roles": {
+      "writer": 1,
+      "reviewer": 1,
+      "debugger": 0
+    },
+    "seconds": 130.912691116333,
+    "failed_at": null,
+    "stumbles": [],
+    "cells": 1030
+  },
+  {
+    "converged": true,
+    "iterations": 1,
+    "calls": 2,
+    "roles": {
+      "writer": 1,
+      "reviewer": 1,
+      "debugger": 0
+    },
+    "seconds": 64.89215111732483,
+    "failed_at": null,
+    "stumbles": [],
+    "cells": 1030
+  },
+  {
+    "converged": true,
+    "iterations": 1,
+    "calls": 2,
+    "roles": {
+      "writer": 1,
+      "reviewer": 1,
+      "debugger": 0
+    },
+    "seconds": 90.58652305603027,
+    "failed_at": null,
+    "stumbles": [],
+    "cells": 1030
+  }
+]

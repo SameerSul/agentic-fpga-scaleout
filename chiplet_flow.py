@@ -283,16 +283,18 @@ def run_endpoint_flow(target_gbps=None, verbose=True, agent_kind=None):
     datapath that cannot close timing at its clock is not an RTL bug, it is
     the wrong datapath. When a width and clock pair fails timing, this
     advances to the next standard option for the same rate (wider datapath,
-    slower clock) and runs the whole loop again, which is the call a human
-    designer makes at exactly that point."""
+    slower clock, then the flat XOR next-state form whose depth does not
+    grow with the width) and runs the whole loop again, which is the call a
+    human designer makes at exactly that point."""
     target = TARGET_LINK_GBPS if target_gbps is None else target_gbps
     rate, opts = specgen.endpoint_options(target)
     say = print if verbose else (lambda *a, **k: None)
     attempts = []
     for opt in range(len(opts)):
-        w, clk = opts[opt]
+        w, clk, arch = opts[opt]
         say("\nEndpoint datapath option {}/{} for {:g} Gbps: {} bytes/cycle "
-            "at {:g} MHz".format(opt + 1, len(opts), rate, w, clk))
+            "at {:g} MHz, {} next-state form".format(
+                opt + 1, len(opts), rate, w, clk, arch))
         specgen.generate_endpoint(target, spec_file=FABRIC_JOB["spec_file"],
                                   tb_file=FABRIC_JOB["tb_file"], option=opt)
         job = dict(FABRIC_JOB)
@@ -300,7 +302,8 @@ def run_endpoint_flow(target_gbps=None, verbose=True, agent_kind=None):
         report, profile = run_flow(job, verbose=verbose,
                                    agent=make_agent(agent_kind))
         attempts.append({"option": opt, "bytes_per_cycle": w,
-                         "clock_mhz": clk, "converged": report["converged"]})
+                         "clock_mhz": clk, "architecture": arch,
+                         "converged": report["converged"]})
         if report["converged"]:
             report["datapath_attempts"] = attempts
             return report, profile

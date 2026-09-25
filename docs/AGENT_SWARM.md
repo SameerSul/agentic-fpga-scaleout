@@ -139,4 +139,75 @@ MAC, where the pipeline does have cross-stage ordering.
 `tests.py` runs the whole mutation sweep as a regression guard, so the DV
 cannot quietly weaken later.
 
+## Does it work for specs nobody tuned it for
+
+A flow that only works on the spec it was written against is a demo.
+`sweep.py` drives many different specs end to end and checks every stage,
+not just the last one: derivation, RTL, simulation, synthesis, timing
+closure, FPGA mapping, the profile fields the sizing model consumes, and a
+full mutation sweep of the testbench generated at that width.
+
+```
+python3 sweep.py                 (everything)
+python3 sweep.py --only chiplet
+python3 sweep.py --skip-dv       (gates only, much faster)
+```
+
+It runs on the rule-based agent, so it is free, deterministic and safe to
+put in CI. Six model specs, from int4 weights to a 16-bit datapath to a
+model small enough that the guard term collapses, and four link rates from
+1G to 100G. Fifteen cases, all clean, every gate, and the generated DV kills
+every behaviour-changing mutant at every width.
+
+## The endpoint could not reach 25G, and why that was an RTL bug
+
+The first endpoint sweep failed at 25G and 100G, at both datapath options.
+That looked like a physics limit until the required combinational delay was
+plotted against the datapath width:
+
+| bytes/cycle | delay needed | clock budget | slack |
+|---|---|---|---|
+| 8 | 6.42 ns | 6.40 ns | -0.02 |
+| 16 | 11.70 ns | 12.80 ns | +1.10 |
+| 32 | 21.78 ns | 10.24 ns | -11.54 |
+| 64 | 42.18 ns | 5.12 ns | -37.06 |
+| 128 | 83.90 ns | 10.24 ns | -73.66 |
+
+Delay is **linear** in the width, which is the signature of a serial ripple.
+The generated RTL wrote the CRC as a byte loop containing a bit loop, so 32
+bytes per cycle is 256 shift-XOR steps in one combinational path.
+
+CRC32 does not need that. Its next-state function is linear over GF(2), so
+the next state is the XOR of a fixed set of current-state and input bits:
+
+    state' = A . state  XOR  B . data
+
+`specgen.crc_matrix` derives A and B from the same polynomial the golden
+vectors use, by pushing basis vectors through the step function. It asserts
+`step(0, 0) == 0` first, because a constant term would mean the function is
+not linear and the whole construction invalid. Written this way each output
+bit is one XOR reduction and the depth is logarithmic in the width:
+
+| bytes/cycle | 1 | 8 | 16 | 32 | 64 | 128 |
+|---|---|---|---|---|---|---|
+| max fan-in | 14 | 52 | 89 | 157 | 288 | 554 |
+| XOR depth | 4 | 6 | 7 | 8 | 9 | 10 |
+
+So the endpoint now has an architecture axis, not just a width axis. Each
+rate offers every width as a ripple first, because it is much smaller, and
+as a flat XOR tree second. The search escalates only when the cheap form
+misses its clock, which is the call a human designer makes at that point.
+
+| rate | before | after |
+|---|---|---|
+| 1G | 1 B/cyc ripple, fmax 476 MHz | unchanged |
+| 10G | 16 B/cyc ripple, fmax 85 MHz | unchanged |
+| 25G | **failed both options** | 16 B/cyc flat, fmax 385 MHz |
+| 100G | **failed both options** | 64 B/cyc flat, fmax 325 MHz |
+
+Both now close on the *narrow* datapath, which is the better answer anyway:
+widening was only ever a way to buy clock period, and it costs bandwidth per
+pin. The 100G endpoint costs 34,682 cells against 774 for 1G, which is the
+honest price of the flat form and the reason the ripple is still tried first.
+
 Results: see RESULTS.md.

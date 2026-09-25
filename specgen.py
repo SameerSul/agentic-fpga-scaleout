@@ -252,10 +252,41 @@ ETH_DATAPATHS = {
 ETH_RATES = tuple(sorted(ETH_DATAPATHS))
 
 
+# CRC32 next state is a linear function over GF(2), so it can be written
+# either as the byte-at-a-time ripple (small, but combinational delay grows
+# linearly with the datapath width) or as a flat XOR reduction per output bit
+# (larger, but depth grows logarithmically). The ripple is tried first
+# because it is the cheaper design; the flat form is what a wide endpoint
+# needs to meet its clock.
+CRC_ARCHS = ("serial", "matrix")
+
+
+def crc_matrix(w, poly=0xEDB88320):
+    """Return (A, B): column j of A is the next state produced by state bit j
+    alone, column k of B the next state produced by data bit k alone. Because
+    the step function has no constant term, the next state is exactly the XOR
+    of the selected columns, which is what makes the flat form legitimate
+    rather than an approximation."""
+    def step(state, data):
+        x = state
+        for i in range(w):
+            x ^= (data >> (8 * i)) & 0xFF
+            for _ in range(8):
+                x = (x >> 1) ^ (poly if x & 1 else 0)
+        return x
+    assert step(0, 0) == 0, "step has a constant term, so it is not linear"
+    return ([step(1 << j, 0) for j in range(32)],
+            [step(0, 1 << k) for k in range(8 * w)])
+
+
 def endpoint_options(link_gbps):
-    """Standard rate at or above the target, and its datapath options."""
+    """Standard rate at or above the target, and its datapath options, each
+    a (bytes_per_cycle, clock_mhz, architecture) triple. Every width is
+    offered as a ripple first and as a flat XOR tree second, so the search
+    only pays for the larger design once the cheaper one misses its clock."""
     rate = next((r for r in ETH_RATES if r >= link_gbps - 1e-9), ETH_RATES[-1])
-    return rate, ETH_DATAPATHS[rate]
+    base = ETH_DATAPATHS[rate]
+    return rate, tuple([(w, clk, a) for a in CRC_ARCHS for w, clk in base])
 
 
 def derive_endpoint_spec(link_gbps, option=0):
@@ -267,12 +298,13 @@ def derive_endpoint_spec(link_gbps, option=0):
     selects among the width/clock trades for that rate, which the flow
     advances when timing does not close."""
     rate, opts = endpoint_options(link_gbps)
-    w, clk = opts[min(option, len(opts) - 1)]
+    w, clk, arch = opts[min(option, len(opts) - 1)]
     return {
         "name": "crc32_endpoint_%dB" % w,
         "description": "Fabric endpoint CRC32 datapath, %d byte(s) per cycle, "
-                       "zlib/Ethernet compatible (reflected polynomial "
-                       "0xEDB88320), sized for a %g Gbps link" % (w, rate),
+                       "%s next-state form, zlib/Ethernet compatible "
+                       "(reflected polynomial 0xEDB88320), sized for a %g "
+                       "Gbps link" % (w, arch, rate),
         "top_module": "crc32",
         "unit": "byte",
         "parameters": {
@@ -280,6 +312,7 @@ def derive_endpoint_spec(link_gbps, option=0):
             "crc_width": 32,
             "bytes_per_cycle": w,
             "target_clock_mhz": clk,
+            "architecture": arch,
             "polynomial": "0xEDB88320 reflected form of 0x04C11DB7",
         },
         "derivation": {
@@ -289,7 +322,8 @@ def derive_endpoint_spec(link_gbps, option=0):
             "options_for_rate": [list(o) for o in opts],
             "rule": "standard Ethernet MAC datapath whose bytes_per_cycle * "
                     "8 * core_clock sustains the link rate; wider and slower "
-                    "options are tried when timing does not close",
+                    "options, then the flat XOR form, are tried when timing "
+                    "does not close",
             "sustains_gbps": w * 8 * clk / 1000.0,
         },
         "ports": [

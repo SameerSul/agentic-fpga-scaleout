@@ -1,4 +1,7 @@
 build/
+build_dv/
+build_sweep/
+build_probe/
 __pycache__/
 *.vcd
 
@@ -6,3 +9,4 @@ __pycache__/
 *_bench.json
 *_bench.v
 bench_headtohead.log
+bench_swarm_fixed.log

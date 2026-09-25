@@ -17,7 +17,7 @@ import swarm as swarm_mod
 from swarm import SwarmAgent, parse_review
 import dv
 from specgen import (derive_chiplet_spec, derive_endpoint_spec,
-                     endpoint_options, generate)
+                     endpoint_options, generate, crc_matrix)
 from boards import BOARDS, fit, TRANSPORTS
 from fpga import synth_fpga
 from fabric import make_cluster, fabric_stats, mm, relu, RX_CAP
@@ -317,6 +317,72 @@ def test_dv_mutation(fp):
         shutil.rmtree(dv.DVDIR, ignore_errors=True)
 
 
+def test_crc_matrix():
+    """The flat CRC form rests on the step function being linear over GF(2).
+    If it is not, the derived matrices are silently wrong and produce RTL
+    that passes synthesis and computes the wrong checksum, so the property
+    is checked directly rather than trusted."""
+    for w in (1, 4, 8, 16, 32, 64, 128):
+        A, B = crc_matrix(w)
+
+        def step(state, data, w=w):
+            x = state
+            for i in range(w):
+                x ^= (data >> (8 * i)) & 0xFF
+                for _ in range(8):
+                    x = (x >> 1) ^ (0xEDB88320 if x & 1 else 0)
+            return x
+
+        rnd = random.Random(w)
+        ok = True
+        for _ in range(64):
+            st, d = rnd.getrandbits(32), rnd.getrandbits(8 * w)
+            acc = 0
+            for j in range(32):
+                if (st >> j) & 1:
+                    acc ^= A[j]
+            for k in range(8 * w):
+                if (d >> k) & 1:
+                    acc ^= B[k]
+            if acc != step(st, d):
+                ok = False
+                break
+        check('flat CRC form reproduces the ripple at %d B/cycle' % w, ok)
+        # Depth, not just correctness: the flat form exists to keep the
+        # combinational path from growing with the datapath width.
+        depth = max((sum(1 for j in range(32) if (A[j] >> i) & 1)
+                     + sum(1 for k in range(8 * w) if (B[k] >> i) & 1))
+                    for i in range(32)).bit_length()
+        check('flat CRC XOR depth stays logarithmic at %d B/cycle' % w,
+              depth <= 11)
+
+    # And the whole chain against the reference implementation.
+    w = 16
+    payload = bytes(random.Random(7).randrange(256) for _ in range(w * 8))
+    x = 0xFFFFFFFF
+    A, B = crc_matrix(w)
+    for off in range(0, len(payload), w):
+        word = int.from_bytes(payload[off:off + w], 'little')
+        acc = 0
+        for j in range(32):
+            if (x >> j) & 1:
+                acc ^= A[j]
+        for k in range(8 * w):
+            if (word >> k) & 1:
+                acc ^= B[k]
+        x = acc
+    check('flat CRC matches zlib over a multi-word frame',
+          (x ^ 0xFFFFFFFF) == zlib.crc32(payload))
+
+    # Both architectures are offered for every width, cheap form first.
+    for g in (1.0, 10.0, 25.0, 100.0):
+        _, opts = endpoint_options(g)
+        archs = [a for _, _, a in opts]
+        check('%g Gbps offers the ripple before the flat form' % g,
+              archs.count('serial') == archs.count('matrix')
+              and archs.index('serial') < archs.index('matrix'))
+
+
 def test_fpga_backend(profile, fp):
     """Real device mapping, not generic cells: the two generated blocks land
     on different resources, which is what makes a single capacity proxy
@@ -350,7 +416,7 @@ def test_endpoint_derivation(fp):
           all(a <= b for a, b in zip(widths, widths[1:])))
     for g in (1.0, 10.0, 25.0):
         rate, opts = endpoint_options(g)
-        ok = all(w * 8 * clk / 1000.0 >= rate - 1e-9 for w, clk in opts)
+        ok = all(w * 8 * clk / 1000.0 >= rate - 1e-9 for w, clk, _ in opts)
         check('every %g Gbps datapath option sustains the rate' % g, ok)
     d = fp.get('derivation', {})
     check('signed-off endpoint sustains its target link rate',
@@ -533,6 +599,7 @@ if __name__ == '__main__':
     test_model_driven_flow(profile)
     test_llm_agent_offline()
     test_swarm_offline()
+    test_crc_matrix()
     test_fit_monotonic(profile)
     test_allreduce(profile)
     test_hetero_bit_identical(profile)
