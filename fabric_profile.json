@@ -20,6 +20,35 @@
     "carry": 0,
     "muxf": 422
   },
+  "derivation": {
+    "target_link_gbps": 10.0,
+    "standard_rate_gbps": 10.0,
+    "datapath_option": 1,
+    "options_for_rate": [
+      [
+        8,
+        156.25,
+        "serial"
+      ],
+      [
+        16,
+        78.125,
+        "serial"
+      ],
+      [
+        8,
+        156.25,
+        "matrix"
+      ],
+      [
+        16,
+        78.125,
+        "matrix"
+      ]
+    ],
+    "rule": "standard Ethernet MAC datapath whose bytes_per_cycle * 8 * core_clock sustains the link rate; wider and slower options, then the flat XOR form, are tried when timing does not close",
+    "sustains_gbps": 10.0
+  },
   "bytes_per_cycle": 16,
   "endpoint_gbps": 10.94017094017094,
   "agent": "RuleBasedAgent"

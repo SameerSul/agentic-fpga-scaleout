@@ -20,9 +20,6 @@
     "carry": 7,
     "muxf": 0
   },
-  "chiplet": "mac8_gpt2_124m",
-  "data_width": 8,
-  "acc_width": 28,
   "derivation": {
     "model": "gpt2_124m",
     "weight_bits": 8,
@@ -35,5 +32,8 @@
     "pipeline_stages": 2,
     "pipeline_rule": "2 stages up to an 8-bit datapath, 3 above it: the signed multiply is the critical path and splitting it into half-width partial products buys the clock back for one cycle of latency"
   },
+  "chiplet": "mac8_gpt2_124m",
+  "data_width": 8,
+  "acc_width": 28,
   "agent": "RuleBasedAgent"
 }

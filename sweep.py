@@ -169,8 +169,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--agent", default="rules",
                     choices=["rules", "llm", "swarm"])
-    ap.add_argument("--only", default="both",
-                    choices=["both", "chiplet", "endpoint"])
+    ap.add_argument("--only", default="all",
+                    choices=["all", "both", "chiplet", "requant", "endpoint"])
     ap.add_argument("--skip-dv", action="store_true")
     a = ap.parse_args()
     do_dv = not a.skip_dv
@@ -178,7 +178,7 @@ def main():
     os.makedirs(BUILD, exist_ok=True)
     rows, details, failures = [], [], []
 
-    if a.only in ("both", "chiplet"):
+    if a.only in ("all", "both", "chiplet"):
         base = specgen.load_model_spec()
         for ms in _models(base):
             spec = specgen.generate(ms, spec_file=JOB["spec_file"],
@@ -193,7 +193,23 @@ def main():
             if any(r[c] not in ("ok", "skip", "-") for c in COLS):
                 failures.append(label)
 
-    if a.only in ("both", "endpoint"):
+    if a.only in ("all", "requant"):
+        # The requantizer is derived from the same model spec, so it has to
+        # track the same spread of widths the chiplet does.
+        base = specgen.load_model_spec()
+        for ms in _models(base):
+            spec = specgen.generate_requant(ms, spec_file=JOB["spec_file"],
+                                            tb_file=JOB["tb_file"])
+            p = spec["parameters"]
+            label = "requant %s acc%d->%d" % (ms["name"], p["acc_width"],
+                                              p["out_width"])
+            r, d = one_case(label, spec, "activation", a.agent, do_dv)
+            rows.append(r)
+            details.append((label, d))
+            if any(r[c] not in ("ok", "skip", "-") for c in COLS):
+                failures.append(label)
+
+    if a.only in ("all", "both", "endpoint"):
         for gbps in LINK_RATES:
             rate, opts = specgen.endpoint_options(gbps)
             # Same architecture-level retry the endpoint flow performs: a

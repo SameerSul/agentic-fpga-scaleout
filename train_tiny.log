@@ -1,0 +1,27 @@
+vocab 16, d_model 16, d_ff 32, seq 24, 2944 parameters
+  step    1  loss 2.7913  lr 0.0500
+  step   25  loss 1.0515  lr 0.0498
+  step   50  loss 1.5726  lr 0.0492
+  step   75  loss 1.3250  lr 0.0481
+  step  100  loss 0.7758  lr 0.0467
+  step  125  loss 0.7225  lr 0.0449
+  step  150  loss 1.7645  lr 0.0428
+  step  175  loss 1.6624  lr 0.0403
+  step  200  loss 1.4671  lr 0.0376
+  step  225  loss 1.0950  lr 0.0347
+  step  250  loss 1.3267  lr 0.0316
+  step  275  loss 0.7656  lr 0.0284
+  step  300  loss 0.5562  lr 0.0251
+  step  325  loss 0.7152  lr 0.0219
+  step  350  loss 0.5131  lr 0.0187
+  step  375  loss 0.4732  lr 0.0156
+  step  400  loss 0.5693  lr 0.0126
+  step  425  loss 0.4441  lr 0.0099
+  step  450  loss 0.3911  lr 0.0074
+  step  475  loss 0.2629  lr 0.0052
+  step  500  loss 0.2528  lr 0.0034
+  step  525  loss 0.2826  lr 0.0020
+  step  550  loss 0.1937  lr 0.0009
+  step  575  loss 0.2292  lr 0.0002
+  step  600  loss 0.2960  lr 0.0000
+wrote tiny_llm.json (61 KB)

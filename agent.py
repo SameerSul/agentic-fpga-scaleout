@@ -14,6 +14,11 @@ import specgen
 FIX_WIDTH = "widen_product_register"
 FIX_CLEAR = "implement_sync_clear"
 FIX_XOR = "apply_final_inversion"
+FIX_SATURATE = "saturate_instead_of_wrap"
+# One definition, in specgen, so the declared depth and the generated
+# depth cannot disagree.
+WIDE_ADD_BITS = specgen.WIDE_ADD_BITS
+ACC_SLICE_BITS = specgen.ACC_SLICE_BITS
 
 
 class RuleBasedAgent:
@@ -24,6 +29,8 @@ class RuleBasedAgent:
         # and those change with the model and the link rate.
         if spec["top_module"] == "crc32":
             return self.render_crc(spec, fixes), sorted(fixes)
+        if spec["top_module"] == "requant":
+            return self.render_requant(spec, fixes), sorted(fixes)
         return self.render_mac(spec, fixes), sorted(fixes)
 
     def diagnose(self, spec, history):
@@ -41,9 +48,229 @@ class RuleBasedAgent:
                     fixes.add(FIX_XOR)
                 elif "clear" in m.get("test", "").lower():
                     fixes.add(FIX_CLEAR)
+                elif "expected_q" in m:
+                    # The requantizer's only seeded bug: it wrapped where
+                    # it had to saturate.
+                    fixes.add(FIX_SATURATE)
                 elif m.get("got_acc") != m.get("expected_acc"):
                     fixes.add(FIX_WIDTH)
         return fixes
+
+    def render_requant(self, spec, fixes):
+        """Requantizer: scale, round, saturate.
+
+        The structure is generated, not written, because every structure
+        guessed at was wrong and OpenSTA named a different critical path
+        each time: the rounding shifters, then the scale multiply, then the
+        adder recombination. The final constraint is blunt. In this generic
+        cell library, with no carry chain, a 64-bit add is about 13.4 ns
+        against a 10 ns budget, and every wide add in the block violated,
+        so no amount of rearranging helps. Wide adds are therefore split
+        across two stages with the carry registered between them.
+
+        Latency is the currency being spent, and it is nearly free here: a
+        requantization happens once per dot product, so once per
+        reduction_depth MACs, which is at least 64 and usually thousands.
+
+        The seeded first-cut bug is wrapping instead of saturating, the
+        mistake this block exists to prevent: a wrapped overflow flips the
+        sign of a large activation and corrupts every later layer.
+        """
+        p = spec["parameters"]
+        aw, dw = p["acc_width"], p["out_width"]
+        mw, sw = p["scale_width"], p["shift_width"]
+        n = p.get("scale_splits", 3)
+        pw = aw + mw
+        wide = pw > WIDE_ADD_BITS
+        half_pt = pw // 2
+        lo_s, hi_s = -(1 << (dw - 1)), (1 << (dw - 1)) - 1
+
+        decls, reset = [], []
+        stages = []          # each entry: list of "dst <= expr" strings
+
+        def reg(name, width=None, init="0"):
+            decls.append("  reg  signed [%d:0] %s;" % ((width or pw) - 1, name)
+                         if width != 1 else "  reg  %s;" % name)
+            reset.append("      %-10s <= %s;" % (name, init))
+
+        def add_stage(pairs):
+            stages.append(pairs)
+
+        def emit_add(dst, x, y, into):
+            """One add, as one stage when it fits and two when it does not.
+            The split keeps the carry in a register between halves."""
+            if not wide:
+                reg(dst)
+                into.append([(dst, "%s + %s" % (x, y))])
+                return
+            lo, hh, yh = dst + "_lo", dst + "_xh", dst + "_yh"
+            decls.append("  reg  [%d:0] %s;" % (half_pt, lo))
+            reset.append("      %-10s <= 0;" % lo)
+            reg(hh)
+            reg(yh)
+            reg(dst)
+            into.append([(lo, "{1'b0, %s[%d:0]} + {1'b0, %s[%d:0]}"
+                          % (x, half_pt - 1, y, half_pt - 1)),
+                         (hh, x), (yh, y)])
+            into.append([(dst, "{%s[%d:%d] + %s[%d:%d] + %s[%d], %s[%d:0]}"
+                          % (hh, pw - 1, half_pt, yh, pw - 1, half_pt,
+                             lo, half_pt, lo, half_pt - 1))])
+
+        # Stage 0: partial products, each already weighted so the tree
+        # never carries a shift.
+        #
+        # Both operands are sliced, not just the scale. Slicing only the
+        # scale left the critical path at acc_in to a partial product:
+        # multiplying a 46-bit accumulator by even a 3-bit slice is two
+        # wide adds of shifted copies, so the multiplicand's width is on
+        # the path whatever the multiplier does. The high slice of acc_in
+        # keeps the sign; the low slice is unsigned.
+        an = 2 if aw > ACC_SLICE_BITS else 1
+        sb = [(i * mw // n, ((i + 1) * mw // n) - 1) for i in range(n)]
+        sb[-1] = (sb[-1][0], mw - 1)
+        ab = [(i * aw // an, ((i + 1) * aw // an) - 1) for i in range(an)]
+        ab[-1] = (ab[-1][0], aw - 1)
+        cur, s0 = [], []
+        for ai, (alo, ahi) in enumerate(ab):
+            atop = (ai == an - 1)
+            aterm = ("$signed(acc_in[%d:%d])" % (ahi, alo) if atop
+                     else "$signed({1'b0, acc_in[%d:%d]})" % (ahi, alo))
+            for si, (slo, shi) in enumerate(sb):
+                nm = "pp%d_%d" % (ai, si)
+                cur.append(nm)
+                reg(nm)
+                e = "%s * $signed({1'b0, scale[%d:%d]})" % (aterm, shi, slo)
+                w = alo + slo
+                s0.append((nm, "(%s) <<< %d" % (e, w) if w else e))
+        add_stage(s0)
+
+        # Pairwise reduction.
+        lvl = 0
+        per_add = 2 if wide else 1
+        while len(cur) > 1:
+            lvl += 1
+            nxt, groups = [], []
+            for i in range(0, len(cur) - 1, 2):
+                dst = "s%d_%d" % (lvl, i // 2)
+                nxt.append(dst)
+                own = []                     # this add's own stage list
+                emit_add(dst, cur[i], cur[i + 1], own)
+                groups.append(own)
+            if len(cur) % 2:
+                # An odd term is carried forward, and must be delayed by
+                # exactly as many stages as the adds beside it or it
+                # arrives at the next level a cycle early.
+                dst = "s%d_%d" % (lvl, len(cur) // 2)
+                nxt.append(dst)
+                own, src = [], cur[-1]
+                for k in range(per_add):
+                    nm = dst if k == per_add - 1 else "%s_d%d" % (dst, k)
+                    reg(nm)
+                    own.append([(nm, src)])
+                    src = nm
+                groups.append(own)
+            # Every add in a level takes the same number of stages, so the
+            # level's stages are the per-add stages merged position by
+            # position.
+            for k in range(per_add):
+                merged = []
+                for grp in groups:
+                    if k < len(grp):
+                        merged.extend(grp[k])
+                add_stage(merged)
+            cur = nxt
+        rdepth = len(stages) - 1
+
+        # Rounding add, then the output shift, then the saturate.
+        built = []
+        emit_add("summed", cur[0], "hf_last", built)
+        for b in built:
+            add_stage(b)
+        reg("shifted")
+        add_stage([("shifted", "summed >>> sh_last")])
+        nstage = len(stages) + 1           # + the saturate stage
+
+        # Sideband pipelines, each exactly as deep as the point it is used.
+        hf_depth = 1 + rdepth              # hf is consumed by the first
+        sh_depth = len(stages) - 1         # sh by the shift stage
+        for nm, depth, src in (("hf", hf_depth, "half_w"),
+                               ("sh", sh_depth, "shift")):
+            w = pw if nm == "hf" else sw
+            names = ["%s%d" % (nm, i) for i in range(depth)]
+            decls.append("  reg  %s[%d:0] %s;"
+                         % ("signed " if nm == "hf" else "", w - 1,
+                            ", ".join(names)))
+            for x in names:
+                reset.append("      %-10s <= 0;" % x)
+            stages[0].append((names[0], src))
+            for i in range(1, depth):
+                stages[i].append((names[i], names[i - 1]))
+        body = "\n".join(
+            "\n".join("      %-10s <= %s;" % (d, e) for d, e in st)
+            for st in stages)
+        body = body.replace("hf_last", "hf%d" % (hf_depth - 1))
+        body = body.replace("sh_last", "sh%d" % (sh_depth - 1))
+
+        vnames = ["v%d" % i for i in range(nstage - 1)]
+        decls.append("  reg  %s;" % ", ".join(vnames))
+        for x in vnames:
+            reset.append("      %-10s <= 1'b0;" % x)
+        vlines = ["      %-10s <= valid_in;" % vnames[0]]
+        vlines += ["      %-10s <= %s;" % (vnames[i], vnames[i - 1])
+                   for i in range(1, len(vnames))]
+
+        if FIX_SATURATE in fixes:
+            clamp = """      if (shifted > %d'sd%d) begin
+        q_out <= %d'sd%d;
+        sat   <= 1'b1;
+      end else if (shifted < -%d'sd%d) begin
+        q_out <= -%d'sd%d;
+        sat   <= 1'b1;
+      end else begin
+        q_out <= shifted[%d:0];
+        sat   <= 1'b0;
+      end""" % (pw, hi_s, dw, hi_s, pw, -lo_s, dw, -lo_s, dw - 1)
+        else:   # first cut truncates, which wraps on overflow
+            clamp = ("      q_out <= shifted[%d:0];\n"
+                     "      sat   <= 1'b0;" % (dw - 1))
+
+        return """module requant (
+  input                     clk,
+  input                     rst_n,
+  input      signed [{awm}:0] acc_in,
+  input             [{mwm}:0] scale,
+  input             [{swm}:0] shift,
+  input                     valid_in,
+  output reg signed [{dwm}:0] q_out,
+  output reg                sat,
+  output reg                valid_out
+);
+  // scale is unsigned, so it is zero-extended before the signed multiply:
+  // mixing a signed and an unsigned operand makes the whole expression
+  // unsigned in Verilog and silently breaks every negative accumulator.
+  // half depends only on shift, so it is built before the tree and never
+  // sits on the rounding path.
+{decls}
+  wire signed [{pwm}:0] half_w = (shift == 0)
+        ? {pw}'sd0 : ({pw}'sd1 <<< (shift - 1));
+  always @(posedge clk) begin
+    if (!rst_n) begin
+{reset}
+      q_out      <= 0;
+      sat        <= 1'b0;
+      valid_out  <= 1'b0;
+    end else begin
+{body}
+{vlines}
+{clamp}
+      valid_out  <= {vlast};
+    end
+  end
+endmodule
+""".format(awm=aw - 1, mwm=mw - 1, swm=sw - 1, dwm=dw - 1, pwm=pw - 1,
+           pw=pw, decls="\n".join(decls), reset="\n".join(reset),
+           body=body, vlines="\n".join(vlines), clamp=clamp,
+           vlast=vnames[-1])
 
     def render_mac(self, spec, fixes):
         p = spec["parameters"]

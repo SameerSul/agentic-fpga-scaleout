@@ -42,6 +42,12 @@ FABRIC_JOB = {
     "profile_file": "fabric_profile.json", "report_file": "report_crc.json",
     "derive_from_link": True,
 }
+REQUANT_JOB = {
+    "spec_file": "spec_requant.json", "tb_file": "tb_requant.v",
+    "rtl_file": "requant.v", "profile_file": "requant_profile.json",
+    "report_file": "report_requant.json",
+    "derive_from_model": "requant",
+}
 # Link rate the fabric endpoint is generated for. 10GbE is the default
 # because it is what the mid board class actually exposes (SFP+ cages) and
 # what a two-board bring-up would be cabled with. 25G is reachable by the
@@ -103,7 +109,10 @@ def stage_sim(job, rtl_path):
     prof = re.search(r"TB_PROFILE (.*)", out)
     if prof:
         p = {k: int(v) for k, v in _parse_kv(prof.group(1)).items()}
-        units = p.get("macs") or p.get("bytes")
+        # The unit count is whatever the testbench named it. Hardcoding the
+        # known unit names means every new block silently divides by None.
+        units = next((v for k, v in p.items()
+                      if k not in ("span_cycles", "latency_cycles")), None)
         res["throughput"] = dict(p, units=units,
                                  cycles_per_unit=p["span_cycles"] / units)
     return res
@@ -285,12 +294,19 @@ def derive_profile(spec, final):
         prof["fpga"] = {k: fpg[k] for k in
                         ("family", "luts", "ffs", "dsps", "brams", "urams",
                          "carry", "muxf") if k in fpg}
+    # Block-specific fields, keyed on the unit the spec declares rather
+    # than on there being exactly two kinds of block.
+    if "derivation" in spec:
+        prof["derivation"] = spec["derivation"]
     if unit == "mac":
         prof["chiplet"] = spec["name"]
         prof["data_width"] = spec["parameters"]["data_width"]
         prof["acc_width"] = spec["parameters"]["acc_width"]
-        if "derivation" in spec:
-            prof["derivation"] = spec["derivation"]
+    elif unit == "activation":
+        prof["requant"] = spec["name"]
+        prof["acc_width"] = spec["parameters"]["acc_width"]
+        prof["out_width"] = spec["parameters"]["out_width"]
+        prof["pipeline_stages"] = spec["parameters"]["pipeline_stages"]
     else:
         prof["bytes_per_cycle"] = spec["parameters"]["bytes_per_cycle"]
         # The link rate the synthesized endpoint can actually sustain:
@@ -348,7 +364,10 @@ def run_flow(job=None, verbose=True, agent=None, max_iters=None):
     say = print if verbose else (lambda *a, **k: None)
     os.makedirs(BUILD, exist_ok=True)
     shutil.copy(LIB, BUILD)
-    if job.get("derive_from_model"):
+    if job.get("derive_from_model") == "requant":
+        specgen.generate_requant(spec_file=job["spec_file"],
+                                 tb_file=job["tb_file"])
+    elif job.get("derive_from_model"):
         specgen.generate(spec_file=job["spec_file"], tb_file=job["tb_file"])
     if job.get("derive_from_link"):
         specgen.generate_endpoint(TARGET_LINK_GBPS,

@@ -126,6 +126,298 @@ def derive_chiplet_spec(ms):
     }
 
 
+# Widest add that closes in one stage in the generic cell library. Measured:
+# a 46-bit add leaves +0.26 ns at 100 MHz, a 64-bit add is 3.4 ns over, and
+# every wide add in the block violated, so this is a property of the library
+# (no carry chain primitive) rather than of one arrangement.
+WIDE_ADD_BITS = 48
+# Widest accumulator that can go into a partial product whole. Above this
+# the multiplicand itself is sliced, because a multiply by a small slice is
+# still a sum of shifted copies of the full multiplicand.
+ACC_SLICE_BITS = 32
+
+
+def requant_terms(aw, splits):
+    """Partial products: the scale slices times the accumulator slices."""
+    return splits * (2 if aw > ACC_SLICE_BITS else 1)
+
+
+def requant_stages(aw, mw, splits):
+    """Pipeline depth of the generated requantizer.
+
+    Lives here so the spec and the renderer cannot drift: the testbench
+    waits for the depth the spec declares, and a disagreement shows up as a
+    datapath failure rather than as the latency mismatch it is.
+    """
+    per_add = 2 if (aw + mw) > WIDE_ADD_BITS else 1
+    levels, n = 0, requant_terms(aw, splits)
+    while n > 1:
+        n = (n + 1) // 2
+        levels += 1
+    # products, the reduction tree, the rounding add, the shift, the saturate
+    return 1 + levels * per_add + per_add + 1 + 1
+
+
+def derive_requant_spec(ms):
+    """model spec -> requantization spec.
+
+    This is the step between two matmuls, and until now it lived in Python
+    while the repo claimed to be generating the inference datapath. A wide
+    signed accumulator has to come back to the next layer's operand width:
+    multiply by a per-tensor scale, round, and saturate rather than wrap,
+    because wrapping turns one saturated activation into a value of the
+    opposite sign and the error propagates through every later layer.
+
+    The scale is a fixed-point reciprocal applied as a multiply and an
+    arithmetic shift, which is how quantized inference does it in hardware:
+    a divider per activation would be absurd, and the scale is constant for
+    the whole tensor so it can be a run-time input.
+    """
+    wb, ab = ms["weight_bits"], ms["activation_bits"]
+    dw = max(wb, ab)
+    depth = max(ms["d_model"], ms["d_ff"])
+    aw = wb + ab + math.ceil(math.log2(depth))
+    mw = 18                       # multiplier operand width for the scale
+    shift_w = math.ceil(math.log2(aw + mw)) + 1
+    # Partial products for the scale multiply. Depth grows with both
+    # operand widths, so the split has to track the accumulator too: at a
+    # fixed three the 46-bit accumulator missed its clock. Roughly six
+    # multiplier bits per partial product at 28 bits of accumuland, and
+    # one more split for every eight bits of accumulator beyond that.
+    splits = min(mw, 3 + max(0, (aw - 28 + 7) // 8))
+    stages = requant_stages(aw, mw, splits)
+    return {
+        "name": "requant%d_%s" % (dw, ms["name"]),
+        "description": "Requantization unit derived from %s: scales a %d-bit "
+                       "signed accumulator back to a %d-bit signed operand "
+                       "by a fixed-point multiply, arithmetic shift with "
+                       "round to nearest, and saturation"
+                       % (ms["name"], aw, dw),
+        "top_module": "requant",
+        "unit": "activation",
+        "parameters": {
+            "acc_width": aw,
+            "out_width": dw,
+            "scale_width": mw,
+            "shift_width": shift_w,
+            "scale_splits": splits,
+            "signed": True,
+            "pipeline_stages": stages,
+            "target_clock_mhz": 100,
+        },
+        "derivation": {
+            "model": ms["name"],
+            "weight_bits": wb,
+            "activation_bits": ab,
+            "reduction_depth": depth,
+            "rule": "in_width = acc_width from the chiplet derivation; "
+                    "out_width = max(weight_bits, activation_bits); the "
+                    "scale is a %d-bit fixed-point multiplier with a "
+                    "run-time arithmetic shift" % mw,
+        },
+        "ports": [
+            {"name": "clk", "dir": "input", "width": 1,
+             "desc": "clock, rising edge"},
+            {"name": "rst_n", "dir": "input", "width": 1,
+             "desc": "active-low synchronous reset"},
+            {"name": "acc_in", "dir": "input", "width": aw, "signed": True,
+             "desc": "accumulator from the MAC, signed two's complement"},
+            {"name": "scale", "dir": "input", "width": mw, "signed": False,
+             "desc": "fixed-point multiplier, unsigned"},
+            {"name": "shift", "dir": "input", "width": shift_w,
+             "desc": "arithmetic right shift applied after the multiply"},
+            {"name": "valid_in", "dir": "input", "width": 1,
+             "desc": "acc_in valid"},
+            {"name": "q_out", "dir": "output", "width": dw, "signed": True,
+             "desc": "requantized activation, saturated not wrapped"},
+            {"name": "sat", "dir": "output", "width": 1,
+             "desc": "high when this output saturated"},
+            {"name": "valid_out", "dir": "output", "width": 1,
+             "desc": "q_out updated this cycle"},
+        ],
+        "behavior": [
+            "Stage 1 registers two half-width partial products of "
+            "acc_in * scale; stage 2 recombines them into the full "
+            "product.",
+            "Stage 3 adds half an LSB, precomputed a stage earlier, for "
+            "round to nearest.",
+            "Stage 4 arithmetically shifts that sum right by shift.",
+            "Stage 5 saturates to the signed %d-bit range [%d, %d] and "
+            "registers the result."
+            % (dw, -(1 << (dw - 1)), (1 << (dw - 1)) - 1),
+            "sat is high on any output that had to be clamped.",
+            "Saturating, not wrapping, is required: a wrapped overflow "
+            "flips the sign of a large activation and corrupts every "
+            "later layer.",
+            "Latency from valid_in to valid_out is %d cycles." % stages,
+        ],
+    }
+
+
+def render_requant_testbench(spec):
+    """Testbench for the requantizer, with the golden values computed here
+    in Python rather than by a mirror of the design, so a design that
+    reproduces its own mistake cannot pass."""
+    p = spec["parameters"]
+    aw, dw, mw = p["acc_width"], p["out_width"], p["scale_width"]
+    lo, hi = -(1 << (dw - 1)), (1 << (dw - 1)) - 1
+    rnd = random.Random(7)
+
+    def golden(acc, scale, sh):
+        prod = acc * scale
+        # Round to nearest via a half-LSB bias, then arithmetic shift.
+        r = (prod + (1 << (sh - 1))) >> sh if sh > 0 else prod
+        sat = 0
+        if r > hi:
+            r, sat = hi, 1
+        elif r < lo:
+            r, sat = lo, 1
+        return r, sat
+
+    cases = []
+    # Directed: zero, the saturation edges in both directions, and the
+    # rounding boundary, then random coverage.
+    sh = 12
+    unit = 1 << sh
+    directed = [(0, unit, sh), (hi, unit, sh), (lo, unit, sh),
+                (hi + 1, unit, sh), (lo - 1, unit, sh),
+                ((1 << (aw - 2)), unit, sh), (-(1 << (aw - 2)), unit, sh),
+                (3, unit // 2, sh), (-3, unit // 2, sh),
+                (1, unit // 2, sh), (-1, unit // 2, sh)]
+    for acc, sc, s_ in directed:
+        cases.append(("directed", acc, sc, s_))
+    # Random coverage, with the shift chosen from the magnitude of the
+    # product so the result lands in the representable range. Picking the
+    # shift independently makes almost every vector saturate, and a
+    # saturated output hides any arithmetic error below it: mutation
+    # testing caught exactly that, an inverted adder in the low half of a
+    # split add surviving 120 random vectors.
+    n_sat = 0
+    for _ in range(140):
+        acc = rnd.randrange(-(1 << (aw - 1)), 1 << (aw - 1))
+        sc = rnd.randrange(1, 1 << (mw - 1))
+        mag = abs(acc * sc)
+        want_bits = rnd.randrange(1, dw)      # target magnitude, in bits
+        s_ = max(0, min((1 << p["shift_width"]) - 1,
+                        mag.bit_length() - want_bits))
+        q, st = golden(acc, sc, s_)
+        n_sat += st
+        cases.append(("random", acc, sc, s_))
+    # Small operands with a small shift. With a wide accumulator the shift
+    # is always large, so the bottom of the product never reaches the
+    # output and the low partial products are untested: mutation testing
+    # showed an inverted adder in the low half of a split add surviving
+    # every vector. These vectors keep the low bits in the result.
+    for _ in range(60):
+        acc = rnd.randrange(-(1 << min(aw - 1, 14)), 1 << min(aw - 1, 14))
+        sc = rnd.randrange(1, 1 << min(mw - 1, 10))
+        s_ = rnd.randrange(0, 6)
+        q, st = golden(acc, sc, s_)
+        if st:            # keep these in range, the clamp has its own cases
+            continue
+        cases.append(("small_operands", acc, sc, s_))
+
+    # A testbench that never saturates would not test the clamp either.
+    for _ in range(20):
+        acc = rnd.randrange(-(1 << (aw - 1)), 1 << (aw - 1))
+        sc = rnd.randrange(1 << (mw - 2), 1 << (mw - 1))
+        cases.append(("saturating", acc, sc, rnd.randrange(0, 4)))
+
+    body = []
+    for name, acc, sc, s_ in cases:
+        want, wsat = golden(acc, sc, s_)
+        body.append('    testname = "%s";' % name)
+        body.append("    drive(%s, %d'd%d, %d'd%d, %s, 1'b%d);"
+                    % (_slit(acc, aw), mw, sc, p["shift_width"], s_,
+                       _slit(want, dw), wsat))
+    return REQUANT_TB.format(
+        awm=aw - 1, dwm=dw - 1, mwm=mw - 1, swm=p["shift_width"] - 1,
+        cases="\n".join(body), n=len(cases),
+        settle=p["pipeline_stages"] - 1)
+
+
+def _slit(v, w):
+    """Signed Verilog literal: the sign goes outside the sized constant."""
+    return "-%d'sd%d" % (w, -v) if v < 0 else "%d'sd%d" % (w, v)
+
+
+REQUANT_TB = """`timescale 1ns/1ps
+// GENERATED by specgen.py: do not edit by hand.
+// Self-checking testbench for the requantizer. Golden outputs are computed
+// in Python from the quantization rule, not by a Verilog mirror of the
+// design, so a design that reproduces its own mistake cannot pass.
+module tb_requant;
+  reg clk = 0, rst_n = 0, valid_in = 0;
+  reg  signed [{awm}:0] acc_in = 0;
+  reg         [{mwm}:0] scale = 0;
+  reg         [{swm}:0] shift = 0;
+  wire signed [{dwm}:0] q_out;
+  wire sat, valid_out;
+  integer checks = 0, i;
+  reg [255:0] testname;
+  reg signed [{dwm}:0] exp_q;
+  reg exp_sat;
+
+  requant dut (.clk(clk), .rst_n(rst_n), .acc_in(acc_in), .scale(scale),
+               .shift(shift), .valid_in(valid_in), .q_out(q_out),
+               .sat(sat), .valid_out(valid_out));
+  always #5 clk = ~clk;
+
+  // One transaction at a time: drive, wait the pipeline out, then check.
+  task drive(input signed [{awm}:0] a, input [{mwm}:0] sc,
+             input [{swm}:0] sh, input signed [{dwm}:0] want,
+             input wsat);
+    begin
+      @(negedge clk); acc_in = a; scale = sc; shift = sh; valid_in = 1;
+      @(negedge clk); valid_in = 0;
+      // Wait the declared pipeline out. Hardcoding a depth here would make
+      // a latency change look like a datapath bug.
+      repeat ({settle}) @(negedge clk);
+      checks = checks + 1;
+      if (q_out !== want || sat !== wsat || valid_out !== 1'b1) begin
+        $display("TB_FAIL test=%0s acc=%0d scale=%0d shift=%0d expected_q=%0d got_q=%0d expected_sat=%b got_sat=%b vout=%b",
+                 testname, a, sc, sh, want, q_out, wsat, sat, valid_out);
+        $display("TB_RESULT: FAIL");
+        $finish;
+      end
+    end
+  endtask
+
+  // Reset has to hold the outputs quiet. Without this the testbench never
+  // depends on the reset branch at all: every transaction flushes the
+  // pipeline with real values before it is checked, so a dead reset passes.
+  // The endpoint testbench had exactly this hole.
+  task expect_quiet;
+    begin
+      checks = checks + 1;
+      if (valid_out !== 1'b0 || q_out !== 0 || sat !== 1'b0) begin
+        $display("TB_FAIL test=reset_init expected_q=0 got_q=%0d expected_sat=0 got_sat=%b vout=%b",
+                 q_out, sat, valid_out);
+        $display("TB_RESULT: FAIL");
+        $finish;
+      end
+    end
+  endtask
+
+  initial begin
+    testname = "reset_init";
+    repeat (3) @(negedge clk);
+    expect_quiet;
+    rst_n = 1;
+    @(negedge clk);
+    expect_quiet;
+{cases}
+
+    $display("TB_PROFILE activations=%0d span_cycles=%0d latency_cycles=%0d",
+             {n}, {n} * (2 + {settle}), 1 + {settle});
+    $display("TB_PASS checks=%0d", checks);
+    $display("TB_RESULT: PASS");
+    $finish;
+  end
+endmodule
+"""
+
+
 TB_TEMPLATE = """`timescale 1ns/1ps
 // GENERATED by specgen.py from the model spec: do not edit by hand.
 // Self-checking testbench for the {dw}-bit MAC with a {aw}-bit accumulator:
@@ -631,6 +923,18 @@ def generate_endpoint(link_gbps, spec_file="spec_crc.json",
         json.dump(spec, f, indent=2)
     with open(os.path.join(ROOT, tb_file), "w") as f:
         f.write(render_crc_testbench(spec))
+    return spec
+
+
+def generate_requant(ms=None, spec_file="spec_requant.json",
+                     tb_file="tb_requant.v"):
+    """Write the derived requantizer spec and testbench, return the spec."""
+    ms = ms or load_model_spec()
+    spec = derive_requant_spec(ms)
+    with open(os.path.join(ROOT, spec_file), "w") as f:
+        json.dump(spec, f, indent=2)
+    with open(os.path.join(ROOT, tb_file), "w") as f:
+        f.write(render_requant_testbench(spec))
     return spec
 
 

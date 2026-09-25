@@ -5,27 +5,27 @@ every command is named so it can be re-run.
 
 ## Short answer
 
-The flow reliably turns a model spec into signed-off RTL for the two blocks
-it generates, and the generated hardware provably computes the arithmetic
-the model needs. It does not yet host a local LLM the way Architect Labs
-does, because the blocks it generates are a MAC unit and a fabric endpoint,
-not a whole inference engine, and nothing has been put on a board. The gap
-is listed at the bottom rather than glossed over.
+The flow turns a model spec into signed-off RTL for three generated blocks,
+and a trained language model now decodes through those blocks' exact
+arithmetic and emits text. It still does not host a local LLM the way
+Architect Labs does: nothing has been put on a board, and the generated
+blocks are the arithmetic of an inference engine rather than the whole of
+one. The remaining gap is listed at the bottom rather than glossed over.
 
 ## Verified
 
 ### The full suite
 
 ```
-python3 tests.py            # 120 tests, all passing
+python3 tests.py            # 138 tests, all passing
 ```
 
 ### Spec to RTL, across the spec space
 
-`python3 sweep.py` drives fifteen cases through every stage: derivation,
+`python3 sweep.py` drives twenty one cases through every stage: derivation,
 RTL, simulation, synthesis, timing closure, FPGA mapping, the profile
 fields the sizing model consumes, and a mutation sweep of the testbench
-generated at that width. All fifteen clean.
+generated at that width. All twenty one clean.
 
 | case | cyc/unit | fmax | cells | DV |
 |---|---|---|---|---|
@@ -134,28 +134,69 @@ is never counted against the testbench.
 | 25G/100G endpoint | failed timing at every option | closes at 385 and 325 MHz |
 | signed netlist | silently fell back to the timing proxy | reads in OpenSTA |
 
+## The model actually runs
+
+```
+python3 train_tiny.py      # one off: trains and writes tiny_llm.json
+python3 generate.py
+```
+
+A character-level transformer, trained from scratch in this repo with a
+hand-written reverse-mode autodiff (`autodiff.py`, gradients checked
+against finite differences to 1e-11), then decoded through the generated
+hardware's arithmetic. Every dot product goes through the bit-accurate MAC
+model and every requantization through the bit-accurate requantizer model,
+and both are checked against their RTL in iverilog on vectors taken from
+that very decode.
+
+    prompt:    'the agent'
+    generated: ' rithe age rtl age. rthe age. ad the age'
+    float ref: ' writes the rtoools decidecidecide. the '
+
+    MAC:       12/12 dot products bit exact
+    requant:   12/12 requantizations bit exact
+
+Two things are worth reading off that.
+
+The text is what the hardware would emit, not what a float model emits.
+Nothing in the decode's arithmetic is unverified against RTL.
+
+And int8 costs this model a great deal: the quantized decode agrees with
+the float decode on 24% of characters. That is not a hardware fault, it is
+the quantization scheme meeting a model with no redundancy to spare. A
+16-dimensional transformer has nothing like the slack a 768 or 1024
+dimensional one has, which is exactly why per-tensor int8 is safe for
+GPT-2 or Qwen and not for this. The useful lesson for the capstone is that
+a quantization scheme has to be validated at the target model's size, not
+at a size that happens to fit the test loop.
+
 ## Not verified, and not claimed
 
 These are the distance between this repo and a local LLM host.
 
 1. **Nothing has run on a board.** There is no bitstream. Vivado does not
-   run on an ARM Mac, so place and route, real fmax and real resource use
-   are all unmeasured. Every timing number here is from OpenSTA against a
-   generic standard cell library, not a device.
-2. **The generated blocks are not an inference engine.** The flow generates
-   a multiply-accumulate unit and a CRC32 fabric endpoint. It does not
-   generate the matrix engine, the attention datapath, softmax, the
-   normalisation, the requantisation between layers, the weight streaming
-   controller or the memory subsystem. `inference.py` models those in
-   Python and puts only the dot products through real hardware.
-3. **No real weights.** The quantized layer uses the model's shapes,
-   reduction depths and quantization scheme, with random weights. No
-   Qwen3-0.6B checkpoint is loaded and no tokenizer exists, so the repo has
-   never produced a token.
+   run on an ARM Mac, and no open place-and-route toolchain (nextpnr,
+   icepack, ecppack) is installed either, so place and route, real fmax and
+   real resource use are all unmeasured. Every timing number here is
+   OpenSTA against a generic standard cell library, not a device. That
+   library has no carry chain, which is why wide adds here cost far more
+   than they would on an FPGA.
+2. **The generated blocks are the arithmetic, not the whole engine.** The
+   flow generates the multiply-accumulate unit, the requantizer between
+   matmuls, and the CRC32 fabric endpoint. It does not generate softmax,
+   the normalisations, the attention sequencing, the weight streaming
+   controller or the memory subsystem. In `generate.py` those run on the
+   host, and the output says so.
+3. **The model is small and its weights are its own.** Qwen3-0.6B is not
+   loaded; there is no numeric stack here to load it with and no network
+   dependency wanted in a capstone repo. The committed checkpoint is a
+   real trained transformer with a real tokenizer, but it is 16
+   dimensional and trained on two sentences.
 4. **Throughput is predicted, not measured.** tokens/s comes from a sizing
    model checked against a fabric simulation, agreeing within 15% and at
    ratio 1.00 on the current configuration. Both are models. Neither is a
    board.
 
-Items 1 and 3 are the ones that would let this claim what Architect Labs
-demonstrated. Item 2 is the largest amount of remaining design work.
+Item 1 is the one that would let this claim what Architect Labs
+demonstrated, and it is blocked on tooling rather than on design. Items 2
+and 3 are ordinary remaining work.

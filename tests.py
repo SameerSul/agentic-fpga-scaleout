@@ -19,6 +19,8 @@ import swarm as swarm_mod
 from swarm import SwarmAgent, parse_review
 import dv
 import inference
+import json
+import specgen as specgen_mod
 from specgen import (derive_chiplet_spec, derive_endpoint_spec,
                      endpoint_options, generate, crc_matrix)
 from boards import BOARDS, fit, TRANSPORTS
@@ -468,6 +470,95 @@ def test_inference_arithmetic():
     shutil.rmtree(inference.WORK, ignore_errors=True)
 
 
+def test_requant_block():
+    """The requantizer is the step between two matmuls, and it is generated
+    like the others: derived from the model spec, gated by the same tools.
+    Its bit-accurate model has to agree with its RTL, or the decode below
+    is not what the hardware would do."""
+    ms = load_model_spec()
+    spec = specgen_mod.derive_requant_spec(ms)
+    p = spec['parameters']
+    check('requantizer width is derived from the chiplet accumulator',
+          p['acc_width'] == derive_chiplet_spec(ms)['parameters']['acc_width']
+          and p['out_width'] == derive_chiplet_spec(ms)['parameters']['data_width'])
+    check('requantizer saturates rather than wraps, by spec',
+          any('aturat' in b for b in spec['behavior']))
+
+    rtl = RuleBasedAgent().render_requant(spec, {agent_mod.FIX_SATURATE})
+    rq = inference.RequantModel(p['out_width'], p['scale_width'],
+                                p['shift_width'])
+    rnd = random.Random(11)
+    vecs = []
+    for _ in range(10):
+        acc = rnd.randrange(-(1 << (p['acc_width'] - 2)),
+                            1 << (p['acc_width'] - 2))
+        sc, sh = rq.pick(max(1, abs(acc)))
+        vecs.append((acc, sc, sh))
+    # Plus a case that must clamp, since that is the block's whole point.
+    vecs.append(((1 << (p['acc_width'] - 2)), (1 << (p['scale_width'] - 1)), 1))
+    got = inference.run_requant_cosim(spec, vecs, rtl)
+    ref = inference.RequantModel(p['out_width'], p['scale_width'],
+                                 p['shift_width'])
+    check('generated requantizer matches its model bit-exactly',
+          all(got.get(i) == ref.apply(a, s_, h)
+              for i, (a, s_, h) in enumerate(vecs)))
+    hi = (1 << (p['out_width'] - 1)) - 1
+    lo = -(1 << (p['out_width'] - 1))
+    check('every requantizer output is inside the operand range',
+          all(lo <= v <= hi for v in got.values()))
+    check('the clamping case actually clamped', ref.saturations >= 1)
+    shutil.rmtree(inference.WORK, ignore_errors=True)
+
+
+def test_generation():
+    """The end of the chain: a trained checkpoint decoded through the
+    hardware's arithmetic. This is the claim that the repo can run a
+    language model, so it is checked rather than asserted in a README."""
+    import generate as gen
+    from train_tiny import CKPT
+    check('a trained checkpoint is committed', os.path.exists(CKPT))
+    ck = json.load(open(CKPT))
+    check('checkpoint carries weights and a tokenizer',
+          set(ck['weights']) >= {'tok', 'pos', 'wq', 'wk', 'wv', 'wo',
+                                 'w1', 'w2', 'head'} and len(ck['chars']) > 5)
+
+    ms = load_model_spec()
+    cspec = derive_chiplet_spec(ms)
+    rspec = specgen_mod.derive_requant_spec(ms)
+    dw = cspec['parameters']['data_width']
+    aw = cspec['parameters']['acc_width']
+    rp = rspec['parameters']
+    rq = inference.RequantModel(rp['out_width'], rp['scale_width'],
+                                rp['shift_width'])
+    hw = gen.HwModel(ck, dw, aw, rq)
+    ids = [hw.stoi[c] for c in 'the ' if c in hw.stoi]
+    out = list(ids)
+    for _ in range(12):
+        lg = hw.forward(out[-hw.seq:])
+        out.append(max(range(len(lg)), key=lambda k: lg[k]))
+    text = ''.join(hw.chars[i] for i in out)
+    check('the model emits tokens', len(text) == len(ids) + 12)
+    check('every emitted token is in the vocabulary',
+          all(c in hw.chars for c in text))
+    check('decode is deterministic', text == ''.join(
+        hw.chars[i] for i in out))
+    check('no accumulator overflow during a decode', hw.mac.overflows == 0)
+    check('the decode exercised both blocks',
+          len(hw.dots) > 100 and len(hw.rqs) > 100)
+
+    # The arithmetic the text came from has to be the hardware's.
+    rnd = random.Random(5)
+    rnd.shuffle(hw.dots)
+    sample = hw.dots[:4]
+    rtl = RuleBasedAgent().render_mac(cspec, {agent_mod.FIX_WIDTH,
+                                              agent_mod.FIX_CLEAR})
+    got = inference.run_cosim(cspec, sample, rtl)
+    check('the decode\'s dot products match the generated RTL',
+          all(got.get(i) == inference.MacModel(dw, aw).dot(xs, ws)
+              for i, (xs, ws) in enumerate(sample)))
+    shutil.rmtree(inference.WORK, ignore_errors=True)
+
+
 def test_fpga_backend(profile, fp):
     """Real device mapping, not generic cells: the two generated blocks land
     on different resources, which is what makes a single capacity proxy
@@ -686,6 +777,8 @@ if __name__ == '__main__':
     test_swarm_offline()
     test_crc_matrix()
     test_inference_arithmetic()
+    test_requant_block()
+    test_generation()
     test_fit_monotonic(profile)
     test_allreduce(profile)
     test_hetero_bit_identical(profile)

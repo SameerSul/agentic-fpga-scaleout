@@ -1,0 +1,35 @@
+{
+  "block": "requant8_gpt2_124m",
+  "top_module": "requant",
+  "unit": "activation",
+  "cycles_per_activation": 6.0,
+  "latency_cycles": 5,
+  "cell_count": 9128,
+  "area": 18324.0,
+  "fmax_estimate_mhz": 102.6694045174538,
+  "fmax_method": "opensta_slack",
+  "target_clock_mhz": 100,
+  "sim_checks_passed": 131,
+  "fpga": {
+    "family": "xcup",
+    "luts": 735,
+    "ffs": 369,
+    "dsps": 6,
+    "brams": 0,
+    "urams": 0,
+    "carry": 45,
+    "muxf": 40
+  },
+  "derivation": {
+    "model": "gpt2_124m",
+    "weight_bits": 8,
+    "activation_bits": 8,
+    "reduction_depth": 3072,
+    "rule": "in_width = acc_width from the chiplet derivation; out_width = max(weight_bits, activation_bits); the scale is a 18-bit fixed-point multiplier with a run-time arithmetic shift"
+  },
+  "requant": "requant8_gpt2_124m",
+  "acc_width": 28,
+  "out_width": 8,
+  "pipeline_stages": 5,
+  "agent": "RuleBasedAgent"
+}
