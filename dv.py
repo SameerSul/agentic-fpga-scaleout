@@ -95,6 +95,9 @@ OPS = [
      "multiplier result is off by one"),
     ("nonblocking_to_blocking", mut_nba,
      "sequential assignments become blocking: scheduling race"),
+    ("signedness_dropped", lambda s: re.sub(r"\bsigned\b\s*", "", s),
+     "signed datapath becomes unsigned: every negative operand is read as "
+     "a large positive one"),
 ]
 
 

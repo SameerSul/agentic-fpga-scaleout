@@ -9,13 +9,16 @@ import re
 import shutil
 import zlib
 
+import chiplet_flow
 from chiplet_flow import (run_flow, run_endpoint_flow, make_agent, ROOT)
+import agent as agent_mod
 from agent import RuleBasedAgent
 from llm_agent import (build_prompt, extract_verilog, condense_feedback,
                        CALLERS)
 import swarm as swarm_mod
 from swarm import SwarmAgent, parse_review
 import dv
+import inference
 from specgen import (derive_chiplet_spec, derive_endpoint_spec,
                      endpoint_options, generate, crc_matrix)
 from boards import BOARDS, fit, TRANSPORTS
@@ -172,7 +175,7 @@ def test_llm_agent_offline():
           and extract_verilog(bare) == 'module mac (input clk);\nendmodule\n')
 
 
-def _scripted_swarm(replies):
+def _scripted_swarm(replies, escalate=True):
     """A SwarmAgent wired to a canned reply list instead of a model, so the
     orchestration logic is testable with no network and no cost. Returns the
     agent and the list of prompts it sent, in order."""
@@ -188,6 +191,7 @@ def _scripted_swarm(replies):
     a.backend, a.model = '_test', 'fake'
     a.review_rounds = swarm_mod.MAX_REVIEW_ROUNDS
     a.use_reviewer = a.use_debugger = True
+    a.escalate = escalate
     a.last_rtl = None
     a.calls = {'writer': 0, 'reviewer': 0, 'debugger': 0}
     a.log = []
@@ -216,18 +220,29 @@ def test_swarm_offline():
     rtl_a = 'module mac (input clk);\nendmodule'
     rtl_b = 'module mac (input clk, input rst);\nendmodule'
 
-    # First call of a run: no feedback yet, so there is nothing to debug.
-    a, sent = _scripted_swarm([rtl_a, 'ACCEPT'])
+    # First attempt of a run. Escalation keeps this to a lone writer, so the
+    # swarm costs exactly what a single agent costs on work that was never
+    # going to fail, which is the majority of runs.
+    a, sent = _scripted_swarm([rtl_a])
     out, notes = a.propose(spec, [])
-    check('no debugger call before any tool has run',
-          a.calls['debugger'] == 0 and a.calls['writer'] == 1)
+    check('a clean first attempt costs exactly one model call',
+          sum(a.calls.values()) == 1 and a.calls['writer'] == 1)
+    check('neither debugger nor reviewer runs before any tool has',
+          a.calls['debugger'] == 0 and a.calls['reviewer'] == 0)
     check('accepted draft is returned unchanged', out.startswith('module mac'))
-    check('notes record which roles ran',
-          'writer' in notes[1] and 'reviewer:accept' in notes[1])
+
+    # With escalation off every role runs from the first draft, which is how
+    # the review loop itself is exercised.
+    a, sent = _scripted_swarm([rtl_a, 'ACCEPT'], escalate=False)
+    out, notes = a.propose(spec, [])
+    check('reviewer runs on the first draft when escalation is off',
+          a.calls['reviewer'] == 1 and 'reviewer:accept' in notes[1])
+    check('notes record which roles ran', 'writer' in notes[1])
 
     # A rejection must cost exactly one rewrite and must show the writer the
     # draft the objections are about, not some older attempt.
-    a, sent = _scripted_swarm([rtl_a, 'acc is truncated to 16 bits', rtl_b])
+    a, sent = _scripted_swarm([rtl_a, 'acc is truncated to 16 bits', rtl_b],
+                              escalate=False)
     out, notes = a.propose(spec, [])
     check('rejection triggers exactly one rewrite',
           a.calls['writer'] == 2 and a.calls['reviewer'] == 1)
@@ -264,7 +279,7 @@ def test_swarm_offline():
             return rtl_a
         return caller
 
-    a2, _ = _scripted_swarm([rtl_a])
+    a2, _ = _scripted_swarm([rtl_a], escalate=False)
     CALLERS['_test2'] = dies_on('reviewing Verilog')
     a2.backend = '_test2'
     out2, notes2 = a2.propose(spec, [])
@@ -279,6 +294,12 @@ def test_swarm_offline():
     check('a dead debugger still yields RTL for the tools to judge',
           out3.startswith('module mac'))
 
+    a4, sent4 = _scripted_swarm(['diagnosis here', rtl_a, 'ACCEPT'])
+    a4.last_rtl = rtl_b
+    a4.propose(spec, fb)
+    check('all three roles engage once the tools have rejected something',
+          a4.calls == {'writer': 1, 'reviewer': 1, 'debugger': 1})
+
     check('swarm satisfies the agent interface the orchestrator calls',
           callable(getattr(SwarmAgent, 'propose')))
     for k in ('_test', '_test2', '_test3'):
@@ -292,11 +313,13 @@ def test_dv_mutation(fp):
     survivor is a defect class the flow would sign off on. Survivors are put
     to yosys for an equivalence proof first, so a mutant that cannot change
     behaviour is never counted against the testbench."""
-    for rtl, tb, label in ((os.path.join('build', 'mac.v'), 'tb_mac.v',
-                            'chiplet'),
-                           (os.path.join('build', 'crc.v'), 'tb_crc.v',
-                            'endpoint')):
-        src = open(os.path.join(ROOT, rtl)).read()
+    # The flow's scratch directory is configurable, so ask it where it put
+    # the RTL rather than assuming.
+    for rtl, tb, label in ((os.path.join(chiplet_flow.BUILD, 'mac.v'),
+                            'tb_mac.v', 'chiplet'),
+                           (os.path.join(chiplet_flow.BUILD, 'crc.v'),
+                            'tb_crc.v', 'endpoint')):
+        src = open(rtl).read()
         tbp = os.path.join(ROOT, tb)
         os.makedirs(dv.DVDIR, exist_ok=True)
         top = re.findall(r'^\s*module\s+([A-Za-z_]\w*)', src, re.M)[0]
@@ -381,6 +404,50 @@ def test_crc_matrix():
         check('%g Gbps offers the ripple before the flat form' % g,
               archs.count('serial') == archs.count('matrix')
               and archs.index('serial') < archs.index('matrix'))
+
+
+def test_inference_arithmetic():
+    """The question every other test is circular about: when the model needs
+    a dot product, does the generated hardware return the number the model
+    needs? The bit-accurate MAC model is checked against the actual RTL on
+    real quantized transformer dot products, and only then used to answer
+    whether the derived accumulator width survives the model's reductions."""
+    ms = load_model_spec()
+    spec = derive_chiplet_spec(ms)
+    dw = spec['parameters']['data_width']
+    aw = spec['parameters']['acc_width']
+    check('datapath is signed, as quantized weights require',
+          spec['parameters']['signed'] is True)
+
+    rtl = RuleBasedAgent().render_mac(spec, {agent_mod.FIX_WIDTH,
+                                             agent_mod.FIX_CLEAR})
+    mac = inference.MacModel(dw, aw)
+    layer = inference.QuantLayer(32, 128, 8, dw, seed=3)
+    x_q, _ = inference.quantize(
+        [random.Random(4).gauss(0, 1) for _ in range(32)], dw)
+    _, taps = layer.forward(x_q, mac, dw)
+    check('a quantized block exercises both reduction depths',
+          {len(t[0]) for t in taps} == {32, 128})
+
+    sample = taps[:4] + taps[-4:]
+    got = inference.run_cosim(spec, sample, rtl)
+    exact = all(got.get(i) == inference.MacModel(dw, aw).dot(xs, ws)
+                for i, (xs, ws) in enumerate(sample))
+    check('generated RTL matches the model bit-exactly on real dot products',
+          exact)
+
+    # Negative operands must actually appear, or the signed path is untested.
+    check('the sampled vectors contain negative operands',
+          any(v < 0 for xs, ws in sample for v in xs + ws))
+
+    # The rule the accumulator width comes from, checked against the model.
+    depth = max(ms['d_model'], ms['d_ff'])
+    need = (depth * (1 << (dw - 1)) ** 2).bit_length() + 1
+    check('derived accumulator is wide enough for the worst-case reduction',
+          aw >= need)
+    check('no accumulator overflow on a real quantized block',
+          mac.overflows == 0)
+    shutil.rmtree(inference.WORK, ignore_errors=True)
 
 
 def test_fpga_backend(profile, fp):
@@ -600,6 +667,7 @@ if __name__ == '__main__':
     test_llm_agent_offline()
     test_swarm_offline()
     test_crc_matrix()
+    test_inference_arithmetic()
     test_fit_monotonic(profile)
     test_allreduce(profile)
     test_hetero_bit_identical(profile)

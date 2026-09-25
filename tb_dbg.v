@@ -15,7 +15,7 @@ module tb_mac;
   reg  signed [27:0] m_acc;
   reg  signed [15:0] m_prod;
   reg m_vpipe, m_vout;
-  reg [255:0] testname;
+  reg [127:0] testname;
 
   // Throughput profiling state
   integer cyc = 0;
@@ -106,6 +106,17 @@ module tb_mac;
     step(1, -8'sd128, 8'sd3, 0);
     idle(4);
 
+    // Accumulating past zero: the running sum has to go negative and come
+    // back, which a truncated or unsigned accumulator gets wrong.
+    testname = "accumulate_negative";
+    step(0, 0, 0, 1);
+    idle(2);
+    step(1, -8'sd128, 8'sd127, 0);
+    step(1, -8'sd128, 8'sd127, 0);
+    step(1, 8'sd127, 8'sd127, 0);
+    step(1, 8'sd127, 8'sd127, 0);
+    idle(4);
+
     // Extreme-magnitude operands: the full product needs 16 bits, so a
     // truncated product register cannot pass this test. -128 * -128
     // is the largest signed magnitude product.
@@ -119,17 +130,6 @@ module tb_mac;
     step(0, 0, 0, 1);
     idle(3);
     step(1, 8'sd12, -8'sd34, 0);
-    idle(4);
-
-    // Accumulating past zero: the running sum has to go negative and come
-    // back, which a truncated or unsigned accumulator gets wrong.
-    testname = "clear_then_negative";
-    step(0, 0, 0, 1);
-    idle(2);
-    step(1, -8'sd128, 8'sd127, 0);
-    step(1, -8'sd128, 8'sd127, 0);
-    step(1, 8'sd127, 8'sd127, 0);
-    step(1, 8'sd127, 8'sd127, 0);
     idle(4);
 
     testname = "random";

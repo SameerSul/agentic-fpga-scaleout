@@ -28,10 +28,25 @@ The swarm splits the job into three roles that each do one thing.
 | **writer** | spec, its previous attempt, the diagnosis, any reviewer objections | the candidate RTL | run tools |
 | **reviewer** | spec, the candidate RTL | `ACCEPT`, or at most four concrete defects | comment on style |
 
-The debugger only runs when there is tool feedback to read, so the first
-proposal of a run costs one call, not three. The reviewer runs before any tool
-does, which is the point: catching a width mismatch by reading costs one call,
-catching it by simulating costs a full iteration.
+## Escalation, and why it was not the first design
+
+The roles do not all run every time. A first attempt is a lone writer. The
+debugger and the reviewer engage only after the tools have rejected
+something, which is the first moment either has anything real to work from:
+the debugger has no failure to read, and the reviewer is otherwise guessing
+at what the tools are about to say.
+
+This was not the original design and it is not a matter of taste. With all
+three roles always on, measured over five runs, the reviewer accepted every
+single first draft that the tools then passed. It doubled the cost of every
+run that was already fine and changed no outcome. Escalation makes the swarm
+cost exactly what one agent costs on work that was never going to fail,
+which is most work, and spend the extra calls only where a single agent
+would have been stuck.
+
+The reviewer still earns its place, but on the retry path: catching a width
+mismatch by reading costs one call, catching it by simulating costs a whole
+iteration of sim, synthesis, timing and mapping.
 
 ## What did not change
 

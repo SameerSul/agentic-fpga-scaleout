@@ -33,6 +33,21 @@ def derive_chiplet_spec(ms):
     depth = max(ms["d_model"], ms["d_ff"])
     guard = math.ceil(math.log2(depth))
     aw = wb + ab + guard
+    # Quantized transformer weights and activations are symmetric signed
+    # two's complement, so the datapath is signed. This is not cosmetic: an
+    # unsigned multiplier turns every negative weight into a large positive
+    # product, which passes an unsigned testbench and computes the wrong
+    # model. Signed also makes the accumulator rule conservative rather than
+    # exact, since the largest signed magnitude product is 2^(wb+ab-2)
+    # rather than 2^(wb+ab), leaving a bit of headroom.
+    signed = bool(ms.get("signed", True))
+    # Pipeline depth follows the datapath width. A signed multiply is the
+    # critical path, and it grows with the operand width: at 16 bits the
+    # two-stage form misses a 100 MHz clock by nearly half. Splitting the
+    # multiply into two half-width partial products and registering them
+    # costs one cycle of latency, not throughput, which is the right trade
+    # for a unit that is fed back to back.
+    stages = 2 if dw <= 8 else 3
     return {
         "name": "mac%d_%s" % (dw, ms["name"]),
         "description": "%d-bit pipelined multiply-accumulate unit derived "
@@ -43,7 +58,8 @@ def derive_chiplet_spec(ms):
         "parameters": {
             "data_width": dw,
             "acc_width": aw,
-            "pipeline_stages": 2,
+            "signed": signed,
+            "pipeline_stages": stages,
             "target_clock_mhz": 100,
         },
         "derivation": {
@@ -52,8 +68,17 @@ def derive_chiplet_spec(ms):
             "activation_bits": ab,
             "reduction_depth": depth,
             "guard_bits": guard,
+            "signed": signed,
             "rule": "acc_width = weight_bits + activation_bits + "
                     "ceil(log2(max(d_model, d_ff)))",
+            "signedness_rule": "symmetric quantization is two's complement "
+                               "signed, so operands, product and accumulator "
+                               "are all signed",
+            "pipeline_stages": stages,
+            "pipeline_rule": "2 stages up to an 8-bit datapath, 3 above it: "
+                             "the signed multiply is the critical path and "
+                             "splitting it into half-width partial products "
+                             "buys the clock back for one cycle of latency",
         },
         "ports": [
             {"name": "clk", "dir": "input", "width": 1,
@@ -63,27 +88,40 @@ def derive_chiplet_spec(ms):
             {"name": "clear", "dir": "input", "width": 1,
              "desc": "synchronous accumulator clear"},
             {"name": "a", "dir": "input", "width": dw,
-             "desc": "multiplicand (activation)"},
+             "signed": signed,
+             "desc": "multiplicand (activation), %s two's complement"
+                     % ("signed" if signed else "unsigned")},
             {"name": "b", "dir": "input", "width": dw,
-             "desc": "multiplier (weight)"},
+             "signed": signed,
+             "desc": "multiplier (weight), %s two's complement"
+                     % ("signed" if signed else "unsigned")},
             {"name": "valid_in", "dir": "input", "width": 1,
              "desc": "input operands valid"},
             {"name": "acc", "dir": "output", "width": aw,
-             "desc": "accumulator value"},
+             "signed": signed,
+             "desc": "accumulator value, %s two's complement"
+                     % ("signed" if signed else "unsigned")},
             {"name": "valid_out", "dir": "output", "width": 1,
              "desc": "acc updated this cycle"},
         ],
         "behavior": [
-            "Stage 1 registers the full %d-bit product a*b and the valid "
-            "flag." % (2 * dw),
-            "Stage 2 adds the registered product into the %d-bit accumulator "
-            "when the piped valid is set." % aw,
+            ("Stage 1 registers the full %d-bit product a*b and the valid "
+             "flag." % (2 * dw)) if stages == 2 else
+            ("Stage 1 registers two half-width partial products of a*b and "
+             "the valid flag; stage 2 combines them into the full %d-bit "
+             "product." % (2 * dw)),
+            "The final stage adds the registered product into the %d-bit "
+            "accumulator when the piped valid is set." % aw,
             "clear synchronously zeroes acc and valid_out, taking priority "
             "over accumulation.",
-            "Latency from valid_in to valid_out is 2 cycles.",
+            "Latency from valid_in to valid_out is %d cycles." % stages,
             "%d accumulator bits = %d product bits + %d guard bits, enough "
             "for a %d-deep dot product with no overflow."
             % (aw, wb + ab, guard, depth),
+            "Operands, product and accumulator are %s. The multiply must be "
+            "a %s multiply and the product must be sign-extended into the "
+            "accumulator." % (("signed two's complement", "signed") if signed
+                              else ("unsigned", "unsigned")),
         ],
     }
 
@@ -98,14 +136,14 @@ TB_TEMPLATE = """`timescale 1ns/1ps
 // from simulation instead of hardcoding it.
 module tb_mac;
   reg clk = 0, rst_n = 0, clear = 0, valid_in = 0;
-  reg [{dwm}:0] a = 0, b = 0;
-  wire [{awm}:0] acc;
+  reg  signed [{dwm}:0] a = 0, b = 0;
+  wire signed [{awm}:0] acc;
   wire valid_out;
   integer checks = 0, i;
-  reg [{awm}:0] m_acc;
-  reg [{pwm}:0] m_prod;
-  reg m_vpipe, m_vout;
-  reg [127:0] testname;
+  reg  signed [{awm}:0] m_acc;
+  reg  signed [{pwm}:0] m_prod;
+{m_extra_decl}  reg m_vpipe, m_vout;
+  reg [255:0] testname;
 
   // Throughput profiling state
   integer cyc = 0;
@@ -127,18 +165,21 @@ module tb_mac;
     end
   end
 
-  // Golden model: full-width product, synchronous clear with priority.
+  // Golden model: full-width SIGNED product, sign-extended into the
+  // accumulator, synchronous clear with priority. Signed matters: the
+  // quantized weights are two's complement, so an unsigned multiplier
+  // computes a large positive product for every negative weight.
   always @(posedge clk) begin
     if (!rst_n) begin
-      m_prod <= 0; m_vpipe <= 0; m_acc <= 0; m_vout <= 0;
+      m_prod <= 0; m_vpipe <= 0; m_acc <= 0; m_vout <= 0;{m_extra_reset}
     end else begin
       m_prod  <= a * b;
       m_vpipe <= valid_in;
-      if (clear) begin
+{m_extra_logic}      if (clear) begin
         m_acc <= 0; m_vout <= 0;
       end else begin
-        if (m_vpipe) m_acc <= m_acc + m_prod;
-        m_vout <= m_vpipe;
+        if ({m_v}) m_acc <= m_acc + {m_p};
+        m_vout <= {m_v};
       end
     end
   end
@@ -156,7 +197,8 @@ module tb_mac;
   endtask
 
   // One clock of stimulus: check state from prior edge, then drive new inputs.
-  task step(input v, input [{dwm}:0] ai, input [{dwm}:0] bi, input c);
+  task step(input v, input signed [{dwm}:0] ai,
+            input signed [{dwm}:0] bi, input c);
     begin
       @(negedge clk);
       check;
@@ -177,23 +219,45 @@ module tb_mac;
     idle(2);
 
     testname = "small_values";
-    step(1, {dw}'d3, {dw}'d5, 0);
-    step(1, {dw}'d7, {dw}'d9, 0);
-    step(1, {dw}'d15, {dw}'d15, 0);
+    step(1, {dw}'sd3, {dw}'sd5, 0);
+    step(1, {dw}'sd7, {dw}'sd9, 0);
+    step(1, {dw}'sd15, {dw}'sd15, 0);
     idle(4);
 
-    // Max-value operands: the full product needs {pw} bits, so a truncated
-    // product register cannot pass this test.
+    // Negative operands. An unsigned multiplier reads -1 as {umax} and
+    // produces a large positive product, so it cannot pass this test, and
+    // an accumulator that is not sign-extended cannot either.
+    testname = "signed_operands";
+    step(1, -{dw}'sd1, {dw}'sd1, 0);
+    step(1, {dw}'sd1, -{dw}'sd1, 0);
+    step(1, -{dw}'sd1, -{dw}'sd1, 0);
+    step(1, -{dw}'sd{half}, {dw}'sd3, 0);
+    idle(4);
+
+    // Extreme-magnitude operands: the full product needs {pw} bits, so a
+    // truncated product register cannot pass this test. -{half} * -{half}
+    // is the largest signed magnitude product.
     testname = "wide_product";
-    step(1, {dw}'d{maxv}, {dw}'d{maxv}, 0);
-    step(1, {dw}'d{v1}, {dw}'d{v2}, 0);
-    step(1, {dw}'d{maxv}, {dw}'d1, 0);
+    step(1, -{dw}'sd{half}, -{dw}'sd{half}, 0);
+    step(1, {dw}'sd{halfm}, {dw}'sd{halfm}, 0);
+    step(1, -{dw}'sd{half}, {dw}'sd{halfm}, 0);
     idle(4);
 
     testname = "sync_clear";
     step(0, 0, 0, 1);
     idle(3);
-    step(1, {dw}'d{c1}, {dw}'d{c2}, 0);
+    step(1, {dw}'sd{c1}, -{dw}'sd{c2}, 0);
+    idle(4);
+
+    // Accumulating past zero: the running sum has to go negative and come
+    // back, which a truncated or unsigned accumulator gets wrong.
+    testname = "clear_then_negative";
+    step(0, 0, 0, 1);
+    idle(2);
+    step(1, -{dw}'sd{half}, {dw}'sd{halfm}, 0);
+    step(1, -{dw}'sd{half}, {dw}'sd{halfm}, 0);
+    step(1, {dw}'sd{halfm}, {dw}'sd{halfm}, 0);
+    step(1, {dw}'sd{halfm}, {dw}'sd{halfm}, 0);
     idle(4);
 
     testname = "random";
@@ -229,10 +293,32 @@ endmodule
 def render_testbench(spec):
     dw = spec["parameters"]["data_width"]
     aw = spec["parameters"]["acc_width"]
+    stages = spec["parameters"].get("pipeline_stages", 2)
     maxv = (1 << dw) - 1
+    half = 1 << (dw - 1)          # magnitude of the most negative operand
+    # The golden model mirrors the pipeline it is checking. A deeper DUT
+    # compared against a two-stage mirror fails on latency alone, which
+    # would read as a datapath bug and send the agent after the wrong thing.
+    if stages >= 3:
+        m_extra_decl = "  reg  signed [%d:0] m_prod2;\n  reg m_vpipe2;\n" % (
+            2 * dw - 1)
+        m_extra_logic = ("      m_prod2 <= m_prod;\n"
+                         "      m_vpipe2 <= m_vpipe;\n")
+        # Reset them too. A pipeline register left out of the reset branch
+        # holds X until the first real datum reaches it, and the mirror then
+        # reports X where the DUT reports 0.
+        m_extra_reset = " m_prod2 <= 0; m_vpipe2 <= 0;"
+        m_v, m_p = "m_vpipe2", "m_prod2"
+    else:
+        m_extra_decl, m_extra_logic, m_extra_reset = "", "", ""
+        m_v, m_p = "m_vpipe", "m_prod"
     return TB_TEMPLATE.format(
+        m_extra_decl=m_extra_decl, m_extra_logic=m_extra_logic,
+        m_extra_reset=m_extra_reset, m_v=m_v, m_p=m_p,
         dw=dw, aw=aw, dwm=dw - 1, awm=aw - 1, pwm=2 * dw - 1, pw=2 * dw,
-        maxv=maxv, v1=maxv - 1, v2=maxv - 2, c1=12 & maxv, c2=34 & maxv)
+        maxv=maxv, umax=maxv, half=half, halfm=half - 1,
+        v1=maxv - 1, v2=maxv - 2,
+        c1=12 & (half - 1), c2=34 & (half - 1))
 
 
 # Standard Ethernet rates and the MAC datapaths that carry them, ordered
@@ -446,7 +532,7 @@ module tb_crc;
   wire [31:0] crc_out;
   wire valid_out;
   integer checks = 0, i;
-  reg [127:0] testname;
+  reg [255:0] testname;
 
   integer cyc = 0;
   integer first_vin_cyc = 0, first_vout_cyc = 0, last_vout_cyc = 0;

@@ -10,7 +10,7 @@ module tb_crc;
   wire [31:0] crc_out;
   wire valid_out;
   integer checks = 0, i;
-  reg [127:0] testname;
+  reg [255:0] testname;
 
   integer cyc = 0;
   integer first_vin_cyc = 0, first_vout_cyc = 0, last_vout_cyc = 0;

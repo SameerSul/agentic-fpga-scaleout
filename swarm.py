@@ -10,6 +10,14 @@ One agent writing RTL is not a swarm. Three roles that check each other is:
               either accepts it or lists concrete defects, which sends the
               writer back for one more pass
 
+The roles escalate rather than all running every time. A first attempt is a
+lone writer, which costs exactly what a single agent costs; the debugger and
+reviewer engage only after the tools have rejected something, which is the
+only point at which either has anything real to work from. That ordering
+came from measurement, not taste: with all three roles always on, the
+reviewer accepted every first draft the tools went on to pass, so it doubled
+the cost of the runs that were already fine.
+
 The orchestrator is unchanged: it still calls propose(spec, feedback_history)
 and still gates everything on the real tools. The swarm only decides what to
 hand over; simulation, synthesis, timing and FPGA mapping remain the judge.
@@ -100,11 +108,12 @@ class SwarmAgent:
     """Writer, reviewer and debugger over one backend. Drop-in for LLMAgent."""
 
     def __init__(self, choice=None, review_rounds=MAX_REVIEW_ROUNDS,
-                 use_reviewer=True, use_debugger=True):
+                 use_reviewer=True, use_debugger=True, escalate=True):
         self.backend, self.model = pick_backend(choice)
         self.review_rounds = review_rounds
         self.use_reviewer = use_reviewer
         self.use_debugger = use_debugger
+        self.escalate = escalate
         self.last_rtl = None
         self.calls = {"writer": 0, "reviewer": 0, "debugger": 0}
         self.log = []
@@ -115,6 +124,15 @@ class SwarmAgent:
 
     def propose(self, spec, feedback_history):
         notes = []
+        # Escalation. On the first attempt there is no tool feedback, so the
+        # debugger has nothing to read and the reviewer is guessing at what
+        # the tools will say. Measured over five runs each, the reviewer
+        # accepted every first draft the tools then passed, so it doubled
+        # the call count and bought nothing. The swarm therefore opens as a
+        # single writer, exactly as cheap as one agent, and engages the
+        # other roles only once the tools have actually rejected something.
+        engaged = bool(feedback_history) or not self.escalate
+        reviewing = self.use_reviewer and engaged
 
         diagnosis = ""
         if feedback_history and self.use_debugger:
@@ -139,7 +157,7 @@ class SwarmAgent:
                 writer_prompt(spec, feedback_history, prev,
                               diagnosis, objections)))
             notes.append("writer" if attempt == 0 else "writer:revised")
-            if not self.use_reviewer or attempt == self.review_rounds:
+            if not reviewing or attempt == self.review_rounds:
                 break
             try:
                 ok, objections = parse_review(self._ask(

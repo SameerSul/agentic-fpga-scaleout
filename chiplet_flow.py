@@ -122,12 +122,34 @@ def stage_synth(job, spec, rtl_path):
         return {"stage": "synth", "status": "fail",
                 "errors": [l for l in out.splitlines() if "ERROR" in l][:5]}
     # Yosys 0.68 stat format: "  1044     2066 cells" (count, area, label)
+    _strip_signed(os.path.join(BUILD, "netlist.v"))
     cells = re.search(r"^\s*(\d+)\s+[\d.]+\s+cells\s*$", out, re.M) \
         or re.search(r"Number of cells:\s+(\d+)", out)
     area = re.search(r"Chip area for module .*?:\s+([\d.]+)", out)
     return {"stage": "synth", "status": "pass",
             "cell_count": int(cells.group(1)) if cells else None,
             "area": float(area.group(1)) if area else None}
+
+
+def _strip_signed(path):
+    """Remove `signed` from a gate-level netlist before OpenSTA reads it.
+
+    Yosys carries the port signedness through to the netlist, and OpenSTA's
+    Verilog reader rejects `input signed [15:0] a;` outright. At gate level
+    signedness carries no information at all: the netlist is cells and wires
+    and the sign lives in how the logic was built, not in a declaration.
+    Without this every signed design fails to read and the flow falls back
+    to the gate-depth proxy, reporting a timing number that never came from
+    a timing tool.
+    """
+    try:
+        src = open(path).read()
+    except OSError:
+        return
+    out = re.sub(r"\b(input|output|inout|wire|reg)\s+signed\b", r"\1", src)
+    if out != src:
+        with open(path, "w") as f:
+            f.write(out)
 
 
 def stage_timing(job, spec):

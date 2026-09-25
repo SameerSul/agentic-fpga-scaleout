@@ -18,9 +18,7 @@
       "guard_bits": 12,
       "signed": true,
       "rule": "acc_width = weight_bits + activation_bits + ceil(log2(max(d_model, d_ff)))",
-      "signedness_rule": "symmetric quantization is two's complement signed, so operands, product and accumulator are all signed",
-      "pipeline_stages": 2,
-      "pipeline_rule": "2 stages up to an 8-bit datapath, 3 above it: the signed multiply is the critical path and splitting it into half-width partial products buys the clock back for one cycle of latency"
+      "signedness_rule": "symmetric quantization is two's complement signed, so operands, product and accumulator are all signed"
     },
     "ports": [
       {
@@ -77,7 +75,7 @@
     ],
     "behavior": [
       "Stage 1 registers the full 16-bit product a*b and the valid flag.",
-      "The final stage adds the registered product into the 28-bit accumulator when the piped valid is set.",
+      "Stage 2 adds the registered product into the 28-bit accumulator when the piped valid is set.",
       "clear synchronously zeroes acc and valid_out, taking priority over accumulation.",
       "Latency from valid_in to valid_out is 2 cycles.",
       "28 accumulator bits = 16 product bits + 12 guard bits, enough for a 3072-deep dot product with no overflow.",
@@ -91,8 +89,8 @@
     "sta": "/Users/ssuleman/.local/bin/sta"
   },
   "agent": "RuleBasedAgent",
-  "converged": true,
-  "iterations_used": 3,
+  "converged": false,
+  "iterations_used": 5,
   "history": [
     {
       "iteration": 1,
@@ -126,9 +124,9 @@
         "checks": null,
         "mismatches": [
           {
-            "test": "sync_clear",
+            "test": "umulate_negative",
             "expected_acc": "0",
-            "got_acc": "16175",
+            "got_acc": "-82",
             "expected_vout": "0",
             "got_vout": "0"
           }
@@ -141,62 +139,78 @@
     {
       "iteration": 3,
       "fixes_applied": [
-        "implement_sync_clear",
         "widen_product_register"
       ],
       "sim": {
         "stage": "sim",
-        "status": "pass",
-        "checks": 613,
-        "mismatches": [],
-        "throughput": {
-          "macs": 256,
-          "span_cycles": 256,
-          "latency_cycles": 4,
-          "units": 256,
-          "cycles_per_unit": 1.0
-        }
+        "status": "fail",
+        "checks": null,
+        "mismatches": [
+          {
+            "test": "umulate_negative",
+            "expected_acc": "0",
+            "got_acc": "-82",
+            "expected_vout": "0",
+            "got_vout": "0"
+          }
+        ]
       },
-      "synth": {
-        "stage": "synth",
-        "status": "pass",
-        "cell_count": 1408,
-        "area": 2763.0
+      "synth": null,
+      "timing": null,
+      "fpga": null
+    },
+    {
+      "iteration": 4,
+      "fixes_applied": [
+        "widen_product_register"
+      ],
+      "sim": {
+        "stage": "sim",
+        "status": "fail",
+        "checks": null,
+        "mismatches": [
+          {
+            "test": "umulate_negative",
+            "expected_acc": "0",
+            "got_acc": "-82",
+            "expected_vout": "0",
+            "got_vout": "0"
+          }
+        ]
       },
-      "timing": {
-        "stage": "timing",
-        "status": "pass",
-        "method": "opensta",
-        "clock_period_ns": 10.0,
-        "worst_slack_ns": 4.36
+      "synth": null,
+      "timing": null,
+      "fpga": null
+    },
+    {
+      "iteration": 5,
+      "fixes_applied": [
+        "widen_product_register"
+      ],
+      "sim": {
+        "stage": "sim",
+        "status": "fail",
+        "checks": null,
+        "mismatches": [
+          {
+            "test": "umulate_negative",
+            "expected_acc": "0",
+            "got_acc": "-82",
+            "expected_vout": "0",
+            "got_vout": "0"
+          }
+        ]
       },
-      "fpga": {
-        "luts": 46,
-        "ffs": 46,
-        "dsps": 1,
-        "brams": 0,
-        "urams": 0,
-        "carry": 7,
-        "muxf": 0,
-        "status": "pass",
-        "family": "xcup",
-        "top": "mac",
-        "lint": [],
-        "stage": "fpga"
-      }
+      "synth": null,
+      "timing": null,
+      "fpga": null
     }
   ],
   "final_metrics": {
-    "sim_pass": true,
-    "sim_checks": 613,
-    "cell_count": 1408,
-    "area": 2763.0,
-    "timing": {
-      "stage": "timing",
-      "status": "pass",
-      "method": "opensta",
-      "clock_period_ns": 10.0,
-      "worst_slack_ns": 4.36
-    }
+    "sim_pass": false,
+    "sim_checks": null,
+    "cell_count": null,
+    "area": null,
+    "timing": null
   }
 }

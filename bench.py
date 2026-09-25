@@ -18,12 +18,21 @@ import time
 import specgen
 from chiplet_flow import run_flow, make_agent, ROOT
 
-JOB = {"spec_file": "spec_bench.json", "tb_file": "tb_bench.v",
-       "rtl_file": "mac_bench.v", "profile_file": "profile_bench.json",
-       "report_file": "report_bench.json"}
+def job_files(tag):
+    """Namespaced job files so two benches can run at once. Paired with
+    CHIPLET_BUILD_DIR, which does the same for the scratch directory."""
+    return {"spec_file": "spec_%s_bench.json" % tag,
+            "tb_file": "tb_%s_bench.v" % tag,
+            "rtl_file": "rtl_%s_bench.v" % tag,
+            "profile_file": "profile_%s_bench.json" % tag,
+            "report_file": "report_%s_bench.json" % tag}
+
+
+JOB = job_files("default")
 
 
 def one_run(kind, max_iters):
+    global JOB
     specgen.generate(spec_file=JOB["spec_file"], tb_file=JOB["tb_file"])
     agent = make_agent(kind)
     t0 = time.time()
@@ -60,7 +69,11 @@ def main():
     ap.add_argument("--runs", type=int, default=5)
     ap.add_argument("--max-iters", type=int, default=6)
     ap.add_argument("--out", default="bench_results.json")
+    ap.add_argument("--tag", default="default",
+                    help="namespace for this bench's job files")
     a = ap.parse_args()
+    global JOB
+    JOB = job_files(a.tag)
 
     print("agent=%s runs=%d max_iters=%d\n" % (a.agent, a.runs, a.max_iters))
     print("%-4s %-10s %5s %6s %7s  %s"

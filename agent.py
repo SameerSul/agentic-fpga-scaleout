@@ -49,6 +49,13 @@ class RuleBasedAgent:
         p = spec["parameters"]
         dw, aw = p["data_width"], p["acc_width"]
         pw = 2 * dw if FIX_WIDTH in fixes else dw  # first cut truncates the product
+        # Quantized weights are two's complement, so the operands, the
+        # product and the accumulator are all signed and the product is
+        # sign-extended on the way in. Declaring only some of them signed
+        # is worse than declaring none: Verilog makes the whole expression
+        # unsigned if any operand is, so a half-signed datapath silently
+        # computes the unsigned answer.
+        sg = "signed " if p.get("signed", True) else ""
         if FIX_CLEAR in fixes:
             acc_logic = """      if (clear) begin
         acc <= {aw}'d0;
@@ -60,32 +67,61 @@ class RuleBasedAgent:
         else:  # first cut forgets the synchronous clear
             acc_logic = """      if (vpipe) acc <= acc + prod;
       valid_out <= vpipe;"""
+        stages = p.get("pipeline_stages", 2)
+        if stages >= 3:
+            # Split the multiply. b's high half is signed, its low half is
+            # not, so the two partial products are formed separately and
+            # recombined a cycle later. Each multiplier is half as deep as
+            # the full one, which is where the clock comes back.
+            h = dw // 2
+            decl = ("  reg {sg}[{p}:0] p_lo, p_hi;\n"
+                    "  reg {sg}[{p}:0] prod;\n"
+                    "  reg         vpipe, vpipe2;").format(sg=sg, p=pw - 1)
+            reset = ("      p_lo      <= 0;\n"
+                     "      p_hi      <= 0;\n"
+                     "      prod      <= 0;\n"
+                     "      vpipe     <= 1'b0;\n"
+                     "      vpipe2    <= 1'b0;")
+            drive = ("      p_lo   <= a * $signed({{1'b0, b[{hm}:0]}});\n"
+                     "      p_hi   <= a * $signed(b[{d}:{h}]);\n"
+                     "      prod   <= p_lo + (p_hi <<< {h});\n"
+                     "      vpipe  <= valid_in;\n"
+                     "      vpipe2 <= vpipe;").format(hm=h - 1, d=dw - 1, h=h)
+            vq = "vpipe2"
+        else:
+            decl = ("  reg {sg}[{p}:0] prod;\n"
+                    "  reg         vpipe;").format(sg=sg, p=pw - 1)
+            reset = ("      prod      <= 0;\n"
+                     "      vpipe     <= 1'b0;")
+            drive = ("      prod  <= a * b;\n"
+                     "      vpipe <= valid_in;")
+            vq = "vpipe"
+        acc_logic = acc_logic.replace("vpipe)", vq + ")").replace(
+            "<= vpipe;", "<= " + vq + ";")
         return """module mac (
-  input              clk,
-  input              rst_n,
-  input              clear,
-  input      [{d}:0] a,
-  input      [{d}:0] b,
-  input              valid_in,
-  output reg [{a}:0] acc,
-  output reg         valid_out
+  input                     clk,
+  input                     rst_n,
+  input                     clear,
+  input      {sg}[{d}:0] a,
+  input      {sg}[{d}:0] b,
+  input                     valid_in,
+  output reg {sg}[{a}:0] acc,
+  output reg                valid_out
 );
-  reg [{p}:0] prod;
-  reg         vpipe;
+{decl}
   always @(posedge clk) begin
     if (!rst_n) begin
-      prod      <= 0;
-      vpipe     <= 1'b0;
+{reset}
       acc       <= 0;
       valid_out <= 1'b0;
     end else begin
-      prod  <= a * b;
-      vpipe <= valid_in;
+{drive}
 {logic}
     end
   end
 endmodule
-""".format(d=dw - 1, a=aw - 1, p=pw - 1, logic=acc_logic)
+""".format(d=dw - 1, a=aw - 1, logic=acc_logic, sg=sg,
+           decl=decl, reset=reset, drive=drive)
 
     def render_crc_matrix(self, spec, fixes):
         """CRC32 next state as one XOR reduction per output bit.

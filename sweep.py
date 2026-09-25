@@ -8,7 +8,7 @@ at every point checks the whole chain rather than just the last step:
   rtl           an agent proposed RTL
   sim           it passes its generated, self-checking testbench
   synth         yosys maps it to the standard cell library
-  timing        OpenSTA closes at the spec's target clock
+  timing        OpenSTA, not the proxy, closes at the spec's target clock
   fpga          it maps to real device primitives
   profile       the signed-off numbers the sizing model consumes are sane
   dv            the generated testbench kills every injected defect
@@ -75,12 +75,20 @@ def _stage_status(entry, name):
     return None if not r else r.get("status")
 
 
-def check_profile(spec, profile, unit):
+def check_profile(spec, profile, unit, timing=None):
     """The signed-off numbers have to be usable by the sizing model, not just
     present. A zero or absent throughput figure silently poisons every
     downstream prediction."""
     if not profile:
         return False, "no profile"
+    # Timing has to come from a timing tool. The flow falls back to a
+    # gate-depth proxy when OpenSTA cannot read the netlist, and a proxy
+    # number is an estimate, not closure. Accepting it silently is how a
+    # design that never met its clock gets signed off.
+    if shutil.which("sta"):
+        method = (timing or {}).get("method") or profile.get("fmax_method")
+        if method and "opensta" not in method:
+            return False, "timing came from %s, not OpenSTA" % method
     per = profile.get("cycles_per_%s" % unit)
     if not per or per <= 0:
         return False, "cycles_per_%s missing" % unit
@@ -145,7 +153,8 @@ def one_case(label, spec, unit, agent_kind, do_dv):
     if not report["converged"]:
         res["profile"] = res["dv"] = "-"
         return res, "did not converge in %d iterations" % report["iterations_used"]
-    ok, detail = check_profile(spec, profile, unit)
+    ok, detail = check_profile(spec, profile, unit,
+                               report["final_metrics"].get("timing"))
     res["profile"] = "ok" if ok else "FAIL"
     if not do_dv:
         res["dv"] = "skip"
