@@ -17,7 +17,7 @@ one. The remaining gap is listed at the bottom rather than glossed over.
 ### The full suite
 
 ```
-python3 tests.py            # 143 tests, all passing
+python3 tests.py            # 145 tests, all passing
 ```
 
 ### Spec to RTL, across the spec space
@@ -150,8 +150,8 @@ and both are checked against their RTL in iverilog on vectors taken from
 that very decode.
 
     prompt:    'the agent'
-    generated: ' rithe age rtl age. rthe age. ad the age'
-    float ref: ' writes the rtoools decidecidecide. the '
+    generated: ' writes the rtools decidecid'
+    float ref: ' writes the rtoools decideci'
 
     MAC:       12/12 dot products bit exact
     requant:   12/12 requantizations bit exact
@@ -161,28 +161,42 @@ Two things are worth reading off that.
 The text is what the hardware would emit, not what a float model emits.
 Nothing in the decode's arithmetic is unverified against RTL.
 
-And int8 costs this model real accuracy, though less than the first
-measurement suggested. Two numbers, which mean different things:
+And int8 costs this model essentially nothing, once the pipeline is
+correct:
 
 | measure | agreement with float |
 |---|---|
-| free-running decode | 41 to 52% of characters |
-| teacher-forced next token | **62%** |
+| teacher-forced next token | **100%** (48/48) |
+| free-running decode | 100% at 16 tokens, 68% at 28 |
 
-The free-running number is the wrong one to quote for quantization. Greedy
-decoding amplifies a single different character into a completely
-different continuation, so one early divergence makes everything after it
-disagree and the figure mostly measures that amplification. Feeding both
-models the same ground-truth context isolates the part that is actually
-about the arithmetic, and that is 62%.
+That is a correction, not a result. This file previously reported that
+int8 cost the model 75% of its characters, and drew a lesson from it about
+validating quantization at the target model size. The lesson was invented
+to explain a bug. Activations carry a scale, and the residual adds were
+summing two int8 vectors whose scales differed, which is not a rounding
+loss but arithmetic in mismatched units. With scales tracked through the
+network the quantized decode reproduces the float model exactly.
 
-62% is still poor, and it is a property of the model rather than of the
-hardware: a 16-dimensional transformer has nothing like the slack a 768 or
-1024 dimensional one has, which is why per-tensor int8 is safe for GPT-2
-or Qwen and not for this. The lesson for the capstone is that a
-quantization scheme has to be validated at the target model's size, and
-that a decode-level accuracy metric has to separate quantization error
-from decode divergence or it will blame the hardware for both.
+Two things are worth keeping from how that was found, since the wrong
+number survived several rounds of reporting.
+
+The first measurement was also the wrong measurement. Free-running
+agreement counts every character after one divergence as a disagreement,
+so it mostly measures how fast greedy decoding amplifies a single flip.
+Teacher-forced agreement, both models given the same context, is the one
+that is about arithmetic. The free-running figure at 28 tokens is still
+68%, entirely from one late divergence where the hardware in fact produced
+the cleaner text.
+
+And a plausible explanation is not evidence. "A 16-dimensional model has
+no redundancy to spare" was a comfortable story that fit the number, so it
+went unchallenged. The test of it, training a wider model, was confounded
+by undertraining (float accuracy 52%, top-2 margin 1.07, against 94% and
+4.37 for the small one) and pointed the wrong way, which is what finally
+forced a look at the pipeline itself. `generate.py` now prints the float
+model's own accuracy and logit margin next to the agreement, so an
+undertrained checkpoint cannot be mistaken for a quantization result
+again.
 
 ## A real bitstream exists
 

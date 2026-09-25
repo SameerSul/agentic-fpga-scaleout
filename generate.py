@@ -33,11 +33,27 @@ from train_tiny import CKPT
 
 
 def qmat(m, bits):
-    """Symmetric per-tensor quantization of a weight matrix."""
-    flat = [v for row in m for v in row]
-    q, scale = quantize(flat, bits)
-    c = len(m[0])
-    return [q[i * c:(i + 1) * c] for i in range(len(m))], scale
+    """Symmetric per-output-channel quantization of a weight matrix.
+
+    One scale for the whole tensor is the easy thing and the wrong thing:
+    a single outlier column forces every other column to share its range,
+    and the small-magnitude columns lose most of their resolution. Real
+    int8 inference gives each output channel its own scale, and the
+    hardware here already allows it, because the requantizer takes the
+    scale as a run-time input rather than baking it in.
+    """
+    rows, cols = len(m), len(m[0])
+    q = [[0] * cols for _ in range(rows)]
+    scales = []
+    hi = (1 << (bits - 1)) - 1
+    for c in range(cols):
+        col = [m[r][c] for r in range(rows)]
+        mx = max(abs(v) for v in col) or 1.0
+        sc = mx / hi
+        scales.append(sc)
+        for r in range(rows):
+            q[r][c] = max(-hi - 1, min(hi, int(round(col[r] / sc))))
+    return q, scales
 
 
 class HwModel:
@@ -62,7 +78,8 @@ class HwModel:
         self.dw = dw
 
     def matvec(self, x, name, keep=1):
-        w, _ = self.q[name]
+        """Returns (accumulators, per-column weight scales)."""
+        w, wscales = self.q[name]
         cols = len(w[0])
         out = []
         for c in range(cols):
@@ -70,91 +87,120 @@ class HwModel:
             out.append(self.mac.dot(x, col))
             if c < keep:
                 self.dots.append((list(x), col))
-        return out
-
-    def requant(self, accs):
-        q, sc, sh = self.rq.vector(accs)
-        for a in accs[:1]:
-            self.rqs.append((a, sc, sh))
-        return q
+        return out, wscales
 
     def forward(self, ids):
-        """One decode step: returns the logits for the last position."""
-        n = len(ids)
-        hs = [[self.tok[t][j] + self.pos[i][j] for j in range(self.d)]
+        """One decode step, with the scale carried alongside every
+        activation.
+
+        An int8 activation is a pair: the codes and the scale that turns
+        them back into values. Adding two int8 vectors that carry
+        different scales adds numbers in different units, which is what
+        this did before and it is simply wrong arithmetic rather than a
+        rounding loss. Residuals are therefore summed in the value domain
+        and requantized, which is what hardware does with a wide
+        accumulator between the add and the next matmul.
+        """
+        n, D = len(ids), self.d
+        hs = [[self.tok[t][j] + self.pos[i][j] for j in range(D)]
               for i, t in enumerate(ids)]
-        # Quantize the residual stream once per position.
-        hq = [quantize(h, self.dw)[0] for h in hs]
-        qs = [self.requant(self.matvec(h, "wq")) for h in hq]
-        ks = [self.requant(self.matvec(h, "wk")) for h in hq]
-        vs = [self.requant(self.matvec(h, "wv")) for h in hq]
+        hq = [self.qact(h) for h in hs]
+        qs = [self.project(h, "wq") for h in hq]
+        ks = [self.project(h, "wk") for h in hq]
+        vs = [self.project(h, "wv") for h in hq]
+
         i = n - 1                     # only the last position is decoded
-        scale = 1.0 / math.sqrt(self.d)
-        scores = [sum(a * b for a, b in zip(qs[i], ks[j])) * scale
-                  for j in range(i + 1)]
+        sc = 1.0 / math.sqrt(D)
+        scores = [sum(a * b for a, b in zip(qs[i][0], ks[j][0]))
+                  * qs[i][1] * ks[j][1] * sc for j in range(i + 1)]
         mx = max(scores)
-        ex = [math.exp(s - mx) for s in scores]
+        ex = [math.exp(s_ - mx) for s_ in scores]
         tot = sum(ex)
-        ctx = [sum(ex[j] * vs[j][t] for j in range(i + 1)) / tot
-               for t in range(self.d)]
-        cq, _ = quantize(ctx, self.dw)
-        att = self.requant(self.matvec(cq, "wo"))
-        res = [hq[i][t] + att[t] for t in range(self.d)]
-        rq, _ = quantize([float(v) for v in res], self.dw)
-        h1 = self.requant(self.matvec(rq, "w1"))
-        h1 = [max(0, u) for u in h1]
-        h2 = self.requant(self.matvec(h1, "w2"))
-        res2 = [rq[t] + h2[t] for t in range(self.d)]
-        r2, _ = quantize([float(v) for v in res2], self.dw)
-        return self.matvec(r2, "head")
+        ctx = [sum(ex[j] * vs[j][0][t] * vs[j][1] for j in range(i + 1)) / tot
+               for t in range(D)]
+        att = self.project(self.qact(ctx), "wo")
+        res = self.add(hq[i], att)
+        h1q, h1s = self.project(res, "w1")
+        h1 = ([max(0, u) for u in h1q], h1s)
+        h2 = self.project(h1, "w2")
+        res2 = self.add(res, h2)
+        logits, ls = self.project(res2, "head")
+        return [v * ls for v in logits]
+
+    def qact(self, vals):
+        """Quantize a float activation vector, returning codes and scale."""
+        q, s = quantize(vals, self.dw)
+        return q, s
+
+    def project(self, act, name):
+        """Matmul then requantize, returning codes and their scale."""
+        xq, xs = act
+        accs, wscales = self.matvec(xq, name)
+        # Per-channel weight scales mean the accumulators are not in one
+        # unit, so they are brought into a common one before the shared
+        # output scale is picked. That correction is a per-channel
+        # multiply, which is what the requantizer's scale input is for.
+        ref = max(wscales) or 1.0
+        adj = [int(round(a * (wscales[k] / ref))) for k, a in enumerate(accs)]
+        q, msc, sh = self.rq.vector(adj)
+        for a in adj[:1]:
+            self.rqs.append((a, msc, sh))
+        # value = code * (acc scale) * (the shift the requantizer applied)
+        out_scale = xs * ref * (float(1 << sh) / msc if msc else 1.0)
+        return q, out_scale
+
+    def add(self, a, b):
+        """Residual add. Both operands are returned to values, summed, and
+        requantized, because their scales differ."""
+        (aq, asc), (bq, bsc) = a, b
+        return self.qact([x * asc + y * bsc for x, y in zip(aq, bq)])
+
+def _float_model(ck):
+    """Rebuild the checkpoint in float, at whatever geometry it records."""
+    from train_tiny import Tiny
+    from autodiff import V
+    m = Tiny.__new__(Tiny)
+    m.d, m.f, m.seq = ck["d_model"], ck["d_ff"], ck["seq"]
+    m.vocab = len(ck["chars"])
+    w = ck["weights"]
+    for name in ("tok", "pos", "wq", "wk", "wv", "wo", "w1", "w2", "head"):
+        setattr(m, name, [[V(c) for c in row] for row in w[name]])
+    return m
 
 
 def teacher_forced_agreement(ck, hw, n=48):
     """Next-token agreement under identical context.
 
-    Free-running agreement conflates two different things: how much
-    quantization perturbs a prediction, and how fast greedy decoding
-    amplifies one different character into a different continuation. One
-    early divergence makes everything after it disagree, so that number
-    says almost nothing about the arithmetic. Feeding both models the same
-    ground-truth context isolates the part that is actually about the
-    hardware.
+    Free-running agreement conflates two things: how much quantization
+    perturbs a prediction, and how fast greedy decoding amplifies one
+    different character into a different continuation. Feeding both models
+    the same ground-truth context isolates the part about the arithmetic.
+    The float model's own accuracy and top-2 margin come back too, because
+    a model whose decisions are nearly ties is easy to flip and that is a
+    property of the checkpoint, not of the hardware.
     """
-    from train_tiny import Tiny
-    from autodiff import V
-    m = Tiny.__new__(Tiny)
-    m.d, m.f, m.seq = ck["d_model"], ck["d_ff"], ck["seq"]
-    w = ck["weights"]
-    for name in ("tok", "pos", "wq", "wk", "wv", "wo", "w1", "w2", "head"):
-        setattr(m, name, [[V(c) for c in row] for row in w[name]])
-    m.vocab = len(ck["chars"])
+    m = _float_model(ck)
     stoi = {c: i for i, c in enumerate(ck["chars"])}
     ids = [stoi[c] for c in ck["corpus"] if c in stoi]
-    same = total = 0
-    top1_float = []
+    same = total = correct = 0
+    margins = []
     for end in range(2, min(len(ids) - 1, n + 2)):
         ctx = ids[max(0, end - ck["seq"]):end]
-        fl = m.forward(ctx)[-1]
-        f_top = max(range(len(fl)), key=lambda k: fl[k].d)
-        q_logits = hw.forward(ctx)
-        q_top = max(range(len(q_logits)), key=lambda k: q_logits[k])
-        same += (f_top == q_top)
+        fl = [v.d for v in m.forward(ctx)[-1]]
+        order = sorted(range(len(fl)), key=lambda k: fl[k], reverse=True)
+        margins.append(fl[order[0]] - fl[order[1]])
+        q = hw.forward(ctx)
+        same += (order[0] == max(range(len(q)), key=lambda k: q[k]))
+        correct += (order[0] == ids[end])
         total += 1
-        top1_float.append(f_top)
-    return same, total
+    return (same, total, correct / max(1, total),
+            sum(margins) / max(1, len(margins)))
 
 
 def float_reference(ck, prompt, n):
     """The same checkpoint in float, so the cost of running it on int8
     hardware is measured rather than assumed."""
-    from train_tiny import Tiny
-    from autodiff import V
-    m = Tiny.__new__(Tiny)
-    m.d, m.f, m.seq = ck["d_model"], ck["d_ff"], ck["seq"]
-    w = ck["weights"]
-    for name in ("tok", "pos", "wq", "wk", "wv", "wo", "w1", "w2", "head"):
-        setattr(m, name, [[V(c) for c in row] for row in w[name]])
-    m.vocab = len(ck["chars"])
+    m = _float_model(ck)
     stoi = {c: i for i, c in enumerate(ck["chars"])}
     out = [stoi[c] for c in prompt if c in stoi]
     for _ in range(n):
@@ -209,9 +255,14 @@ def main():
     print("float ref: %r" % ref_text[len(a.prompt):])
     print("free-running agreement with the float model: %d of %d characters "
           "(%.0f%%)" % (agree, len(text), 100.0 * agree / len(text)))
-    tf_same, tf_total = teacher_forced_agreement(ck, hw)
+    tf_same, tf_total, fl_acc, margin = teacher_forced_agreement(ck, hw)
     print("teacher-forced next-token agreement: %d of %d (%.0f%%)"
           % (tf_same, tf_total, 100.0 * tf_same / max(1, tf_total)))
+    print("float model's own next-token accuracy: %.0f%%, mean top-2 logit "
+          "margin %.2f" % (100.0 * fl_acc, margin))
+    print("  a model with a small margin is easy to flip, so agreement has "
+          "to be\n  read next to the margin: an undertrained checkpoint "
+          "looks like a\n  quantization problem when it is not")
     print("  the second number is the one about quantization; the first "
           "also\n  measures how fast greedy decoding amplifies a single "
           "divergence\n")

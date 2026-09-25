@@ -548,6 +548,20 @@ def test_generation():
     check('the decode exercised both blocks',
           len(hw.dots) > 100 and len(hw.rqs) > 100)
 
+    # The bug this pins: activations carry a scale, and adding two int8
+    # vectors with different scales adds numbers in different units. It
+    # cost 38% of next-token agreement and read like a quantization limit.
+    import generate as g2
+    a_pair = ([10] * hw.d, 0.5)
+    b_pair = ([10] * hw.d, 0.25)
+    summed = hw.add(a_pair, b_pair)
+    vals = [q * summed[1] for q in summed[0]]
+    check('a residual add respects the operands\' differing scales',
+          all(abs(v - 7.5) < 0.2 for v in vals))
+    same, total, facc, margin = g2.teacher_forced_agreement(ck, hw, n=24)
+    check('int8 decode tracks the float model once scales are tracked '
+          '(%d/%d)' % (same, total), same >= 0.9 * total)
+
     # The arithmetic the text came from has to be the hardware's.
     rnd = random.Random(5)
     rnd.shuffle(hw.dots)
