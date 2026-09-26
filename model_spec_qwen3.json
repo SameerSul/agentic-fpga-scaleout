@@ -1,0 +1,26 @@
+{
+  "name": "qwen3_0p6b",
+  "description": "Qwen3 0.6B, the model this fabric is sized to host. Chosen because it is the largest of the candidates whose int8 weights fit the 1 GB DDR3L on a Zybo Z7-20 (596 MB), and it is the model Architect Labs demonstrated hosting locally.",
+  "n_layer": 28,
+  "d_model": 1024,
+  "n_head": 16,
+  "d_ff": 3072,
+  "vocab": 151936,
+  "dtype_bytes": 8,
+  "weight_bits": 8,
+  "activation_bits": 8,
+  "seq_len": 1024,
+  "target_tokens_per_s": 7,
+  "allreduces_per_token_per_layer": 2,
+  "notes": [
+    "Qwen3-0.6B: 28 layers, hidden 1024, intermediate 3072, 16 query heads over 8 key/value heads (grouped query attention).",
+    "int8 weights are 596 MB, which fits the Zybo Z7-20's 1 GB DDR3L. The next size up, TinyLlama 1.1B, does not.",
+    "Batch-1 decode reads every weight once per token, so a single board at 2 GB/s sustained is bounded near 3.4 tokens/s and two boards splitting the weights near 7. That bound is memory bandwidth, not arithmetic: the MAC chiplet is idle most of the time and adding more of them does not help.",
+    "d_ff 3072 is the longest reduction, so it sets the accumulator width the same way it did for GPT-2; the derived hardware is identical in shape and different in size.",
+    "Megatron tensor parallelism: QKV and c_fc column-parallel, out-proj and c_proj row-parallel.",
+    "Batch-1 decode identity: every block weight is used exactly once per token, so per-token block MACs equal block parameter count, and weight traffic per token equals per_token_macs * weight_bits / 8 bytes. The LM head and embeddings are excluded from both compute and traffic (modeled as host-side)."
+  ],
+  "batch_size": 8,
+  "n_kv_head": 8,
+  "head_dim": 128
+}

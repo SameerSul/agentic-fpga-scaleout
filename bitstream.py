@@ -82,6 +82,9 @@ BLOCKS = {
 EXTRA_SRC = {"matvec": ("mac",), "wmem": ("mac", "matvec"),
              "softmax": ("exp", "recip"),
              "mlp": ("matvec", "mac", "requant")}
+# Generated constant tables, which are dependencies rather than blocks.
+ROM_FOR = {"exp": ("exp_rom",), "recip": ("recip_rom",),
+           "rsqrt": ("rsqrt_rom",), "softmax": ("exp_rom", "recip_rom")}
 
 
 def package_pins(device, package):
@@ -246,6 +249,14 @@ def main():
           % (a.block, spec["name"], a.device, a.package, freq))
 
     extra = []
+    for rname in ROM_FOR.get(a.block, ()):
+        base = {"exp_rom": specgen.derive_exp_spec,
+                "recip_rom": specgen.derive_recip_spec,
+                "rsqrt_rom": specgen.derive_rsqrt_spec}[rname]
+        fn = rname + ".v"
+        open(os.path.join(WORK, fn), "w").write(
+            getattr(specgen, rname)(base(ms)))
+        extra.append(fn)
     for n, dep in enumerate(EXTRA_SRC.get(a.block, ())):
         dtop, dderive, dfixes = BLOCKS[dep]
         fn = "dep%d.v" % n

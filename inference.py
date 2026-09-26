@@ -370,9 +370,12 @@ endmodule
     shutil.rmtree(WORK, ignore_errors=True)
     os.makedirs(WORK)
     open(os.path.join(WORK, "rsqrt.v"), "w").write(rtl_src)
+    # The constant table is a generated module, so it travels with the
+    # design under test rather than being inlined into it.
+    open(os.path.join(WORK, "rom.v"), "w").write(specgen.rsqrt_rom(spec))
     open(os.path.join(WORK, "tb.v"), "w").write(tb)
     r = subprocess.run(["iverilog", "-g2005", "-o", "rs.out", "tb.v",
-                        "rsqrt.v"], cwd=WORK, capture_output=True, text=True)
+                        "rsqrt.v", "rom.v"], cwd=WORK, capture_output=True, text=True)
     if r.returncode:
         raise SystemExit("rsqrt cosim compile failed:\n" + r.stdout + r.stderr)
     r = subprocess.run(["vvp", "rs.out"], cwd=WORK, capture_output=True,
@@ -424,9 +427,12 @@ endmodule
     shutil.rmtree(WORK, ignore_errors=True)
     os.makedirs(WORK)
     open(os.path.join(WORK, "recip.v"), "w").write(rtl_src)
+    # The constant table is a generated module, so it travels with the
+    # design under test rather than being inlined into it.
+    open(os.path.join(WORK, "rom.v"), "w").write(specgen.recip_rom(spec))
     open(os.path.join(WORK, "tb.v"), "w").write(tb)
     r = subprocess.run(["iverilog", "-g2005", "-o", "rc.out", "tb.v",
-                        "recip.v"], cwd=WORK, capture_output=True, text=True)
+                        "recip.v", "rom.v"], cwd=WORK, capture_output=True, text=True)
     if r.returncode:
         raise SystemExit("recip cosim compile failed:\n" + r.stdout + r.stderr)
     r = subprocess.run(["vvp", "rc.out"], cwd=WORK, capture_output=True,
@@ -476,9 +482,12 @@ endmodule
     shutil.rmtree(WORK, ignore_errors=True)
     os.makedirs(WORK)
     open(os.path.join(WORK, "expu.v"), "w").write(rtl_src)
+    # The constant table is a generated module, so it travels with the
+    # design under test rather than being inlined into it.
+    open(os.path.join(WORK, "rom.v"), "w").write(specgen.exp_rom(spec))
     open(os.path.join(WORK, "tb.v"), "w").write(tb)
     r = subprocess.run(["iverilog", "-g2005", "-o", "ex.out", "tb.v",
-                        "expu.v"], cwd=WORK, capture_output=True, text=True)
+                        "expu.v", "rom.v"], cwd=WORK, capture_output=True, text=True)
     if r.returncode:
         raise SystemExit("exp cosim compile failed:\n" + r.stdout + r.stderr)
     r = subprocess.run(["vvp", "ex.out"], cwd=WORK, capture_output=True,

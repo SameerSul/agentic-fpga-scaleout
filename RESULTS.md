@@ -17,7 +17,7 @@ one. The remaining gap is listed at the bottom rather than glossed over.
 ### The full suite
 
 ```
-python3 tests.py            # 197 tests, all passing
+python3 tests.py            # 201 tests, or 199 without OpenSTA
 ```
 
 ### Spec to RTL, across the spec space
@@ -353,6 +353,50 @@ changes a weight about once in a hundred thousand random rows, and that
 mutation survived every vector. The generator now searches for a row
 that lands on the carry boundary and embeds it, which took under a
 second.
+
+## Which blocks an LLM can write, measured
+
+The agent interface takes either a deterministic rule-based agent or a
+real LLM. Both face identical gates. Running the swarm at every block,
+for Qwen2.5-0.5B, gives a clean split:
+
+| block | swarm | calls |
+|---|---|---|
+| MAC chiplet | converged | 1 |
+| matmul sequencer | converged | 1 |
+| weight memory | converged | 15 |
+| exponential | failed | 15 |
+| reciprocal | failed | 18 |
+| inverse square root | failed | tool error |
+| requantizer, softmax, MLP layer | failed | 23 to 26 |
+
+The blocks it writes are structural: ports, a state machine, a counter, a
+handshake. The blocks it cannot are the ones whose correctness is exact
+fixed-point arithmetic, where being one bit out in a shift or one count
+out in a table index is the whole difference between right and wrong.
+
+A first explanation was that the transcendental blocks each embedded a
+256-entry table of constants, and that asking a model to emit 256 exact
+values of 2**(i/256) is asking it to be a calculator. That was worth
+fixing on its own and it was fixed: the tables are generated modules
+now, the RTL the agent has to write fell from about 270 lines to between
+44 and 56, and the blocks got smaller and faster because yosys shares
+one table instance instead of inlining a case into the datapath.
+
+It did not fix the LLM path. The exponential and the reciprocal still
+fail on their first vector, with the same mismatch as before. So the
+barrier was not the table. It is that these blocks require getting
+t = (x * 94548) >> 16, then the integer part by arithmetic shift, then
+the fraction as a table index, then a clamped shift, all exactly right
+at once, and the tools accept nothing less than exact.
+
+The useful conclusion is not that LLM-written RTL does not work. It is
+that the two kinds of block want different agents, and the flow already
+supports both behind one interface. Exact fixed-point datapaths are
+better derived than written, which is what specgen does. Structure,
+sequencing and control are where an agent earns its place. Anyone
+pulling this should use the deterministic agent to generate hardware and
+the swarm where they want to see the loop work.
 
 ## Not verified, and not claimed
 

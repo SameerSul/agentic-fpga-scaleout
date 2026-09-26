@@ -1,20 +1,20 @@
 {
-  "name": "crc32_endpoint_16B",
-  "description": "Fabric endpoint CRC32 datapath, 16 byte(s) per cycle, serial next-state form, zlib/Ethernet compatible (reflected polynomial 0xEDB88320), sized for a 10 Gbps link",
+  "name": "crc32_endpoint_8B",
+  "description": "Fabric endpoint CRC32 datapath, 8 byte(s) per cycle, serial next-state form, zlib/Ethernet compatible (reflected polynomial 0xEDB88320), sized for a 10 Gbps link",
   "top_module": "crc32",
   "unit": "byte",
   "parameters": {
-    "data_width": 128,
+    "data_width": 64,
     "crc_width": 32,
-    "bytes_per_cycle": 16,
-    "target_clock_mhz": 78.125,
+    "bytes_per_cycle": 8,
+    "target_clock_mhz": 156.25,
     "architecture": "serial",
     "polynomial": "0xEDB88320 reflected form of 0x04C11DB7"
   },
   "derivation": {
     "target_link_gbps": 10.0,
     "standard_rate_gbps": 10.0,
-    "datapath_option": 1,
+    "datapath_option": 0,
     "options_for_rate": [
       [
         8,
@@ -62,8 +62,8 @@
     {
       "name": "data",
       "dir": "input",
-      "width": 128,
-      "desc": "one 16-byte word per cycle, bytes LSB-first (little-endian packing)"
+      "width": 64,
+      "desc": "one 8-byte word per cycle, bytes LSB-first (little-endian packing)"
     },
     {
       "name": "valid_in",
@@ -86,8 +86,8 @@
   ],
   "behavior": [
     "State initializes to 0xFFFFFFFF on reset and on synchronous clear.",
-    "Each valid word consumes its 16 bytes LSB-first; per byte b, state s becomes 8 iterations of s = (s >> 1) ^ (0xEDB88320 & -(s & 1)) starting from s ^ b.",
+    "Each valid word consumes its 8 bytes LSB-first; per byte b, state s becomes 8 iterations of s = (s >> 1) ^ (0xEDB88320 & -(s & 1)) starting from s ^ b.",
     "crc_out registers the updated state XOR 0xFFFFFFFF (the standard final inversion), matching zlib.crc32 of the byte stream.",
-    "Latency from valid_in to valid_out is 1 cycle; throughput is one 16-byte word per cycle."
+    "Latency from valid_in to valid_out is 1 cycle; throughput is one 8-byte word per cycle."
   ]
 }

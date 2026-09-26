@@ -32,6 +32,14 @@ from llm_agent import (pick_backend, CALLERS, extract_verilog,
 import json
 
 MAX_REVIEW_ROUNDS = 1      # internal revisions before handing to the tools
+# The gates in the order the flow runs them. How far an attempt got is
+# the only ranking signal available, and it is a real one: a design that
+# fails timing is strictly further along than one that fails to compile.
+STAGE_RANK = {"sim": 0, "synth": 1, "timing": 2, "fpga": 3}
+# Failed iterations before the reviewer is switched on. It is off by
+# default because it never changed an outcome on a first draft, but a
+# writer that has failed repeatedly is the case it was built for.
+REVIEW_AFTER = 2
 REVIEW_ACCEPT = "ACCEPT"
 # The reviewer is off by default. Across every bench run recorded in
 # RESULTS.md it accepted the draft every single time, including on runs the
@@ -59,7 +67,8 @@ def debugger_prompt(spec, history, last_rtl):
     ])
 
 
-def writer_prompt(spec, history, last_rtl, diagnosis, objections):
+def writer_prompt(spec, history, last_rtl, diagnosis, objections,
+                  tried=()):
     """Build the writer's prompt with the tool output as the authority.
 
     The ordering here is load bearing. An earlier version put the debugger
@@ -79,6 +88,14 @@ def writer_prompt(spec, history, last_rtl, diagnosis, objections):
     if history:
         parts += ["", "TOOL FEEDBACK, most recent last (make these pass). "
                       "This is ground truth:", _fmt_feedback(history)]
+    if tried and history:
+        # Proposing a design the tools already rejected wastes a whole
+        # iteration of simulation, synthesis, timing and mapping, and it
+        # is the most common way a retry loop stalls.
+        parts += ["", "You have already proposed %d design%s that the "
+                      "tools rejected. Do not propose any of them again; "
+                      "change the part the feedback above names."
+                      % (len(tried), "" if len(tried) == 1 else "s")]
     if objections:
         parts += ["", "A REVIEWER RAISED THESE OBJECTIONS TO YOUR LAST "
                       "DRAFT (address them where they agree with the tool "
@@ -139,6 +156,13 @@ class SwarmAgent:
         self.use_debugger = use_debugger
         self.escalate = escalate
         self.last_rtl = None
+        # The furthest any attempt has got, and the RTL that got there.
+        # Handing the writer its most recent attempt compounds a
+        # regression: if iteration three is worse than iteration two,
+        # every later iteration starts from the worse one.
+        self.best_rtl = None
+        self.best_rank = -1
+        self.tried = []
         self.calls = {"writer": 0, "reviewer": 0, "debugger": 0}
         self.log = []
 
@@ -146,8 +170,24 @@ class SwarmAgent:
         self.calls[role] += 1
         return CALLERS[self.backend](prompt, self.model)
 
+    def _rank(self, feedback_history):
+        """How far the most recent attempt got, by the last stage the
+        tools complained about."""
+        if not feedback_history:
+            return -1
+        last_iter = max(f.get("iteration", 0) for f in feedback_history)
+        stages = [STAGE_RANK.get(f.get("stage"), -1)
+                  for f in feedback_history
+                  if f.get("iteration", 0) == last_iter]
+        return max(stages) if stages else -1
+
     def propose(self, spec, feedback_history):
         notes = []
+        # Keep whichever attempt reached the furthest gate.
+        rank = self._rank(feedback_history)
+        if self.last_rtl is not None and rank > self.best_rank:
+            self.best_rank, self.best_rtl = rank, self.last_rtl
+        fails = len({f.get("iteration") for f in feedback_history})
         # Escalation. On the first attempt there is no tool feedback, so the
         # debugger has nothing to read and the reviewer is guessing at what
         # the tools will say. Measured over five runs each, the reviewer
@@ -156,7 +196,10 @@ class SwarmAgent:
         # single writer, exactly as cheap as one agent, and engages the
         # other roles only once the tools have actually rejected something.
         engaged = bool(feedback_history) or not self.escalate
-        reviewing = self.use_reviewer and engaged
+        # After repeated failures the reviewer is worth its call: a
+        # writer that has been wrong several times in a row is exactly
+        # the case that reading the draft before simulating it helps.
+        reviewing = (self.use_reviewer or fails >= REVIEW_AFTER) and engaged
 
         diagnosis = ""
         if feedback_history and self.use_debugger:
@@ -174,12 +217,17 @@ class SwarmAgent:
         # starts as the last iteration's RTL, but once the reviewer rejects a
         # draft it becomes that draft: objections are worthless to a writer
         # that cannot see the code they refer to.
-        objections, rtl, prev = "", None, self.last_rtl
+        # Start from the best attempt, not the latest, and say which it
+        # is so the writer is not told a design failed when it was the
+        # furthest one to get through.
+        base = self.best_rtl if (self.best_rank > rank and self.best_rtl)  \
+            else self.last_rtl
+        objections, rtl, prev = "", None, base
         for attempt in range(self.review_rounds + 1):
             rtl = extract_verilog(self._ask(
                 "writer",
                 writer_prompt(spec, feedback_history, prev,
-                              diagnosis, objections)))
+                              diagnosis, objections, self.tried)))
             notes.append("writer" if attempt == 0 else "writer:revised")
             if not reviewing or attempt == self.review_rounds:
                 break
@@ -196,6 +244,8 @@ class SwarmAgent:
             notes.append("reviewer:reject")
             prev = rtl
 
+        if rtl and rtl not in self.tried:
+            self.tried.append(rtl)
         self.last_rtl = rtl
         n = sum(self.calls.values())
         return rtl, ["swarm:%s@%s" % (self.model, self.backend),

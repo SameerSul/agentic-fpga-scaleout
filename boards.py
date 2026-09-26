@@ -31,6 +31,28 @@ CABLE_M = 3.0        # a rack-local direct-attach copper cable
 # needs a switch. Decode is memory-bound (see sizing.py), so the figure that
 # decides throughput is mem_gbytes_per_s, not the logic capacity.
 BOARDS = {
+    # Zybo Z7-20 (Digilent), the board the team actually owns. Zynq-7020
+    # PL resources from the datasheet; 1 GB DDR3L on a 32-bit bus at
+    # 1066 Mbps is 4.3 GB/s on paper, and a PL master through the HP
+    # ports realistically sustains well under half of that, so the
+    # figure here is the one worth sizing against rather than the peak.
+    "zybo_z7_20": {
+        "name": "zybo_z7_20",
+        "class": "Zybo Z7-20 (Zynq XC7Z020)",
+        "family": "xc7",
+        "price_usd": 300,
+        "luts": 53200,
+        "ffs": 106400,
+        "dsps": 220,
+        "sram_bytes": 630000,
+        "max_chiplet_clock_mhz": 150.0,
+        "mem_gbytes_per_s": 2.0,
+        "dram_gbytes": 1.0,
+        "serdes_line_gbps": 0.125,
+        "eth_line_gbps": 0.125,
+        "link_ports": 1,
+        "num_links": 1,
+    },
     "arty_a7_100t": {
         "name": "arty_a7_100t",
         "class": "Arty A7-100T (Artix-7 XC7A100T)",
