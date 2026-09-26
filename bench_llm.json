@@ -1,0 +1,52 @@
+[
+  {
+    "converged": true,
+    "iterations": 1,
+    "calls": 1,
+    "roles": null,
+    "seconds": 68.46074390411377,
+    "failed_at": null,
+    "stumbles": [],
+    "cells": 1030
+  },
+  {
+    "converged": true,
+    "iterations": 1,
+    "calls": 1,
+    "roles": null,
+    "seconds": 48.08225679397583,
+    "failed_at": null,
+    "stumbles": [],
+    "cells": 1030
+  },
+  {
+    "converged": true,
+    "iterations": 1,
+    "calls": 1,
+    "roles": null,
+    "seconds": 69.75898504257202,
+    "failed_at": null,
+    "stumbles": [],
+    "cells": 1030
+  },
+  {
+    "converged": true,
+    "iterations": 1,
+    "calls": 1,
+    "roles": null,
+    "seconds": 26.061171293258667,
+    "failed_at": null,
+    "stumbles": [],
+    "cells": 1030
+  },
+  {
+    "converged": true,
+    "iterations": 1,
+    "calls": 1,
+    "roles": null,
+    "seconds": 70.01372528076172,
+    "failed_at": null,
+    "stumbles": [],
+    "cells": 1030
+  }
+]

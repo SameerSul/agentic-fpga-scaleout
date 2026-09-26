@@ -1,0 +1,39 @@
+{
+  "block": "mac8_gpt2_124m",
+  "top_module": "mac",
+  "unit": "mac",
+  "cycles_per_mac": 1.0,
+  "latency_cycles": 4,
+  "cell_count": 1408,
+  "area": 2763.0,
+  "fmax_estimate_mhz": 177.3049645390071,
+  "fmax_method": "opensta_slack",
+  "target_clock_mhz": 100,
+  "sim_checks_passed": 613,
+  "fpga": {
+    "family": "xcup",
+    "luts": 46,
+    "ffs": 46,
+    "dsps": 1,
+    "brams": 0,
+    "urams": 0,
+    "carry": 7,
+    "muxf": 0
+  },
+  "derivation": {
+    "model": "gpt2_124m",
+    "weight_bits": 8,
+    "activation_bits": 8,
+    "reduction_depth": 3072,
+    "guard_bits": 12,
+    "signed": true,
+    "rule": "acc_width = weight_bits + activation_bits + ceil(log2(max(d_model, d_ff)))",
+    "signedness_rule": "symmetric quantization is two's complement signed, so operands, product and accumulator are all signed",
+    "pipeline_stages": 2,
+    "pipeline_rule": "2 stages up to an 8-bit datapath, 3 above it: the signed multiply is the critical path and splitting it into half-width partial products buys the clock back for one cycle of latency"
+  },
+  "chiplet": "mac8_gpt2_124m",
+  "data_width": 8,
+  "acc_width": 28,
+  "agent": "LLMAgent"
+}
