@@ -39,7 +39,18 @@ import dv
 from chiplet_flow import ROOT, run_flow, make_agent
 
 BUILD = os.path.join(ROOT, "build_sweep")
-chiplet_flow.BUILD = BUILD          # never the flow's own build directory
+
+
+def _claim_build_dir():
+    """Point the flow at the sweep's scratch directory.
+
+    This used to run at import time, which made `import sweep` a
+    statement that silently redirected every later flow call in the
+    process. A test that imported this module for its model-variant list
+    sent the rest of the suite looking for RTL in build_sweep. Only the
+    sweep's own entry point claims the directory now.
+    """
+    chiplet_flow.BUILD = BUILD
 
 JOB = {"spec_file": "spec_sweep.json", "tb_file": "tb_sweep.v",
        "rtl_file": "rtl_sweep.v", "profile_file": "profile_sweep.json",
@@ -178,6 +189,7 @@ def one_case(label, spec, unit, agent_kind, do_dv, extra=()):
 
 
 def main():
+    _claim_build_dir()
     ap = argparse.ArgumentParser()
     ap.add_argument("--agent", default="rules",
                     choices=["rules", "llm", "swarm"])

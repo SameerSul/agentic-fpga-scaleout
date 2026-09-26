@@ -25,6 +25,7 @@ import os
 import re
 import shutil
 import subprocess
+import time
 import urllib.error
 import urllib.request
 
@@ -144,15 +145,48 @@ def call_ollama(prompt, model):
         return json.loads(r.read())["response"]
 
 
-def call_claude_cli(prompt, model):
-    r = subprocess.run(["claude", "-p", "--model", model],
-                       input=prompt, capture_output=True, text=True,
-                       timeout=600)
-    if r.returncode != 0:
-        # The CLI reports auth and API errors on stdout, not stderr.
-        detail = (r.stderr.strip() or r.stdout.strip())[:500]
-        raise RuntimeError("claude CLI failed: " + detail)
-    return r.stdout
+# A hung or rate-limited call is a property of the transport, not of the
+# design being written, so it gets retried rather than ending the block.
+# This is not hypothetical: the exponential was recorded as a convergence
+# failure once when what actually happened was one call sitting at zero
+# CPU until it hit the timeout, which aborted the whole run.
+CLI_TIMEOUT_S = 600
+CLI_ATTEMPTS = 3
+
+
+def call_claude_cli(prompt, model, attempts=CLI_ATTEMPTS):
+    last = None
+    for attempt in range(1, attempts + 1):
+        try:
+            r = subprocess.run(["claude", "-p", "--model", model],
+                               input=prompt, capture_output=True, text=True,
+                               timeout=CLI_TIMEOUT_S)
+        except subprocess.TimeoutExpired:
+            last = "timed out after %ds" % CLI_TIMEOUT_S
+        else:
+            if r.returncode == 0:
+                return r.stdout
+            # The CLI reports auth and API errors on stdout, not stderr.
+            last = (r.stderr.strip() or r.stdout.strip())[:500]
+            # An auth or argument fault will fail the same way every time;
+            # only transport faults are worth another attempt.
+            if not _is_retryable(last):
+                break
+        if attempt < attempts:
+            time.sleep(min(30, 5 * 2 ** (attempt - 1)))
+    raise RuntimeError("claude CLI failed after %d attempt(s): %s"
+                       % (attempt, last))
+
+
+def _is_retryable(detail):
+    d = (detail or "").lower()
+    if any(k in d for k in ("not logged in", "unauthor", "invalid api key",
+                            "authentication", "unknown option",
+                            "no such model")):
+        return False
+    return any(k in d for k in ("timed out", "timeout", "rate limit",
+                                "429", "overloaded", "503", "502", "500",
+                                "connection", "network", "temporarily"))
 
 
 CALLERS = {"anthropic": call_anthropic, "ollama": call_ollama,
