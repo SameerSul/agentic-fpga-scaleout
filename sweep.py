@@ -233,7 +233,11 @@ def main():
             label = "exp %s Q%d.%d->Q0.%d" % (
                 ms["name"], p["in_width"] - 1 - p["in_frac"], p["in_frac"],
                 p["out_frac"])
-            r, d = one_case(label, spec, "score", a.agent, do_dv)
+            os.makedirs(BUILD, exist_ok=True)
+            with open(os.path.join(BUILD, "exp_rom.v"), "w") as f:
+                f.write(specgen.exp_rom(spec))
+            r, d = one_case(label, spec, "score", a.agent, do_dv,
+                            extra=("exp_rom.v",))
             rows.append(r)
             details.append((label, d))
             if any(r[c] not in ("ok", "skip", "-") for c in COLS):
@@ -247,7 +251,11 @@ def main():
             p = spec["parameters"]
             label = "recip %s %db->%db" % (ms["name"], p["in_width"],
                                            p["out_width"])
-            r, d = one_case(label, spec, "row", a.agent, do_dv)
+            os.makedirs(BUILD, exist_ok=True)
+            with open(os.path.join(BUILD, "recip_rom.v"), "w") as f:
+                f.write(specgen.recip_rom(spec))
+            r, d = one_case(label, spec, "row", a.agent, do_dv,
+                            extra=("recip_rom.v",))
             rows.append(r)
             details.append((label, d))
             if any(r[c] not in ("ok", "skip", "-") for c in COLS):
@@ -261,7 +269,11 @@ def main():
             p = spec["parameters"]
             label = "rsqrt %s %db->%db" % (ms["name"], p["in_width"],
                                            p["out_width"])
-            r, d = one_case(label, spec, "row", a.agent, do_dv)
+            os.makedirs(BUILD, exist_ok=True)
+            with open(os.path.join(BUILD, "rsqrt_rom.v"), "w") as f:
+                f.write(specgen.rsqrt_rom(spec))
+            r, d = one_case(label, spec, "row", a.agent, do_dv,
+                            extra=("rsqrt_rom.v",))
             rows.append(r)
             details.append((label, d))
             if any(r[c] not in ("ok", "skip", "-") for c in COLS):
@@ -331,8 +343,13 @@ def main():
                     specgen.derive_recip_spec(ms), {FIX_NORM}))
             p = spec["parameters"]
             label = "softmax %s cap%d" % (ms["name"], p["capacity"])
+            with open(os.path.join(BUILD, "exp_rom.v"), "w") as f:
+                f.write(specgen.exp_rom(specgen.derive_exp_spec(ms)))
+            with open(os.path.join(BUILD, "recip_rom.v"), "w") as f:
+                f.write(specgen.recip_rom(specgen.derive_recip_spec(ms)))
             r, d = one_case(label, spec, "row", a.agent, do_dv,
-                            extra=("expu_dep.v", "recip_dep.v"))
+                            extra=("expu_dep.v", "recip_dep.v",
+                                   "exp_rom.v", "recip_rom.v"))
             rows.append(r)
             details.append((label, d))
             if any(r[c] not in ("ok", "skip", "-") for c in COLS):

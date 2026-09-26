@@ -674,9 +674,6 @@ endmodule
         p = spec["parameters"]
         iw, ow, lb = p["in_width"], p["out_width"], p["lut_bits"]
         ew = max(4, iw.bit_length())
-        lut = specgen.rsqrt_lut(lb, ow)
-        arms = "\n".join("      %d'd%d: lut = %d'd%d;" % (lb, i, ow, v)
-                          for i, v in enumerate(lut))
         align = iw - 2 if FIX_EVEN in fixes else iw - 1
         return """module rsqrt (
   input               clk,
@@ -701,18 +698,12 @@ endmodule
     end
   endfunction
 
-  function [{owm}:0] lut;
-    input [{lbm}:0] idx;
-    case (idx)
-{arms}
-      default: lut = {ow}'d{one};
-    endcase
-  endfunction
-
   wire [{ewm}:0] e_w  = msb(x) >> 1;
   wire [{ewm}:0] s_w  = {align} - (e_w << 1);
   wire [{iwm}:0] xn_w = x << s_w;
   reg  [{iwm}:0] xn;
+  wire [{owm}:0] lut_out;
+  rsqrt_rom rom (.idx(xn[{hi}:{lo}]), .val(lut_out));
   reg  [{ewm}:0] e1, e2;
   reg  [{owm}:0] m;
   reg            vpipe, vpipe2;
@@ -731,7 +722,7 @@ endmodule
       xn        <= xn_w;
       e1        <= e_w;
       vpipe     <= valid_in;
-      m         <= lut(xn[{hi}:{lo}]);
+      m         <= lut_out;
       e2        <= e1;
       vpipe2    <= vpipe;
       y         <= m;
@@ -740,8 +731,7 @@ endmodule
     end
   end
 endmodule
-""".format(iwm=iw - 1, owm=ow - 1, ewm=ew - 1, lbm=lb - 1, ow=ow,
-           arms=arms, one=(1 << ow) - 1, align=align,
+""".format(iwm=iw - 1, owm=ow - 1, ewm=ew - 1, ow=ow, align=align,
            hi=iw - 1, lo=iw - lb)
 
     def render_recip(self, spec, fixes):
@@ -760,9 +750,6 @@ endmodule
         p = spec["parameters"]
         iw, ow, lb = p["in_width"], p["out_width"], p["lut_bits"]
         kw = max(4, iw.bit_length())
-        lut = specgen.recip_lut(lb, ow)
-        arms = "\n".join("      %d'd%d: lut = %d'd%d;" % (lb, i, ow, v)
-                          for i, v in enumerate(lut))
         src = "xn" if FIX_NORM in fixes else "x"
         return """module recip (
   input               clk,
@@ -787,17 +774,11 @@ endmodule
     end
   endfunction
 
-  function [{owm}:0] lut;
-    input [{lbm}:0] idx;
-    case (idx)
-{arms}
-      default: lut = {ow}'d{one};
-    endcase
-  endfunction
-
   wire [{kwm}:0] k_w  = lzc(x);
   wire [{iwm}:0] xn_w = x << k_w;
   reg  [{iwm}:0] xn;
+  wire [{owm}:0] lut_out;
+  recip_rom rom (.idx({src}[{hi}:{lo}]), .val(lut_out));
   reg  [{kwm}:0] k1, k2;
   reg  [{owm}:0] m;
   reg            vpipe, vpipe2;
@@ -816,7 +797,7 @@ endmodule
       xn        <= xn_w;
       k1        <= k_w;
       vpipe     <= valid_in;
-      m         <= lut({src}[{hi}:{lo}]);
+      m         <= lut_out;
       k2        <= k1;
       vpipe2    <= vpipe;
       y         <= m;
@@ -825,8 +806,7 @@ endmodule
     end
   end
 endmodule
-""".format(iwm=iw - 1, owm=ow - 1, kwm=kw - 1, lbm=lb - 1, iw=iw, ow=ow,
-           arms=arms, one=(1 << ow) - 1, src=src,
+""".format(iwm=iw - 1, owm=ow - 1, kwm=kw - 1, iw=iw, ow=ow, src=src,
            hi=iw - 2, lo=iw - 1 - lb)
 
     def render_exp(self, spec, fixes):
@@ -855,10 +835,8 @@ endmodule
         ow, fo, lb = p["out_width"], p["out_frac"], p["lut_bits"]
         tw = iw + 18
         shw = max(4, (tw).bit_length())
-        lut = specgen.exp_lut(lb, fo)
-        arms = "\n".join(
-            "      %d'd%d: lut = %d'd%d;" % (lb, i, ow, v)
-            for i, v in enumerate(lut))
+        # The table is a generated module, instantiated rather than
+        # transcribed. See specgen.render_rom for why.
         return """module expu (
   input                     clk,
   input                     rst_n,
@@ -871,18 +849,12 @@ endmodule
   // 2**f and its integer part is a right shift. x is non-positive, which
   // softmax guarantees by subtracting the row maximum, so the shift only
   // ever goes right.
-  function [{owm}:0] lut;
-    input [{lbm}:0] idx;
-    case (idx)
-{arms}
-      default: lut = {ow}'d{one};
-    endcase
-  endfunction
-
   reg signed [{twm}:0] t;
   reg        [{owm}:0] m;
   reg        [{shm}:0] sh;
   reg                  vpipe, vpipe2;
+  wire [{owm}:0] lut_out;
+  exp_rom rom (.idx(t[{fim}:0]), .val(lut_out));
   wire signed [{twm}:0] prod = x * $signed({{1'b0, 18'd{log2e}}});
   wire signed [{twm}:0] tt   = prod >>> 16;
   wire signed [{twm}:0] n    = t >>> {fi};
@@ -910,9 +882,9 @@ endmodule
   end
 endmodule
 """.format(iwm=iw - 1, owm=ow - 1, twm=tw - 1, shm=shw - 1, lbm=lb - 1,
-           fim=fi - 1, fi=fi, fo=fo, fo1=fo + 1, ow=ow, arms=arms,
+           fim=fi - 1, fi=fi, fo=fo, fo1=fo + 1, ow=ow,
            one=1 << fo, log2e=specgen.LOG2E_Q16,
-           mexpr=("lut(t[%d:0])" % (fi - 1)) if FIX_LUT in fixes
+           mexpr="lut_out" if FIX_LUT in fixes
                  else ("%d'd%d" % (ow, 1 << fo)))
 
     def render_requant(self, spec, fixes):

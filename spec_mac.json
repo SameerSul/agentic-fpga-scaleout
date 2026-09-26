@@ -1,20 +1,20 @@
 {
-  "name": "mac8_gpt2_124m",
-  "description": "8-bit pipelined multiply-accumulate unit derived from gpt2_124m: datapath from the model quantization, accumulator sized for its longest reduction",
+  "name": "mac8_qwen2_5_0p5b",
+  "description": "8-bit pipelined multiply-accumulate unit derived from qwen2_5_0p5b: datapath from the model quantization, accumulator sized for its longest reduction",
   "top_module": "mac",
   "parameters": {
     "data_width": 8,
-    "acc_width": 28,
+    "acc_width": 29,
     "signed": true,
     "pipeline_stages": 2,
     "target_clock_mhz": 100
   },
   "derivation": {
-    "model": "gpt2_124m",
+    "model": "qwen2_5_0p5b",
     "weight_bits": 8,
     "activation_bits": 8,
-    "reduction_depth": 3072,
-    "guard_bits": 12,
+    "reduction_depth": 4864,
+    "guard_bits": 13,
     "signed": true,
     "rule": "acc_width = weight_bits + activation_bits + ceil(log2(max(d_model, d_ff)))",
     "signedness_rule": "symmetric quantization is two's complement signed, so operands, product and accumulator are all signed",
@@ -63,7 +63,7 @@
     {
       "name": "acc",
       "dir": "output",
-      "width": 28,
+      "width": 29,
       "signed": true,
       "desc": "accumulator value, signed two's complement"
     },
@@ -76,10 +76,10 @@
   ],
   "behavior": [
     "Stage 1 registers the full 16-bit product a*b and the valid flag.",
-    "The final stage adds the registered product into the 28-bit accumulator when the piped valid is set.",
+    "The final stage adds the registered product into the 29-bit accumulator when the piped valid is set.",
     "clear synchronously zeroes acc and valid_out, taking priority over accumulation.",
     "Latency from valid_in to valid_out is 2 cycles.",
-    "28 accumulator bits = 16 product bits + 12 guard bits, enough for a 3072-deep dot product with no overflow.",
+    "29 accumulator bits = 16 product bits + 13 guard bits, enough for a 4864-deep dot product with no overflow.",
     "Operands, product and accumulator are signed two's complement. The multiply must be a signed multiply and the product must be sign-extended into the accumulator."
   ]
 }

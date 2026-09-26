@@ -1,0 +1,11 @@
+{
+  "model": "qwen2_5_0p5b",
+  "agent": "swarm",
+  "blocks": [
+    {
+      "block": "rsqrt",
+      "converged": false,
+      "error": "Command '['claude', '-p', '--model', 'haiku']' timed out after 600 seconds"
+    }
+  ]
+}

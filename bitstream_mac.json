@@ -1,9 +1,9 @@
 {
   "block": "mac",
-  "spec": "mac8_gpt2_124m",
+  "spec": "mac8_qwen2_5_0p5b",
   "device": "ice40-hx8k-ct256",
   "target_mhz": 100,
-  "post_route_fmax_mhz": 166.14,
+  "post_route_fmax_mhz": 162.76,
   "timing_met": true,
   "luts": 0,
   "bitstream_bytes": 135100,

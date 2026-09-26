@@ -1,0 +1,78 @@
+{
+  "model": "qwen2_5_0p5b",
+  "agent": "rules",
+  "blocks": [
+    {
+      "block": "chiplet",
+      "converged": true,
+      "iterations": 3,
+      "calls": null,
+      "roles": null,
+      "note": "169 MHz, 1473 cells"
+    },
+    {
+      "block": "requant",
+      "converged": true,
+      "iterations": 2,
+      "calls": null,
+      "roles": null,
+      "note": "115 MHz, 10445 cells"
+    },
+    {
+      "block": "exp",
+      "converged": true,
+      "iterations": 2,
+      "calls": null,
+      "roles": null,
+      "note": "164 MHz, 1428 cells"
+    },
+    {
+      "block": "recip",
+      "converged": true,
+      "iterations": 2,
+      "calls": null,
+      "roles": null,
+      "note": "206 MHz, 1010 cells"
+    },
+    {
+      "block": "rsqrt",
+      "converged": true,
+      "iterations": 2,
+      "calls": null,
+      "roles": null,
+      "note": "170 MHz, 841 cells"
+    },
+    {
+      "block": "matvec",
+      "converged": true,
+      "iterations": 3,
+      "calls": null,
+      "roles": null,
+      "note": "187 MHz, 1294 cells"
+    },
+    {
+      "block": "wmem",
+      "converged": true,
+      "iterations": 2,
+      "calls": null,
+      "roles": null,
+      "note": "333 MHz, 61712 cells"
+    },
+    {
+      "block": "softmax",
+      "converged": true,
+      "iterations": 2,
+      "calls": null,
+      "roles": null,
+      "note": "103 MHz, 1466 cells"
+    },
+    {
+      "block": "mlp",
+      "converged": true,
+      "iterations": 2,
+      "calls": null,
+      "roles": null,
+      "note": "119 MHz, 10396 cells"
+    }
+  ]
+}

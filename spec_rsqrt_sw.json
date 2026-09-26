@@ -1,0 +1,71 @@
+{
+  "name": "rsqrt30_qwen2_5_0p5b",
+  "description": "Inverse square root for RMSNorm: 30-bit unsigned mean of squares, returns a 17-bit mantissa and a halved exponent, by normalising to [1,4) and a 256-entry table",
+  "top_module": "rsqrt",
+  "unit": "row",
+  "parameters": {
+    "in_width": 30,
+    "out_width": 17,
+    "lut_bits": 8,
+    "signed": false,
+    "pipeline_stages": 3,
+    "target_clock_mhz": 100
+  },
+  "derivation": {
+    "model": "qwen2_5_0p5b",
+    "activation_bits": 8,
+    "reduction_depth": 4864,
+    "rule": "in_width holds a sum of 4864 squares of 8-bit values; the output is a mantissa and a halved exponent, so a normalised activation is one multiply and one shift"
+  },
+  "ports": [
+    {
+      "name": "clk",
+      "dir": "input",
+      "width": 1,
+      "desc": "clock, rising edge"
+    },
+    {
+      "name": "rst_n",
+      "dir": "input",
+      "width": 1,
+      "desc": "active-low synchronous reset"
+    },
+    {
+      "name": "x",
+      "dir": "input",
+      "width": 30,
+      "desc": "mean of squares, unsigned"
+    },
+    {
+      "name": "valid_in",
+      "dir": "input",
+      "width": 1,
+      "desc": "x valid"
+    },
+    {
+      "name": "y",
+      "dir": "output",
+      "width": 17,
+      "desc": "1/sqrt mantissa, always full width"
+    },
+    {
+      "name": "e",
+      "dir": "output",
+      "width": 5,
+      "desc": "halved exponent; 1/sqrt(x) is y >> (17 + e)"
+    },
+    {
+      "name": "valid_out",
+      "dir": "output",
+      "width": 1,
+      "desc": "y updated this cycle"
+    }
+  ],
+  "behavior": [
+    "Stage 1 finds the position of the highest set bit and halves it, registering both the even normalisation and the shifted value, which then lies in [1,4).",
+    "Stage 2 registers the table entry that mantissa selects.",
+    "Stage 3 registers the entry and the halved exponent. The consumer applies the shift, keeping the mantissa full width.",
+    "A zero input returns the saturated mantissa; RMSNorm adds an epsilon before this unit so that case does not arise.",
+    "Latency from valid_in to valid_out is 3 cycles."
+  ]
+}

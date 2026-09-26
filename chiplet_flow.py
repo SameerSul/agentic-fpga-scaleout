@@ -56,7 +56,8 @@ SOFTMAX_JOB = {
     "derive_from_model": "softmax",
     # It instantiates these, so they are part of the design under test
     # rather than companions to it.
-    "extra_sources": ("expu_dep.v", "recip_dep.v"),
+    "extra_sources": ("expu_dep.v", "recip_dep.v",
+                      "exp_rom.v", "recip_rom.v"),
 }
 WMEM_JOB = {
     "spec_file": "spec_wmem.json", "tb_file": "tb_wmem.v",
@@ -81,18 +82,22 @@ RSQRT_JOB = {
     "rtl_file": "rsqrt.v", "profile_file": "rsqrt_profile.json",
     "report_file": "report_rsqrt.json",
     "derive_from_model": "rsqrt",
+    "extra_sources": ("rsqrt_rom.v",),
 }
 RECIP_JOB = {
     "spec_file": "spec_recip.json", "tb_file": "tb_recip.v",
     "rtl_file": "recip.v", "profile_file": "recip_profile.json",
     "report_file": "report_recip.json",
     "derive_from_model": "recip",
+    "extra_sources": ("recip_rom.v",),
 }
 EXP_JOB = {
     "spec_file": "spec_exp.json", "tb_file": "tb_expu.v",
     "rtl_file": "expu.v", "profile_file": "exp_profile.json",
     "report_file": "report_exp.json",
     "derive_from_model": "exp",
+    # The constant table is generated, not written by the agent.
+    "extra_sources": ("exp_rom.v",),
 }
 REQUANT_JOB = {
     "spec_file": "spec_requant.json", "tb_file": "tb_requant.v",
@@ -479,6 +484,10 @@ def run_flow(job=None, verbose=True, agent=None, max_iters=None):
         with open(os.path.join(BUILD, "recip_dep.v"), "w") as f:
             f.write(RuleBasedAgent().render_recip(
                 specgen.derive_recip_spec(_ms), {FIX_NORM}))
+        with open(os.path.join(BUILD, "exp_rom.v"), "w") as f:
+            f.write(specgen.exp_rom(specgen.derive_exp_spec(_ms)))
+        with open(os.path.join(BUILD, "recip_rom.v"), "w") as f:
+            f.write(specgen.recip_rom(specgen.derive_recip_spec(_ms)))
     elif job.get("derive_from_model") == "wmem":
         specgen.generate_wmem(spec_file=job["spec_file"],
                               tb_file=job["tb_file"])
@@ -505,14 +514,23 @@ def run_flow(job=None, verbose=True, agent=None, max_iters=None):
                 specgen.derive_chiplet_spec(specgen.load_model_spec()),
                 {FIX_WIDTH, FIX_CLEAR}))
     elif job.get("derive_from_model") == "rsqrt":
-        specgen.generate_rsqrt(spec_file=job["spec_file"],
-                               tb_file=job["tb_file"])
+        sp = specgen.generate_rsqrt(spec_file=job["spec_file"],
+                                    tb_file=job["tb_file"])
+        os.makedirs(BUILD, exist_ok=True)
+        with open(os.path.join(BUILD, "rsqrt_rom.v"), "w") as f:
+            f.write(specgen.rsqrt_rom(sp))
     elif job.get("derive_from_model") == "recip":
-        specgen.generate_recip(spec_file=job["spec_file"],
-                               tb_file=job["tb_file"])
+        sp = specgen.generate_recip(spec_file=job["spec_file"],
+                                    tb_file=job["tb_file"])
+        os.makedirs(BUILD, exist_ok=True)
+        with open(os.path.join(BUILD, "recip_rom.v"), "w") as f:
+            f.write(specgen.recip_rom(sp))
     elif job.get("derive_from_model") == "exp":
-        specgen.generate_exp(spec_file=job["spec_file"],
-                             tb_file=job["tb_file"])
+        sp = specgen.generate_exp(spec_file=job["spec_file"],
+                                  tb_file=job["tb_file"])
+        os.makedirs(BUILD, exist_ok=True)
+        with open(os.path.join(BUILD, "exp_rom.v"), "w") as f:
+            f.write(specgen.exp_rom(sp))
     elif job.get("derive_from_model") == "requant":
         specgen.generate_requant(spec_file=job["spec_file"],
                                  tb_file=job["tb_file"])
