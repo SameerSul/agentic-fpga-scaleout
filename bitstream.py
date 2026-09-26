@@ -84,7 +84,12 @@ EXTRA_SRC = {"matvec": ("mac",), "wmem": ("mac", "matvec"),
              "mlp": ("matvec", "mac", "requant")}
 
 
-ICEBOX_PY = "/opt/homebrew/Cellar/icestorm/1.1/share/icestorm/python"
+# icestorm's Python pin database lives next to its binaries; derive the
+# path from icebox_vlog so this works on any install (Homebrew, oss-cad-suite)
+_icebox_vlog = shutil.which("icebox_vlog")
+ICEBOX_PY = (os.path.join(os.path.dirname(os.path.dirname(_icebox_vlog)),
+             "share", "icestorm", "python") if _icebox_vlog else
+             "/opt/homebrew/Cellar/icestorm/1.1/share/icestorm/python")
 
 
 def package_pins(device, package):
