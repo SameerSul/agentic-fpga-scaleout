@@ -179,15 +179,17 @@ derive and simulate.
 block, every time, for free, and it is what generated the RTL you are
 about to synthesise. Use it.
 
-`--agent swarm` puts a real LLM in the writing seat. Measured across all
-nine blocks, it writes the structural ones (the MAC, the matmul
-sequencer, the weight memory) and it does not write the ones whose
-correctness is exact fixed-point arithmetic (the exponential, the
-reciprocal, the inverse square root). That is a real result rather than a
-tuning problem: a block that needs a shift to be exactly right, at the
-same time as a table index and a clamp, is a poor fit for a model, and
-the tools accept nothing approximate. Use the swarm to watch the loop
-work, not to produce the RTL you build with.
+`--agent llm` or `--agent swarm` puts a real LLM in the writing seat.
+Measured, it now signs off six of the nine blocks: the MAC, the matmul
+sequencer, the weight memory, and the exponential, reciprocal and
+inverse square root. Those last three were first recorded as blocks a
+model could not write. The real cause was that their specs left the
+exact bit ranges to guesswork, and once the specs stated them the
+reciprocal and inverse square root converged in every run and the
+exponential converged by correcting its own errors from tool feedback.
+The requantizer, softmax and MLP layer have not been rerun since that
+fix. Build with the rules agent anyway: its output is what the numbers
+below were measured on, and it is reproducible and needs no network.
 
 ## Two things that look like failures and are not
 

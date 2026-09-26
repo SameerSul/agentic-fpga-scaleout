@@ -324,14 +324,27 @@ def derive_exp_spec(ms):
              "desc": "y updated this cycle"},
         ],
         "behavior": [
-            "Stage 1 registers x*log2(e) as a Q.%d value, using a %d-bit "
-            "fixed-point constant." % (fi, 17),
-            "Stage 2 splits it into an integer part and a fractional "
-            "part and registers the table entry the fraction selects.",
-            "Stage 3 shifts that entry right by the magnitude of the "
-            "integer part and registers the result.",
-            "An input small enough that the shift exceeds %d output "
-            "fraction bits flushes to zero rather than wrapping." % fo,
+            "Stage 1 computes t = (x * %d) >>> 16 and registers it as a "
+            "signed value. %d is log2(e) scaled by 2**16. The shift is "
+            "arithmetic, so t truncates toward minus infinity, and t is a "
+            "signed Q.%d number."
+            % (LOG2E_Q16, LOG2E_Q16, fi),
+            "Stage 2 splits t at bit %d. The integer part is n = t >>> %d, "
+            "an arithmetic shift, so n is the floor and is zero or "
+            "negative. The fractional part is f = t - (n << %d), which is "
+            "always in [0, %d). Stage 2 registers exp_rom[f >> %d] and the "
+            "shift amount sh = -n."
+            % (fi, fi, fi, 1 << fi, fi - lb),
+            "Stage 3 registers that table entry logically right-shifted "
+            "by sh. The shift is unsigned: the table entry is a "
+            "magnitude, not a signed number.",
+            "When sh is greater than %d the result is zero. Do not "
+            "saturate and do not let the shift wrap." % fo,
+            "exp_rom is a separate module supplied as a source file, not "
+            "something to write. Instantiate it. Its ports are "
+            "input [%d:0] idx and output [%d:0] val, combinational, and "
+            "it holds %d entries where entry i is 2**(i/%d) in Q0.%d."
+            % (lb - 1, fo, 1 << lb, 1 << lb, fo),
             "x is required to be non-positive, which softmax guarantees "
             "by subtracting the row maximum first.",
             "Latency from valid_in to valid_out is 3 cycles.",
@@ -548,13 +561,30 @@ def derive_recip_spec(ms):
              "desc": "y updated this cycle"},
         ],
         "behavior": [
-            "Stage 1 counts the leading zeros of x and registers both the "
-            "count and x shifted left by it, so the value sits in [1,2).",
-            "Stage 2 registers the table entry the normalised mantissa "
-            "selects and the shift the count implies.",
-            "Stage 3 registers the table entry and the count. The "
-            "consumer applies the shift, which keeps the mantissa at "
-            "full precision instead of truncating it here.",
+            "Stage 1 computes k, the number of leading zeros of x within "
+            "its %d-bit width, and registers both k and xn = x << k. "
+            "After the shift bit %d of xn is set, so xn read as a Q1.%d "
+            "number lies in [1,2)."
+            % (iw, iw - 1, iw - 1),
+            "Stage 2 registers recip_rom[idx] and k, where idx is bits "
+            "[%d:%d] of xn, that is idx = (xn >> %d) and then the low %d "
+            "bits of it. The leading one at bit %d is NOT part of idx: it "
+            "is implicit, so the table is indexed by the fraction alone."
+            % (iw - 2, iw - 1 - lb, iw - 1 - lb, lb, iw - 1),
+            "Stage 3 registers those two values onto the mantissa and "
+            "shift outputs. Do not apply the shift here. The consumer "
+            "folds it into the multiply it was going to do anyway, which "
+            "keeps the mantissa at full precision.",
+            "The contract the testbench checks is that num/x equals "
+            "(num * mantissa) >> (%d - shift), so mantissa must come out "
+            "unshifted and shift must come out as k itself."
+            % (ow + iw - 1),
+            "recip_rom is a separate module supplied as a source file, "
+            "not something to write. Instantiate it. Its ports are "
+            "input [%d:0] idx and output [%d:0] val, combinational."
+            % (lb - 1, ow - 1),
+            "When x is zero the mantissa output saturates to all ones "
+            "and the shift output is zero.",
             "x is required to be non-zero, which the softmax denominator "
             "guarantees because it always contains exp(0) = 1.",
             "Latency from valid_in to valid_out is 3 cycles.",
@@ -763,14 +793,31 @@ def derive_rsqrt_spec(ms):
              "desc": "y updated this cycle"},
         ],
         "behavior": [
-            "Stage 1 finds the position of the highest set bit and halves "
-            "it, registering both the even normalisation and the shifted "
-            "value, which then lies in [1,4).",
-            "Stage 2 registers the table entry that mantissa selects.",
-            "Stage 3 registers the entry and the halved exponent. The "
-            "consumer applies the shift, keeping the mantissa full width.",
-            "A zero input returns the saturated mantissa; RMSNorm adds an "
-            "epsilon before this unit so that case does not arise.",
+            "Let b be the index of the highest set bit of x, counting "
+            "from zero. Stage 1 computes e = b >> 1, an integer halving "
+            "that rounds down, and s = %d - 2*e, and registers e together "
+            "with xn = x << s. s is always even and never negative. "
+            "After the shift the highest set bit of xn is at %d or %d, so "
+            "xn read as a Q2.%d number lies in [1,4)."
+            % (iw - 2, iw - 2, iw - 1, iw - 2),
+            "Stage 2 registers rsqrt_rom[idx] where idx is the top %d "
+            "bits of xn, that is idx = xn >> %d. Unlike the reciprocal "
+            "unit, the leading one IS part of idx here, because the "
+            "normalised range spans a factor of four and the table has "
+            "to tell 1.x from 2.x."
+            % (lb, iw - lb),
+            "Stage 3 registers the table entry and e onto the mantissa "
+            "and shift outputs. Do not apply the shift here.",
+            "The contract the testbench checks is that num/sqrt(x) equals "
+            "(num * mantissa) >> (%d + shift), so mantissa must come out "
+            "unshifted and shift must come out as e itself." % ow,
+            "rsqrt_rom is a separate module supplied as a source file, "
+            "not something to write. Instantiate it. Its ports are "
+            "input [%d:0] idx and output [%d:0] val, combinational."
+            % (lb - 1, ow - 1),
+            "A zero input returns the saturated mantissa, all ones, with "
+            "a shift of zero. RMSNorm adds an epsilon before this unit "
+            "so that case does not arise in practice.",
             "Latency from valid_in to valid_out is 3 cycles.",
         ],
     }

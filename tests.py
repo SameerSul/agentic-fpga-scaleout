@@ -1068,6 +1068,185 @@ def test_requant_golden_is_shared():
           specgen_mod.requant_golden(3, 1 << 11, 12, 8)[0] == 2)
 
 
+def test_table_unit_specs_are_implementable():
+    """The three table-driven units are held to bit-exact agreement with a
+    Python model, so their specs have to state the arithmetic exactly.
+
+    They did not. Both the exponential and the two normalisers left the
+    index extraction to inference, and the two normalisers extract it
+    differently: the reciprocal drops the implicit leading one and the
+    inverse square root keeps it, because its normalised range spans a
+    factor of four. Nothing in the prose said so, and no reader could
+    have guessed it. Measured, an agent given the old text failed on the
+    first vector every time.
+
+    This walks the arithmetic the spec now describes and checks it
+    reproduces the golden model, on every model variant the sweep
+    covers. If someone changes a golden model without changing the
+    prose, or the reverse, this fails rather than the specification
+    quietly becoming unimplementable again.
+    """
+    import sweep as sweep_mod
+    # Importing the sweep must not move the flow's build directory. It
+    # used to, at import time, and this test was what tripped over it:
+    # every later test went looking for RTL in build_sweep.
+    check('importing the sweep leaves the build directory alone',
+          chiplet_flow.BUILD != sweep_mod.BUILD)
+    rnd = random.Random(5)
+    models = sweep_mod._models(load_model_spec())
+    for ms in models:
+        # exponential: t = (x*K)>>>16, split at in_frac, shift by -n
+        spec = specgen_mod.derive_exp_spec(ms)
+        p = spec['parameters']
+        fi, fo, lb = p['in_frac'], p['out_frac'], p['lut_bits']
+        lut = specgen_mod.exp_lut(lb, fo)
+        for x in range(0, -(1 << (p['in_width'] - 1)), -3):
+            t = (x * specgen_mod.LOG2E_Q16) >> 16
+            n = t >> fi
+            frac = t - (n << fi)
+            assert 0 <= frac < (1 << fi)
+            y = 0 if -n > fo else (lut[frac >> (fi - lb)] >> -n)
+            if y != specgen_mod.exp_golden(x, p):
+                check('exp spec arithmetic matches golden (%s, x=%d)'
+                      % (ms['name'], x), False)
+                break
+        else:
+            check('exp spec arithmetic matches golden (%s)' % ms['name'],
+                  True)
+
+        # reciprocal: index is the fraction alone, leading one implicit
+        spec = specgen_mod.derive_recip_spec(ms)
+        p = spec['parameters']
+        iw, ow, lb = p['in_width'], p['out_width'], p['lut_bits']
+        check('recip shift bias in the spec text is %d (%s)'
+              % (ow + iw - 1, ms['name']),
+              p['shift_bias'] == ow + iw - 1)
+        rl = specgen_mod.recip_lut(lb, ow)
+        ok = True
+        for x in ([1, 2, 3, 1 << (iw - 1), (1 << iw) - 1]
+                  + [rnd.randrange(1, 1 << iw) for _ in range(300)]):
+            k = iw - x.bit_length()
+            xn = x << k
+            ok &= bool((xn >> (iw - 1)) & 1)       # normalised to [1,2)
+            idx = (xn >> (iw - 1 - lb)) & ((1 << lb) - 1)
+            ok &= (rl[idx], k) == specgen_mod.recip_golden(x, p)
+        check('recip spec arithmetic matches golden (%s)' % ms['name'], ok)
+
+        # inverse square root: index keeps the leading one, range is [1,4)
+        spec = specgen_mod.derive_rsqrt_spec(ms)
+        p = spec['parameters']
+        iw, ow, lb = p['in_width'], p['out_width'], p['lut_bits']
+        sl = specgen_mod.rsqrt_lut(lb, ow)
+        ok = True
+        for x in ([1, 2, 3, 4, 5, 1 << (iw - 1), (1 << iw) - 1]
+                  + [rnd.randrange(1, 1 << iw) for _ in range(300)]):
+            e = (x.bit_length() - 1) >> 1
+            sh = iw - 2 - 2 * e
+            ok &= sh >= 0 and sh % 2 == 0          # even alignment
+            xn = x << sh
+            ok &= (xn.bit_length() - 1) in (iw - 2, iw - 1)
+            idx = xn >> (iw - lb)
+            ok &= idx < (1 << lb)
+            ok &= (sl[idx], e) == specgen_mod.rsqrt_golden(x, p)
+        check('rsqrt spec arithmetic matches golden (%s)' % ms['name'], ok)
+
+    # The two normalisers really do differ, and the prose says which is
+    # which. If they are ever made to agree, this test is what notices.
+    r = specgen_mod.derive_recip_spec(models[0])
+    q = specgen_mod.derive_rsqrt_spec(models[0])
+    check('recip spec states the leading one is implicit',
+          any('implicit' in b for b in r['behavior']))
+    check('rsqrt spec states the leading one is part of the index',
+          any('IS part of idx' in b for b in q['behavior']))
+    check('both specs name the rom module they must instantiate',
+          any('recip_rom' in b for b in r['behavior'])
+          and any('rsqrt_rom' in b for b in q['behavior']))
+
+
+def test_llm_transport_is_retried():
+    """A hung call is a transport fault, not a verdict on the design.
+
+    The exponential was written up as a block the agent could not
+    converge on. What actually happened on that run was one CLI call
+    sitting at zero CPU until it hit the ten minute timeout, which
+    aborted the block before the loop got a second chance. A flake that
+    reads as a design failure is worse than a flake, because it becomes
+    a conclusion.
+
+    Retrying blindly is its own trap, though: an expired login fails
+    identically every time, and three attempts at it just costs thirty
+    seconds before the same error. So only transport faults retry.
+    """
+    import llm_agent
+
+    calls = []
+
+    class Result:
+        def __init__(self, rc, out, err=''):
+            self.returncode, self.stdout, self.stderr = rc, out, err
+
+    def fake_run(seq):
+        it = iter(seq)
+        def run(cmd, **kw):
+            calls.append(cmd)
+            nxt = next(it)
+            if isinstance(nxt, Exception):
+                raise nxt
+            return nxt
+        return run
+
+    real_run, real_sleep = llm_agent.subprocess.run, llm_agent.time.sleep
+    llm_agent.time.sleep = lambda *_: None
+    try:
+        # A timeout, then success: the loop should see the success.
+        calls[:] = []
+        llm_agent.subprocess.run = fake_run([
+            subprocess.TimeoutExpired('claude', 600),
+            Result(0, 'module m(); endmodule'),
+        ])
+        out = llm_agent.call_claude_cli('p', 'm')
+        check('a timed out call is retried rather than ending the block',
+              'module m' in out and len(calls) == 2)
+
+        # Rate limiting is transport too.
+        calls[:] = []
+        llm_agent.subprocess.run = fake_run([
+            Result(1, 'rate limit exceeded'),
+            Result(0, 'module m(); endmodule'),
+        ])
+        llm_agent.call_claude_cli('p', 'm')
+        check('a rate limited call is retried', len(calls) == 2)
+
+        # An auth fault is not, because the next attempt cannot differ.
+        calls[:] = []
+        llm_agent.subprocess.run = fake_run([
+            Result(1, 'Invalid API key'), Result(1, 'Invalid API key'),
+            Result(1, 'Invalid API key'),
+        ])
+        raised = False
+        try:
+            llm_agent.call_claude_cli('p', 'm')
+        except RuntimeError:
+            raised = True
+        check('an auth fault fails immediately instead of retrying',
+              raised and len(calls) == 1)
+
+        # Exhausting the attempts still raises, and says how many it tried.
+        calls[:] = []
+        llm_agent.subprocess.run = fake_run(
+            [subprocess.TimeoutExpired('claude', 600)] * 3)
+        msg = ''
+        try:
+            llm_agent.call_claude_cli('p', 'm')
+        except RuntimeError as e:
+            msg = str(e)
+        check('exhausted retries report the attempt count and the cause',
+              len(calls) == 3 and 'attempt' in msg and 'timed out' in msg)
+    finally:
+        llm_agent.subprocess.run = real_run
+        llm_agent.time.sleep = real_sleep
+
+
 def test_fpga_backend(profile, fp):
     """Real device mapping, not generic cells: the two generated blocks land
     on different resources, which is what makes a single capacity proxy
@@ -1314,6 +1493,8 @@ if __name__ == '__main__':
     test_softmax_sequencer()
     test_mlp_layer()
     test_requant_golden_is_shared()
+    test_table_unit_specs_are_implementable()
+    test_llm_transport_is_retried()
     test_generation()
     test_bitstream()
     test_fit_monotonic(profile)

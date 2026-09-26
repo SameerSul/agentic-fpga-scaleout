@@ -4,6 +4,74 @@ The input is an LLM: a model spec (GPT-2 124M here) with a target token rate. Th
 
 Pure Python 3 stdlib, no dependencies. The RTL half runs real open tools (Icarus Verilog, Yosys, OpenSTA); the scaleout half is a discrete-event simulator in nanoseconds on a `heapq` event queue.
 
+## How it fits together
+
+```
+                       model_spec.json
+        (n_layer, d_model, d_ff, weight_bits, activation_bits,
+         seq_len, target_tokens_per_s)        one file you edit
+                             |
+                             v
+                    +-----------------+
+                    |   specgen.py    |   derives every block's spec AND
+                    +-----------------+   its self-checking testbench.
+                             |            Golden values are computed in
+                             |            Python, so a design can never
+                             |            mark its own work.
+                             v
+                    +-----------------+
+                    |      agent      |   writes the Verilog
+                    +-----------------+
+                     |              |
+              --agent rules   --agent llm / swarm
+              deterministic,  a real model, re-prompted
+              free, offline   with parsed tool feedback
+                             |
+                             v
+        +-----------------------------------------+
+        |  iverilog  ->  yosys  ->  OpenSTA        |   the gates
+        |     ->  synth_xilinx  ->  mutation DV    |
+        +-----------------------------------------+
+                             |
+              fails ---------+--------- passes
+                |                            |
+        parsed feedback                      v
+        back to the agent       signed-off RTL + measured profile
+                                             |
+                                             v
+                                    +-----------------+
+                                    |  bitstream.py   |  nextpnr, icepack,
+                                    +-----------------+  then the packed
+                                             |           bits are unpacked
+                                             v           and re-simulated
+                                 sizing, fabric, board fit
+```
+
+The nine generated blocks, and what each is for:
+
+```
+  arithmetic
+    mac        signed multiply-accumulate, the thing that does the work
+    requant    scale, round, saturate between two matmuls
+    exp        e^x by table and shift, for softmax
+    recip      1/x, for the softmax denominator
+    rsqrt      1/sqrt(x), for RMSNorm
+    crc32      the link endpoint, for board to board
+
+  sequencing, which is what turns the above into a layer
+    matvec     walks a matrix through the mac
+    wmem       the weight tile the matvec reads from
+    softmax    drives exp and recip across a row
+    mlp        two chained matmuls with requant between them
+```
+
+Four of those are composite: they instantiate the blocks below them
+rather than reimplementing the arithmetic, and the flow feeds the
+dependencies in as extra sources. The three table-driven units (exp,
+recip, rsqrt) also take a generated constant ROM as a dependency, since
+emitting 256 exact table entries is a job for a generator and not for a
+writer of RTL.
+
 ## The three files that connect everything
 
 Everything downstream is driven by three machine-readable files:
@@ -351,7 +419,7 @@ checked against another model. Read that list before quoting any number here.
 - Feeding 8601 MAC instances would need on-chip operand bandwidth the model does not check. DSP count is the right first-order capacity ceiling, not a claim that the array is routable at that size.
 - A 25 Gbps endpoint does not close timing in this flow at either standard datapath. Reaching it needs a pipelined or matrix-form CRC that the rule-based agent does not write, so the default target is 10 Gbps, which is also what the mid board class actually exposes.
 - There is no place-and-route anywhere; timing is real OpenSTA static timing but against a toy illustrative liberty, so fmax is an estimate of an estimate.
-- The derivation covers the matmul datapath only: MAC and accumulator widths from closed-form rules. Softmax, layernorm, and nonlinearity hardware are not generated and their cost is not modeled; a fuller version derives those blocks the same way.
+- The derivation now covers nine blocks, not just the matmul datapath: the exponential, reciprocal and inverse square root are generated and signed off, and softmax and an MLP layer sequence them. What is still missing above that is attention sequencing and tiling. The weight tile holds 1024 entries and the activation bank 64, so a real matrix needs tiling logic that does not exist yet, and the blocks are the arithmetic of an inference engine rather than the whole of one.
 - Boards are simulated, not real: link rates, propagation delays, clock caps, and capacities are representative class parameters, not measured silicon.
 - The 30% fabric reservation for NIC and routing logic is a stated guess, not a floorplan; the endpoint reservation per link is real, from the synthesized cell count.
 - Decode compute time is charged from the measured chiplet profile at full model dimensions; the weights are not materialized. The sharded numerics (real arithmetic, bit-exactness across cluster shapes) are validated at reduced dimensions in stage 8 and in the test suite.
@@ -360,4 +428,4 @@ checked against another model. Read that list before quoting any number here.
 - Activations travel as 8-byte IEEE doubles end to end so every all-reduce check is exact; a real deployment would use fp16 or fp32 and halve or quarter the fabric traffic.
 - ACK/credit control packets share link bandwidth but are assumed error-free (in RTL they are short, heavily protected control words); topology is a full mesh of point-to-point links; payloads are fixed 1024 B with a 20 B header.
 - The compute cycle model charges cycles per unit from the profile; it ignores on-board operand distribution to the chiplet array and memory bandwidth limits.
-- The "agents" shipped here are rule-based (see above), so convergence in 3 and 2 iterations demonstrates the loop mechanics, not LLM capability.
+- The committed RTL and profiles come from the rule-based agent, so they are reproducible offline. The LLM agent is measured separately in `RESULTS.md`: it signs off six of the nine blocks, including the three fixed-point table units once their specs stated the exact bit ranges, and has not yet been rerun on the requantizer, softmax and MLP layer.

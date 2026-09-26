@@ -357,46 +357,63 @@ second.
 ## Which blocks an LLM can write, measured
 
 The agent interface takes either a deterministic rule-based agent or a
-real LLM. Both face identical gates. Running the swarm at every block,
-for Qwen2.5-0.5B, gives a clean split:
+real LLM. Both face identical gates. Running it at every block, for
+Qwen2.5-0.5B:
 
-| block | swarm | calls |
+| block | LLM result | iterations |
 |---|---|---|
 | MAC chiplet | converged | 1 |
 | matmul sequencer | converged | 1 |
 | weight memory | converged | 15 |
-| exponential | failed | 15 |
-| reciprocal | failed | 18 |
-| inverse square root | failed | tool error |
-| requantizer, softmax, MLP layer | failed | 23 to 26 |
+| exponential | converged | 6 |
+| reciprocal | converged, 4 of 4 runs | 1, 2, 1, 2 |
+| inverse square root | converged, 4 of 4 runs | 3, 1, 2, 2 |
+| requantizer, softmax, MLP layer | failed | 23 to 26 calls |
 
-The blocks it writes are structural: ports, a state machine, a counter, a
-handshake. The blocks it cannot are the ones whose correctness is exact
-fixed-point arithmetic, where being one bit out in a shift or one count
-out in a table index is the whole difference between right and wrong.
+The three table-driven units were first recorded here as blocks an LLM
+cannot write, with the explanation that exact fixed-point arithmetic is
+a poor fit for a model. That explanation was wrong, and the measurement
+behind it was measuring the specification rather than the agent.
 
-A first explanation was that the transcendental blocks each embedded a
-256-entry table of constants, and that asking a model to emit 256 exact
-values of 2**(i/256) is asking it to be a calculator. That was worth
-fixing on its own and it was fixed: the tables are generated modules
-now, the RTL the agent has to write fell from about 270 lines to between
-44 and 56, and the blocks got smaller and faster because yosys shares
-one table instance instead of inlining a case into the datapath.
+The testbench holds these units to bit-exact agreement with a Python
+model, but the spec described the arithmetic in prose that left the
+deciding details to guesswork. It never said the log2(e) constant is
+scaled by 2**16, or that the integer part is an arithmetic shift that
+floors toward minus infinity. Worse, the reciprocal indexes its table
+with the mantissa bits below the implicit leading one, while the inverse
+square root keeps the leading one in the index because its normalised
+range spans a factor of four. Both specs said only "the table entry the
+normalised mantissa selects". No engineer could have guessed which, and
+every draft failed on the first vector.
 
-It did not fix the LLM path. The exponential and the reciprocal still
-fail on their first vector, with the same mismatch as before. So the
-barrier was not the table. It is that these blocks require getting
-t = (x * 94548) >> 16, then the integer part by arithmetic shift, then
-the fraction as a table index, then a clamped shift, all exactly right
-at once, and the tools accept nothing less than exact.
+Rewriting the three behaviour sections at the level of a datasheet,
+with the exact operations and bit ranges, changed the result from zero
+to every run converging. A test now walks the arithmetic the prose
+describes and checks it against the golden model on all six model
+variants, so the two cannot drift apart again.
 
-The useful conclusion is not that LLM-written RTL does not work. It is
-that the two kinds of block want different agents, and the flow already
-supports both behind one interface. Exact fixed-point datapaths are
-better derived than written, which is what specgen does. Structure,
-sequencing and control are where an agent earns its place. Anyone
-pulling this should use the deterministic agent to generate hardware and
-the swarm where they want to see the loop work.
+The exponential run is also the clearest instance of the loop working as
+intended. Its first draft multiplied a signed input by a bare decimal
+literal, which Verilog treats as unsigned, so the whole product was
+unsigned and the shift logical. It diverged at the very first vector,
+x = -1, and the model corrected that and the errors after it from tool
+feedback alone over six iterations.
+
+One recorded failure was not a failure of the model at all. An earlier
+exponential run, and the inverse square root row above as first
+recorded, ended on a tool error: a single CLI call sat at zero CPU
+until the ten minute timeout and aborted the block. Transport faults are
+now retried with backoff, and authentication faults still fail at once,
+since retrying them cannot give a different answer.
+
+The requantizer, softmax and MLP rows are from before the specification
+fix and have not been rerun. Given what the table units turned out to
+be, the first thing to check there is whether their specs are
+implementable as written, before concluding anything about the agent.
+
+The deterministic agent is still what generated the committed RTL, and
+it is still the right default for anyone who wants hardware reproducibly
+and offline. The LLM path is no longer only a demonstration of the loop.
 
 ## Not verified, and not claimed
 
