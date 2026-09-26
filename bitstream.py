@@ -84,26 +84,41 @@ EXTRA_SRC = {"matvec": ("mac",), "wmem": ("mac", "matvec"),
              "mlp": ("matvec", "mac", "requant")}
 
 
-# icestorm's Python pin database lives next to its binaries; derive the
-# path from icebox_vlog so this works on any install (Homebrew, oss-cad-suite)
-_icebox_vlog = shutil.which("icebox_vlog")
-ICEBOX_PY = (os.path.join(os.path.dirname(os.path.dirname(_icebox_vlog)),
-             "share", "icestorm", "python") if _icebox_vlog else
-             "/opt/homebrew/Cellar/icestorm/1.1/share/icestorm/python")
-
-
 def package_pins(device, package):
-    """Valid pin names for a package, from icestorm's own database."""
-    env = dict(os.environ)
-    env["PYTHONPATH"] = ICEBOX_PY + ":" + env.get("PYTHONPATH", "")
+    """Valid pin names for a package, from icestorm's own chip database.
+
+    Parsed from the textual chipdb (the ".pins <package>" section) rather
+    than imported through the icebox Python module, because not every
+    icestorm install exposes that module to the system interpreter:
+    oss-cad-suite runs its tools on a bundled environment. The chipdb
+    text ships with every install, next to the binaries.
+    """
     # icestorm keys these by size alone: hx8k and lp8k are both "8k".
-    key = "%s-%s" % (re.sub(r"^[a-z]+", "", device), package)
-    code = ("import icebox,sys;"
-            "print(' '.join(sorted({str(p[0]) for p in "
-            "icebox.pinloc_db[%r]})))" % key)
-    r = subprocess.run([sys.executable, "-c", code], capture_output=True,
-                       text=True, env=env)
-    return r.stdout.split() if r.returncode == 0 else []
+    size = re.sub(r"^[a-z]+", "", device)
+    tool = shutil.which("icebox_vlog")
+    prefixes = ([os.path.dirname(os.path.dirname(tool))] if tool else [])
+    prefixes.append("/opt/homebrew")
+    for prefix in prefixes:
+        for rel in (os.path.join("share", "icestorm", "chipdb",
+                                 "chipdb-%s.txt" % size),
+                    os.path.join("share", "icestorm",
+                                 "chipdb-%s.txt" % size)):
+            path = os.path.join(prefix, rel)
+            if not os.path.exists(path):
+                continue
+            pins, active = set(), False
+            with open(path) as f:
+                for line in f:
+                    if line.startswith("."):
+                        parts = line.split()
+                        active = (parts[0] == ".pins"
+                                  and len(parts) > 1 and parts[1] == package)
+                        continue
+                    if active and line.strip():
+                        pins.add(line.split()[0])
+            if pins:
+                return sorted(pins)
+    return []
 
 
 def write_pcf(spec, pins, path):
