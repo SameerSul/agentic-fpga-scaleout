@@ -17,14 +17,6 @@ jobs:
       - name: run the suite
         run: python3 tests.py
 
-      - name: locate icestorm data on this runner (issue #12 diagnostic)
-        if: failure()
-        run: |
-          W=$(which icebox_vlog); echo "icebox_vlog: $W"; head -1 "$W" || true
-          R=$(dirname $(dirname "$W")); echo "prefix: $R"
-          find "$R" -maxdepth 4 \( -name 'chipdb*' -o -name 'icebox.py' \) 2>/dev/null | head -20
-          python3 -c "import icebox" 2>&1 | head -2
-
       - name: rerun the bitstream flow verbosely on failure (issue #12)
         if: failure()
         run: python3 bitstream.py --block mac || true

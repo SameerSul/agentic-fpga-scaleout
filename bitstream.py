@@ -102,6 +102,8 @@ def package_pins(device, package):
         for rel in (os.path.join("share", "icestorm", "chipdb",
                                  "chipdb-%s.txt" % size),
                     os.path.join("share", "icestorm",
+                                 "chipdb-%s.txt" % size),
+                    os.path.join("share", "icebox",
                                  "chipdb-%s.txt" % size)):
             path = os.path.join(prefix, rel)
             if not os.path.exists(path):
