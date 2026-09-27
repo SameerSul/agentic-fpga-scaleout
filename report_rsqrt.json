@@ -1,11 +1,11 @@
 {
   "spec": {
-    "name": "rsqrt28_gpt2_124m",
-    "description": "Inverse square root for RMSNorm: 28-bit unsigned mean of squares, returns a 17-bit mantissa and a halved exponent, by normalising to [1,4) and a 256-entry table",
+    "name": "rsqrt30_qwen2_5_0p5b",
+    "description": "Inverse square root for RMSNorm: 30-bit unsigned mean of squares, returns a 17-bit mantissa and a halved exponent, by normalising to [1,4) and a 256-entry table",
     "top_module": "rsqrt",
     "unit": "row",
     "parameters": {
-      "in_width": 28,
+      "in_width": 30,
       "out_width": 17,
       "lut_bits": 8,
       "signed": false,
@@ -13,10 +13,10 @@
       "target_clock_mhz": 100
     },
     "derivation": {
-      "model": "gpt2_124m",
+      "model": "qwen2_5_0p5b",
       "activation_bits": 8,
-      "reduction_depth": 3072,
-      "rule": "in_width holds a sum of 3072 squares of 8-bit values; the output is a mantissa and a halved exponent, so a normalised activation is one multiply and one shift"
+      "reduction_depth": 4864,
+      "rule": "in_width holds a sum of 4864 squares of 8-bit values; the output is a mantissa and a halved exponent, so a normalised activation is one multiply and one shift"
     },
     "ports": [
       {
@@ -34,7 +34,7 @@
       {
         "name": "x",
         "dir": "input",
-        "width": 28,
+        "width": 30,
         "desc": "mean of squares, unsigned"
       },
       {
@@ -63,10 +63,12 @@
       }
     ],
     "behavior": [
-      "Stage 1 finds the position of the highest set bit and halves it, registering both the even normalisation and the shifted value, which then lies in [1,4).",
-      "Stage 2 registers the table entry that mantissa selects.",
-      "Stage 3 registers the entry and the halved exponent. The consumer applies the shift, keeping the mantissa full width.",
-      "A zero input returns the saturated mantissa; RMSNorm adds an epsilon before this unit so that case does not arise.",
+      "Let b be the index of the highest set bit of x, counting from zero. Stage 1 computes e = b >> 1, an integer halving that rounds down, and s = 28 - 2*e, and registers e together with xn = x << s. s is always even and never negative. After the shift the highest set bit of xn is at 28 or 29, so xn read as a Q2.28 number lies in [1,4).",
+      "Stage 2 registers rsqrt_rom[idx] where idx is the top 8 bits of xn, that is idx = xn >> 22. Unlike the reciprocal unit, the leading one IS part of idx here, because the normalised range spans a factor of four and the table has to tell 1.x from 2.x.",
+      "Stage 3 registers the table entry and e onto the mantissa and shift outputs. Do not apply the shift here.",
+      "The contract the testbench checks is that num/sqrt(x) equals (num * mantissa) >> (17 + shift), so mantissa must come out unshifted and shift must come out as e itself.",
+      "rsqrt_rom is a separate module supplied as a source file, not something to write. Instantiate it. Its ports are input [7:0] idx and output [16:0] val, combinational.",
+      "A zero input returns the saturated mantissa, all ones, with a shift of zero. RMSNorm adds an epsilon before this unit so that case does not arise in practice.",
       "Latency from valid_in to valid_out is 3 cycles."
     ]
   },
@@ -111,37 +113,37 @@
       "sim": {
         "stage": "sim",
         "status": "pass",
-        "checks": 212,
+        "checks": 218,
         "mismatches": [],
         "throughput": {
-          "rows": 210,
-          "span_cycles": 840,
+          "rows": 216,
+          "span_cycles": 864,
           "latency_cycles": 3,
-          "units": 210,
+          "units": 216,
           "cycles_per_unit": 4.0
         }
       },
       "synth": {
         "stage": "synth",
         "status": "pass",
-        "cell_count": 1351,
-        "area": 2797.0
+        "cell_count": 1340,
+        "area": 2757.0
       },
       "timing": {
         "stage": "timing",
         "status": "pass",
         "method": "opensta",
         "clock_period_ns": 10.0,
-        "worst_slack_ns": 4.24
+        "worst_slack_ns": 4.12
       },
       "fpga": {
-        "luts": 214,
-        "ffs": 57,
+        "luts": 404,
+        "ffs": 114,
         "dsps": 0,
         "brams": 0,
         "urams": 0,
-        "carry": 1,
-        "muxf": 115,
+        "carry": 2,
+        "muxf": 158,
         "status": "pass",
         "family": "xcup",
         "top": "rsqrt",
@@ -152,15 +154,15 @@
   ],
   "final_metrics": {
     "sim_pass": true,
-    "sim_checks": 212,
-    "cell_count": 1351,
-    "area": 2797.0,
+    "sim_checks": 218,
+    "cell_count": 1340,
+    "area": 2757.0,
     "timing": {
       "stage": "timing",
       "status": "pass",
       "method": "opensta",
       "clock_period_ns": 10.0,
-      "worst_slack_ns": 4.24
+      "worst_slack_ns": 4.12
     }
   }
 }

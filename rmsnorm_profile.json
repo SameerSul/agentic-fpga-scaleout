@@ -1,0 +1,38 @@
+{
+  "block": "rmsnorm_qwen2_5_0p5b",
+  "top_module": "rmsnorm",
+  "unit": "norm",
+  "cycles_per_norm": 1792.0,
+  "latency_cycles": 16,
+  "cell_count": 19904,
+  "area": 42105.0,
+  "fmax_estimate_mhz": 115.20737327188941,
+  "fmax_method": "opensta_slack",
+  "target_clock_mhz": 100,
+  "sim_checks_passed": 3596,
+  "fpga": {
+    "family": "xcup",
+    "luts": 3095,
+    "ffs": 2003,
+    "dsps": 20,
+    "brams": 0,
+    "urams": 0,
+    "carry": 132,
+    "muxf": 201
+  },
+  "derivation": {
+    "model": "qwen2_5_0p5b",
+    "rsqrt": {
+      "in_width": 30,
+      "out_width": 17,
+      "lut_bits": 8,
+      "signed": false,
+      "pipeline_stages": 3,
+      "target_clock_mhz": 100
+    },
+    "rule": "row length from d_model; the rsqrt input and shift widths from that block's ports; the extra shift k from the bound |t| < 2**(data_width+ow-k) against the requantizer input"
+  },
+  "norm": "rmsnorm_qwen2_5_0p5b",
+  "d_model": 896,
+  "agent": "RuleBasedAgent"
+}

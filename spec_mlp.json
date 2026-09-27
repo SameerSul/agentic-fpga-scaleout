@@ -1,25 +1,25 @@
 {
-  "name": "mlp_gpt2_124m",
+  "name": "mlp_qwen2_5_0p5b",
   "description": "MLP layer sequencer: two matmuls with a requantize and rectify between them, over a two-bank activation buffer of 64 each",
   "top_module": "mlp",
   "unit": "layer",
   "parameters": {
     "data_width": 8,
-    "acc_width": 28,
+    "acc_width": 29,
     "bank": 64,
     "bank_width": 6,
-    "depth_width": 12,
-    "col_width": 12,
-    "addr_width": 24,
+    "depth_width": 13,
+    "col_width": 13,
+    "addr_width": 13,
     "scale_width": 18,
     "shift_width": 7,
-    "requant_stages": 6,
+    "requant_stages": 9,
     "signed": true,
     "pipeline_stages": 1,
     "target_clock_mhz": 100
   },
   "derivation": {
-    "model": "gpt2_124m",
+    "model": "qwen2_5_0p5b",
     "rule": "the activation bank is one tile; the matmul and requantizer formats come from those blocks, so a change to either changes this one"
   },
   "ports": [
@@ -57,19 +57,19 @@
     {
       "name": "depth1",
       "dir": "input",
-      "width": 12,
+      "width": 13,
       "desc": "reduction length of the first matmul"
     },
     {
       "name": "cols1",
       "dir": "input",
-      "width": 12,
+      "width": 13,
       "desc": "outputs of the first matmul"
     },
     {
       "name": "cols2",
       "dir": "input",
-      "width": 12,
+      "width": 13,
       "desc": "outputs of the second matmul"
     },
     {
@@ -99,7 +99,7 @@
     {
       "name": "w_addr",
       "dir": "output",
-      "width": 24,
+      "width": 13,
       "desc": "weight address, into the weight memory"
     },
     {
@@ -136,10 +136,16 @@
     }
   ],
   "behavior": [
-    "load_valid writes input activations into bank zero in order.",
-    "start runs the first matmul over bank zero, requantizes each column with scale1 and shift1, rectifies it and writes it to bank one.",
-    "It then runs the second matmul over bank one, requantizes with scale2 and shift2, and emits each result on o_data.",
-    "The second matmul's reduction length is the first one's column count, because that is what the first matmul produced. Taking it from an input instead would let the two disagree.",
-    "The weight address continues across both matmuls, so the second matrix follows the first in memory."
+    "Both banks are one memory named act, declared reg signed [7:0] act [0:127]. Bank zero is act[0..63] and bank one is act[64..127]. The testbench reads act directly to check the hidden layer, so this name and layout are part of the interface.",
+    "Each cycle with load_valid high writes load_data into bank zero at the next index, starting from 0 after reset, so x[0..depth1-1] are loaded in order before start.",
+    "start is a one-cycle pulse, with depth1, cols1, cols2, scale1, shift1, scale2 and shift2 held stable for the whole layer. busy must be high on the clock edge that samples start, so it already reads 1 one cycle later, and it stays high until the last output has been emitted.",
+    "Weights are column-major and packed back to back in one memory. The first matrix's weight for input r of hidden unit c is at address c*depth1 + r. The second matrix follows it: its weight for hidden unit r of output c is at depth1*cols1 + c*cols1 + r.",
+    "w_data is a registered read: it carries the weight at address a on the cycle after w_addr = a. If w_addr is itself a register, that is two clock edges after the edge that loads a into it.",
+    "Hidden layer: h[c] = max(0, requant(sum over r of x[r] * W1[c][r], scale1, shift1)) for c in 0..cols1-1, written to act[64 + c]. Requantize first, then rectify.",
+    "Output: y[c] = requant(sum over r of h[r] * W2[c][r], scale2, shift2) for c in 0..cols2-1, with no rectifier. The second matmul's reduction length is cols1, because that is what the first produced; there is no separate input for it, so the two cannot disagree.",
+    "requant is exactly the supplied requantizer: multiply by scale, add 2**(shift-1) when shift > 0, arithmetic shift right by shift, then saturate to [-128, 127].",
+    "Emit each y[c] with o_index = c and o_valid high for exactly that one cycle. Outputs may come in any order, but each index exactly once, and o_valid must be low at every other time.",
+    "matvec, mac and requant are separate modules supplied as source files, not something to write. Instantiate them. matvec sequences one matrix: after a start pulse with depth and cols it walks a_addr 0..depth-1 and w_addr col*depth onward for each column, drives mac_valid one cycle behind the address, pulses col_valid with col_index when a column's sum is ready in the MAC, and pulses mac_clear after it. Its w_addr starts from 0, so the second matrix needs a base offset of depth1*cols1 added. mac has ports clk, rst_n, clear, a, b, valid_in, acc ([28:0] signed) and valid_out. requant has ports clk, rst_n, acc_in, scale, shift, valid_in, q_out, sat and valid_out, with a latency of exactly 9 cycles.",
+    "All state resets to zero: busy and o_valid are 0 during reset."
   ]
 }

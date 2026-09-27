@@ -90,6 +90,31 @@ def write_attn_deps(ms, build):
             f.write(srcs[fn])
 
 
+RMSNORM_DEPS = ("rs_dep.v", "rsqrt_rom.v", "rq_dep.v")
+RMSNORM_JOB = {
+    "spec_file": "spec_rmsnorm.json", "tb_file": "tb_rmsnorm.v",
+    "rtl_file": "rmsnorm.v", "profile_file": "rmsnorm_profile.json",
+    "report_file": "report_rmsnorm.json",
+    "derive_from_model": "rmsnorm",
+    "extra_sources": RMSNORM_DEPS,
+}
+
+
+def write_rmsnorm_deps(ms, build):
+    """The rsqrt unit, its table, and the requantizer RMSNorm drives."""
+    from agent import RuleBasedAgent, FIX_EVEN, FIX_SATURATE
+    r = RuleBasedAgent()
+    rs = specgen.derive_rsqrt_spec(ms)
+    srcs = {"rs_dep.v": r.render_rsqrt(rs, {FIX_EVEN}),
+            "rsqrt_rom.v": specgen.rsqrt_rom(rs),
+            "rq_dep.v": r.render_requant(specgen.derive_requant_spec(ms),
+                                         {FIX_SATURATE})}
+    os.makedirs(build, exist_ok=True)
+    for fn in RMSNORM_DEPS:
+        with open(os.path.join(build, fn), "w") as f:
+            f.write(srcs[fn])
+
+
 SOFTMAX_JOB = {
     "spec_file": "spec_softmax.json", "tb_file": "tb_softmax.v",
     "rtl_file": "softmax.v", "profile_file": "softmax_profile.json",
@@ -301,12 +326,24 @@ def stage_synth(job, spec, rtl_path):
                 "errors": [l for l in out.splitlines() if "ERROR" in l][:5]}
     # Yosys 0.68 stat format: "  1044     2066 cells" (count, area, label)
     _strip_signed(os.path.join(BUILD, "netlist.v"))
-    cells = re.search(r"^\s*(\d+)\s+[\d.]+\s+cells\s*$", out, re.M) \
-        or re.search(r"Number of cells:\s+(\d+)", out)
-    area = re.search(r"Chip area for module .*?:\s+([\d.]+)", out)
+    # A block that instantiates others is reported per module, and the
+    # first "cells" line is whichever module yosys lists first. That was
+    # the requantizer: the MLP layer and RMSNorm both reported its 10396
+    # cells as their own. The design hierarchy section carries the real
+    # total, on the top module's line, submodules included.
+    top = spec["top_module"]
+    total = re.search(r"=== design hierarchy ===.*?^\s*(\d+)\s+([\d.]+)\s+%s\s*$"
+                      % re.escape(top), out, re.M | re.S)
+    if total:
+        n_cells, area_v = int(total.group(1)), float(total.group(2))
+    else:
+        cells = re.search(r"^\s*(\d+)\s+[\d.]+\s+cells\s*$", out, re.M) \
+            or re.search(r"Number of cells:\s+(\d+)", out)
+        area = re.search(r"Chip area for module .*?:\s+([\d.]+)", out)
+        n_cells = int(cells.group(1)) if cells else None
+        area_v = float(area.group(1)) if area else None
     return {"stage": "synth", "status": "pass",
-            "cell_count": int(cells.group(1)) if cells else None,
-            "area": float(area.group(1)) if area else None}
+            "cell_count": n_cells, "area": area_v}
 
 
 def _strip_signed(path):
@@ -491,6 +528,9 @@ def derive_profile(spec, final):
     elif unit == "column":
         prof["sequencer"] = spec["name"]
         prof["mac_stages"] = spec["parameters"]["mac_stages"]
+    elif unit == "norm":
+        prof["norm"] = spec["name"]
+        prof["d_model"] = spec["parameters"]["d_model"]
     elif unit == "head":
         prof["head"] = spec["name"]
         prof["head_dim"] = spec["parameters"]["head_dim"]
@@ -584,6 +624,10 @@ def run_flow(job=None, verbose=True, agent=None, max_iters=None):
                     specgen.derive_requant_spec(_ms), {FIX_SATURATE}))):
             with open(os.path.join(BUILD, _fn), "w") as f:
                 f.write(_src)
+    elif job.get("derive_from_model") == "rmsnorm":
+        specgen.generate_rmsnorm(spec_file=job["spec_file"],
+                                 tb_file=job["tb_file"])
+        write_rmsnorm_deps(specgen.load_model_spec(), BUILD)
     elif job.get("derive_from_model") == "attn":
         specgen.generate_attn(spec_file=job["spec_file"],
                               tb_file=job["tb_file"])

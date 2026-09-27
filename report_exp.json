@@ -1,6 +1,6 @@
 {
   "spec": {
-    "name": "exp13_gpt2_124m",
+    "name": "exp13_qwen2_5_0p5b",
     "description": "Fixed-point exponential for the attention softmax: Q4.8 signed input constrained to be non-positive, Q0.15 unsigned output, by a 256-entry table of 2**f and an arithmetic shift",
     "top_module": "expu",
     "unit": "score",
@@ -15,7 +15,7 @@
       "target_clock_mhz": 100
     },
     "derivation": {
-      "model": "gpt2_124m",
+      "model": "qwen2_5_0p5b",
       "activation_bits": 8,
       "rule": "exp(x) = 2**(x*log2(e)); the integer part of x*log2(e) is an arithmetic right shift and the fractional part indexes a 256-entry table of 2**f",
       "log2e_q16": 94548
@@ -60,10 +60,11 @@
       }
     ],
     "behavior": [
-      "Stage 1 registers x*log2(e) as a Q.8 value, using a 17-bit fixed-point constant.",
-      "Stage 2 splits it into an integer part and a fractional part and registers the table entry the fraction selects.",
-      "Stage 3 shifts that entry right by the magnitude of the integer part and registers the result.",
-      "An input small enough that the shift exceeds 15 output fraction bits flushes to zero rather than wrapping.",
+      "Stage 1 computes t = (x * 94548) >>> 16 and registers it as a signed value. 94548 is log2(e) scaled by 2**16. The shift is arithmetic, so t truncates toward minus infinity, and t is a signed Q.8 number.",
+      "Stage 2 splits t at bit 8. The integer part is n = t >>> 8, an arithmetic shift, so n is the floor and is zero or negative. The fractional part is f = t - (n << 8), which is always in [0, 256). Stage 2 registers exp_rom[f >> 0] and the shift amount sh = -n.",
+      "Stage 3 registers that table entry logically right-shifted by sh. The shift is unsigned: the table entry is a magnitude, not a signed number.",
+      "When sh is greater than 15 the result is zero. Do not saturate and do not let the shift wrap.",
+      "exp_rom is a separate module supplied as a source file, not something to write. Instantiate it. Its ports are input [7:0] idx and output [15:0] val, combinational, and it holds 256 entries where entry i is 2**(i/256) in Q0.15.",
       "x is required to be non-positive, which softmax guarantees by subtracting the row maximum first.",
       "Latency from valid_in to valid_out is 3 cycles."
     ]
@@ -75,8 +76,8 @@
     "sta": "/Users/ssuleman/.local/bin/sta"
   },
   "agent": "RuleBasedAgent",
-  "converged": false,
-  "iterations_used": 3,
+  "converged": true,
+  "iterations_used": 2,
   "history": [
     {
       "iteration": 1,
@@ -84,16 +85,16 @@
       "sim": {
         "stage": "sim",
         "status": "fail",
-        "phase": "compile",
-        "errors": [
-          "/Users/ssuleman/Desktop/ML4PD Projects/capstone-prototypes/agentic-fpga-scaleout/tb_expu.v:37: error: Unable to bind wire/reg/memory `k' in `tb_expu.drive'",
-          "/Users/ssuleman/Desktop/ML4PD Projects/capstone-prototypes/agentic-fpga-scaleout/tb_expu.v:37: error: Unable to bind wire/reg/memory `wantk' in `tb_expu.drive'",
-          "/Users/ssuleman/Desktop/ML4PD Projects/capstone-prototypes/agentic-fpga-scaleout/tb_expu.v:37: error: Unable to elaborate condition expression.",
-          "/Users/ssuleman/Desktop/ML4PD Projects/capstone-prototypes/agentic-fpga-scaleout/tb_expu.v:22: error: Unable to bind wire/reg/memory `k' in `tb_expu.expect_quiet'",
-          "/Users/ssuleman/Desktop/ML4PD Projects/capstone-prototypes/agentic-fpga-scaleout/tb_expu.v:22: error: Unable to elaborate condition expression.",
-          "5 error(s) during elaboration."
-        ],
-        "mismatches": []
+        "checks": null,
+        "mismatches": [
+          {
+            "test": "exp",
+            "x": "-1",
+            "expected_y": "32591",
+            "got_y": "16384",
+            "vout": "1"
+          }
+        ]
       },
       "synth": null,
       "timing": null,
@@ -101,52 +102,62 @@
     },
     {
       "iteration": 2,
-      "fixes_applied": [],
+      "fixes_applied": [
+        "interpolate_the_fractional_part"
+      ],
       "sim": {
         "stage": "sim",
-        "status": "fail",
-        "phase": "compile",
-        "errors": [
-          "/Users/ssuleman/Desktop/ML4PD Projects/capstone-prototypes/agentic-fpga-scaleout/tb_expu.v:37: error: Unable to bind wire/reg/memory `k' in `tb_expu.drive'",
-          "/Users/ssuleman/Desktop/ML4PD Projects/capstone-prototypes/agentic-fpga-scaleout/tb_expu.v:37: error: Unable to bind wire/reg/memory `wantk' in `tb_expu.drive'",
-          "/Users/ssuleman/Desktop/ML4PD Projects/capstone-prototypes/agentic-fpga-scaleout/tb_expu.v:37: error: Unable to elaborate condition expression.",
-          "/Users/ssuleman/Desktop/ML4PD Projects/capstone-prototypes/agentic-fpga-scaleout/tb_expu.v:22: error: Unable to bind wire/reg/memory `k' in `tb_expu.expect_quiet'",
-          "/Users/ssuleman/Desktop/ML4PD Projects/capstone-prototypes/agentic-fpga-scaleout/tb_expu.v:22: error: Unable to elaborate condition expression.",
-          "5 error(s) during elaboration."
-        ],
-        "mismatches": []
+        "status": "pass",
+        "checks": 153,
+        "mismatches": [],
+        "throughput": {
+          "scores": 151,
+          "span_cycles": 604,
+          "latency_cycles": 3,
+          "units": 151,
+          "cycles_per_unit": 4.0
+        }
       },
-      "synth": null,
-      "timing": null,
-      "fpga": null
-    },
-    {
-      "iteration": 3,
-      "fixes_applied": [],
-      "sim": {
-        "stage": "sim",
-        "status": "fail",
-        "phase": "compile",
-        "errors": [
-          "/Users/ssuleman/Desktop/ML4PD Projects/capstone-prototypes/agentic-fpga-scaleout/tb_expu.v:37: error: Unable to bind wire/reg/memory `k' in `tb_expu.drive'",
-          "/Users/ssuleman/Desktop/ML4PD Projects/capstone-prototypes/agentic-fpga-scaleout/tb_expu.v:37: error: Unable to bind wire/reg/memory `wantk' in `tb_expu.drive'",
-          "/Users/ssuleman/Desktop/ML4PD Projects/capstone-prototypes/agentic-fpga-scaleout/tb_expu.v:37: error: Unable to elaborate condition expression.",
-          "/Users/ssuleman/Desktop/ML4PD Projects/capstone-prototypes/agentic-fpga-scaleout/tb_expu.v:22: error: Unable to bind wire/reg/memory `k' in `tb_expu.expect_quiet'",
-          "/Users/ssuleman/Desktop/ML4PD Projects/capstone-prototypes/agentic-fpga-scaleout/tb_expu.v:22: error: Unable to elaborate condition expression.",
-          "5 error(s) during elaboration."
-        ],
-        "mismatches": []
+      "synth": {
+        "stage": "synth",
+        "status": "pass",
+        "cell_count": 2370,
+        "area": 4750.0
       },
-      "synth": null,
-      "timing": null,
-      "fpga": null
+      "timing": {
+        "stage": "timing",
+        "status": "pass",
+        "method": "opensta",
+        "clock_period_ns": 10.0,
+        "worst_slack_ns": 3.92
+      },
+      "fpga": {
+        "luts": 232,
+        "ffs": 110,
+        "dsps": 2,
+        "brams": 0,
+        "urams": 0,
+        "carry": 20,
+        "muxf": 45,
+        "status": "pass",
+        "family": "xcup",
+        "top": "expu",
+        "lint": [],
+        "stage": "fpga"
+      }
     }
   ],
   "final_metrics": {
-    "sim_pass": false,
-    "sim_checks": null,
-    "cell_count": null,
-    "area": null,
-    "timing": null
+    "sim_pass": true,
+    "sim_checks": 153,
+    "cell_count": 2370,
+    "area": 4750.0,
+    "timing": {
+      "stage": "timing",
+      "status": "pass",
+      "method": "opensta",
+      "clock_period_ns": 10.0,
+      "worst_slack_ns": 3.92
+    }
   }
 }

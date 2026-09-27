@@ -1,25 +1,25 @@
 {
   "spec": {
-    "name": "matvec_gpt2_124m",
+    "name": "matvec_qwen2_5_0p5b",
     "description": "Weight-streaming sequencer for the MAC chiplet: walks a matrix column by column, drives the MAC, drains its 2-stage pipeline and flags each finished column",
     "top_module": "matvec",
     "unit": "column",
     "parameters": {
       "data_width": 8,
-      "acc_width": 28,
-      "depth_width": 12,
-      "col_width": 12,
-      "addr_width": 24,
+      "acc_width": 29,
+      "depth_width": 13,
+      "col_width": 13,
+      "addr_width": 26,
       "mac_stages": 2,
-      "max_depth": 3072,
+      "max_depth": 4864,
       "mem_latency": 1,
       "signed": true,
       "pipeline_stages": 1,
       "target_clock_mhz": 100
     },
     "derivation": {
-      "model": "gpt2_124m",
-      "reduction_depth": 3072,
+      "model": "qwen2_5_0p5b",
+      "reduction_depth": 4864,
       "mac_pipeline_stages": 2,
       "rule": "address widths from the longest reduction; the drain count is the MAC's own pipeline depth, so a change there changes this block"
     },
@@ -45,25 +45,25 @@
       {
         "name": "depth",
         "dir": "input",
-        "width": 12,
+        "width": 13,
         "desc": "reduction length, elements per column"
       },
       {
         "name": "cols",
         "dir": "input",
-        "width": 12,
+        "width": 13,
         "desc": "number of output columns"
       },
       {
         "name": "a_addr",
         "dir": "output",
-        "width": 12,
+        "width": 13,
         "desc": "activation index being read"
       },
       {
         "name": "w_addr",
         "dir": "output",
-        "width": 24,
+        "width": 26,
         "desc": "weight index, column major: col*depth + row"
       },
       {
@@ -87,7 +87,7 @@
       {
         "name": "col_index",
         "dir": "output",
-        "width": 12,
+        "width": 13,
         "desc": "which column col_valid refers to"
       },
       {
@@ -168,36 +168,36 @@
       "sim": {
         "stage": "sim",
         "status": "pass",
-        "checks": 64,
+        "checks": 124,
         "mismatches": [],
         "throughput": {
-          "columns": 62,
-          "span_cycles": 4216,
+          "columns": 122,
+          "span_cycles": 8296,
           "latency_cycles": 68,
-          "units": 62,
+          "units": 122,
           "cycles_per_unit": 68.0
         }
       },
       "synth": {
         "stage": "synth",
         "status": "pass",
-        "cell_count": 2841,
-        "area": 5619.0
+        "cell_count": 1294,
+        "area": 2809.0
       },
       "timing": {
         "stage": "timing",
         "status": "pass",
         "method": "opensta",
         "clock_period_ns": 10.0,
-        "worst_slack_ns": 2.54
+        "worst_slack_ns": 4.64
       },
       "fpga": {
-        "luts": 165,
-        "ffs": 73,
-        "dsps": 1,
+        "luts": 246,
+        "ffs": 104,
+        "dsps": 0,
         "brams": 0,
         "urams": 0,
-        "carry": 15,
+        "carry": 23,
         "muxf": 17,
         "status": "pass",
         "family": "xcup",
@@ -209,15 +209,15 @@
   ],
   "final_metrics": {
     "sim_pass": true,
-    "sim_checks": 64,
-    "cell_count": 2841,
-    "area": 5619.0,
+    "sim_checks": 124,
+    "cell_count": 1294,
+    "area": 2809.0,
     "timing": {
       "stage": "timing",
       "status": "pass",
       "method": "opensta",
       "clock_period_ns": 10.0,
-      "worst_slack_ns": 2.54
+      "worst_slack_ns": 4.64
     }
   }
 }

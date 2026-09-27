@@ -47,7 +47,7 @@ Pure Python 3 stdlib, no dependencies. The RTL half runs real open tools (Icarus
                                  sizing, fabric, board fit
 ```
 
-The eleven generated blocks, and what each is for:
+The twelve generated blocks, and what each is for:
 
 ```
   arithmetic
@@ -65,6 +65,8 @@ The eleven generated blocks, and what each is for:
     mlp        two chained matmuls with requant between them
     attn       one attention head: q.k scores over the KV cache,
                softmax, then the weighted sum of V
+    rmsnorm    the norm before attention and the MLP: sum of squares,
+               one rsqrt, then a scaled product per element
 ```
 
 Four of those are composite: they instantiate the blocks below them
@@ -421,7 +423,7 @@ checked against another model. Read that list before quoting any number here.
 - Feeding 8601 MAC instances would need on-chip operand bandwidth the model does not check. DSP count is the right first-order capacity ceiling, not a claim that the array is routable at that size.
 - A 25 Gbps endpoint does not close timing in this flow at either standard datapath. Reaching it needs a pipelined or matrix-form CRC that the rule-based agent does not write, so the default target is 10 Gbps, which is also what the mid board class actually exposes.
 - There is no place-and-route anywhere; timing is real OpenSTA static timing but against a toy illustrative liberty, so fmax is an estimate of an estimate.
-- The derivation now covers eleven blocks, not just the matmul datapath: the exponential, reciprocal and inverse square root are generated and signed off, softmax and an MLP layer sequence them, and an attention head composes matvec, the MAC, softmax and the requantizer. What is still missing above that is tiling and a sequencer that runs a whole layer, norms and residuals included. The weight tile holds 1024 entries and the activation bank 64, so a real matrix needs tiling logic that does not exist yet, and the blocks are the arithmetic of an inference engine rather than the whole of one.
+- The derivation now covers twelve blocks, not just the matmul datapath: the exponential, reciprocal and inverse square root are generated and signed off, softmax and an MLP layer sequence them, an attention head composes matvec, the MAC, softmax and the requantizer, and RMSNorm drives the inverse square root. What is still missing above that is tiling, the residual adds, and a sequencer that runs heads and layers into a whole model. The weight tile holds 1024 entries and the activation bank 64, so a real matrix needs tiling logic that does not exist yet, and the blocks are the arithmetic of an inference engine rather than the whole of one.
 - Boards are simulated, not real: link rates, propagation delays, clock caps, and capacities are representative class parameters, not measured silicon.
 - The 30% fabric reservation for NIC and routing logic is a stated guess, not a floorplan; the endpoint reservation per link is real, from the synthesized cell count.
 - Decode compute time is charged from the measured chiplet profile at full model dimensions; the weights are not materialized. The sharded numerics (real arithmetic, bit-exactness across cluster shapes) are validated at reduced dimensions in stage 8 and in the test suite.

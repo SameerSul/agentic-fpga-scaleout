@@ -1,30 +1,30 @@
 {
-  "block": "mlp_gpt2_124m",
+  "block": "mlp_qwen2_5_0p5b",
   "top_module": "mlp",
   "unit": "layer",
   "cycles_per_layer": 78.0,
   "latency_cycles": 16,
-  "cell_count": 9275,
-  "area": 19073.0,
-  "fmax_estimate_mhz": 102.24948875255625,
+  "cell_count": 23124,
+  "area": 52173.0,
+  "fmax_estimate_mhz": 119.04761904761904,
   "fmax_method": "opensta_slack",
   "target_clock_mhz": 100,
-  "sim_checks_passed": 6,
+  "sim_checks_passed": 12,
   "fpga": {
     "family": "xcup",
-    "luts": 3786,
-    "ffs": 3469,
-    "dsps": 15,
+    "luts": 4773,
+    "ffs": 4331,
+    "dsps": 19,
     "brams": 0,
     "urams": 0,
-    "carry": 164,
-    "muxf": 678
+    "carry": 191,
+    "muxf": 779
   },
   "derivation": {
-    "model": "gpt2_124m",
+    "model": "qwen2_5_0p5b",
     "rule": "the activation bank is one tile; the matmul and requantizer formats come from those blocks, so a change to either changes this one"
   },
-  "layer": "mlp_gpt2_124m",
+  "layer": "mlp_qwen2_5_0p5b",
   "bank": 64,
   "agent": "RuleBasedAgent"
 }

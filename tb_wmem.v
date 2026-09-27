@@ -12,17 +12,17 @@ module tb_wmem;
   wire signed [7:0] rd_data;
 
   reg start = 0;
-  reg  [11:0] depth = 0;
-  reg  [11:0] cols = 0;
-  wire [11:0] a_addr;
-  wire [23:0] w_addr;
+  reg  [12:0] depth = 0;
+  reg  [12:0] cols = 0;
+  wire [12:0] a_addr;
+  wire [25:0] w_addr;
   wire mac_valid, mac_clear, col_valid, busy;
-  wire [11:0] col_index;
-  wire signed [27:0] acc;
+  wire [12:0] col_index;
+  wire signed [28:0] acc;
   wire mac_vout;
 
   reg signed [7:0] amem [0:64-1];
-  reg signed [27:0] expect_col [0:16-1];
+  reg signed [28:0] expect_col [0:16-1];
   reg signed [7:0] a_data;
   integer checks = 0, seen = 0, i;
   reg [255:0] testname;
@@ -63,26 +63,44 @@ module tb_wmem;
   initial begin
     for (i = 0; i < 64; i = i + 1)
       amem[i] = (i * 104729 + 7) % 251 - 125;
-    expect_col[0] = -28'sd2803;
-    expect_col[1] = -28'sd51558;
-    expect_col[2] = -28'sd99560;
-    expect_col[3] = -28'sd51178;
-    expect_col[4] = 28'sd28077;
-    expect_col[5] = 28'sd26008;
-    expect_col[6] = 28'sd24692;
-    expect_col[7] = -28'sd21051;
-    expect_col[8] = -28'sd2538;
-    expect_col[9] = 28'sd27270;
-    expect_col[10] = 28'sd57831;
-    expect_col[11] = 28'sd58774;
-    expect_col[12] = 28'sd7509;
-    expect_col[13] = -28'sd17401;
-    expect_col[14] = 28'sd14666;
-    expect_col[15] = 28'sd37697;
-    testname = "load";
+    expect_col[0] = -29'sd2803;
+    expect_col[1] = -29'sd51558;
+    expect_col[2] = -29'sd99560;
+    expect_col[3] = -29'sd51178;
+    expect_col[4] = 29'sd28077;
+    expect_col[5] = 29'sd26008;
+    expect_col[6] = 29'sd24692;
+    expect_col[7] = -29'sd21051;
+    expect_col[8] = -29'sd2538;
+    expect_col[9] = 29'sd27270;
+    expect_col[10] = 29'sd57831;
+    expect_col[11] = 29'sd58774;
+    expect_col[12] = 29'sd7509;
+    expect_col[13] = -29'sd17401;
+    expect_col[14] = 29'sd14666;
+    expect_col[15] = 29'sd37697;
+    testname = "reset_init";
     repeat (3) @(negedge clk);
+    checks = checks + 1;
+    // Reset has to clear the write pointer. Without this the testbench
+    // never depends on it, because load_start clears it too and every
+    // load starts with one.
+    if (load_count !== 0) begin
+      $display("TB_FAIL test=reset_init col=0 expected_acc=0 got_acc=%0d",
+               load_count);
+      $display("TB_RESULT: FAIL");
+      $finish;
+    end
     rst_n = 1;
     @(negedge clk);
+    checks = checks + 1;
+    if (load_count !== 0) begin
+      $display("TB_FAIL test=reset_init col=0 expected_acc=0 got_acc=%0d",
+               load_count);
+      $display("TB_RESULT: FAIL");
+      $finish;
+    end
+    testname = "load";
 
     // Stream the tile in, as a host or a DMA engine would.
     load_start = 1;

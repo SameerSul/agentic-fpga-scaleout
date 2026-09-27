@@ -9,7 +9,7 @@ is worth knowing and worth reporting.
 You give it a model spec, a small JSON file naming a transformer's
 dimensions and its quantization. It derives the hardware that model
 needs, writes the Verilog, and checks it with real tools until it passes.
-Eleven blocks come out, each one sized from the model rather than written
+Twelve blocks come out, each one sized from the model rather than written
 for it. Point it at a different model and every block re-derives.
 
 ## The picture
@@ -44,7 +44,7 @@ for it. Point it at a different model and every block re-derives.
                            re-simulated against the same testbench
 ```
 
-## The eleven blocks
+## The twelve blocks
 
 Arithmetic, bottom to top:
 
@@ -67,6 +67,8 @@ Sequencing, which is what makes the above into a layer:
               activation banks. This is the one that is a layer.
    attn       one attention head for a decode step: q.k over the KV
               cache, softmax, then the weighted sum of V
+   rmsnorm    RMSNorm over a d_model row: sum of squares, one rsqrt,
+              a scaled product per element
 ```
 
 ## Build it
@@ -124,6 +126,7 @@ Four blocks instantiate others, so bring their dependencies along:
    mlp.v      needs  matvec.v mac.v requant.v
    attn.v     needs  matvec.v mac.v requant.v softmax.v expu.v recip.v
                      exp_rom.v recip_rom.v
+   rmsnorm.v  needs  rsqrt.v rsqrt_rom.v requant.v
 ```
 
 The testbenches are in the repo root as `tb_*.v` if you want to run them
@@ -137,21 +140,28 @@ Measured here with yosys against a generic library, for Qwen2.5-0.5B:
    block      fmax      cells     note
    wmem       333 MHz   61712     huge only because the generic library
                                   has no BRAM; on your part it is 1 BRAM
-   recip      206 MHz    1010
+   recip      206 MHz    1636
    matvec     187 MHz    1294
-   rsqrt      170 MHz     841
-   exp        164 MHz    1428
+   rsqrt      170 MHz    1340
+   exp        164 MHz    2370
    mac        169 MHz    1473     infers one DSP48
-   mlp        119 MHz   10396
+   mlp        119 MHz   23124
    requant    115 MHz   10445
-   softmax    103 MHz    1466
-   attn       112 MHz    1458     its own logic; the sub-blocks above
-                                  are counted in their own rows
+   rmsnorm    115 MHz   19904
+   attn       112 MHz  115091     the score and weight buffers and the
+                                  softmax's become flops here; on the
+                                  FPGA they map to 6 BRAMs, 6364 LUTs
+   softmax    103 MHz   40017     its exponential buffer, the same way
+
+   Counts include each block's submodules. Before this, a composite
+   block reported whichever submodule yosys listed first: the MLP and
+   RMSNorm both showed the requantizer's 10396.
 ```
 
-A Zynq 7020 has 53200 LUTs and 220 DSPs. All eleven together map to about
-13500 LUTs and 51 DSPs on yosys's UltraScale+ mapping, a quarter of the
-part, even counting the attention head's sub-blocks twice.
+A Zynq 7020 has 53200 LUTs and 220 DSPs. All twelve together map to
+18866 LUTs and 77 DSPs on yosys's UltraScale+ mapping, about 35% and 35% of
+the part, and that counts the attention head's and RMSNorm's sub-blocks
+twice.
 Expect better numbers than these: the generic library has no carry chain
 and no block RAM, and Vivado has both.
 

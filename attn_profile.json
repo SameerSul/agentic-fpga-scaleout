@@ -4,8 +4,8 @@
   "unit": "head",
   "cycles_per_head": 128.0,
   "latency_cycles": 16,
-  "cell_count": 1458,
-  "area": 2991.0,
+  "cell_count": 115091,
+  "area": 276670.0,
   "fmax_estimate_mhz": 112.10762331838565,
   "fmax_method": "opensta_slack",
   "target_clock_mhz": 100,
@@ -22,6 +22,22 @@
   },
   "derivation": {
     "model": "qwen2_5_0p5b",
+    "softmax": {
+      "capacity": 256,
+      "index_width": 8,
+      "score_width": 13,
+      "score_frac": 8,
+      "weight_width": 16,
+      "weight_frac": 15,
+      "exp_stages": 3,
+      "recip_stages": 3,
+      "recip_in_width": 26,
+      "recip_out_width": 17,
+      "shift_bias": 42,
+      "signed": true,
+      "pipeline_stages": 1,
+      "target_clock_mhz": 100
+    },
     "rule": "head_dim from the model; capacity and the score and weight formats from the softmax block; the output requantizer and accumulator widths from the MAC and requantizer blocks"
   },
   "head": "attn_qwen2_5_0p5b",

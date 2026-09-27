@@ -1843,6 +1843,7 @@ def derive_attn_spec(ms):
         },
         "derivation": {
             "model": ms["name"],
+            "softmax": sm["parameters"],
             "rule": "head_dim from the model; capacity and the score and "
                     "weight formats from the softmax block; the output "
                     "requantizer and accumulator widths from the MAC and "
@@ -1973,8 +1974,7 @@ def attn_golden(q, K, V, n, shift_s, scale_o, shift_o, p, sm_p):
 def render_attn_testbench(spec):
     """Rows chosen to exercise each part: one position (a weight of 1.0),
     a few, a clamped score, and enough to stress the weight sum."""
-    ms = load_model_spec()
-    sm_p = derive_softmax_spec(ms)["parameters"]
+    sm_p = spec["derivation"]["softmax"]
     p = spec["parameters"]
     dw, hd = p["data_width"], p["head_dim"]
     mw, sw_o = p["scale_width"], p["shift_width"]
@@ -2167,6 +2167,318 @@ def generate_attn(ms=None, spec_file="spec_attn.json", tb_file="tb_attn.v"):
         json.dump(spec, f, indent=2)
     with open(os.path.join(ROOT, tb_file), "w") as f:
         f.write(render_attn_testbench(spec))
+    return spec
+
+
+# --------------------------------------------------------------------------
+# RMSNorm: sum of squares, one inverse square root, a scaled product each.
+# --------------------------------------------------------------------------
+
+def derive_rmsnorm_spec(ms):
+    """model spec -> RMSNorm spec for one d_model activation row.
+
+    Qwen normalises before attention and before the MLP. The inverse
+    square root has been generated for this since it was added; this is
+    the sequencer that uses it. The mean's 1/D and the quantization
+    scales are folded into the runtime output scale, so the block
+    computes t_i = (x_i * g_i * m) >> (e + k) with (m, e) the rsqrt of
+    the sum of squares, and requantizes t_i to int8.
+    """
+    c = derive_chiplet_spec(ms)
+    rs = derive_rsqrt_spec(ms)
+    rq = derive_requant_spec(ms)
+    dw, aw = c["parameters"]["data_width"], c["parameters"]["acc_width"]
+    wb = ms["weight_bits"]
+    D = ms["d_model"]
+    iw, ow = rs["parameters"]["in_width"], rs["parameters"]["out_width"]
+    xaw = max(1, (D - 1).bit_length())
+    # |x_i| <= sqrt(ssq) and 2**e > sqrt(ssq)/2, and the gain is a
+    # data_width value, so |t| < 2**(dw+ow-k): k is the extra shift that
+    # brings that inside the requantizer input.
+    k = max(0, dw + ow + 1 - aw)
+    ew = [q["width"] for q in rs["ports"] if q["name"] == "e"][0]
+    assert D * (1 << (2 * dw - 2)) < (1 << iw), "rsqrt input too narrow"
+    return {
+        "name": "rmsnorm_%s" % ms["name"],
+        "description": "RMSNorm over a row of %d activations: sum of "
+                       "squares, one inverse square root, and a scaled "
+                       "product per element, requantized to int8" % D,
+        "top_module": "rmsnorm",
+        "unit": "norm",
+        "parameters": {
+            "data_width": dw, "acc_width": aw, "d_model": D,
+            "addr_width": xaw, "rsqrt_in_width": iw, "rsqrt_out_width": ow,
+            "rsqrt_e_width": ew, "norm_shift": k,
+            "scale_width": rq["parameters"]["scale_width"],
+            "shift_width": rq["parameters"]["shift_width"],
+            "requant_stages": rq["parameters"]["pipeline_stages"],
+            "rsqrt_stages": rs["parameters"]["pipeline_stages"],
+            "signed": True, "pipeline_stages": 1,
+            "target_clock_mhz": 100,
+        },
+        "derivation": {
+            "model": ms["name"],
+            # The golden model needs this variant's rsqrt, not the base
+            # model's: re-deriving from load_model_spec() sized the 16-bit
+            # variant's 46-bit sum of squares for a 30-bit unit.
+            "rsqrt": rs["parameters"],
+            "rule": "row length from d_model; the rsqrt input and shift "
+                    "widths from that block's ports; the extra shift k from "
+                    "the bound |t| < 2**(data_width+ow-k) against the "
+                    "requantizer input",
+        },
+        "ports": [
+            {"name": "clk", "dir": "input", "width": 1,
+             "desc": "clock, rising edge"},
+            {"name": "rst_n", "dir": "input", "width": 1,
+             "desc": "active-low synchronous reset"},
+            {"name": "start", "dir": "input", "width": 1,
+             "desc": "normalise the row"},
+            {"name": "eps", "dir": "input", "width": iw,
+             "desc": "epsilon, in units of the sum of squares"},
+            {"name": "scale_o", "dir": "input",
+             "width": rq["parameters"]["scale_width"],
+             "desc": "output requantizer scale"},
+            {"name": "shift_o", "dir": "input",
+             "width": rq["parameters"]["shift_width"],
+             "desc": "output requantizer shift"},
+            {"name": "x_addr", "dir": "output", "width": xaw,
+             "desc": "activation address"},
+            {"name": "x_data", "dir": "input", "width": dw, "signed": True,
+             "desc": "activation, registered read"},
+            {"name": "g_addr", "dir": "output", "width": xaw,
+             "desc": "gain (gamma) address"},
+            {"name": "g_data", "dir": "input", "width": dw, "signed": True,
+             "desc": "gain, registered read"},
+            {"name": "o_valid", "dir": "output", "width": 1,
+             "desc": "a normalised element is on o_data"},
+            {"name": "o_index", "dir": "output", "width": xaw,
+             "desc": "which element"},
+            {"name": "o_data", "dir": "output", "width": dw, "signed": True,
+             "desc": "normalised element, int8"},
+            {"name": "busy", "dir": "output", "width": 1,
+             "desc": "a row is being normalised"},
+        ],
+        "behavior": [
+            "start is a one-cycle pulse, with eps, scale_o and shift_o "
+            "held stable for the whole row. busy must be high on the clock "
+            "edge that samples start, so it already reads 1 one cycle "
+            "later, and it stays high until the last output is emitted.",
+            "x_data and g_data are registered reads: each carries the "
+            "element at address a on the cycle after x_addr or g_addr = a. "
+            "If the address is itself a register, that is two clock edges "
+            "after the edge that loads a into it.",
+            "Pass 1: ssq = eps + sum over i in 0..%d of x_i * x_i, an "
+            "unsigned %d-bit value held in a register named ssq. Start "
+            "the sum from eps, not from zero." % (D - 1, iw),
+            "Then (m, e) = rsqrt(ssq) from the supplied rsqrt block, held "
+            "in registers named rs_m ([%d:0]) and rs_e ([%d:0])."
+            % (ow - 1, ew - 1),
+            "Pass 2: for i in 0..%d, t_i = (x_i * g_i * m) >>> (e + %d), "
+            "an arithmetic shift of the signed product, which floors. Then "
+            "o_i = requant(t_i, scale_o, shift_o): multiply by scale_o, add "
+            "2**(shift_o-1) when shift_o > 0, arithmetic shift right by "
+            "shift_o, saturate to [%d, %d]. |t_i| stays under 2**%d, so it "
+            "fits the requantizer's %d-bit input."
+            % (D - 1, k, -(1 << (dw - 1)), (1 << (dw - 1)) - 1,
+               dw + ow - k, aw),
+            "Emit each o_i with o_index = i and o_valid high for exactly "
+            "that one cycle. Outputs may come in any order, but each index "
+            "exactly once, and o_valid must be low at every other time.",
+            "The testbench reads ssq, rs_m and rs_e directly to check pass "
+            "1 and the inverse square root, so those names and widths are "
+            "part of the interface.",
+            "rsqrt and requant are separate modules supplied as source "
+            "files, not something to write. Instantiate them with exactly "
+            "these ports, connected by name: %s; %s. rsqrt has a latency of "
+            "%d cycles and requant of exactly %d."
+            % (port_signature(rs), port_signature(rq),
+               rs["parameters"]["pipeline_stages"],
+               rq["parameters"]["pipeline_stages"]),
+            "All state resets to zero: busy and o_valid are 0 during "
+            "reset.",
+        ],
+    }
+
+
+def rmsnorm_golden(x, g, eps, scale_o, shift_o, p, rs_p):
+    """Exact model of the norm, built from the rsqrt and requantizer
+    models."""
+    ssq = eps + sum(v * v for v in x)
+    assert ssq < 1 << p["rsqrt_in_width"]
+    m, e = rsqrt_golden(ssq, rs_p)
+    t = [(x[i] * g[i] * m) >> (e + p["norm_shift"]) for i in range(len(x))]
+    assert all(abs(v) < 1 << (p["acc_width"] - 1) for v in t), \
+        "t exceeds the requantizer input"
+    o = [requant_golden(v, scale_o, shift_o, p["data_width"])[0] for v in t]
+    return ssq, m, e, t, o
+
+
+def render_rmsnorm_testbench(spec):
+    """Rows for each part: typical values, all zeros (the sum is eps
+    alone, the smallest rsqrt input), one full-scale spike that puts t at
+    its bound, and full-range values."""
+    rs_p = spec["derivation"]["rsqrt"]
+    p = spec["parameters"]
+    dw, D = p["data_width"], p["d_model"]
+    mw, sw_o = p["scale_width"], p["shift_width"]
+    top = (1 << (dw - 1)) - 1
+    rnd = random.Random(83)
+    cases = []
+    for kind in ("typical", "zeros", "spike", "full"):
+        if kind == "typical":
+            x = [rnd.randrange(-top // 2, top // 2) for _ in range(D)]
+            g = [rnd.randrange(-top * 3 // 4, top * 3 // 4) for _ in range(D)]
+            eps = D
+        elif kind == "zeros":
+            x = [0] * D
+            g = [rnd.randrange(-top, top) for _ in range(D)]
+            eps = 5
+        elif kind == "spike":
+            x = [rnd.randrange(-3, 4) for _ in range(D)]
+            x[0] = -(top + 1)
+            g = [rnd.randrange(-top, top) for _ in range(D)]
+            g[0] = -(top + 1)
+            eps = 1
+        else:
+            x = [rnd.randrange(-top - 1, top + 1) for _ in range(D)]
+            g = [rnd.randrange(-top - 1, top + 1) for _ in range(D)]
+            eps = 0
+        _, _, _, t, _ = rmsnorm_golden(x, g, eps, 1, 0, p, rs_p)
+        sc, so = _mlp_scale(t, dw, mw, sw_o)
+        ssq, m, e, t, o = rmsnorm_golden(x, g, eps, sc, so, p, rs_p)
+        cases.append((kind, x, g, eps, sc, so, ssq, m, e, o))
+    body = []
+    for kind, x, g, eps, sc, so, ssq, m, e, o in cases:
+        body.append("    // %s" % kind)
+        body.append("    testname = \"%s\";" % kind)
+        for i in range(D):
+            body.append("    xmem[%d] = %s; gmem[%d] = %s; expect_o[%d] = %s;"
+                        % (i, _slit(x[i], dw), i, _slit(g[i], dw), i,
+                           _slit(o[i], dw)))
+        body.append("    run_row(%d, %d, %d, %d, %d, %d);"
+                    % (eps, sc, so, ssq, m, e))
+    return RMSNORM_TB.format(
+        dwm=dw - 1, D=D, awm=p["addr_width"] - 1,
+        iwm=p["rsqrt_in_width"] - 1, owm=p["rsqrt_out_width"] - 1,
+        ewm=p["rsqrt_e_width"] - 1, mwm=mw - 1, sowm=sw_o - 1,
+        cases="\n".join(body), ncases=len(cases))
+
+
+RMSNORM_TB = """`timescale 1ns/1ps
+// GENERATED by specgen.py: do not edit by hand.
+// Testbench for RMSNorm over one row. Golden values come from the rsqrt
+// and requantizer models. The sum of squares and the inverse square root
+// are checked directly, before the outputs, because both are upstream.
+module tb_rmsnorm;
+  reg clk = 0, rst_n = 0, start = 0;
+  reg [{iwm}:0] eps = 0;
+  reg [{mwm}:0] scale_o = 0;
+  reg [{sowm}:0] shift_o = 0;
+  wire [{awm}:0] x_addr, g_addr, o_index;
+  wire o_valid, busy;
+  wire signed [{dwm}:0] o_data;
+  reg signed [{dwm}:0] xmem [0:{D}-1];
+  reg signed [{dwm}:0] gmem [0:{D}-1];
+  reg signed [{dwm}:0] expect_o [0:{D}-1];
+  reg signed [{dwm}:0] x_data, g_data;
+  integer checks = 0, seen = 0, i, bad, nbad;
+  reg [255:0] testname;
+  reg [15:0] bad_idx [0:7];
+  reg signed [{dwm}:0] bad_exp [0:7], bad_got [0:7];
+
+  always @(posedge clk) begin
+    x_data <= xmem[x_addr];
+    g_data <= gmem[g_addr];
+  end
+
+  rmsnorm dut (.clk(clk), .rst_n(rst_n), .start(start), .eps(eps),
+               .scale_o(scale_o), .shift_o(shift_o), .x_addr(x_addr),
+               .x_data(x_data), .g_addr(g_addr), .g_data(g_data),
+               .o_valid(o_valid), .o_index(o_index), .o_data(o_data),
+               .busy(busy));
+
+  always #5 clk = ~clk;
+
+  always @(posedge clk) begin
+    if (rst_n && o_valid) begin
+      checks = checks + 1;
+      seen = seen + 1;
+      if (o_index >= {D}) begin
+        $display("TB_FAIL test=%0s out=%0d d_model={D} expected=no_output_past_the_row got_norm=%0d",
+                 testname, o_index, o_data);
+        $display("TB_RESULT: FAIL");
+        $finish;
+      end
+      if (o_data !== expect_o[o_index]) begin
+        if (nbad < 8) begin
+          bad_idx[nbad] = o_index; bad_exp[nbad] = expect_o[o_index];
+          bad_got[nbad] = o_data;
+        end
+        nbad = nbad + 1;
+      end
+    end
+  end
+
+  task run_row(input integer ep, input integer sc, input integer so,
+               input [{iwm}:0] want_ssq, input [{owm}:0] want_m,
+               input [{ewm}:0] want_e);
+    begin
+      seen = 0; nbad = 0; bad = 0;
+      eps = ep; scale_o = sc; shift_o = so;
+      @(negedge clk); start = 1;
+      @(negedge clk); start = 0;
+      while (busy) @(negedge clk);
+      repeat (8) @(negedge clk);
+      checks = checks + 3;
+      if (dut.ssq !== want_ssq) begin
+        $display("TB_FAIL test=%0s expected_ssq=%0d got_ssq=%0d",
+                 testname, want_ssq, dut.ssq);
+        bad = bad + 1;
+      end
+      if (dut.rs_m !== want_m || dut.rs_e !== want_e) begin
+        $display("TB_FAIL test=%0s expected_rsm=%0d got_rsm=%0d expected_rse=%0d got_rse=%0d",
+                 testname, want_m, dut.rs_m, want_e, dut.rs_e);
+        bad = bad + 1;
+      end
+      for (i = 0; i < nbad && i < 8; i = i + 1)
+        $display("TB_FAIL test=%0s out=%0d expected_norm=%0d got_norm=%0d",
+                 testname, bad_idx[i], bad_exp[i], bad_got[i]);
+      if (!bad && !nbad && seen !== {D})
+        $display("TB_FAIL test=%0s out=0 expected_count={D} got_count=%0d",
+                 testname, seen);
+      if (bad || nbad || seen !== {D}) begin
+        $display("TB_RESULT: FAIL");
+        $finish;
+      end
+    end
+  endtask
+
+  initial begin
+    repeat (3) @(negedge clk);
+    rst_n = 1;
+    @(negedge clk);
+{cases}
+
+    $display("TB_PROFILE rows=%0d span_cycles=%0d latency_cycles=%0d",
+             {ncases}, {ncases} * {D} * 2, 16);
+    $display("TB_PASS checks=%0d", checks);
+    $display("TB_RESULT: PASS");
+    $finish;
+  end
+endmodule
+"""
+
+
+def generate_rmsnorm(ms=None, spec_file="spec_rmsnorm.json",
+                     tb_file="tb_rmsnorm.v"):
+    """Write the derived RMSNorm spec and testbench."""
+    ms = ms or load_model_spec()
+    spec = derive_rmsnorm_spec(ms)
+    with open(os.path.join(ROOT, spec_file), "w") as f:
+        json.dump(spec, f, indent=2)
+    with open(os.path.join(ROOT, tb_file), "w") as f:
+        f.write(render_rmsnorm_testbench(spec))
     return spec
 
 def requant_golden(acc, scale, sh, out_width):

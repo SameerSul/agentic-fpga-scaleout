@@ -28,6 +28,7 @@ BLOCKS = [
     ("softmax",  cf.SOFTMAX_JOB),
     ("mlp",      cf.MLP_JOB),
     ("attn",     cf.ATTN_JOB),
+    ("rmsnorm",  cf.RMSNORM_JOB),
 ]
 
 

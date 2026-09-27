@@ -24,6 +24,7 @@ FIX_REGRD = "register_the_read_port"
 FIX_SUBMAX = "subtract_the_row_maximum"
 FIX_CHAIN = "take_the_second_depth_from_the_first_count"
 FIX_VLAT = "pair_each_value_with_its_weight_after_the_two_edge_read"
+FIX_EPS = "start_the_sum_of_squares_from_epsilon"
 # One definition, in specgen, so the declared depth and the generated
 # depth cannot disagree.
 WIDE_ADD_BITS = specgen.WIDE_ADD_BITS
@@ -56,6 +57,8 @@ class RuleBasedAgent:
             return self.render_mlp(spec, fixes), sorted(fixes)
         if spec["top_module"] == "attn":
             return self.render_attn(spec, fixes), sorted(fixes)
+        if spec["top_module"] == "rmsnorm":
+            return self.render_rmsnorm(spec, fixes), sorted(fixes)
         return self.render_mac(spec, fixes), sorted(fixes)
 
     def diagnose(self, spec, history):
@@ -73,6 +76,10 @@ class RuleBasedAgent:
                     fixes.add(FIX_XOR)
                 elif "clear" in m.get("test", "").lower():
                     fixes.add(FIX_CLEAR)
+                elif "expected_ssq" in m:
+                    # The norm's only seeded bug: the sum of squares started
+                    # from zero, so epsilon never reached the rsqrt.
+                    fixes.add(FIX_EPS)
                 elif "expected_o" in m:
                     # The head's only seeded bug: each value was used on
                     # the edge before its registered read arrived, so it
@@ -123,6 +130,163 @@ class RuleBasedAgent:
                 elif m.get("got_acc") != m.get("expected_acc"):
                     fixes.add(FIX_WIDTH)
         return fixes
+
+    def render_rmsnorm(self, spec, fixes):
+        """RMSNorm: a sum of squares, one rsqrt, then a scaled product per
+        element through the requantizer.
+
+        The seeded first cut starts the sum of squares from zero. Epsilon
+        then never reaches the inverse square root, which only shows on a
+        row whose squares are small, where it is most of the answer.
+        """
+        p = spec["parameters"]
+        dw, aw, D = p["data_width"], p["acc_width"], p["d_model"]
+        xaw, iw, ow = p["addr_width"], p["rsqrt_in_width"], p["rsqrt_out_width"]
+        ew, k = p["rsqrt_e_width"], p["norm_shift"]
+        mw, shw, rqs = p["scale_width"], p["shift_width"], p["requant_stages"]
+        pmw = 2 * dw + ow + 1
+        seed = "eps" if FIX_EPS in fixes else "{iw}'d0".format(iw=iw)
+        return """module rmsnorm (
+  input                    clk,
+  input                    rst_n,
+  input                    start,
+  input      [{iwm}:0] eps,
+  input      [{mwm}:0] scale_o,
+  input      [{shwm}:0] shift_o,
+  output reg [{xawm}:0] x_addr,
+  input      signed [{dwm}:0] x_data,
+  output reg [{xawm}:0] g_addr,
+  input      signed [{dwm}:0] g_data,
+  output reg               o_valid,
+  output reg [{xawm}:0] o_index,
+  output reg signed [{dwm}:0] o_data,
+  output reg               busy
+);
+  reg [{iwm}:0] ssq;
+  reg [{owm}:0] rs_m;
+  reg [{ewm}:0] rs_e;
+  reg [1:0] st;
+  localparam S_IDLE = 2'd0, S_P1 = 2'd1, S_RS = 2'd2, S_P2 = 2'd3;
+
+  // Issue counter shared by both passes. Every read is two edges from
+  // issue to data: one for the address register, one for the memory.
+  reg issuing;
+  reg [{xawm}:0] ii;
+  reg v0, v1, v2, l0, l1, l2;
+  reg [{xawm}:0] i0, i1, i2, i3, i4, i5;
+  reg v3, v4, u5;
+
+  // Pass 1: squares into the sum.
+  reg [{sqm}:0] sqr;
+  // Pass 2: x*g, then times the mantissa as four partial products, then
+  // the shift. Both factors are split in half: the whole product is
+  // 2*dw+ow bits, and at 16-bit operands one multiply missed timing by
+  // 1.54 ns and a split of the mantissa alone still by 0.40 ns.
+  reg signed [{sqm}:0] pr;
+  reg signed [{pmwm}:0] p00, p01, p10, p11, s0, s1, pm;
+
+  reg rs_vin, rs_go;
+  wire [{owm}:0] rs_y;
+  wire [{ewm}:0] rs_eo;
+  wire rs_vout;
+  rsqrt rs (.clk(clk), .rst_n(rst_n), .x(ssq), .valid_in(rs_vin),
+            .y(rs_y), .e(rs_eo), .valid_out(rs_vout));
+
+  reg  rq_vin;
+  reg  signed [{awm}:0] rq_acc;
+  reg  [{xawm}:0] rq_idx;
+  wire signed [{dwm}:0] rq_q;
+  wire rq_sat, rq_vout;
+  requant rq (.clk(clk), .rst_n(rst_n), .acc_in(rq_acc),
+              .scale(scale_o), .shift(shift_o), .valid_in(rq_vin),
+              .q_out(rq_q), .sat(rq_sat), .valid_out(rq_vout));
+  reg [{xawm}:0] idx_pipe [0:{rqsm}];
+  reg [{xaw}:0] ocnt;
+  wire signed [{pmwm}:0] shv = pm >>> (rs_e + {shaw}'d{k});
+  integer n;
+
+  always @(posedge clk) begin
+    if (!rst_n) begin
+      ssq <= 0; rs_m <= 0; rs_e <= 0; st <= S_IDLE; busy <= 1'b0;
+      issuing <= 1'b0; ii <= 0; x_addr <= 0; g_addr <= 0;
+      v0 <= 1'b0; v1 <= 1'b0; v2 <= 1'b0; l0 <= 1'b0; l1 <= 1'b0;
+      l2 <= 1'b0; i0 <= 0; i1 <= 0; i2 <= 0; i3 <= 0; i4 <= 0;
+      i5 <= 0; v3 <= 1'b0; v4 <= 1'b0; u5 <= 1'b0; sqr <= 0; pr <= 0;
+      p00 <= 0; p01 <= 0; p10 <= 0; p11 <= 0; s0 <= 0; s1 <= 0;
+      pm <= 0; rs_vin <= 1'b0; rs_go <= 1'b0;
+      rq_vin <= 1'b0; rq_acc <= 0; rq_idx <= 0; ocnt <= 0;
+      o_valid <= 1'b0; o_index <= 0; o_data <= 0;
+      for (n = 0; n <= {rqsm}; n = n + 1) idx_pipe[n] <= 0;
+    end else begin
+      rs_vin  <= 1'b0;
+      rq_vin  <= 1'b0;
+      o_valid <= 1'b0;
+      idx_pipe[0] <= rq_idx;
+      for (n = 1; n <= {rqsm}; n = n + 1) idx_pipe[n] <= idx_pipe[n-1];
+
+      v0 <= 1'b0;
+      if (issuing) begin
+        x_addr <= ii; g_addr <= ii;
+        v0 <= 1'b1; l0 <= (ii == {Dm}); i0 <= ii;
+        if (ii == {Dm}) begin issuing <= 1'b0; ii <= 0; end
+        else ii <= ii + 1;
+      end
+      v1 <= v0; l1 <= l0; i1 <= i0;
+      v2 <= v1; l2 <= l1; i2 <= i1;
+      if (v1) begin
+        sqr <= x_data * x_data;
+        pr  <= x_data * g_data;
+      end
+      v3 <= v2; i3 <= i2;
+      if (v2) begin
+        p00 <= $signed({{1'b0, pr[{dwm}:0]}}) * $signed({{1'b0, rs_m[{mlom}:0]}});
+        p01 <= $signed({{1'b0, pr[{dwm}:0]}}) * $signed({{1'b0, rs_m[{owm}:{mlo}]}});
+        p10 <= $signed(pr[{sqm}:{dw}]) * $signed({{1'b0, rs_m[{mlom}:0]}});
+        p11 <= $signed(pr[{sqm}:{dw}]) * $signed({{1'b0, rs_m[{owm}:{mlo}]}});
+      end
+      v4 <= v3; i4 <= i3;
+      if (v3) begin
+        s0 <= p00 + (p01 <<< {mlo});
+        s1 <= p10 + (p11 <<< {mlo});
+      end
+      u5 <= (st == S_P2) && v4; i5 <= i4;
+      if (v4) pm <= s0 + (s1 <<< {dw});
+
+      case (st)
+        S_IDLE: if (start) begin
+          st <= S_P1; busy <= 1'b1; ssq <= {seed}; issuing <= 1'b1;
+          ii <= 0; ocnt <= 0;
+        end
+        S_P1: if (v2) begin
+          ssq <= ssq + sqr;
+          if (l2) begin st <= S_RS; rs_go <= 1'b1; end
+        end
+        S_RS: begin
+          if (rs_go) begin rs_vin <= 1'b1; rs_go <= 1'b0; end
+          if (rs_vout) begin
+            rs_m <= rs_y; rs_e <= rs_eo; st <= S_P2; issuing <= 1'b1;
+            ii <= 0;
+          end
+        end
+        S_P2: begin
+          if (u5) begin
+            rq_acc <= shv[{awm}:0]; rq_idx <= i5; rq_vin <= 1'b1;
+          end
+          if (rq_vout) begin
+            o_valid <= 1'b1; o_index <= idx_pipe[{rqsm}]; o_data <= rq_q;
+            ocnt <= ocnt + 1;
+          end
+          if (ocnt == {D}) begin st <= S_IDLE; busy <= 1'b0; end
+        end
+      endcase
+    end
+  end
+endmodule
+""".format(iwm=iw - 1, mwm=mw - 1, shwm=shw - 1, xawm=xaw - 1, xaw=xaw,
+           dwm=dw - 1, owm=ow - 1, ewm=ew - 1, sqm=2 * dw - 1,
+           pmwm=pmw - 1, awm=aw - 1, rqsm=rqs - 1, Dm=D - 1, D=D,
+           k=k, shaw=ew, seed=seed, mlo=(ow + 1) // 2, dw=dw,
+           mlom=(ow + 1) // 2 - 1)
 
     def render_attn(self, spec, fixes):
         """Attention head: scores through matvec and the MAC, weights

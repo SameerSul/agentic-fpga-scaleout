@@ -1,31 +1,31 @@
 {
-  "block": "rsqrt28_gpt2_124m",
+  "block": "rsqrt30_qwen2_5_0p5b",
   "top_module": "rsqrt",
   "unit": "row",
   "cycles_per_row": 4.0,
   "latency_cycles": 3,
-  "cell_count": 1351,
-  "area": 2797.0,
-  "fmax_estimate_mhz": 173.61111111111111,
+  "cell_count": 1340,
+  "area": 2757.0,
+  "fmax_estimate_mhz": 170.06802721088437,
   "fmax_method": "opensta_slack",
   "target_clock_mhz": 100,
-  "sim_checks_passed": 212,
+  "sim_checks_passed": 218,
   "fpga": {
     "family": "xcup",
-    "luts": 214,
-    "ffs": 57,
+    "luts": 404,
+    "ffs": 114,
     "dsps": 0,
     "brams": 0,
     "urams": 0,
-    "carry": 1,
-    "muxf": 115
+    "carry": 2,
+    "muxf": 158
   },
   "derivation": {
-    "model": "gpt2_124m",
+    "model": "qwen2_5_0p5b",
     "activation_bits": 8,
-    "reduction_depth": 3072,
-    "rule": "in_width holds a sum of 3072 squares of 8-bit values; the output is a mantissa and a halved exponent, so a normalised activation is one multiply and one shift"
+    "reduction_depth": 4864,
+    "rule": "in_width holds a sum of 4864 squares of 8-bit values; the output is a mantissa and a halved exponent, so a normalised activation is one multiply and one shift"
   },
-  "row_unit": "rsqrt28_gpt2_124m",
+  "row_unit": "rsqrt30_qwen2_5_0p5b",
   "agent": "RuleBasedAgent"
 }

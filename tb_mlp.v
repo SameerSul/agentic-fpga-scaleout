@@ -7,11 +7,11 @@
 module tb_mlp;
   reg clk = 0, rst_n = 0, start = 0, load_valid = 0;
   reg signed [7:0] load_data = 0;
-  reg [11:0] depth1 = 0;
-  reg [11:0] cols1 = 0, cols2 = 0;
+  reg [12:0] depth1 = 0;
+  reg [12:0] cols1 = 0, cols2 = 0;
   reg [17:0] scale1 = 0, scale2 = 0;
   reg [6:0] shift1 = 0, shift2 = 0;
-  wire [23:0] w_addr;
+  wire [12:0] w_addr;
   wire o_valid, busy;
   wire [5:0] o_index;
   wire signed [7:0] o_data;
@@ -19,6 +19,10 @@ module tb_mlp;
   reg signed [7:0] acts [0:8-1];
   reg signed [7:0] wmem_tb [0:78-1];
   reg signed [7:0] expect_y [0:5-1];
+  reg signed [7:0] expect_h [0:6-1];
+  integer nbad = 0, hbad = 0;
+  reg [7:0] bad_idx [0:7];
+  reg signed [7:0] bad_exp [0:7], bad_got [0:7];
   reg signed [7:0] w_data;
   integer checks = 0, seen = 0, i;
   reg [255:0] testname;
@@ -38,11 +42,20 @@ module tb_mlp;
     if (rst_n && o_valid) begin
       checks = checks + 1;
       seen = seen + 1;
-      if (o_data !== expect_y[o_index]) begin
-        $display("TB_FAIL test=%0s out=%0d expected_y=%0d got_y=%0d",
-                 testname, o_index, expect_y[o_index], o_data);
+      if (o_index >= 5) begin
+        $display("TB_FAIL test=%0s out=%0d cols2=%0d expected=no_output_past_cols2 got_y=%0d",
+                 testname, o_index, 5, o_data);
         $display("TB_RESULT: FAIL");
         $finish;
+      end
+      if (o_data !== expect_y[o_index]) begin
+        // Held, not reported yet: a wrong hidden layer makes every output
+        // wrong, and the hidden check below names the cause.
+        if (nbad < 8) begin
+          bad_idx[nbad] = o_index; bad_exp[nbad] = expect_y[o_index];
+          bad_got[nbad] = o_data;
+        end
+        nbad = nbad + 1;
       end
     end
   end
@@ -56,14 +69,14 @@ module tb_mlp;
     acts[5] = 8'sd107;
     acts[6] = -8'sd43;
     acts[7] = -8'sd50;
-    wmem_tb[0] = -8'sd43;
-    wmem_tb[1] = 8'sd80;
-    wmem_tb[2] = 8'sd52;
-    wmem_tb[3] = -8'sd118;
-    wmem_tb[4] = -8'sd1;
-    wmem_tb[5] = -8'sd34;
-    wmem_tb[6] = -8'sd34;
-    wmem_tb[7] = -8'sd109;
+    wmem_tb[0] = 8'sd125;
+    wmem_tb[1] = -8'sd125;
+    wmem_tb[2] = 8'sd125;
+    wmem_tb[3] = -8'sd125;
+    wmem_tb[4] = 8'sd125;
+    wmem_tb[5] = 8'sd125;
+    wmem_tb[6] = -8'sd125;
+    wmem_tb[7] = -8'sd125;
     wmem_tb[8] = -8'sd22;
     wmem_tb[9] = -8'sd7;
     wmem_tb[10] = -8'sd41;
@@ -104,12 +117,12 @@ module tb_mlp;
     wmem_tb[45] = 8'sd75;
     wmem_tb[46] = 8'sd57;
     wmem_tb[47] = 8'sd32;
-    wmem_tb[48] = -8'sd59;
-    wmem_tb[49] = -8'sd18;
-    wmem_tb[50] = -8'sd21;
-    wmem_tb[51] = -8'sd66;
-    wmem_tb[52] = -8'sd92;
-    wmem_tb[53] = -8'sd79;
+    wmem_tb[48] = 8'sd125;
+    wmem_tb[49] = 8'sd125;
+    wmem_tb[50] = 8'sd125;
+    wmem_tb[51] = 8'sd125;
+    wmem_tb[52] = 8'sd125;
+    wmem_tb[53] = 8'sd125;
     wmem_tb[54] = -8'sd111;
     wmem_tb[55] = 8'sd13;
     wmem_tb[56] = -8'sd31;
@@ -134,11 +147,17 @@ module tb_mlp;
     wmem_tb[75] = 8'sd34;
     wmem_tb[76] = -8'sd35;
     wmem_tb[77] = 8'sd32;
-    expect_y[0] = -8'sd128;
-    expect_y[1] = -8'sd128;
-    expect_y[2] = 8'sd127;
-    expect_y[3] = -8'sd128;
-    expect_y[4] = -8'sd128;
+    expect_y[0] = 8'sd126;
+    expect_y[1] = -8'sd100;
+    expect_y[2] = -8'sd9;
+    expect_y[3] = -8'sd70;
+    expect_y[4] = -8'sd36;
+    expect_h[0] = 8'sd126;
+    expect_h[1] = 8'sd0;
+    expect_h[2] = 8'sd22;
+    expect_h[3] = 8'sd0;
+    expect_h[4] = 8'sd0;
+    expect_h[5] = 8'sd0;
     testname = "layer";
     repeat (3) @(negedge clk);
     rst_n = 1;
@@ -149,13 +168,32 @@ module tb_mlp;
     end
     load_valid = 0;
     depth1 = 8; cols1 = 6; cols2 = 5;
-    scale1 = 256; shift1 = 12; scale2 = 256; shift2 = 12;
+    scale1 = 75329; shift1 = 25; scale2 = 114266; shift2 = 24;
     @(negedge clk);
     start = 1;
     @(negedge clk);
     start = 0;
     while (busy) @(negedge clk);
     repeat (8) @(negedge clk);
+    // Whitebox check of the hidden layer, which the spec places in act at
+    // 64..64+cols1-1. Reported before the outputs because it is
+    // upstream of them: traced, a draft whose writeback was wrong sat for
+    // six iterations on "output 0 wrong" and never looked at layer one.
+    for (i = 0; i < 6; i = i + 1) begin
+      checks = checks + 1;
+      if (dut.act[64 + i] !== expect_h[i]) begin
+        $display("TB_FAIL test=hidden_layer h_index=%0d expected_h=%0d got_h=%0d",
+                 i, expect_h[i], dut.act[64 + i]);
+        hbad = hbad + 1;
+      end
+    end
+    for (i = 0; i < nbad && i < 8; i = i + 1)
+      $display("TB_FAIL test=%0s out=%0d expected_y=%0d got_y=%0d",
+               testname, bad_idx[i], bad_exp[i], bad_got[i]);
+    if (hbad || nbad) begin
+      $display("TB_RESULT: FAIL");
+      $finish;
+    end
     checks = checks + 1;
     if (seen !== 5) begin
       $display("TB_FAIL test=%0s out=0 expected_y=%0d got_y=%0d",

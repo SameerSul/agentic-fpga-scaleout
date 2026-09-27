@@ -1113,6 +1113,94 @@ def test_attention_head():
         shutil.rmtree(work, ignore_errors=True)
 
 
+def test_rmsnorm():
+    """The norm Qwen applies before attention and before the MLP: a sum
+    of squares, one inverse square root, and a scaled product per
+    element. The testbench checks the sum of squares and the rsqrt result
+    directly before the outputs, and includes an all-zero row, where
+    epsilon is the whole answer, and a full-scale spike, which puts t at
+    the bound its shift is derived from."""
+    import math
+    import chiplet_flow as cf
+    ms = load_model_spec()
+    spec = specgen_mod.derive_rmsnorm_spec(ms)
+    p = spec['parameters']
+    rs_p = spec['derivation']['rsqrt']
+    check('the row length is the model\'s d_model', p['d_model'] == ms['d_model'])
+
+    rnd = random.Random(2)
+    D = p['d_model']
+    x = [rnd.randrange(-60, 60) for _ in range(D)]
+    g = [rnd.randrange(-90, 90) for _ in range(D)]
+    ssq, m, e, t, o = specgen_mod.rmsnorm_golden(x, g, D, 1, 0, p, rs_p)
+    fl = [x[i] * g[i] / math.sqrt(ssq / D) for i in range(D)]
+    fx = [t[i] * math.sqrt(D) * (1 << p['norm_shift'])
+          / (1 << p['rsqrt_out_width']) for i in range(D)]
+    rel = max(abs(fx[i] - fl[i]) for i in range(D)) / max(abs(v) for v in fl)
+    check('the fixed-point norm matches float RMSNorm to within 0.5%% '
+          '(worst %.4f%%)' % (100 * rel), rel < 0.005)
+
+    work = os.path.join(ROOT, 'build_rmstest')
+    shutil.rmtree(work, ignore_errors=True)
+    try:
+        cf.write_rmsnorm_deps(ms, work)
+        rr = RuleBasedAgent()
+        with open(os.path.join(work, 'tb.v'), 'w') as f:
+            f.write(specgen_mod.render_rmsnorm_testbench(spec))
+        res = {}
+        for label, fx_ in (('first', set()), ('fixed', {agent_mod.FIX_EPS})):
+            with open(os.path.join(work, 'rms.v'), 'w') as f:
+                f.write(rr.render_rmsnorm(spec, fx_))
+            r = subprocess.run(['iverilog', '-g2005', '-o', 's.out', 'tb.v',
+                                'rms.v'] + list(cf.RMSNORM_DEPS), cwd=work,
+                               capture_output=True, text=True)
+            assert r.returncode == 0, r.stdout + r.stderr
+            r = subprocess.run(['vvp', 's.out'], cwd=work,
+                               capture_output=True, text=True, timeout=900)
+            res[label] = r.stdout
+        check('the norm computes the sum of squares, rsqrt and the products',
+              'TB_RESULT: PASS' in res['fixed'])
+        check('a sum of squares that leaves out epsilon is caught',
+              'TB_RESULT: PASS' not in res['first']
+              and 'expected_ssq' in res['first'])
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def test_composite_cell_count():
+    """A block that instantiates others is reported per module by yosys,
+    and the flow took the first module's count: the MLP layer and RMSNorm
+    both reported their requantizer's 10396 cells as their own. The total
+    has to include the submodules."""
+    work = os.path.join(ROOT, 'build_cellcount')
+    shutil.rmtree(work, ignore_errors=True)
+    os.makedirs(work)
+    saved = chiplet_flow.BUILD
+    try:
+        chiplet_flow.BUILD = work
+        shutil.copy(chiplet_flow.LIB, work)
+        with open(os.path.join(work, 'top.v'), 'w') as f:
+            f.write("module sub(input clk, input [7:0] a, output reg [7:0] y);\n"
+                    "  always @(posedge clk) y <= a * a;\nendmodule\n"
+                    "module top(input clk, input [7:0] a, output [7:0] y);\n"
+                    "  wire [7:0] m;\n  reg [7:0] r;\n"
+                    "  sub s0 (.clk(clk), .a(a), .y(m));\n"
+                    "  sub s1 (.clk(clk), .a(m), .y(y));\n"
+                    "  always @(posedge clk) r <= a;\nendmodule\n")
+        both = chiplet_flow.stage_synth({}, {'top_module': 'top'},
+                                        os.path.join(work, 'top.v'))
+        one = chiplet_flow.stage_synth({}, {'top_module': 'sub'},
+                                       os.path.join(work, 'top.v'))
+        check('a composite block counts its submodules\' cells '
+              '(%s against %s for one of them)'
+              % (both['cell_count'], one['cell_count']),
+              both['cell_count'] > 2 * one['cell_count'] - 1
+              and both['area'] > one['area'])
+    finally:
+        chiplet_flow.BUILD = saved
+        shutil.rmtree(work, ignore_errors=True)
+
+
 def test_requant_golden_is_shared():
     """One model of requantization, used by the requantizer's own
     testbench and by the layer that sequences it, so the two cannot
@@ -1841,6 +1929,8 @@ if __name__ == '__main__':
     test_softmax_sequencer()
     test_mlp_layer()
     test_attention_head()
+    test_rmsnorm()
+    test_composite_cell_count()
     test_requant_golden_is_shared()
     test_table_unit_specs_are_implementable()
     test_llm_transport_is_retried()

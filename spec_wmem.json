@@ -1,5 +1,5 @@
 {
-  "name": "wmem1024_gpt2_124m",
+  "name": "wmem1024_qwen2_5_0p5b",
   "description": "Weight tile memory with a streaming loader: 1024 entries of 8 bits, sequential write port, registered read port",
   "top_module": "wmem",
   "unit": "tile",
@@ -12,7 +12,7 @@
     "target_clock_mhz": 100
   },
   "derivation": {
-    "model": "gpt2_124m",
+    "model": "qwen2_5_0p5b",
     "rule": "one tile of 1024 weights at the model's datapath width; the read port is registered because that is what the sequencer was built against and what block RAM provides"
   },
   "ports": [

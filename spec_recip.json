@@ -1,5 +1,5 @@
 {
-  "name": "recip26_gpt2_124m",
+  "name": "recip26_qwen2_5_0p5b",
   "description": "Reciprocal for the attention softmax denominator: 26-bit unsigned input, returns a 17-bit mantissa and the shift that goes with it, by normalising to [1,2) and a 256-entry table",
   "top_module": "recip",
   "unit": "row",
@@ -13,7 +13,7 @@
     "target_clock_mhz": 100
   },
   "derivation": {
-    "model": "gpt2_124m",
+    "model": "qwen2_5_0p5b",
     "exp_out_frac": 15,
     "max_terms": 1024,
     "rule": "in_width bounds a sum of at most 1024 exponentials each below 2**15; the output is a mantissa and a shift, so a softmax weight is one multiply and one shift"
@@ -63,9 +63,12 @@
     }
   ],
   "behavior": [
-    "Stage 1 counts the leading zeros of x and registers both the count and x shifted left by it, so the value sits in [1,2).",
-    "Stage 2 registers the table entry the normalised mantissa selects and the shift the count implies.",
-    "Stage 3 registers the table entry and the count. The consumer applies the shift, which keeps the mantissa at full precision instead of truncating it here.",
+    "Stage 1 computes k, the number of leading zeros of x within its 26-bit width, and registers both k and xn = x << k. After the shift bit 25 of xn is set, so xn read as a Q1.25 number lies in [1,2).",
+    "Stage 2 registers recip_rom[idx] and k, where idx is bits [24:17] of xn, that is idx = (xn >> 17) and then the low 8 bits of it. The leading one at bit 25 is NOT part of idx: it is implicit, so the table is indexed by the fraction alone.",
+    "Stage 3 registers those two values onto the mantissa and shift outputs. Do not apply the shift here. The consumer folds it into the multiply it was going to do anyway, which keeps the mantissa at full precision.",
+    "The contract the testbench checks is that num/x equals (num * mantissa) >> (42 - shift), so mantissa must come out unshifted and shift must come out as k itself.",
+    "recip_rom is a separate module supplied as a source file, not something to write. Instantiate it. Its ports are input [7:0] idx and output [16:0] val, combinational.",
+    "When x is zero the mantissa output saturates to all ones and the shift output is zero.",
     "x is required to be non-zero, which the softmax denominator guarantees because it always contains exp(0) = 1.",
     "Latency from valid_in to valid_out is 3 cycles."
   ]

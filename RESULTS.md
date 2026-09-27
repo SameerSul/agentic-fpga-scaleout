@@ -5,9 +5,9 @@ every command is named so it can be re-run.
 
 ## Short answer
 
-The flow turns a model spec into signed-off RTL for eleven generated
-blocks, an attention head now among them. An LLM has written and signed
-off every block but that newest one through the same gates, and the multiply-accumulate unit's accumulator is formally proved
+The flow turns a model spec into signed-off RTL for twelve generated
+blocks, an attention head and RMSNorm now among them. An LLM has written
+and signed off every block but those two newest through the same gates, and the multiply-accumulate unit's accumulator is formally proved
 never to overflow, for any input sequence, on the int8 targets. A trained
 language model decodes through the blocks' exact arithmetic and emits
 text. It still does not host a local LLM the way Architect Labs does:
@@ -20,7 +20,7 @@ The remaining gap is listed at the bottom rather than glossed over.
 ### The full suite
 
 ```
-python3 tests.py            # 295 tests, or 293 without OpenSTA
+python3 tests.py            # 300 tests, or 298 without OpenSTA
 ```
 
 ### Spec to RTL, across the spec space
@@ -375,13 +375,17 @@ Qwen2.5-0.5B:
 | softmax | converged | 8 | Haiku |
 | MLP layer | converged | 3 | Haiku |
 | attention head | not converged | 8 | Haiku |
+| RMSNorm | not yet attempted | | |
 
 Every block the flow generated before the attention head has been
 written and signed off by an LLM through all four gates. The attention
 head, with eight generated blocks beneath it, has not yet: Haiku's drafts
 compile and simulate once the spec lists each sub-block's exact ports,
 and the testbench's direct check of the score buffer names where they go
-wrong, but eight drafts did not close it. A Sonnet run is next. Haiku is the smallest current Claude model,
+wrong, but eight drafts did not close it. Sonnet, which closed the
+requantizer, did not return a single draft: on this spec each call spent
+more than the 25 minute limit in extended thinking, at low effort, and
+the run was stopped after two. Haiku is the smallest current Claude model,
 run through the Claude Code CLI; the requantizer is the one block it did
 not close, reaching timing with a correct datapath and running out of
 drafts there, and Sonnet closed it. Transcripts of the three hardest runs,
@@ -505,6 +509,31 @@ softmax's score read, and the testbench catches it. The testbench checks
 the scores and the softmax weights directly, before the outputs, since
 both are upstream of them.
 
+## RMSNorm
+
+Qwen normalises before attention and before the MLP. The inverse square
+root was generated for this from the start; this is the sequencer that
+uses it. Pass one sums the squares of the row, starting from epsilon.
+One inverse square root gives a mantissa and a shift, and pass two forms
+t = (x * g * m) >> (e + k) per element and requantizes it, with the
+mean's square root and the quantization scales folded into the output
+scale. Against float RMSNorm it is within 0.04% of the row's largest
+output.
+
+The extra shift k is derived rather than chosen. Since x squared cannot
+exceed the sum of squares, |x| is at most its square root, and the
+halved exponent keeps 2**e above half of that, so |t| stays under
+2**(data_width + 17 - k). k is what brings that inside the
+requantizer's input: 0 for the int8 targets, 2 for the tiny model. The
+testbench drives a full-scale spike to put t at that bound, and an
+all-zero row where epsilon is the whole answer. It checks the sum of
+squares and the rsqrt result directly, before the outputs, and the
+seeded first cut that forgets epsilon fails on exactly that check.
+
+At 16-bit operands the product is 50 bits wide and missed timing by
+1.54 ns as one multiply; splitting both factors into four partial
+products closes it on every variant.
+
 ## Formal proof: the accumulator cannot overflow
 
 The accumulator width comes from a closed-form rule, and until now every
@@ -570,10 +599,10 @@ These are the distance between this repo and a local LLM host.
    a matrix, the weight tile and its loader, softmax as a single
    sequenced block, an MLP layer that drives two matmuls in order
    and routes the activations between them, and one attention head over
-   a KV cache. Softmax is hardware apart from accumulating the
-   sum, and so is the transcendental part of RMSNorm. Nothing yet runs a
-   whole layer: the norms, the residual adds and the sequencing of heads
-   and layers are still on the host. The weight
+   a KV cache, and RMSNorm. Softmax is hardware apart from
+   accumulating the sum. Nothing yet runs a whole layer: the residual
+   adds, the tiling of real matrices, and the sequencing of heads and
+   layers are still on the host. The weight
    tile holds 1024 entries and the activation bank 64, so a real matrix
    needs tiling logic that does not exist yet. In `generate.py` those run on the host, and the
    output says so each run.

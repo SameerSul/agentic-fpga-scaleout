@@ -15,7 +15,7 @@ module tb_softmax;
   reg signed [12:0] smem [0:256-1];
   reg        [15:0] expect_w [0:256-1];
   reg signed [12:0] s_data;
-  integer checks = 0, seen = 0, i;
+  integer checks = 0, seen = 0, i, j, other, best, dist, own;
   reg [255:0] testname;
 
   always @(posedge clk) s_data <= smem[s_addr];
@@ -30,7 +30,36 @@ module tb_softmax;
     if (rst_n && w_valid) begin
       checks = checks + 1;
       seen = seen + 1;
+      // A weight for an index past the row has no expected value, and
+      // comparing against one printed expected_w=x, which a traced agent
+      // read as a datapath fault for three drafts running.
+      if (w_index >= n) begin
+        $display("TB_FAIL test=%0s idx=%0d n=%0d expected=no_weight_past_the_row got_w=%0d",
+                 testname, w_index, n, w_data);
+        $display("TB_RESULT: FAIL");
+        $finish;
+      end
       if (w_data !== expect_w[w_index]) begin
+        // A right value under the wrong index is a pipeline alignment
+        // fault, not an arithmetic one. Traced, two different models
+        // emitted weight 1 as weight 0 and read only "expected 14668 got
+        // 18118", which says nothing about which of the two is wrong.
+        // Nearest other index, reported only when the value is within
+        // about 1.5% of it, which a coincidence rarely manages. Exact
+        // equality missed a draft that was misaligned and also ten counts
+        // off in its arithmetic.
+        other = -1; best = 1 << 30;
+        for (j = 0; j < n; j = j + 1) begin
+          dist = (expect_w[j] > w_data) ? expect_w[j] - w_data
+                                        : w_data - expect_w[j];
+          if (j != w_index && dist < best) begin best = dist; other = j; end
+        end
+        own = (expect_w[w_index] > w_data) ? expect_w[w_index] - w_data
+                                           : w_data - expect_w[w_index];
+        if (other >= 0 && best < own && best <= expect_w[other] / 64 + 2)
+          $display("TB_FAIL test=%0s idx=%0d expected_w=%0d got_w=%0d got_w_is_closest_to_the_expected_value_for_idx=%0d",
+                   testname, w_index, expect_w[w_index], w_data, other);
+        else
         $display("TB_FAIL test=%0s idx=%0d expected_w=%0d got_w=%0d",
                  testname, w_index, expect_w[w_index], w_data);
         $display("TB_RESULT: FAIL");
@@ -294,9 +323,19 @@ module tb_softmax;
     expect_w[2] = 16'd31655;
     expect_w[3] = 16'd597;
     run_row(9'd4);
+    // row 8, n=4
+    smem[0] = -13'sd1500;
+    smem[1] = 13'sd1067;
+    smem[2] = -13'sd1309;
+    smem[3] = -13'sd902;
+    expect_w[0] = 16'd0;
+    expect_w[1] = 16'd32767;
+    expect_w[2] = 16'd2;
+    expect_w[3] = 16'd13;
+    run_row(9'd4);
 
     $display("TB_PROFILE rows=%0d span_cycles=%0d latency_cycles=%0d",
-             8, 8 * 64, 8);
+             9, 9 * 64, 8);
     $display("TB_PASS checks=%0d", checks);
     $display("TB_RESULT: PASS");
     $finish;

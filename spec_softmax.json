@@ -1,5 +1,5 @@
 {
-  "name": "softmax_gpt2_124m",
+  "name": "softmax_qwen2_5_0p5b",
   "description": "Softmax sequencer over a row of at most 256 scores: max pass, exponential pass with sum, one reciprocal, normalising multiply",
   "top_module": "softmax",
   "unit": "row",
@@ -20,7 +20,7 @@
     "target_clock_mhz": 100
   },
   "derivation": {
-    "model": "gpt2_124m",
+    "model": "qwen2_5_0p5b",
     "rule": "capacity is one attention row tile; the score and weight formats come from the exponential unit and the normalising shift from the reciprocal, so a change to either changes this block"
   },
   "ports": [
@@ -87,11 +87,14 @@
     }
   ],
   "behavior": [
-    "start begins a row of n scores.",
-    "The first pass reads every score and keeps the maximum, because the exponential is only defined for non-positive arguments and subtracting the row maximum is what guarantees that.",
-    "The second pass reads them again, feeds score minus maximum to the exponential unit, buffers each result and accumulates their sum.",
-    "The sum then goes through the reciprocal unit once. A divide per weight would be absurd.",
-    "The third pass multiplies each buffered exponential by that reciprocal and emits it with w_valid.",
-    "Every read is registered, so addresses lead data by one cycle throughout."
+    "start is a one-cycle pulse that begins a row of n scores, 1 <= n <= 256, held stable for the whole row. busy must be high on the clock edge that samples start, so it already reads 1 one cycle later, and it stays high until the last weight has been emitted.",
+    "Scores are read through s_addr and s_data, and the read is registered: s_data carries score[a] on the cycle after s_addr = a. If s_addr is itself a register, that is two clock edges after the edge that loads a into it: one edge updates s_addr and the next one reads the memory. Count those two edges when pairing each score with its index.",
+    "Pass 1 reads every score and keeps the maximum mx. The exponential is only defined for non-positive arguments, and subtracting the row maximum is what guarantees that.",
+    "Pass 2 feeds e_i = expu(score_i - mx) for every i. score_i - mx always fits the 13-bit signed input of expu. Buffer every e_i, a 16-bit unsigned value, and accumulate their sum S. S is at most 256 * 2**15, so it fits the 26-bit input of recip without saturating.",
+    "S then goes through recip once, giving a mantissa m and a shift k. A divide per weight would be absurd.",
+    "Pass 3 emits, for every i, w_i = min(2**15, ((e_i << 15) * m) >> (42 - k)), with w_index = i and w_valid high for exactly that one cycle. The product is unsigned and needs about 48 bits; the min clamps any weight that would round above 1.0.",
+    "Weights may be emitted in any order, but each index exactly once per row, and w_valid must be low at every other time.",
+    "expu and recip are separate modules supplied as source files, not something to write. Instantiate them. expu has ports clk, rst_n, x (signed [12:0]), valid_in, y ([15:0]) and valid_out, with a latency of 3 cycles. recip has ports clk, rst_n, x ([25:0]), valid_in, y ([16:0], the mantissa m), k ([4:0], the shift) and valid_out, with a latency of 3 cycles. Use their valid_out rather than counting cycles.",
+    "All state resets to zero: busy and w_valid are 0 during reset."
   ]
 }
