@@ -602,7 +602,11 @@ These are the distance between this repo and a local LLM host.
    a KV cache, and RMSNorm. Softmax is hardware apart from
    accumulating the sum. Nothing yet runs a whole layer: the residual
    adds, the tiling of real matrices, and the sequencing of heads and
-   layers are still on the host. The weight
+   layers are still on the host. And the MLP block is not Qwen's MLP:
+   Qwen's is gated, down(SiLU(gate(x)) * up(x)) over three projections,
+   where this one is two matmuls with a ReLU between. The routing is
+   the same kind of problem; the SiLU and the elementwise product are
+   not generated yet. The weight
    tile holds 1024 entries and the activation bank 64, so a real matrix
    needs tiling logic that does not exist yet. In `generate.py` those run on the host, and the
    output says so each run.
