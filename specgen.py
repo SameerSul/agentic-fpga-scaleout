@@ -1494,20 +1494,56 @@ def derive_softmax_spec(ms):
              "desc": "a row is in progress"},
         ],
         "behavior": [
-            "start begins a row of n scores.",
-            "The first pass reads every score and keeps the maximum, "
-            "because the exponential is only defined for non-positive "
-            "arguments and subtracting the row maximum is what "
-            "guarantees that.",
-            "The second pass reads them again, feeds score minus "
-            "maximum to the exponential unit, buffers each result and "
-            "accumulates their sum.",
-            "The sum then goes through the reciprocal unit once. A "
-            "divide per weight would be absurd.",
-            "The third pass multiplies each buffered exponential by "
-            "that reciprocal and emits it with w_valid.",
-            "Every read is registered, so addresses lead data by one "
-            "cycle throughout.",
+            "start is a one-cycle pulse that begins a row of n scores, "
+            "1 <= n <= %d, held stable for the whole row. busy must be "
+            "high on the clock edge that samples start, so it already "
+            "reads 1 one cycle later, and it stays high until the last "
+            "weight has been emitted." % cap,
+            "Scores are read through s_addr and s_data, and the read is "
+            "registered: s_data carries score[a] on the cycle after "
+            "s_addr = a. If s_addr is itself a register, that is two clock "
+            "edges after the edge that loads a into it: one edge updates "
+            "s_addr and the next one reads the memory. Count those two "
+            "edges when pairing each score with its index.",
+            "Pass 1 reads every score and keeps the maximum mx. The "
+            "exponential is only defined for non-positive arguments, and "
+            "subtracting the row maximum is what guarantees that.",
+            "Pass 2 feeds e_i = expu(score_i - mx) for every i. score_i - "
+            "mx always fits the %d-bit signed input of expu. Buffer every "
+            "e_i, a %d-bit unsigned value, and accumulate their sum S. S "
+            "is at most %d * 2**%d, so it fits the %d-bit input of recip "
+            "without saturating."
+            % (e["parameters"]["in_width"], e["parameters"]["out_width"],
+               cap, e["parameters"]["out_frac"], r["parameters"]["in_width"]),
+            "S then goes through recip once, giving a mantissa m and a "
+            "shift k. A divide per weight would be absurd.",
+            "Pass 3 emits, for every i, w_i = min(2**%d, ((e_i << %d) * m) "
+            ">> (%d - k)), with w_index = i and w_valid high for exactly "
+            "that one cycle. The product is unsigned and needs about %d "
+            "bits; the min clamps any weight that would round above "
+            "1.0."
+            % (e["parameters"]["out_frac"], e["parameters"]["out_frac"],
+               r["parameters"]["shift_bias"],
+               e["parameters"]["out_width"] + e["parameters"]["out_frac"]
+               + r["parameters"]["out_width"]),
+            "Weights may be emitted in any order, but each index exactly "
+            "once per row, and w_valid must be low at every other time.",
+            "expu and recip are separate modules supplied as source "
+            "files, not something to write. Instantiate them. expu has "
+            "ports clk, rst_n, x (signed [%d:0]), valid_in, y ([%d:0]) and "
+            "valid_out, with a latency of %d cycles. recip has ports clk, "
+            "rst_n, x ([%d:0]), valid_in, y ([%d:0], the mantissa m), k "
+            "([%d:0], the shift) and valid_out, with a latency of %d "
+            "cycles. Use their valid_out rather than counting cycles."
+            % (e["parameters"]["in_width"] - 1,
+               e["parameters"]["out_width"] - 1,
+               e["parameters"]["pipeline_stages"],
+               r["parameters"]["in_width"] - 1,
+               r["parameters"]["out_width"] - 1,
+               (r["parameters"]["in_width"]).bit_length() - 1,
+               r["parameters"]["pipeline_stages"]),
+            "All state resets to zero: busy and w_valid are 0 during "
+            "reset.",
         ],
     }
 
@@ -1612,7 +1648,7 @@ module tb_softmax;
   reg signed [{swm}:0] smem [0:{cap}-1];
   reg        [{wwm}:0] expect_w [0:{cap}-1];
   reg signed [{swm}:0] s_data;
-  integer checks = 0, seen = 0, i;
+  integer checks = 0, seen = 0, i, j, other, best, dist, own;
   reg [255:0] testname;
 
   always @(posedge clk) s_data <= smem[s_addr];
@@ -1627,7 +1663,36 @@ module tb_softmax;
     if (rst_n && w_valid) begin
       checks = checks + 1;
       seen = seen + 1;
+      // A weight for an index past the row has no expected value, and
+      // comparing against one printed expected_w=x, which a traced agent
+      // read as a datapath fault for three drafts running.
+      if (w_index >= n) begin
+        $display("TB_FAIL test=%0s idx=%0d n=%0d expected=no_weight_past_the_row got_w=%0d",
+                 testname, w_index, n, w_data);
+        $display("TB_RESULT: FAIL");
+        $finish;
+      end
       if (w_data !== expect_w[w_index]) begin
+        // A right value under the wrong index is a pipeline alignment
+        // fault, not an arithmetic one. Traced, two different models
+        // emitted weight 1 as weight 0 and read only "expected 14668 got
+        // 18118", which says nothing about which of the two is wrong.
+        // Nearest other index, reported only when the value is within
+        // about 1.5% of it, which a coincidence rarely manages. Exact
+        // equality missed a draft that was misaligned and also ten counts
+        // off in its arithmetic.
+        other = -1; best = 1 << 30;
+        for (j = 0; j < n; j = j + 1) begin
+          dist = (expect_w[j] > w_data) ? expect_w[j] - w_data
+                                        : w_data - expect_w[j];
+          if (j != w_index && dist < best) begin best = dist; other = j; end
+        end
+        own = (expect_w[w_index] > w_data) ? expect_w[w_index] - w_data
+                                           : w_data - expect_w[w_index];
+        if (other >= 0 && best < own && best <= expect_w[other] / 64 + 2)
+          $display("TB_FAIL test=%0s idx=%0d expected_w=%0d got_w=%0d got_w_is_closest_to_the_expected_value_for_idx=%0d",
+                   testname, w_index, expect_w[w_index], w_data, other);
+        else
         $display("TB_FAIL test=%0s idx=%0d expected_w=%0d got_w=%0d",
                  testname, w_index, expect_w[w_index], w_data);
         $display("TB_RESULT: FAIL");
@@ -1779,8 +1844,11 @@ def derive_mlp_spec(ms):
             {"name": "shift2", "dir": "input",
              "width": rq["parameters"]["shift_width"],
              "desc": "requantizer shift for the second matmul"},
+            # The port the writer reads, sized like the parameter above.
+            # Fixing only the parameter left a 26-bit port in the spec
+            # against a 13-bit wire in the testbench.
             {"name": "w_addr", "dir": "output",
-             "width": mv["parameters"]["addr_width"],
+             "width": (2 * bank * bank - 1).bit_length(),
              "desc": "weight address, into the weight memory"},
             {"name": "w_data", "dir": "input", "width": dw, "signed": True,
              "desc": "weight, registered read"},
@@ -1794,18 +1862,61 @@ def derive_mlp_spec(ms):
              "desc": "a layer is in progress"},
         ],
         "behavior": [
-            "load_valid writes input activations into bank zero in order.",
-            "start runs the first matmul over bank zero, requantizes each "
-            "column with scale1 and shift1, rectifies it and writes it to "
-            "bank one.",
-            "It then runs the second matmul over bank one, requantizes "
-            "with scale2 and shift2, and emits each result on o_data.",
-            "The second matmul's reduction length is the first one's "
-            "column count, because that is what the first matmul "
-            "produced. Taking it from an input instead would let the two "
-            "disagree.",
-            "The weight address continues across both matmuls, so the "
-            "second matrix follows the first in memory.",
+            "Both banks are one memory named act, declared reg signed "
+            "[%d:0] act [0:%d]. Bank zero is act[0..%d] and bank one is "
+            "act[%d..%d]. The testbench reads act directly to check the "
+            "hidden layer, so this name and layout are part of the "
+            "interface." % (dw - 1, 2 * bank - 1, bank - 1, bank,
+                            2 * bank - 1),
+            "Each cycle with load_valid high writes load_data into bank "
+            "zero at the next index, starting from 0 after reset, so "
+            "x[0..depth1-1] are loaded in order before start.",
+            "start is a one-cycle pulse, with depth1, cols1, cols2, "
+            "scale1, shift1, scale2 and shift2 held stable for the whole "
+            "layer. busy must be high on the clock edge that samples "
+            "start, so it already reads 1 one cycle later, and it stays "
+            "high until the last output has been emitted.",
+            "Weights are column-major and packed back to back in one "
+            "memory. The first matrix's weight for input r of hidden "
+            "unit c is at address c*depth1 + r. The second matrix "
+            "follows it: its weight for hidden unit r of output c is at "
+            "depth1*cols1 + c*cols1 + r.",
+            "w_data is a registered read: it carries the weight at "
+            "address a on the cycle after w_addr = a. If w_addr is itself "
+            "a register, that is two clock edges after the edge that loads "
+            "a into it.",
+            "Hidden layer: h[c] = max(0, requant(sum over r of x[r] * "
+            "W1[c][r], scale1, shift1)) for c in 0..cols1-1, written to "
+            "act[%d + c]. Requantize first, then rectify." % bank,
+            "Output: y[c] = requant(sum over r of h[r] * W2[c][r], "
+            "scale2, shift2) for c in 0..cols2-1, with no rectifier. The "
+            "second matmul's reduction length is cols1, because that is "
+            "what the first produced; there is no separate input for it, "
+            "so the two cannot disagree.",
+            "requant is exactly the supplied requantizer: multiply by "
+            "scale, add 2**(shift-1) when shift > 0, arithmetic shift "
+            "right by shift, then saturate to [%d, %d]."
+            % (-(1 << (dw - 1)), (1 << (dw - 1)) - 1),
+            "Emit each y[c] with o_index = c and o_valid high for exactly "
+            "that one cycle. Outputs may come in any order, but each "
+            "index exactly once, and o_valid must be low at every other "
+            "time.",
+            "matvec, mac and requant are separate modules supplied as "
+            "source files, not something to write. Instantiate them. "
+            "matvec sequences one matrix: after a start pulse with depth "
+            "and cols it walks a_addr 0..depth-1 and w_addr col*depth "
+            "onward for each column, drives mac_valid one cycle behind "
+            "the address, pulses col_valid with col_index when a column's "
+            "sum is ready in the MAC, and pulses mac_clear after it. Its "
+            "w_addr starts from 0, so the second matrix needs a base "
+            "offset of depth1*cols1 added. mac has ports clk, rst_n, "
+            "clear, a, b, valid_in, acc ([%d:0] signed) and valid_out. "
+            "requant has ports clk, rst_n, acc_in, scale, shift, "
+            "valid_in, q_out, sat and valid_out, with a latency of "
+            "exactly %d cycles."
+            % (aw - 1, rq["parameters"]["pipeline_stages"]),
+            "All state resets to zero: busy and o_valid are 0 during "
+            "reset.",
         ],
     }
 
@@ -1823,26 +1934,64 @@ def render_mlp_testbench(spec):
     acts = [rnd.randrange(-half, half) for _ in range(d1)]
     w1 = [rnd.randrange(-half, half) for _ in range(d1 * c1)]
     w2 = [rnd.randrange(-half, half) for _ in range(c1 * c2)]
-    sh = 12
-    sc = 1 << (sh - 4)              # a gentle scale, mostly in range
+    # One column per layer has its weights aligned in sign with its
+    # inputs, so that accumulator is large by construction. Without it
+    # nothing reached the top half of the accumulator, and a design that
+    # kept only the low half of it passed: an earlier version killed that
+    # mutant through one value that happened to cross the line.
+    for r in range(d1):
+        w1[r] = half if acts[r] >= 0 else -half
+    for r in range(c1):
+        w2[r] = half                  # hidden values are rectified, >= 0
+    # Each layer's scale is derived from its own accumulators. A fixed
+    # scale used to put every output on a rail, and a layer whose outputs
+    # all clamp only checks the sign of the arithmetic: the hidden layer
+    # came out as two values pinned at the maximum and the rest zero.
     h_acc = [sum(acts[r] * w1[c * d1 + r] for r in range(d1))
              for c in range(c1)]
-    h = [max(0, requant_golden(v, sc, sh, dw)[0]) for v in h_acc]
+    sc1, sh1 = _mlp_scale(h_acc, dw, mw, sw)
+    h = [max(0, requant_golden(v, sc1, sh1, dw)[0]) for v in h_acc]
     y_acc = [sum(h[r] * w2[c * c1 + r] for r in range(c1))
              for c in range(c2)]
-    y = [requant_golden(v, sc, sh, dw)[0] for v in y_acc]
+    sc2, sh2 = _mlp_scale(y_acc, dw, mw, sw)
+    y = [requant_golden(v, sc2, sh2, dw)[0] for v in y_acc]
+    # The two layers use different scales, and a design that applies the
+    # first one to both has to fail. Check the vectors can see that.
+    assert [requant_golden(v, sc1, sh1, dw)[0] for v in y_acc] != y, \
+        "mlp testbench cannot tell scale1 from scale2"
+    for name, accs in (("first", h_acc), ("second", y_acc)):
+        assert max(abs(v) for v in accs) >= 1 << (aw // 2), \
+            "mlp %s layer never reaches the top half of the accumulator" % name
     init = "\n".join(
         ["    acts[%d] = %s;" % (i, _slit(v, dw))
          for i, v in enumerate(acts)]
         + ["    wmem_tb[%d] = %s;" % (i, _slit(v, dw))
            for i, v in enumerate(w1 + w2)]
         + ["    expect_y[%d] = %s;" % (i, _slit(v, dw))
-           for i, v in enumerate(y)])
+           for i, v in enumerate(y)]
+        + ["    expect_h[%d] = %s;" % (i, _slit(v, dw))
+           for i, v in enumerate(h)])
     return MLP_TB.format(
         dwm=dw - 1, awm=aw - 1, mwm=mw - 1, swm=sw - 1,
         bwm=p["bank_width"] - 1, depwm=p["depth_width"] - 1,
         colwm=p["col_width"] - 1, addrwm=p["addr_width"] - 1,
-        d1=d1, c1=c1, c2=c2, nw=len(w1 + w2), sc=sc, sh=sh, init=init)
+        d1=d1, c1=c1, c2=c2, bank=p["bank"], nw=len(w1 + w2), sc1=sc1, sh1=sh1,
+        sc2=sc2, sh2=sh2, init=init)
+
+
+def _mlp_scale(accs, dw, mw, sw):
+    """A (scale, shift) that maps the largest accumulator just inside the
+    output range, so every output lands in range and its value, not just
+    its sign, is checked. That includes the large column, which is the
+    one that exercises the accumulator's top bits: a clamped output
+    there would hide exactly the error it exists to catch. Saturation
+    itself is the requantizer's to test, and its own testbench does."""
+    hi = (1 << (dw - 1)) - 2
+    ref = max(1, max(abs(v) for v in accs))
+    sh = 1
+    while (hi << sh) // ref < (1 << (mw - 2)) and sh < (1 << sw) - 1:
+        sh += 1
+    return max(1, min((1 << mw) - 1, (hi << sh) // ref)), sh
 
 
 MLP_TB = """`timescale 1ns/1ps
@@ -1866,6 +2015,10 @@ module tb_mlp;
   reg signed [{dwm}:0] acts [0:{d1}-1];
   reg signed [{dwm}:0] wmem_tb [0:{nw}-1];
   reg signed [{dwm}:0] expect_y [0:{c2}-1];
+  reg signed [{dwm}:0] expect_h [0:{c1}-1];
+  integer nbad = 0, hbad = 0;
+  reg [7:0] bad_idx [0:7];
+  reg signed [{dwm}:0] bad_exp [0:7], bad_got [0:7];
   reg signed [{dwm}:0] w_data;
   integer checks = 0, seen = 0, i;
   reg [255:0] testname;
@@ -1885,11 +2038,20 @@ module tb_mlp;
     if (rst_n && o_valid) begin
       checks = checks + 1;
       seen = seen + 1;
-      if (o_data !== expect_y[o_index]) begin
-        $display("TB_FAIL test=%0s out=%0d expected_y=%0d got_y=%0d",
-                 testname, o_index, expect_y[o_index], o_data);
+      if (o_index >= {c2}) begin
+        $display("TB_FAIL test=%0s out=%0d cols2=%0d expected=no_output_past_cols2 got_y=%0d",
+                 testname, o_index, {c2}, o_data);
         $display("TB_RESULT: FAIL");
         $finish;
+      end
+      if (o_data !== expect_y[o_index]) begin
+        // Held, not reported yet: a wrong hidden layer makes every output
+        // wrong, and the hidden check below names the cause.
+        if (nbad < 8) begin
+          bad_idx[nbad] = o_index; bad_exp[nbad] = expect_y[o_index];
+          bad_got[nbad] = o_data;
+        end
+        nbad = nbad + 1;
       end
     end
   end
@@ -1906,13 +2068,32 @@ module tb_mlp;
     end
     load_valid = 0;
     depth1 = {d1}; cols1 = {c1}; cols2 = {c2};
-    scale1 = {sc}; shift1 = {sh}; scale2 = {sc}; shift2 = {sh};
+    scale1 = {sc1}; shift1 = {sh1}; scale2 = {sc2}; shift2 = {sh2};
     @(negedge clk);
     start = 1;
     @(negedge clk);
     start = 0;
     while (busy) @(negedge clk);
     repeat (8) @(negedge clk);
+    // Whitebox check of the hidden layer, which the spec places in act at
+    // {bank}..{bank}+cols1-1. Reported before the outputs because it is
+    // upstream of them: traced, a draft whose writeback was wrong sat for
+    // six iterations on "output 0 wrong" and never looked at layer one.
+    for (i = 0; i < {c1}; i = i + 1) begin
+      checks = checks + 1;
+      if (dut.act[{bank} + i] !== expect_h[i]) begin
+        $display("TB_FAIL test=hidden_layer h_index=%0d expected_h=%0d got_h=%0d",
+                 i, expect_h[i], dut.act[{bank} + i]);
+        hbad = hbad + 1;
+      end
+    end
+    for (i = 0; i < nbad && i < 8; i = i + 1)
+      $display("TB_FAIL test=%0s out=%0d expected_y=%0d got_y=%0d",
+               testname, bad_idx[i], bad_exp[i], bad_got[i]);
+    if (hbad || nbad) begin
+      $display("TB_RESULT: FAIL");
+      $finish;
+    end
     checks = checks + 1;
     if (seen !== {c2}) begin
       $display("TB_FAIL test=%0s out=0 expected_y=%0d got_y=%0d",
@@ -2019,20 +2200,36 @@ def derive_requant_spec(ms):
              "desc": "q_out updated this cycle"},
         ],
         "behavior": [
-            "Stage 1 registers two half-width partial products of "
-            "acc_in * scale; stage 2 recombines them into the full "
-            "product.",
-            "Stage 3 adds half an LSB, precomputed a stage earlier, for "
-            "round to nearest.",
-            "Stage 4 arithmetically shifts that sum right by shift.",
-            "Stage 5 saturates to the signed %d-bit range [%d, %d] and "
-            "registers the result."
+            "Let p = acc_in * scale. scale is a non-negative magnitude, "
+            "so p is a signed %d-bit product with the sign of acc_in."
+            % (aw + mw),
+            "If shift is greater than zero, r = (p + 2**(shift-1)) >>> "
+            "shift, an arithmetic right shift. That rounds to nearest "
+            "with ties toward plus infinity: 2.5 becomes 3 and -2.5 "
+            "becomes -2. If shift is zero, r = p and no rounding term "
+            "is added. shift is always less than %d." % (aw + mw),
+            "q_out is r clamped to the signed %d-bit range [%d, %d]. sat "
+            "is 1 exactly when the clamp changed the value, and 0 "
+            "otherwise."
             % (dw, -(1 << (dw - 1)), (1 << (dw - 1)) - 1),
-            "sat is high on any output that had to be clamped.",
+            "Latency from valid_in to valid_out is exactly %d cycles, "
+            "and q_out, sat and valid_out are sampled at exactly that "
+            "cycle. If a design needs fewer register stages it must add "
+            "delay registers to reach %d; more is also a failure."
+            % (stages, stages),
+            "The multiply is too wide for one cycle at the target "
+            "clock. The reference splits scale into %d slices, "
+            "registers the %d partial products, sums them in a "
+            "registered adder tree, then registers the rounding add, "
+            "the shift and the saturate. Any structure that meets both "
+            "timing and the exact latency is acceptable."
+            % (splits, requant_terms(aw, splits)),
+            "Every pipeline register resets to zero, so valid_out, "
+            "q_out and sat all read 0 during reset and on the first "
+            "cycle after it.",
             "Saturating, not wrapping, is required: a wrapped overflow "
             "flips the sign of a large activation and corrupts every "
             "later layer.",
-            "Latency from valid_in to valid_out is %d cycles." % stages,
         ],
     }
 

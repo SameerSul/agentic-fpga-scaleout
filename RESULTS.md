@@ -360,15 +360,24 @@ The agent interface takes either a deterministic rule-based agent or a
 real LLM. Both face identical gates. Running it at every block, for
 Qwen2.5-0.5B:
 
-| block | LLM result | iterations |
-|---|---|---|
-| MAC chiplet | converged | 1 |
-| matmul sequencer | converged | 1 |
-| weight memory | converged | 15 |
-| exponential | converged | 6 |
-| reciprocal | converged, 4 of 4 runs | 1, 2, 1, 2 |
-| inverse square root | converged, 4 of 4 runs | 3, 1, 2, 2 |
-| requantizer, softmax, MLP layer | failed | 23 to 26 calls |
+| block | LLM result | drafts | model |
+|---|---|---|---|
+| MAC chiplet | converged | 1 | Haiku |
+| matmul sequencer | converged | 1 | Haiku |
+| weight memory | converged | 15 | Haiku |
+| exponential | converged | 6 | Haiku |
+| reciprocal | converged, 4 of 4 runs | 1, 2, 1, 2 | Haiku |
+| inverse square root | converged, 4 of 4 runs | 3, 1, 2, 2 | Haiku |
+| requantizer | converged | 5 | Sonnet |
+| softmax | converged | 8 | Haiku |
+| MLP layer | converged | 3 | Haiku |
+
+Every block the flow generates has now been written and signed off by an
+LLM through all four gates. Haiku is the smallest current Claude model,
+run through the Claude Code CLI; the requantizer is the one block it did
+not close, reaching timing with a correct datapath and running out of
+drafts there, and Sonnet closed it. Transcripts of the three hardest runs,
+every draft with the tool feedback it received, are in `transcripts/`.
 
 The three table-driven units were first recorded here as blocks an LLM
 cannot write, with the explanation that exact fixed-point arithmetic is
@@ -406,10 +415,55 @@ until the ten minute timeout and aborted the block. Transport faults are
 now retried with backoff, and authentication faults still fail at once,
 since retrying them cannot give a different answer.
 
-The requantizer, softmax and MLP rows are from before the specification
-fix and have not been rerun. Given what the table units turned out to
-be, the first thing to check there is whether their specs are
-implementable as written, before concluding anything about the agent.
+### What it took for the last three
+
+The same diagnosis as the table units, three times over, and then a
+series of defects in what the tools told the agent. Each was found by
+tracing a failed run draft by draft and asking what an engineer would
+have needed to see.
+
+The specs were not implementable as written. The requantizer described
+five pipeline stages and demanded a latency of nine, and never said what
+a shift of zero does. Softmax never gave its normalising formula. The MLP
+layer never gave its weight layout or said the rectifier follows the
+requantizer, and declared a 26-bit port against a 13-bit testbench wire.
+Softmax also said a score arrives "on the cycle after s_addr = a", which
+is true, but three different agents drove s_addr from a register and
+read one edge early, giving every score the same weight. The spec now
+counts the two edges.
+
+The feedback was the rest:
+
+- Compile errors named a line number and nothing else. The model sees
+  its draft without line numbers, so it rewrote around an illegal
+  literal and kept it in every draft. Errors now quote the source line,
+  and a sign inside a sized literal is explained.
+- A yosys message about legalising `$_DFFE_PN0P_` is how an asynchronous
+  reset shows up. It is now restated in the design's terms.
+- A reply that was a fragment rather than a module used to be compiled
+  as the design. It is re-asked instead, without spending an iteration.
+- A draft that never lowered busy hung the simulator, and the timeout
+  raised out of the flow and ended the run. It is now a failed
+  simulation the agent can read.
+- A timing failure reported only a slack. It now names the path, from
+  the register whose net keeps its RTL name to the endpoint.
+- The requantizer multiplied a signed accumulator by an unsigned scale,
+  and when that was fixed, lost the sign again in a concatenation, which
+  Verilog makes unsigned. Both are now reported as facts about the code,
+  checked against all 48 reference designs with no false positives.
+- The MLP testbench now checks the hidden layer directly and reports it
+  before the outputs, since a draft sat for six iterations on "output 0
+  wrong" when layer one was at fault.
+- Softmax reported `expected_w=x` for a weight emitted past the end of a
+  row, and a right value under the wrong index read as an arithmetic
+  error. Both are now named for what they are.
+
+Two findings about the models themselves. Sonnet was not failing: it
+spent every call in extended thinking past the ten minute timeout, 778
+thinking deltas in 150 s without a character of output. At low effort
+its first requantizer draft passed all 209 checks. And a larger model is
+not simply better here: it fell into the same read-latency trap as
+Haiku, because the trap was in the spec.
 
 The deterministic agent is still what generated the committed RTL, and
 it is still the right default for anyone who wants hardware reproducibly

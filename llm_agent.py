@@ -25,6 +25,7 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -42,7 +43,8 @@ RULES = """Write synthesizable Verilog for the block specified below.
 Hard rules:
 - Output ONLY the Verilog source. No explanation, no markdown fences.
 - One module named exactly '{top}'. Port names, directions, and widths
-  exactly as listed in the spec. No other modules, no includes.
+  exactly as listed in the spec. Define no other module and use no
+  includes; where the spec names supplied modules, instantiate them.
 - Verilog-2005 only: no SystemVerilog (no logic, always_ff, always_comb,
   typedef, enum, interfaces, packed structs).
 - Fully synchronous: state changes only on posedge clk. rst_n and clear are
@@ -80,19 +82,193 @@ def pick_backend(choice=None):
         "server, or install the Claude CLI (or set CHIPLET_LLM explicitly)")
 
 
-def condense_feedback(history):
-    """Bound the prompt: the most recent failure records, each trimmed to the
-    fields an engineer would actually read."""
+_BAD_LITERAL = re.compile(r"\d+\s*'\s*[sS]?[dDhHbBoO]\s*[-(]")
+_ERR_LOC = re.compile(r"^(?P<path>[^\s:]+(?: [^\s:]+)*\.s?v):(?P<line>\d+):\s*(?P<msg>.*)$")
+
+
+def annotate_errors(errors, rtl):
+    """Quote the source line each compile error points at.
+
+    iverilog reports 'file.v:141: syntax error' and nothing else. An
+    engineer opens the file at line 141; the model sees its draft as plain
+    text and has to count to it, which it does badly. Measured on the
+    requantizer: told only a line number, it restructured the code around
+    an illegal literal (48'sd-128) and kept that literal in every draft.
+    Absolute paths are cut to the file name, since they cost tokens and
+    carry nothing. Lines in the testbench or the supplied dependency and
+    table files are not the writer's code, so they are left unquoted.
+    """
+    lines = rtl.splitlines() if rtl else []
     out = []
-    for fb in history[-MAX_FEEDBACK:]:
+    for e in errors:
+        m = _ERR_LOC.match(e.strip())
+        if not m:
+            out.append(_explain(e, lines))
+            continue
+        name = os.path.basename(m.group("path"))
+        n = int(m.group("line"))
+        text = _explain("%s line %d: %s" % (name, n, m.group("msg")), lines)
+        ours = not (name.startswith("tb_") or name.endswith("_dep.v")
+                    or name.endswith("_rom.v"))
+        if ours and 1 <= n <= len(lines):
+            src = lines[n - 1]
+            text += "  | source: " + src.strip()
+            # A sign inside a sized literal. Traced on the requantizer, the
+            # model wrote 48'sd-128, then 8'sd(-128), then 47'sd-128, each
+            # time with the line quoted back to it: it is a misconception
+            # about the syntax, so the feedback states the rule.
+            if _BAD_LITERAL.search(src):
+                text += ("  | meaning: a sized literal cannot hold a sign "
+                         "or parentheses after the base. Put the minus in "
+                         "front of the whole literal: -8'sd128, not "
+                         "8'sd-128 or 8'sd(-128).")
+        out.append(text)
+    return out
+
+
+def _explain(err, lines):
+    """Restate a yosys message whose wording names an internal cell rather
+    than the construct in the design. This is the tool's verdict in the
+    design's terms, not a guess at a cause: the cell type in the message
+    is an asynchronously reset flop, and nothing else produces it.
+    Traced on softmax, the only report was '$_DFFE_PN0P_ cannot be
+    legalized', after a draft that passed simulation with an asynchronous
+    reset the testbench cannot see."""
+    m = re.search(r"Unable to bind [\w/ ]*`dut\.(\w+)", err)
+    if m:
+        err += ("  | meaning: the testbench checks an internal memory named "
+                "%s that the spec requires. Declare it with exactly that "
+                "name and layout." % m.group(1))
+    if "async set or reset are not supported" in err:
+        where = ["line %d: %s" % (i + 1, l.strip())
+                 for i, l in enumerate(lines)
+                 if "always" in l and "rst" in l and "edge" in l
+                 and l.count("edge") > 1][:3]
+        err += ("  | meaning: a flop has an asynchronous reset, which this "
+                "flow does not support. The reset must be synchronous: "
+                "always @(posedge clk) with if (!rst_n) inside the block."
+                + ("  | at " + "; ".join(where) if where else ""))
+    return err
+
+
+# A declaration runs to the next port keyword as well as to ';', so an
+# ANSI port list on one line does not fold every port into the first.
+_DECL = re.compile(r"\b(input|output|inout|wire|reg)\b"
+                   r"((?:(?!\b(?:input|output|inout)\b)[^;])*)")
+_MUL = re.compile(r"(\$signed\s*\(\s*)?\b([A-Za-z_]\w*)\b\s*\*\s*"
+                  r"(\$signed\s*\(\s*)?\b([A-Za-z_]\w*)\b")
+
+
+def _signedness(rtl):
+    """Map each declared name to whether it was declared signed."""
+    sig = {}
+    for line in rtl.splitlines():
+        line = line.split("//")[0]
+        for m in _DECL.finditer(line):
+            body = m.group(2)
+            signed = bool(re.search(r"\bsigned\b", body))
+            body = re.sub(r"\[[^\]]*\]", " ", body)
+            body = re.sub(r"\b(wire|reg|signed|unsigned|integer)\b", " ",
+                          body).split("=")[0]
+            for name in re.findall(r"[A-Za-z_]\w*", body):
+                sig.setdefault(name, signed)
+    return sig
+
+
+def code_findings(rtl, history):
+    """Facts about the failing draft, found by inspecting it and the
+    testbench output. Not diagnoses: each is true of the code whether or
+    not it is the cause, and the prompt labels them that way.
+
+    Both come from traces. The requantizer multiplied a signed
+    accumulator by an unsigned scale for five drafts running, reading
+    'acc -128 in, 127 saturated out' each time without connecting it to
+    Verilog making the product unsigned. Softmax emitted x, which always
+    means a value that was never written or reset.
+    """
+    out = []
+    if not rtl:
+        return out
+    sig = _signedness(rtl)
+    for n, line in enumerate(rtl.splitlines(), 1):
+        code = line.split("//")[0]
+        for m in _MUL.finditer(code):
+            a, b = m.group(2), m.group(4)
+            if m.group(1) or m.group(3) or a not in sig or b not in sig:
+                continue
+            if sig[a] != sig[b]:
+                s_, u_ = (a, b) if sig[a] else (b, a)
+                out.append(
+                    "line %d: %s * %s multiplies a signed operand (%s) by an "
+                    "unsigned one (%s). Verilog then evaluates the whole "
+                    "expression as unsigned, so a negative %s multiplies as "
+                    "a large positive number. For a signed value times a "
+                    "non-negative unsigned one, write %s * $signed({1'b0, %s})."
+                    % (n, a, b, s_, u_, s_, s_, u_))
+        for m in re.finditer(r"(\$signed\s*\(\s*)?(\{[^{}]*\})", code):
+            if m.group(1):
+                continue
+            # Only a whole signed signal inside the braces loses a sign. A
+            # part-select is unsigned by the language already, and
+            # {1'b0, x[22:0]} is a deliberate zero-extension: the reference
+            # requantizer does exactly that, and flagging it would teach the
+            # agent to distrust a correct construct.
+            whole = {v for v in re.findall(r"([A-Za-z_]\w*)(?!\s*\[)",
+                                           m.group(2))}
+            # {x[msb], x} and {{n{x[msb]}}, x} are sign extension, the
+            # standard idiom for widening a signed value by hand, and they
+            # produce the right bits. Sonnet's first requantizer draft
+            # passed all 209 checks using one; flagging it would send a
+            # model after a bug that is not there.
+            ext = re.match(r"\{\s*(?:\d+\s*\{\s*)?([A-Za-z_]\w*)\s*\[[^\]]*\]",
+                           m.group(2))
+            if ext and ext.group(1) in whole:
+                continue
+            rest = code[:m.start()] + code[m.end():]
+            arith = re.search(r"[-+*]", rest.split("=", 1)[-1]) or \
+                re.search(r"[-+*]\s*$", code[:m.start()])
+            if arith and any(sig.get(v) for v in whole):
+                out.append(
+                    "line %d: %s is a concatenation, and in Verilog a "
+                    "concatenation is always unsigned, even when its parts "
+                    "are signed. Used in arithmetic next to a signed value it "
+                    "makes the whole expression unsigned, so negative values "
+                    "turn into large positive ones. To shift a signed value, "
+                    "write x <<< n, or wrap it as $signed(%s)."
+                    % (n, m.group(2), m.group(2)))
+                break
+    last = history[-1] if history else {}
+    for mm in last.get("mismatches") or []:
+        if any(k.startswith("got") and re.fullmatch(r"[xXzZ]+", str(v))
+               for k, v in mm.items()):
+            out.append("the testbench read x (unknown) from the design: that "
+                       "value came from a register or memory that was never "
+                       "written or reset, or from an address never loaded.")
+            break
+    return out
+
+
+def condense_feedback(history, rtl=None):
+    """Bound the prompt: the most recent failure records, each trimmed to the
+    fields an engineer would actually read. rtl is the draft the most
+    recent record was produced from; its failing lines get quoted."""
+    out = []
+    recent = history[-MAX_FEEDBACK:]
+    for i, fb in enumerate(recent):
         rec = {"iteration": fb.get("iteration"), "stage": fb.get("stage"),
                "status": fb.get("status")}
         if fb.get("phase"):
             rec["phase"] = fb["phase"]
         if fb.get("errors"):
-            rec["tool_errors"] = fb["errors"][:MAX_ERR_LINES]
+            errs = fb["errors"][:MAX_ERR_LINES]
+            # Only the latest record matches the draft we are holding.
+            rec["tool_errors"] = annotate_errors(
+                errs, rtl if i == len(recent) - 1 else None)
         if fb.get("mismatches"):
             rec["testbench_mismatches"] = fb["mismatches"][:MAX_MISMATCHES]
+        for k in ("worst_slack_ns", "clock_period_ns", "critical_path"):
+            if fb.get(k) is not None:
+                rec[k] = fb[k]
         out.append(rec)
     return out
 
@@ -105,8 +281,38 @@ def build_prompt(spec, history, last_rtl):
                   last_rtl]
     if history:
         parts += ["", "TOOL FEEDBACK, most recent last (make these pass):",
-                  json.dumps(condense_feedback(history), indent=2)]
+                  json.dumps(condense_feedback(history, last_rtl), indent=2)]
+        found = code_findings(last_rtl, history)
+        if found:
+            parts += ["", "FACTS ABOUT YOUR PREVIOUS ATTEMPT, found by "
+                          "inspecting it (true of the code; check whether "
+                          "they explain the failure):"] + ["- " + f for f in found]
     return "\n".join(parts)
+
+
+def is_complete_module(rtl, top):
+    return bool(re.search(r"\bmodule\s+%s\b" % re.escape(top), rtl)) \
+        and "endmodule" in rtl
+
+
+def ask_for_module(ask, prompt, top, retries=2):
+    """Call the model and insist on a whole module.
+
+    A reply that is a fragment, as if proposing an edit, used to be
+    compiled as the design and spend a full iteration of every gate on a
+    formatting slip; traced on the requantizer, one draft was a single
+    line. It is re-asked on the spot instead, which costs one call and no
+    tool time. Returns (rtl, calls made).
+    """
+    rtl = extract_verilog(ask(prompt))
+    calls = 1
+    while not is_complete_module(rtl, top) and calls <= retries:
+        rtl = extract_verilog(ask(
+            prompt + "\n\nYour previous reply was not a complete module. "
+            "Reply with the entire Verilog source, from 'module %s' to "
+            "'endmodule', and nothing else." % top))
+        calls += 1
+    return rtl, calls
 
 
 def extract_verilog(text):
@@ -151,18 +357,49 @@ def call_ollama(prompt, model):
 # failure once when what actually happened was one call sitting at zero
 # CPU until it hit the timeout, which aborted the whole run.
 CLI_TIMEOUT_S = 600
+# Measured: one Sonnet softmax call at low effort took 852 s and returned a
+# complete module. The larger models get room for that; haiku keeps 600.
+CLI_TIMEOUT_LARGE_S = 1500
 CLI_ATTEMPTS = 3
+
+
+def cli_timeout(model):
+    return CLI_TIMEOUT_S if "haiku" in model else CLI_TIMEOUT_LARGE_S
+
+
+def cli_command(model):
+    """The CLI invocation for one writer call.
+
+    --tools "": the model writes text and the flow runs the tools. Left
+    enabled, print mode is an agent that may go off and run its own.
+    --effort: larger models think at length by default, and on these specs
+    Sonnet spent over ten minutes in extended thinking without emitting a
+    character (778 thinking deltas in 150 s, measured), so every call hit
+    the timeout. Low effort returned a complete requantizer in about four
+    minutes, and that first draft passed all 209 checks. Haiku keeps its
+    default so its results stay comparable with every earlier run.
+    CHIPLET_LLM_EFFORT overrides either way.
+    """
+    cmd = ["claude", "-p", "--model", model, "--tools", ""]
+    effort = os.environ.get("CHIPLET_LLM_EFFORT") or \
+        (None if "haiku" in model else "low")
+    if effort:
+        cmd += ["--effort", effort]
+    return cmd
 
 
 def call_claude_cli(prompt, model, attempts=CLI_ATTEMPTS):
     last = None
     for attempt in range(1, attempts + 1):
         try:
-            r = subprocess.run(["claude", "-p", "--model", model],
-                               input=prompt, capture_output=True, text=True,
-                               timeout=CLI_TIMEOUT_S)
+            # A neutral directory, so the CLI does not load this repo's
+            # project context into what should be a self-contained prompt.
+            r = subprocess.run(cli_command(model), input=prompt,
+                               capture_output=True, text=True,
+                               timeout=cli_timeout(model),
+                               cwd=tempfile.gettempdir())
         except subprocess.TimeoutExpired:
-            last = "timed out after %ds" % CLI_TIMEOUT_S
+            last = "timed out after %ds" % cli_timeout(model)
         else:
             if r.returncode == 0:
                 return r.stdout
@@ -204,10 +441,11 @@ class LLMAgent:
 
     def propose(self, spec, feedback_history):
         prompt = build_prompt(spec, feedback_history, self.last_rtl)
-        raw = CALLERS[self.backend](prompt, self.model)
-        rtl = extract_verilog(raw)
+        rtl, n = ask_for_module(
+            lambda p: CALLERS[self.backend](p, self.model), prompt,
+            spec["top_module"])
         self.last_rtl = rtl
-        self.calls += 1
+        self.calls += n
         return rtl, ["llm:%s@%s#%d" % (self.model, self.backend, self.calls)]
 
 

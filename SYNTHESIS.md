@@ -180,16 +180,10 @@ block, every time, for free, and it is what generated the RTL you are
 about to synthesise. Use it.
 
 `--agent llm` or `--agent swarm` puts a real LLM in the writing seat.
-Measured, it now signs off six of the nine blocks: the MAC, the matmul
-sequencer, the weight memory, and the exponential, reciprocal and
-inverse square root. Those last three were first recorded as blocks a
-model could not write. The real cause was that their specs left the
-exact bit ranges to guesswork, and once the specs stated them the
-reciprocal and inverse square root converged in every run and the
-exponential converged by correcting its own errors from tool feedback.
-The requantizer, softmax and MLP layer have not been rerun since that
-fix. Build with the rules agent anyway: its output is what the numbers
-below were measured on, and it is reproducible and needs no network.
+Measured, it has now signed off all nine blocks, eight with Haiku and
+the requantizer with Sonnet. Build with the rules agent anyway: its
+output is what the numbers below were measured on, and it is
+reproducible and needs no network.
 
 ## Two things that look like failures and are not
 

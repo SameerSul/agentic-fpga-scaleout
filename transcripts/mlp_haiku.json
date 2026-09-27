@@ -1,0 +1,101 @@
+{
+ "block": "mlp",
+ "model": "claude-haiku-4-5 via Claude Code CLI",
+ "converged": true,
+ "drafts": 3,
+ "note": "Each entry is one draft. feedback_in is the tool result for the previous draft, which is what the model was revising against.",
+ "steps": [
+  {
+   "draft": 1,
+   "feedback_in": null,
+   "rtl": "module mlp (\n  input clk,\n  input rst_n,\n  input load_valid,\n  input signed [7:0] load_data,\n  input start,\n  input [12:0] depth1,\n  input [12:0] cols1,\n  input [12:0] cols2,\n  input [17:0] scale1,\n  input [6:0] shift1,\n  input [17:0] scale2,\n  input [6:0] shift2,\n  output [12:0] w_addr,\n  input signed [7:0] w_data,\n  output o_valid,\n  output [5:0] o_index,\n  output signed [7:0] o_data,\n  output busy\n);\n\n  reg signed [7:0] act [0:127];\n\n  reg [5:0] load_idx;\n  always @(posedge clk) begin\n    if (!rst_n)\n      load_idx <= 0;\n    else if (load_valid)\n      load_idx <= load_idx + 1;\n  end\n\n  always @(posedge clk) begin\n    if (load_valid)\n      act[load_idx] <= load_data;\n  end\n\n  reg [1:0] state;\n  localparam IDLE = 2'b00, MATMUL1 = 2'b01, MATMUL2 = 2'b10;\n\n  wire [12:0] a_addr1, w_addr1;\n  wire mac_valid1, col_valid1, mac_clear1;\n  wire [5:0] col_index1;\n\n  matvec matvec1 (\n    .clk(clk),\n    .rst_n(rst_n),\n    .start(state == IDLE && start),\n    .depth(depth1),\n    .cols(cols1),\n    .a_addr(a_addr1),\n    .w_addr(w_addr1),\n    .mac_valid(mac_valid1),\n    .col_valid(col_valid1),\n    .col_index(col_index1),\n    .mac_clear(mac_clear1)\n  );\n\n  wire [12:0] a_addr2, w_addr2;\n  wire mac_valid2, col_valid2, mac_clear2;\n  wire [5:0] col_index2;\n\n  matvec matvec2 (\n    .clk(clk),\n    .rst_n(rst_n),\n    .start(state == MATMUL1 && count_req1 == cols1 && !requant1_valid_out),\n    .depth(cols1),\n    .cols(cols2),\n    .a_addr(a_addr2),\n    .w_addr(w_addr2),\n    .mac_valid(mac_valid2),\n    .col_valid(col_valid2),\n    .col_index(col_index2),\n    .mac_clear(mac_clear2)\n  );\n\n  wire [12:0] a_addr_sel = (state == MATMUL1) ? a_addr1 : a_addr2;\n  wire [12:0] w_addr_raw = (state == MATMUL1) ? w_addr1 : w_addr2;\n  assign w_addr = w_addr_raw + ((state == MATMUL1) ? 13'b0 : (depth1 * cols1));\n\n  wire mac_valid_sel = (state == MATMUL1) ? mac_valid1 : mac_valid2;\n  wire mac_clear_sel = (state == MATMUL1) ? mac_clear1 : mac_clear2;\n\n  reg signed [7:0] a_data;\n  always @(posedge clk) begin\n    if (state == MATMUL1)\n      a_data <= act[a_addr1];\n    else\n      a_data <= act[64 + a_addr2];\n  end\n\n  wire [28:0] mac_acc;\n  wire mac_valid_out;\n\n  mac mac_inst (\n    .clk(clk),\n    .rst_n(rst_n),\n    .clear(mac_clear_sel),\n    .a(a_data),\n    .b(w_data),\n    .valid_in(mac_valid_sel),\n    .acc(mac_acc),\n    .valid_out(mac_valid_out)\n  );\n\n  wire requant1_valid_in = (state == MATMUL1) ? col_valid1 : 1'b0;\n  wire signed [7:0] requant1_q_out;\n  wire requant1_valid_out;\n\n  requant requant1_inst (\n    .clk(clk),\n    .rst_n(rst_n),\n    .acc_in(mac_acc),\n    .scale(scale1),\n    .shift(shift1),\n    .valid_in(requant1_valid_in),\n    .q_out(requant1_q_out),\n    .sat(),\n    .valid_out(requant1_valid_out)\n  );\n\n  wire requant2_valid_in = (state == MATMUL2) ? col_valid2 : 1'b0;\n  wire signed [7:0] requant2_q_out;\n  wire requant2_valid_out;\n\n  requant requant2_inst (\n    .clk(clk),\n    .rst_n(rst_n),\n    .acc_in(mac_acc),\n    .scale(scale2),\n    .shift(shift2),\n    .valid_in(requant2_valid_in),\n    .q_out(requant2_q_out),\n    .sat(),\n    .valid_out(requant2_valid_out)\n  );\n\n  reg [12:0] count_req1;\n  always @(posedge clk) begin\n    if (!rst_n || state != MATMUL1)\n      count_req1 <= 0;\n    else if (requant1_valid_out)\n      count_req1 <= count_req1 + 1;\n  end\n\n  reg [5:0] col_index_delay1 [0:8];\n  always @(posedge clk) begin\n    if (col_valid1)\n      col_index_delay1[0] <= col_index1;\n    col_index_delay1[1] <= col_index_delay1[0];\n    col_index_delay1[2] <= col_index_delay1[1];\n    col_index_delay1[3] <= col_index_delay1[2];\n    col_index_delay1[4] <= col_index_delay1[3];\n    col_index_delay1[5] <= col_index_delay1[4];\n    col_index_delay1[6] <= col_index_delay1[5];\n    col_index_delay1[7] <= col_index_delay1[6];\n    col_index_delay1[8] <= col_index_delay1[7];\n  end\n\n  always @(posedge clk) begin\n    if (requant1_valid_out) begin\n      if (requant1_q_out[7])\n        act[64 + col_index_delay1[8]] <= 8'b0;\n      else\n        act[64 + col_index_delay1[8]] <= requant1_q_out;\n    end\n  end\n\n  reg [12:0] count_req2;\n  always @(posedge clk) begin\n    if (!rst_n || state != MATMUL2)\n      count_req2 <= 0;\n    else if (requant2_valid_out)\n      count_req2 <= count_req2 + 1;\n  end\n\n  reg [5:0] col_index_delay2 [0:8];\n  always @(posedge clk) begin\n    if (col_valid2)\n      col_index_delay2[0] <= col_index2;\n    col_index_delay2[1] <= col_index_delay2[0];\n    col_index_delay2[2] <= col_index_delay2[1];\n    col_index_delay2[3] <= col_index_delay2[2];\n    col_index_delay2[4] <= col_index_delay2[3];\n    col_index_delay2[5] <= col_index_delay2[4];\n    col_index_delay2[6] <= col_index_delay2[5];\n    col_index_delay2[7] <= col_index_delay2[6];\n    col_index_delay2[8] <= col_index_delay2[7];\n  end\n\n  assign o_valid = requant2_valid_out;\n  assign o_index = col_index_delay2[8];\n  assign o_data = requant2_q_out;\n\n  always @(posedge clk) begin\n    if (!rst_n)\n      state <= IDLE;\n    else begin\n      case (state)\n        IDLE: begin\n          if (start)\n            state <= MATMUL1;\n        end\n        MATMUL1: begin\n          if (count_req1 == cols1 && !requant1_valid_out)\n            state <= MATMUL2;\n        end\n        MATMUL2: begin\n          if (count_req2 == cols2 && !requant2_valid_out)\n            state <= IDLE;\n        end\n      endcase\n    end\n  end\n\n  assign busy = (state != IDLE);\n\nendmodule\n"
+  },
+  {
+   "draft": 2,
+   "feedback_in": {
+    "stage": "sim",
+    "status": "fail",
+    "phase": "compile",
+    "errors": [
+     "build_hk_mlp/mlp_hk.v:44: warning: Port 7 (w_addr) of module matvec expects 26 bit(s), given 13.",
+     "build_hk_mlp/mlp_hk.v:44:        : Padding 13 high bits of the port.",
+     "build_hk_mlp/mlp_hk.v:44: warning: Port 11 (col_index) of module matvec expects 13 bit(s), given 6.",
+     "build_hk_mlp/mlp_hk.v:44:        : Padding 7 high bits of the port.",
+     "build_hk_mlp/mlp_hk.v:65: error: Unable to bind wire/reg/memory `count_req1' in `tb_mlp.dut'",
+     "build_hk_mlp/mlp_hk.v:137:      : A symbol with that name was declared here. Check for declaration after use.",
+     "build_hk_mlp/mlp_hk.v:65: error: Unable to bind wire/reg/memory `requant1_valid_out' in `tb_mlp.dut'",
+     "build_hk_mlp/mlp_hk.v:107:      : A symbol with that name was declared here. Check for declaration after use.",
+     "build_hk_mlp/mlp_hk.v:65: error: Failed to elaborate input port 'start' expression ((((state)==(MATMUL1))&&((count_req1)==(cols1)))&&(!(requant1_valid_out))) in instance dut.matvec2 of module: matvec.",
+     "build_hk_mlp/mlp_hk.v:62: warning: Port 7 (w_addr) of module matvec expects 26 bit(s), given 13."
+    ],
+    "mismatches": [],
+    "iteration": 1
+   },
+   "rtl": "module mlp (\n  input clk,\n  input rst_n,\n  input load_valid,\n  input signed [7:0] load_data,\n  input start,\n  input [12:0] depth1,\n  input [12:0] cols1,\n  input [12:0] cols2,\n  input [17:0] scale1,\n  input [6:0] shift1,\n  input [17:0] scale2,\n  input [6:0] shift2,\n  output [12:0] w_addr,\n  input signed [7:0] w_data,\n  output o_valid,\n  output [5:0] o_index,\n  output signed [7:0] o_data,\n  output busy\n);\n\n  reg signed [7:0] act [0:127];\n\n  reg [5:0] load_idx;\n  always @(posedge clk) begin\n    if (!rst_n)\n      load_idx <= 0;\n    else if (load_valid)\n      load_idx <= load_idx + 1;\n  end\n\n  always @(posedge clk) begin\n    if (load_valid)\n      act[load_idx] <= load_data;\n  end\n\n  reg [1:0] state;\n  localparam IDLE = 2'b00, MATMUL1 = 2'b01, MATMUL2 = 2'b10;\n\n  reg [12:0] count_req1, count_req2;\n\n  wire [25:0] w_addr1, w_addr2;\n  wire [12:0] a_addr1, a_addr2;\n  wire mac_valid1, col_valid1, mac_clear1;\n  wire [12:0] col_index1;\n\n  wire mac_valid2, col_valid2, mac_clear2;\n  wire [12:0] col_index2;\n\n  wire [28:0] mac_acc;\n  wire mac_valid_out;\n\n  wire requant1_valid_in, requant1_valid_out;\n  wire signed [7:0] requant1_q_out;\n\n  wire requant2_valid_in, requant2_valid_out;\n  wire signed [7:0] requant2_q_out;\n\n  wire mac_valid_sel, mac_clear_sel;\n  wire [25:0] w_addr_raw;\n  reg signed [7:0] a_data;\n\n  matvec matvec1 (\n    .clk(clk),\n    .rst_n(rst_n),\n    .start(state == IDLE && start),\n    .depth(depth1),\n    .cols(cols1),\n    .a_addr(a_addr1),\n    .w_addr(w_addr1),\n    .mac_valid(mac_valid1),\n    .col_valid(col_valid1),\n    .col_index(col_index1),\n    .mac_clear(mac_clear1)\n  );\n\n  matvec matvec2 (\n    .clk(clk),\n    .rst_n(rst_n),\n    .start(state == MATMUL1 && count_req1 == cols1 && !requant1_valid_out),\n    .depth(cols1),\n    .cols(cols2),\n    .a_addr(a_addr2),\n    .w_addr(w_addr2),\n    .mac_valid(mac_valid2),\n    .col_valid(col_valid2),\n    .col_index(col_index2),\n    .mac_clear(mac_clear2)\n  );\n\n  assign w_addr_raw = (state == MATMUL1) ? w_addr1 : w_addr2;\n  assign w_addr = (w_addr_raw + ((state == MATMUL1) ? 26'b0 : (depth1 * cols1)))[12:0];\n\n  assign mac_valid_sel = (state == MATMUL1) ? mac_valid1 : mac_valid2;\n  assign mac_clear_sel = (state == MATMUL1) ? mac_clear1 : mac_clear2;\n\n  always @(posedge clk) begin\n    if (state == MATMUL1)\n      a_data <= act[a_addr1];\n    else\n      a_data <= act[64 + a_addr2];\n  end\n\n  mac mac_inst (\n    .clk(clk),\n    .rst_n(rst_n),\n    .clear(mac_clear_sel),\n    .a(a_data),\n    .b(w_data),\n    .valid_in(mac_valid_sel),\n    .acc(mac_acc),\n    .valid_out(mac_valid_out)\n  );\n\n  assign requant1_valid_in = (state == MATMUL1) ? col_valid1 : 1'b0;\n\n  requant requant1_inst (\n    .clk(clk),\n    .rst_n(rst_n),\n    .acc_in(mac_acc),\n    .scale(scale1),\n    .shift(shift1),\n    .valid_in(requant1_valid_in),\n    .q_out(requant1_q_out),\n    .sat(),\n    .valid_out(requant1_valid_out)\n  );\n\n  assign requant2_valid_in = (state == MATMUL2) ? col_valid2 : 1'b0;\n\n  requant requant2_inst (\n    .clk(clk),\n    .rst_n(rst_n),\n    .acc_in(mac_acc),\n    .scale(scale2),\n    .shift(shift2),\n    .valid_in(requant2_valid_in),\n    .q_out(requant2_q_out),\n    .sat(),\n    .valid_out(requant2_valid_out)\n  );\n\n  always @(posedge clk) begin\n    if (!rst_n || state != MATMUL1)\n      count_req1 <= 0;\n    else if (requant1_valid_out)\n      count_req1 <= count_req1 + 1;\n  end\n\n  reg [12:0] col_index_delay1 [0:8];\n  always @(posedge clk) begin\n    if (col_valid1)\n      col_index_delay1[0] <= col_index1;\n    col_index_delay1[1] <= col_index_delay1[0];\n    col_index_delay1[2] <= col_index_delay1[1];\n    col_index_delay1[3] <= col_index_delay1[2];\n    col_index_delay1[4] <= col_index_delay1[3];\n    col_index_delay1[5] <= col_index_delay1[4];\n    col_index_delay1[6] <= col_index_delay1[5];\n    col_index_delay1[7] <= col_index_delay1[6];\n    col_index_delay1[8] <= col_index_delay1[7];\n  end\n\n  always @(posedge clk) begin\n    if (requant1_valid_out) begin\n      if (requant1_q_out[7])\n        act[64 + col_index_delay1[8]] <= 8'b0;\n      else\n        act[64 + col_index_delay1[8]] <= requant1_q_out;\n    end\n  end\n\n  always @(posedge clk) begin\n    if (!rst_n || state != MATMUL2)\n      count_req2 <= 0;\n    else if (requant2_valid_out)\n      count_req2 <= count_req2 + 1;\n  end\n\n  reg [12:0] col_index_delay2 [0:8];\n  always @(posedge clk) begin\n    if (col_valid2)\n      col_index_delay2[0] <= col_index2;\n    col_index_delay2[1] <= col_index_delay2[0];\n    col_index_delay2[2] <= col_index_delay2[1];\n    col_index_delay2[3] <= col_index_delay2[2];\n    col_index_delay2[4] <= col_index_delay2[3];\n    col_index_delay2[5] <= col_index_delay2[4];\n    col_index_delay2[6] <= col_index_delay2[5];\n    col_index_delay2[7] <= col_index_delay2[6];\n    col_index_delay2[8] <= col_index_delay2[7];\n  end\n\n  assign o_valid = requant2_valid_out;\n  assign o_index = col_index_delay2[8][5:0];\n  assign o_data = requant2_q_out;\n\n  always @(posedge clk) begin\n    if (!rst_n)\n      state <= IDLE;\n    else begin\n      case (state)\n        IDLE: begin\n          if (start)\n            state <= MATMUL1;\n        end\n        MATMUL1: begin\n          if (count_req1 == cols1 && !requant1_valid_out)\n            state <= MATMUL2;\n        end\n        MATMUL2: begin\n          if (count_req2 == cols2 && !requant2_valid_out)\n            state <= IDLE;\n        end\n      endcase\n    end\n  end\n\n  assign busy = (state != IDLE);\n\nendmodule\n"
+  },
+  {
+   "draft": 3,
+   "feedback_in": {
+    "stage": "sim",
+    "status": "fail",
+    "phase": "compile",
+    "errors": [
+     "build_hk_mlp/mlp_hk.v:92: syntax error",
+     "build_hk_mlp/mlp_hk.v:92: error: Syntax error in continuous assignment"
+    ],
+    "mismatches": [],
+    "iteration": 2
+   },
+   "rtl": "module mlp (\n  input clk,\n  input rst_n,\n  input load_valid,\n  input signed [7:0] load_data,\n  input start,\n  input [12:0] depth1,\n  input [12:0] cols1,\n  input [12:0] cols2,\n  input [17:0] scale1,\n  input [6:0] shift1,\n  input [17:0] scale2,\n  input [6:0] shift2,\n  output [12:0] w_addr,\n  input signed [7:0] w_data,\n  output o_valid,\n  output [5:0] o_index,\n  output signed [7:0] o_data,\n  output busy\n);\n\n  reg signed [7:0] act [0:127];\n\n  reg [5:0] load_idx;\n  always @(posedge clk) begin\n    if (!rst_n)\n      load_idx <= 0;\n    else if (load_valid)\n      load_idx <= load_idx + 1;\n  end\n\n  always @(posedge clk) begin\n    if (load_valid)\n      act[load_idx] <= load_data;\n  end\n\n  reg [1:0] state;\n  localparam IDLE = 2'b00, MATMUL1 = 2'b01, MATMUL2 = 2'b10;\n\n  reg [12:0] count_req1, count_req2;\n\n  wire [25:0] w_addr1, w_addr2;\n  wire [12:0] a_addr1, a_addr2;\n  wire mac_valid1, col_valid1, mac_clear1;\n  wire [12:0] col_index1;\n  wire mac_valid2, col_valid2, mac_clear2;\n  wire [12:0] col_index2;\n\n  wire [28:0] mac_acc;\n  wire mac_valid_out;\n\n  wire requant1_valid_in, requant1_valid_out;\n  wire signed [7:0] requant1_q_out;\n  wire requant2_valid_in, requant2_valid_out;\n  wire signed [7:0] requant2_q_out;\n\n  wire mac_valid_sel, mac_clear_sel;\n  reg signed [7:0] a_data;\n\n  matvec matvec1 (\n    .clk(clk),\n    .rst_n(rst_n),\n    .start(state == IDLE && start),\n    .depth(depth1),\n    .cols(cols1),\n    .a_addr(a_addr1),\n    .w_addr(w_addr1),\n    .mac_valid(mac_valid1),\n    .col_valid(col_valid1),\n    .col_index(col_index1),\n    .mac_clear(mac_clear1)\n  );\n\n  matvec matvec2 (\n    .clk(clk),\n    .rst_n(rst_n),\n    .start(state == MATMUL1 && count_req1 == cols1 && !requant1_valid_out),\n    .depth(cols1),\n    .cols(cols2),\n    .a_addr(a_addr2),\n    .w_addr(w_addr2),\n    .mac_valid(mac_valid2),\n    .col_valid(col_valid2),\n    .col_index(col_index2),\n    .mac_clear(mac_clear2)\n  );\n\n  reg [25:0] w_addr_offset;\n  always @(posedge clk) begin\n    if (!rst_n)\n      w_addr_offset <= 0;\n    else if (state == IDLE && start)\n      w_addr_offset <= 0;\n    else if (state == MATMUL1 && count_req1 == cols1 && !requant1_valid_out)\n      w_addr_offset <= depth1 * cols1;\n  end\n\n  wire [25:0] w_addr_full = (state == MATMUL1) ? w_addr1 : (w_addr2 + w_addr_offset);\n  assign w_addr = w_addr_full[12:0];\n\n  assign mac_valid_sel = (state == MATMUL1) ? mac_valid1 : mac_valid2;\n  assign mac_clear_sel = (state == MATMUL1) ? mac_clear1 : mac_clear2;\n\n  always @(posedge clk) begin\n    if (state == MATMUL1)\n      a_data <= act[a_addr1];\n    else\n      a_data <= act[64 + a_addr2];\n  end\n\n  mac mac_inst (\n    .clk(clk),\n    .rst_n(rst_n),\n    .clear(mac_clear_sel),\n    .a(a_data),\n    .b(w_data),\n    .valid_in(mac_valid_sel),\n    .acc(mac_acc),\n    .valid_out(mac_valid_out)\n  );\n\n  assign requant1_valid_in = (state == MATMUL1) ? col_valid1 : 1'b0;\n\n  requant requant1_inst (\n    .clk(clk),\n    .rst_n(rst_n),\n    .acc_in(mac_acc),\n    .scale(scale1),\n    .shift(shift1),\n    .valid_in(requant1_valid_in),\n    .q_out(requant1_q_out),\n    .sat(),\n    .valid_out(requant1_valid_out)\n  );\n\n  assign requant2_valid_in = (state == MATMUL2) ? col_valid2 : 1'b0;\n\n  requant requant2_inst (\n    .clk(clk),\n    .rst_n(rst_n),\n    .acc_in(mac_acc),\n    .scale(scale2),\n    .shift(shift2),\n    .valid_in(requant2_valid_in),\n    .q_out(requant2_q_out),\n    .sat(),\n    .valid_out(requant2_valid_out)\n  );\n\n  always @(posedge clk) begin\n    if (!rst_n || state != MATMUL1)\n      count_req1 <= 0;\n    else if (requant1_valid_out)\n      count_req1 <= count_req1 + 1;\n  end\n\n  reg [12:0] col_index_delay1 [0:8];\n  always @(posedge clk) begin\n    if (col_valid1)\n      col_index_delay1[0] <= col_index1;\n    col_index_delay1[1] <= col_index_delay1[0];\n    col_index_delay1[2] <= col_index_delay1[1];\n    col_index_delay1[3] <= col_index_delay1[2];\n    col_index_delay1[4] <= col_index_delay1[3];\n    col_index_delay1[5] <= col_index_delay1[4];\n    col_index_delay1[6] <= col_index_delay1[5];\n    col_index_delay1[7] <= col_index_delay1[6];\n    col_index_delay1[8] <= col_index_delay1[7];\n  end\n\n  always @(posedge clk) begin\n    if (requant1_valid_out) begin\n      if (requant1_q_out[7])\n        act[64 + col_index_delay1[8]] <= 8'b0;\n      else\n        act[64 + col_index_delay1[8]] <= requant1_q_out;\n    end\n  end\n\n  always @(posedge clk) begin\n    if (!rst_n || state != MATMUL2)\n      count_req2 <= 0;\n    else if (requant2_valid_out)\n      count_req2 <= count_req2 + 1;\n  end\n\n  reg [12:0] col_index_delay2 [0:8];\n  always @(posedge clk) begin\n    if (col_valid2)\n      col_index_delay2[0] <= col_index2;\n    col_index_delay2[1] <= col_index_delay2[0];\n    col_index_delay2[2] <= col_index_delay2[1];\n    col_index_delay2[3] <= col_index_delay2[2];\n    col_index_delay2[4] <= col_index_delay2[3];\n    col_index_delay2[5] <= col_index_delay2[4];\n    col_index_delay2[6] <= col_index_delay2[5];\n    col_index_delay2[7] <= col_index_delay2[6];\n    col_index_delay2[8] <= col_index_delay2[7];\n  end\n\n  assign o_valid = requant2_valid_out;\n  assign o_index = col_index_delay2[8][5:0];\n  assign o_data = requant2_q_out;\n\n  always @(posedge clk) begin\n    if (!rst_n)\n      state <= IDLE;\n    else begin\n      case (state)\n        IDLE: begin\n          if (start)\n            state <= MATMUL1;\n        end\n        MATMUL1: begin\n          if (count_req1 == cols1 && !requant1_valid_out)\n            state <= MATMUL2;\n        end\n        MATMUL2: begin\n          if (count_req2 == cols2 && !requant2_valid_out)\n            state <= IDLE;\n        end\n      endcase\n    end\n  end\n\n  assign busy = (state != IDLE);\n\nendmodule\n"
+  }
+ ],
+ "final_gates": {
+  "iteration": 3,
+  "fixes_applied": [
+   "llm:haiku@claude-cli#3"
+  ],
+  "sim": {
+   "stage": "sim",
+   "status": "pass",
+   "checks": 12,
+   "mismatches": [],
+   "throughput": {
+    "layers": 1,
+    "span_cycles": 78,
+    "latency_cycles": 16,
+    "units": 1,
+    "cycles_per_unit": 78.0
+   }
+  },
+  "synth": {
+   "stage": "synth",
+   "status": "pass",
+   "cell_count": 10396,
+   "area": 22548.0
+  },
+  "timing": {
+   "stage": "timing",
+   "status": "pass",
+   "method": "opensta",
+   "clock_period_ns": 10.0,
+   "worst_slack_ns": 1.28
+  },
+  "fpga": {
+   "luts": 7572,
+   "ffs": 5068,
+   "dsps": 27,
+   "brams": 0,
+   "urams": 0,
+   "carry": 286,
+   "muxf": 971,
+   "status": "pass",
+   "family": "xcup",
+   "top": "mlp",
+   "lint": [],
+   "unmapped_cells": {
+    "SRL16E": 26
+   },
+   "stage": "fpga"
+  }
+ }
+}

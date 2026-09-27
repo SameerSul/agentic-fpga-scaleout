@@ -28,6 +28,7 @@ able to block a design the tools would have accepted."""
 import re
 
 from llm_agent import (pick_backend, CALLERS, extract_verilog,
+                       ask_for_module, code_findings,
                        condense_feedback, RULES)
 import json
 
@@ -50,8 +51,8 @@ REVIEW_ACCEPT = "ACCEPT"
 USE_REVIEWER = False
 
 
-def _fmt_feedback(history):
-    return json.dumps(condense_feedback(history), indent=2)
+def _fmt_feedback(history, rtl=None):
+    return json.dumps(condense_feedback(history, rtl), indent=2)
 
 
 def debugger_prompt(spec, history, last_rtl):
@@ -63,7 +64,7 @@ def debugger_prompt(spec, history, last_rtl):
         "thing you would check first.",
         "", "SPEC:", json.dumps(spec, indent=2),
         "", "THE RTL THAT FAILED:", last_rtl or "(none)",
-        "", "WHAT THE TOOLS REPORTED:", _fmt_feedback(history),
+        "", "WHAT THE TOOLS REPORTED:", _fmt_feedback(history, last_rtl),
     ])
 
 
@@ -87,7 +88,12 @@ def writer_prompt(spec, history, last_rtl, diagnosis, objections,
                   last_rtl]
     if history:
         parts += ["", "TOOL FEEDBACK, most recent last (make these pass). "
-                      "This is ground truth:", _fmt_feedback(history)]
+                      "This is ground truth:", _fmt_feedback(history, last_rtl)]
+        found = code_findings(last_rtl, history)
+        if found:
+            parts += ["", "FACTS ABOUT YOUR PREVIOUS ATTEMPT, found by "
+                          "inspecting it (true of the code; check whether "
+                          "they explain the failure):"] + ["- " + f for f in found]
     if tried and history:
         # Proposing a design the tools already rejected wastes a whole
         # iteration of simulation, synthesis, timing and mapping, and it
@@ -224,10 +230,11 @@ class SwarmAgent:
             else self.last_rtl
         objections, rtl, prev = "", None, base
         for attempt in range(self.review_rounds + 1):
-            rtl = extract_verilog(self._ask(
-                "writer",
+            rtl, _ = ask_for_module(
+                lambda p: self._ask("writer", p),
                 writer_prompt(spec, feedback_history, prev,
-                              diagnosis, objections, self.tried)))
+                              diagnosis, objections, self.tried),
+                spec["top_module"])
             notes.append("writer" if attempt == 0 else "writer:revised")
             if not reviewing or attempt == self.review_rounds:
                 break

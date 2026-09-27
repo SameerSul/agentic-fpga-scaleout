@@ -1207,6 +1207,11 @@ def test_llm_transport_is_retried():
         out = llm_agent.call_claude_cli('p', 'm')
         check('a timed out call is retried rather than ending the block',
               'module m' in out and len(calls) == 2)
+        check('the writer call runs with tools disabled',
+              calls[-1][calls[-1].index('--tools') + 1] == '')
+        check('larger models get bounded effort, haiku keeps its default',
+              '--effort' in llm_agent.cli_command('sonnet')
+              and '--effort' not in llm_agent.cli_command('haiku'))
 
         # Rate limiting is transport too.
         calls[:] = []
@@ -1245,6 +1250,216 @@ def test_llm_transport_is_retried():
     finally:
         llm_agent.subprocess.run = real_run
         llm_agent.time.sleep = real_sleep
+
+
+def test_sequencer_specs_are_implementable():
+    """Same audit as the table units, for the requantizer, softmax and
+    the MLP layer, which the LLM had never converged on.
+
+    Each had the same defect. The requantizer spec walked the writer
+    through five pipeline stages and then demanded a latency of nine,
+    and never said what a shift of zero does, though the testbench
+    drives it eight times. Softmax never gave the normalising formula
+    at all. The MLP spec never gave the weight layout, never said the
+    rectifier comes after requantization and not on the output, and
+    declared a 26-bit weight port against a 13-bit testbench wire.
+
+    Along the way the MLP testbench turned out to be weak: one fixed
+    scale put every output on a rail, so it checked the sign of the
+    layer and little else. Its scales are now derived per layer.
+    """
+    import sweep as sweep_mod
+    import re as re_mod
+    ms0 = load_model_spec()
+
+    # requantizer: the stated rounding, including the two tie examples
+    rq = specgen_mod.derive_requant_spec(ms0)
+    check('requant ties round toward plus infinity, as the spec says',
+          specgen_mod.requant_golden(5, 1, 1, 8)[0] == 3
+          and specgen_mod.requant_golden(-5, 1, 1, 8)[0] == -2)
+    check('requant with shift zero adds no rounding term, as stated',
+          specgen_mod.requant_golden(7, 1, 0, 8)[0] == 7)
+    st = rq['parameters']['pipeline_stages']
+    check('requant spec states the exact latency the testbench waits for',
+          any(('exactly %d cycles' % st) in b for b in rq['behavior'])
+          and not any(b.startswith('Stage 5') for b in rq['behavior']))
+
+    rnd = random.Random(9)
+    for ms in sweep_mod._models(ms0):
+        # softmax: the stated normalising formula against the golden
+        sp = specgen_mod.derive_softmax_spec(ms)
+        p = sp['parameters']
+        e_p = {'in_width': p['score_width'], 'in_frac': p['score_frac'],
+               'out_frac': p['weight_frac'], 'lut_bits': p['score_frac']}
+        r_p = {'in_width': p['recip_in_width'],
+               'out_width': p['recip_out_width'], 'lut_bits': 8,
+               'shift_bias': p['shift_bias']}
+        lo = -(1 << (p['score_width'] - 1))
+        ok = True
+        for _ in range(150):
+            row = [rnd.randrange(lo // 2, -lo // 2)
+                   for _ in range(rnd.randrange(1, 30))]
+            mx = max(row)
+            ex = [specgen_mod.exp_golden(v - mx, e_p) for v in row]
+            tot = sum(ex)
+            ok &= tot < (1 << p['recip_in_width'])
+            m, k = specgen_mod.recip_golden(tot, r_p)
+            wf = p['weight_frac']
+            w = [min(1 << wf, ((v << wf) * m) >> (p['shift_bias'] - k))
+                 for v in ex]
+            ok &= w == specgen_mod.softmax_golden(row, p)[0]
+        check('softmax spec formula matches golden (%s)' % ms['name'], ok)
+
+        # MLP: port width, layout, and a testbench that sees values
+        sp = specgen_mod.derive_mlp_spec(ms)
+        p = sp['parameters']
+        wport = [q for q in sp['ports'] if q['name'] == 'w_addr'][0]
+        check('mlp w_addr port matches its address width (%s)'
+              % ms['name'], wport['width'] == p['addr_width'])
+        tb = specgen_mod.render_mlp_testbench(sp)
+        ys = [int(a + b) for a, b in
+              re_mod.findall(r"expect_y\[\d+\] = (-?)\d+'sd(\d+);", tb)]
+        hi = (1 << (p['data_width'] - 1)) - 1
+        check('mlp testbench outputs are mostly in range, not on a rail '
+              '(%s)' % ms['name'],
+              sum(-hi - 1 < v < hi for v in ys) >= len(ys) - 1)
+        sc = re_mod.search(r'scale1 = (\d+); shift1 = (\d+); '
+                           r'scale2 = (\d+); shift2 = (\d+);', tb).groups()
+        check('mlp testbench uses a different scale per layer (%s)'
+              % ms['name'], sc[:2] != sc[2:])
+        check('mlp testbench checks the hidden layer before the outputs (%s)'
+              % ms['name'],
+              'dut.act[%d + i]' % p['bank'] in tb
+              and tb.index('hidden_layer') < tb.index('bad_idx[i]')
+              and any('named act' in b for b in sp['behavior']))
+
+
+def test_compile_errors_quote_the_source_line():
+    """iverilog names a line number and nothing else. The model sees its
+    own draft without line numbers, so a bare 'line 148: syntax error'
+    asks it to count. Traced on the requantizer, it restructured the code
+    around an illegal literal and kept that literal in every draft."""
+    import llm_agent
+    rtl = "\n".join("line_%d;" % i for i in range(1, 160))
+    rtl = rtl.replace("line_148;", "x = (y < 48'sd-128) ? 8'sd-128 : z;")
+    path = "/Users/someone/My Projects/repo/build_x/requant_sw.v"
+    out = llm_agent.annotate_errors(
+        [path + ":148: syntax error",
+         "/tmp/a b/tb_requant_sw.v:20: error: unknown",
+         "/tmp/x/exp_rom.v:3: warning",
+         "no location here"], rtl)
+    check('a compile error quotes the failing source line',
+          out[0].startswith("requant_sw.v line 148: syntax error  | source: "
+                            "x = (y < 48'sd-128) ? 8'sd-128 : z;"))
+    check('testbench and supplied files are named but not quoted',
+          out[1] == "tb_requant_sw.v line 20: error: unknown"
+          and out[2] == "exp_rom.v line 3: warning")
+    check('an error without a location passes through unchanged',
+          out[3] == "no location here")
+    hist = [{"iteration": 1, "stage": "sim", "status": "fail",
+             "errors": [path + ":2: syntax error"]},
+            {"iteration": 2, "stage": "sim", "status": "fail",
+             "errors": [path + ":148: syntax error"]}]
+    rec = llm_agent.condense_feedback(hist, rtl)
+    check('only the latest record is quoted, against the draft it came from',
+          "source:" not in rec[0]["tool_errors"][0]
+          and "48'sd-128" in rec[1]["tool_errors"][0])
+    async_rtl = "module m;\n  always @(posedge clk or negedge rst_n) begin\nend"
+    msg = llm_agent.annotate_errors(
+        ["ERROR: FF m.$auto$ff.cc:337:slice$1 (type $_DFFE_PN0P_) cannot be "
+         "legalized: dffs with async set or reset are not supported"],
+        async_rtl)[0]
+    check('the async-reset synthesis error names the construct and its line',
+          "synchronous" in msg and "line 2:" in msg)
+    lit_rtl = "module m;\n a = (w < 47'sd-128);\n b = c ? 8'sd(-128) : d;\n e = -8'sd128;"
+    lit = llm_agent.annotate_errors(
+        ["/x/m.v:2: syntax error", "/x/m.v:3: syntax error",
+         "/x/m.v:4: syntax error"], lit_rtl)
+    check('a sign inside a sized literal is explained, the legal form is not',
+          "-8'sd128, not" in lit[0] and "-8'sd128, not" in lit[1]
+          and "meaning" not in lit[2])
+    mixed = ("module requant(input signed [28:0] acc_in, input [17:0] scale);\n"
+             "  wire signed [46:0] p = acc_in * scale;\n"
+             "  wire signed [46:0] ok = acc_in * $signed({1'b0, scale});\n"
+             "endmodule")
+    found = llm_agent.code_findings(mixed, [])
+    check('a signed-times-unsigned multiply is reported with its line',
+          len(found) == 1 and found[0].startswith("line 2: acc_in * scale"))
+    xs = llm_agent.code_findings(mixed.replace(" * scale;", " * 1;"),
+                                 [{"mismatches": [{"got_w": "x"}]}])
+    check('an x read back from the design is explained',
+          any("never written or reset" in f for f in xs))
+    import agent as agent_m
+    fixes = {getattr(agent_m, n) for n in dir(agent_m) if n.startswith("FIX_")}
+    ref = agent_m.RuleBasedAgent()
+    clean = all(not llm_agent.code_findings(
+        getattr(ref, r)(getattr(specgen_mod, d)(load_model_spec()), fixes), [])
+        for d, r in (("derive_requant_spec", "render_requant"),
+                     ("derive_softmax_spec", "render_softmax"),
+                     ("derive_mlp_spec", "render_mlp"),
+                     ("derive_exp_spec", "render_exp")))
+    check('the lint raises nothing on the reference designs', clean)
+    cat = ("module m(input signed [47:0] a, input signed [47:0] b,\n"
+           "         input signed [31:0] c);\n"
+           "  wire signed [52:0] s = a + {b, 5'b0};\n"
+           "  wire [33:0] ok = {1'b0, c[22:0]} + {1'b0, c[31:23]};\n"
+           "endmodule")
+    cf = llm_agent.code_findings(cat, [])
+    check('a concatenation of a whole signed signal in arithmetic is reported, '
+          'a zero-extended slice is not',
+          len(cf) == 1 and cf[0].startswith("line 3: {b, 5'b0}"))
+    ext = ("module m(input signed [46:0] x, input signed [49:0] r);\n"
+           "  wire signed [47:0] s = {x[46], x} + r;\n"
+           "  wire signed [49:0] t = {{3{x[46]}}, x} + r;\nendmodule")
+    check('sign extension by hand is not reported, since its bits are right',
+          llm_agent.code_findings(ext, []) == [])
+    sta = ("Startpoint: _109349_ (rising edge-triggered flip-flop clocked by clk)\n"
+           "Endpoint: w_data[0] (output port clocked by clk)\n")
+    net = os.path.join(ROOT, 'build_cptest.v')
+    with open(net, 'w') as f:
+        f.write("  DFF _109349_ (\n    .CK(clk),\n    .D(_002800_),\n"
+                "    .Q(\\exp_buf[90] [6])\n  );\n")
+    try:
+        cp = chiplet_flow._critical_path(sta, net)
+    finally:
+        os.remove(net)
+    check('a timing failure names its path in RTL terms',
+          cp.startswith("from register exp_buf to port w_data"))
+    replies = iter(["wire x = 1;", "module m(); endmodule"])
+    rtl2, calls = llm_agent.ask_for_module(lambda p: next(replies), "P", "m")
+    check('a fragment reply is re-asked instead of spending an iteration',
+          rtl2.strip() == "module m(); endmodule" and calls == 2)
+
+
+def test_hung_simulation_is_feedback_not_a_crash():
+    """A draft that never lowers busy leaves the testbench waiting forever.
+    The simulator timeout used to raise out of the flow and end the run,
+    which lost a traced softmax run. It has to come back as a failed
+    simulation the agent can read."""
+    work = os.path.join(ROOT, 'build_hangtest')
+    shutil.rmtree(work, ignore_errors=True)
+    os.makedirs(work)
+    with open(os.path.join(work, 'tb_hang.v'), 'w') as f:
+        f.write("module tb_hang; reg clk = 0; wire busy;\n"
+                "hang dut(.clk(clk), .busy(busy)); always #5 clk = ~clk;\n"
+                "initial begin @(negedge clk); while (busy) @(negedge clk);\n"
+                "$display(\"TB_RESULT: PASS\"); $finish; end endmodule\n")
+    rtl = os.path.join(work, 'hang.v')
+    with open(rtl, 'w') as f:
+        f.write("module hang(input clk, output busy); "
+                "assign busy = 1'b1; endmodule\n")
+    saved = (chiplet_flow.BUILD, chiplet_flow.ROOT, chiplet_flow.run)
+    real = chiplet_flow.run
+    try:
+        chiplet_flow.BUILD = chiplet_flow.ROOT = work
+        chiplet_flow.run = lambda cmd, timeout=120: real(cmd, timeout=3)
+        r = chiplet_flow.stage_sim({'tb_file': 'tb_hang.v'}, rtl)
+    finally:
+        chiplet_flow.BUILD, chiplet_flow.ROOT, chiplet_flow.run = saved
+        shutil.rmtree(work, ignore_errors=True)
+    check('a hung simulation fails as feedback instead of raising',
+          r['status'] == 'fail' and r.get('phase') == 'run'
+          and 'never finished' in r['errors'][0])
 
 
 def test_fpga_backend(profile, fp):
@@ -1495,6 +1710,9 @@ if __name__ == '__main__':
     test_requant_golden_is_shared()
     test_table_unit_specs_are_implementable()
     test_llm_transport_is_retried()
+    test_sequencer_specs_are_implementable()
+    test_compile_errors_quote_the_source_line()
+    test_hung_simulation_is_feedback_not_a_crash()
     test_generation()
     test_bitstream()
     test_fit_monotonic(profile)

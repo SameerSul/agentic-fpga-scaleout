@@ -129,8 +129,25 @@ def make_agent(kind=None):
         "unknown agent %r, expected 'rules', 'llm' or 'swarm'" % kind)
 
 
+TIMEOUT_RC = 124
+
+
 def run(cmd, timeout=120):
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, cwd=BUILD)
+    """A tool that runs past its timeout is a result, not a crash.
+
+    A generated design that never finishes a handshake leaves the
+    testbench waiting forever, and that is a property of the design the
+    agent needs to hear about. Raising here used to end the whole run:
+    softmax lost a traced run when one draft never lowered busy.
+    """
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                           timeout=timeout, cwd=BUILD)
+    except subprocess.TimeoutExpired as e:
+        partial = e.stdout or ""
+        if isinstance(partial, bytes):
+            partial = partial.decode("utf-8", "replace")
+        return TIMEOUT_RC, "TIMEOUT after %ds\n%s" % (timeout, partial)
     return r.returncode, r.stdout + r.stderr
 
 
@@ -166,6 +183,14 @@ def stage_sim(job, rtl_path):
                 "errors": out.strip().splitlines()[:10], "mismatches": []}
     rc, out = run(["vvp", sim])
     mismatches = [_parse_kv(l) for l in re.findall(r"TB_FAIL (.*)", out)]
+    if rc == TIMEOUT_RC and not mismatches:
+        return {"stage": "sim", "status": "fail", "phase": "run",
+                "errors": ["simulation never finished: the testbench waits "
+                           "on the design (for busy to fall, or for a valid "
+                           "output) and that never happened. Check that "
+                           "busy clears once the work is done and that "
+                           "every output handshake completes."],
+                "mismatches": []}
     passed = "TB_RESULT: PASS" in out and rc == 0
     checks = re.search(r"TB_PASS checks=(\d+)", out)
     res = {"stage": "sim", "status": "pass" if passed else "fail",
@@ -181,6 +206,40 @@ def stage_sim(job, rtl_path):
         res["throughput"] = dict(p, units=units,
                                  cycles_per_unit=p["span_cycles"] / units)
     return res
+
+
+def _critical_path(sta_out, netlist):
+    """Name the failing path in the design's own terms.
+
+    A slack number says a path is too long, not which one. OpenSTA names
+    the start point by its netlist cell, which is anonymous after
+    synthesis, but the flop's output net keeps the register's RTL name,
+    so the cell is looked up there. Traced on softmax: -3.4 ns was all the
+    agent ever saw, twice, for a path from the buffered exponentials
+    straight through the normalising multiply to the output port.
+    """
+    sp = re.search(r"Startpoint: (\S+) \(([^)]*)\)", sta_out)
+    ep = re.search(r"Endpoint: (\S+) \(([^)]*)\)", sta_out)
+    if not (sp and ep):
+        return None
+
+    def rtl_name(point, kind):
+        if "port" in kind:
+            return "port " + re.sub(r"\[\d+\]$", "", point)
+        name = point
+        try:
+            text = open(netlist).read()
+            m = re.search(r"\b%s \((.*?)\);" % re.escape(point), text, re.S)
+            q = m and re.search(r"\.Q\(\\?([^\s\[)]+)", m.group(1))
+            if q:
+                name = q.group(1)
+        except OSError:
+            pass
+        return "register " + name
+
+    return ("from %s to %s. This path takes longer than one clock period: "
+            "add a pipeline register on it or split the logic between them."
+            % (rtl_name(*sp.groups()), rtl_name(*ep.groups())))
 
 
 def stage_synth(job, spec, rtl_path):
@@ -255,9 +314,14 @@ exit
         m = re.search(r"worst slack (?:max )?(-?[\d.]+)", out)
         if rc == 0 and m:
             slack = float(m.group(1))
-            return {"stage": "timing", "status": "pass" if slack >= 0 else "fail",
-                    "method": "opensta", "clock_period_ns": period_ns,
-                    "worst_slack_ns": slack}
+            res = {"stage": "timing", "status": "pass" if slack >= 0 else "fail",
+                   "method": "opensta", "clock_period_ns": period_ns,
+                   "worst_slack_ns": slack}
+            if slack < 0:
+                path = _critical_path(out, os.path.join(BUILD, "netlist.v"))
+                if path:
+                    res["critical_path"] = path
+            return res
     # Proxy fallback: yosys longest topological path in AND-mapped netlist.
     rc, out = run(["yosys", "-p",
                    "read_verilog {rtl}; synth -top {top} -flatten; "
