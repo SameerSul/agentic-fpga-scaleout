@@ -27,6 +27,7 @@ BLOCKS = [
     ("wmem",     cf.WMEM_JOB),
     ("softmax",  cf.SOFTMAX_JOB),
     ("mlp",      cf.MLP_JOB),
+    ("attn",     cf.ATTN_JOB),
 ]
 
 

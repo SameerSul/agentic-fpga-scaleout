@@ -23,6 +23,7 @@ FIX_MEMLAT = "delay_valid_for_the_memory_read"
 FIX_REGRD = "register_the_read_port"
 FIX_SUBMAX = "subtract_the_row_maximum"
 FIX_CHAIN = "take_the_second_depth_from_the_first_count"
+FIX_VLAT = "pair_each_value_with_its_weight_after_the_two_edge_read"
 # One definition, in specgen, so the declared depth and the generated
 # depth cannot disagree.
 WIDE_ADD_BITS = specgen.WIDE_ADD_BITS
@@ -53,6 +54,8 @@ class RuleBasedAgent:
             return self.render_softmax(spec, fixes), sorted(fixes)
         if spec["top_module"] == "mlp":
             return self.render_mlp(spec, fixes), sorted(fixes)
+        if spec["top_module"] == "attn":
+            return self.render_attn(spec, fixes), sorted(fixes)
         return self.render_mac(spec, fixes), sorted(fixes)
 
     def diagnose(self, spec, history):
@@ -70,6 +73,11 @@ class RuleBasedAgent:
                     fixes.add(FIX_XOR)
                 elif "clear" in m.get("test", "").lower():
                     fixes.add(FIX_CLEAR)
+                elif "expected_o" in m:
+                    # The head's only seeded bug: each value was used on
+                    # the edge before its registered read arrived, so it
+                    # was paired with the previous element's weight.
+                    fixes.add(FIX_VLAT)
                 elif "expected_y" in m and "out" in m:
                     # The layer's only seeded bug: the second matmul's
                     # reduction length came from an input rather than
@@ -115,6 +123,252 @@ class RuleBasedAgent:
                 elif m.get("got_acc") != m.get("expected_acc"):
                     fixes.add(FIX_WIDTH)
         return fixes
+
+    def render_attn(self, spec, fixes):
+        """Attention head: scores through matvec and the MAC, weights
+        through the softmax block, output through a 16x8 weighted sum and
+        the requantizer.
+
+        The seeded first-cut bug consumes v_data on the edge before it
+        arrives. The value cache is a registered read behind a registered
+        address, two edges from issue to data, and taking it after one
+        pairs every value with the previous element's weight. Every model
+        that wrote softmax made exactly this mistake on its score read.
+        """
+        p = spec["parameters"]
+        dw, aw, hd = p["data_width"], p["acc_width"], p["head_dim"]
+        hdw, nw, adw = p["head_dim_width"], p["n_width"], p["addr_width"]
+        sw, smax, ww = p["score_width"], p["score_max"], p["weight_width"]
+        mw, shw, rqs = p["scale_width"], p["shift_width"], p["requant_stages"]
+        mvd, mvc, mva = (p["mv_depth_width"], p["mv_col_width"],
+                         p["mv_addr_width"])
+        siw = p["sm_index_width"]
+        wsw = p["wsum_width"]
+        late = FIX_VLAT in fixes
+        # Stage that forms the weight-by-value product. Fixed: after both
+        # the weight and the value have been through their registered
+        # reads. First cut: one edge early, against a stale v_data.
+        prod = ("""      iv2 <= iv1; f2 <= f1; l2 <= l1; d2 <= d1;
+      if (iv1) prod2 <= $signed({1'b0, p_r}) * v_data;"""
+                if late else
+                """      iv2 <= iv0; f2 <= f0; l2 <= l0; d2 <= d0;
+      if (iv0) prod2 <= $signed({1'b0, pbuf[pidx]}) * v_data;""")
+        return ("""module attn (
+  input                    clk,
+  input                    rst_n,
+  input                    load_valid,
+  input      signed [{dwm}:0] load_data,
+  input                    start,
+  input      [{nwm}:0] n,
+  input      [4:0]  shift_s,
+  input      [{mwm}:0] scale_o,
+  input      [{shwm}:0] shift_o,
+  output     [{adwm}:0] k_addr,
+  input      signed [{dwm}:0] k_data,
+  output reg [{adwm}:0] v_addr,
+  input      signed [{dwm}:0] v_data,
+  output reg               o_valid,
+  output reg [{hdwm}:0] o_index,
+  output reg signed [{dwm}:0] o_data,
+  output reg               busy
+);
+  reg signed [{dwm}:0] qbuf [0:{hdm}];
+  reg signed [{swm}:0] sbuf [0:{capm}];
+  reg        [{wwm}:0] pbuf [0:{capm}];
+  reg [{hdwm}:0] lptr;
+  reg [{nwm}:0] n_r;
+  reg [2:0] st;
+  localparam S_IDLE = 3'd0, S_SCORE = 3'd1, S_SOFT = 3'd2, S_OUT = 3'd3;
+
+  // Scores: matvec walks the key cache as a matrix of n columns of
+  // head_dim, so its weight address is the key address.
+  reg  mv_start;
+  wire [{mvdm}:0] mv_a_addr;
+  wire [{mvam}:0] mv_w_addr;
+  wire mv_valid, mv_clear, mv_colv, mv_busy;
+  wire [{mvcm}:0] mv_coli;
+  assign k_addr = mv_w_addr[{adwm}:0];
+  reg signed [{dwm}:0] a_data;
+  always @(posedge clk) a_data <= qbuf[mv_a_addr[{hdwm}:0]];
+  matvec mv (.clk(clk), .rst_n(rst_n), .start(mv_start),
+             .depth({mvd}'d{hd}), .cols({{{{{mvcpad}{{1'b0}}}}, n_r}}),
+             .a_addr(mv_a_addr), .w_addr(mv_w_addr),
+             .mac_valid(mv_valid), .mac_clear(mv_clear),
+             .col_valid(mv_colv), .col_index(mv_coli), .busy(mv_busy));
+  wire signed [{awm}:0] acc;
+  wire mac_vout;
+  mac mc (.clk(clk), .rst_n(rst_n), .clear(mv_clear), .a(a_data),
+          .b(k_data), .valid_in(mv_valid), .acc(acc),
+          .valid_out(mac_vout));
+
+  // Score quantizer: round, shift, clamp. Two stages, so the rounding
+  // add and the variable shift are not in the same cycle.
+  wire signed [{aw}:0] rnd_s = (shift_s == 5'd0) ? {aw1}'sd0
+                                : ({aw1}'sd1 <<< (shift_s - 5'd1));
+  // shift_s is held for the whole run, so its rounding constant is
+  // registered once at start. Built from the port every cycle, the
+  // shifter sat in front of the rounding add and missed timing by 0.64 ns
+  // at 16-bit operands, where the add is 47 bits.
+  reg  signed [{aw}:0] rnd_r;
+  reg  sv1;
+  reg  signed [{aw}:0] st1;
+  reg  [{siwm}:0] si1;
+  wire signed [{aw}:0] shv = st1 >>> shift_s;
+  reg  [{nwm}:0] scnt;
+
+  // Weights: the softmax block reads the score buffer.
+  reg  sm_start;
+  wire [{siwm}:0] sm_saddr, sm_wi;
+  reg  signed [{swm}:0] sm_sdata;
+  wire sm_wv, sm_busy;
+  wire [{wwm}:0] sm_wd;
+  always @(posedge clk) sm_sdata <= sbuf[sm_saddr];
+  softmax sm (.clk(clk), .rst_n(rst_n), .start(sm_start), .n(n_r),
+              .s_addr(sm_saddr), .s_data(sm_sdata), .w_valid(sm_wv),
+              .w_index(sm_wi), .w_data(sm_wd), .busy(sm_busy));
+  reg  [{nwm}:0] pcnt;
+
+  // Output: for each d, the weighted sum over positions j.
+  reg issuing;
+  reg [{hdwm}:0] dd;
+  reg [{nwm}:0] jj;
+  reg [{adwm}:0] vbase;
+  reg iv0, iv1, iv2, f0, f1, f2, l0, l1, l2;
+  reg [{hdwm}:0] d0, d1, d2;
+  reg [{siwm}:0] pidx;
+  reg [{wwm}:0] p_r;
+  reg signed [{pwm}:0] prod2;
+  // The weighted sum is sized from its own bound, the weights summing to
+  // about 1.0, and widened to the requantizer's input only at the end.
+  reg signed [{wswm}:0] accb;
+  wire signed [{wswm}:0] sum3 = accb + prod2;
+
+  reg  rq_vin;
+  reg  signed [{awm}:0] rq_acc;
+  reg  [{hdwm}:0] rq_idx;
+  wire signed [{dwm}:0] rq_q;
+  wire rq_sat, rq_vout;
+  requant rq (.clk(clk), .rst_n(rst_n), .acc_in(rq_acc),
+              .scale(scale_o), .shift(shift_o), .valid_in(rq_vin),
+              .q_out(rq_q), .sat(rq_sat), .valid_out(rq_vout));
+  // The index travels with its data through the requantizer's depth.
+  reg [{hdwm}:0] idx_pipe [0:{rqsm}];
+  reg [{hdw1}:0] ocnt;
+  integer k;
+
+  always @(posedge clk) begin
+    if (!rst_n) begin
+      lptr <= 0; n_r <= 0; st <= S_IDLE; busy <= 1'b0;
+      mv_start <= 1'b0; sm_start <= 1'b0; sv1 <= 1'b0; st1 <= 0;
+      si1 <= 0; scnt <= 0; pcnt <= 0; issuing <= 1'b0; dd <= 0;
+      rnd_r <= 0;
+      jj <= 0; vbase <= 0; v_addr <= 0; pidx <= 0; p_r <= 0;
+      iv0 <= 1'b0; iv1 <= 1'b0; iv2 <= 1'b0; f0 <= 1'b0; f1 <= 1'b0;
+      f2 <= 1'b0; l0 <= 1'b0; l1 <= 1'b0; l2 <= 1'b0; d0 <= 0;
+      d1 <= 0; d2 <= 0; prod2 <= 0; accb <= 0; rq_vin <= 1'b0;
+      rq_acc <= 0; rq_idx <= 0; ocnt <= 0; o_valid <= 1'b0;
+      o_index <= 0; o_data <= 0;
+      for (k = 0; k <= {rqsm}; k = k + 1) idx_pipe[k] <= 0;
+    end else begin
+      mv_start <= 1'b0;
+      sm_start <= 1'b0;
+      rq_vin   <= 1'b0;
+      o_valid  <= 1'b0;
+      idx_pipe[0] <= rq_idx;
+      for (k = 1; k <= {rqsm}; k = k + 1)
+        idx_pipe[k] <= idx_pipe[k-1];
+
+      if (load_valid && !busy) begin
+        qbuf[lptr] <= load_data;
+        lptr <= lptr + 1;
+      end
+
+      // Score quantizer.
+      sv1 <= mv_colv;
+      if (mv_colv) begin
+        st1 <= {{acc[{awm}], acc}} + rnd_r;
+        si1 <= mv_coli[{siwm}:0];
+      end
+      if (sv1) begin
+        if (shv > {aw1}'sd{smax})
+          sbuf[si1] <= {sw}'sd{smax};
+        else if (shv < -{aw1}'sd{smax1})
+          sbuf[si1] <= -{sw}'sd{smax1};
+        else
+          sbuf[si1] <= shv[{swm}:0];
+        scnt <= scnt + 1;
+      end
+
+      if (sm_wv) begin
+        pbuf[sm_wi] <= sm_wd;
+        pcnt <= pcnt + 1;
+      end
+
+      // Weighted sum, four stages: issue the address, register the
+      // weight while the value cache reads, form the product, add.
+      iv0 <= 1'b0;
+      if (issuing) begin
+        v_addr <= vbase + dd;
+        pidx <= jj[{siwm}:0];
+        iv0 <= 1'b1; f0 <= (jj == 0); l0 <= (jj == n_r - 1); d0 <= dd;
+        if (jj == n_r - 1) begin
+          jj <= 0; vbase <= 0;
+          if (dd == {hdm}) issuing <= 1'b0;
+          else dd <= dd + 1;
+        end else begin
+          jj <= jj + 1; vbase <= vbase + {adw}'d{hd};
+        end
+      end
+      p_r <= pbuf[pidx];
+      iv1 <= iv0; f1 <= f0; l1 <= l0; d1 <= d0;
+{prod}
+      if (iv2) begin
+        accb <= l2 ? {wsw}'sd0 : sum3;
+        if (l2) begin
+          rq_acc <= {widen};
+          rq_idx <= d2; rq_vin <= 1'b1;
+        end
+      end
+
+      if (rq_vout) begin
+        o_valid <= 1'b1;
+        o_index <= idx_pipe[{rqsm}];
+        o_data  <= rq_q;
+        ocnt <= ocnt + 1;
+      end
+
+      case (st)
+        S_IDLE: if (start) begin
+          st <= S_SCORE; busy <= 1'b1; n_r <= n; scnt <= 0; pcnt <= 0;
+          rnd_r <= rnd_s;
+          ocnt <= 0; mv_start <= 1'b1;
+        end
+        S_SCORE: if (scnt == n_r) begin
+          st <= S_SOFT; sm_start <= 1'b1;
+        end
+        S_SOFT: if (pcnt == n_r) begin
+          st <= S_OUT; issuing <= 1'b1; dd <= 0; jj <= 0; vbase <= 0;
+          accb <= 0;
+        end
+        S_OUT: if (ocnt == {hd}) begin
+          st <= S_IDLE; busy <= 1'b0; lptr <= 0;
+        end
+        default: st <= S_IDLE;
+      endcase
+    end
+  end
+endmodule
+""").format(dwm=dw - 1, nwm=nw - 1, mwm=mw - 1, shwm=shw - 1,
+            adwm=adw - 1, adw=adw, hdwm=hdw - 1, hdw1=hdw, hdm=hd - 1,
+            hd=hd, swm=sw - 1, sw=sw, wwm=ww - 1, capm=p["capacity"] - 1,
+            mvdm=mvd - 1, mvd=mvd, mvam=mva - 1, mvcm=mvc - 1,
+            mvcpad=mvc - nw, awm=aw - 1, aw=aw, aw1=aw + 1,
+            siwm=siw - 1, smax=smax, smax1=smax + 1, pwm=ww + dw,
+            rqsm=rqs - 1, prod=prod, wswm=wsw - 1, wsw=wsw,
+            # A zero-width replication is not legal Verilog-2005, and the
+            # tiny model's sum is exactly the requantizer's width.
+            widen=("sum3" if aw == wsw else
+                   "{{%d{sum3[%d]}}, sum3}" % (aw - wsw, wsw - 1)))
 
     def render_mlp(self, spec, fixes):
         """MLP layer: two matmuls with a requantize and rectify between.

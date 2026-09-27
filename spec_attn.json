@@ -1,0 +1,157 @@
+{
+  "name": "attn_qwen2_5_0p5b",
+  "description": "Single attention head for one decode step: q.k scores over up to 256 cached positions, softmax, and the weighted sum of V over head_dim 64",
+  "top_module": "attn",
+  "unit": "head",
+  "parameters": {
+    "data_width": 8,
+    "acc_width": 29,
+    "head_dim": 64,
+    "head_dim_width": 6,
+    "capacity": 256,
+    "n_width": 9,
+    "addr_width": 14,
+    "score_width": 13,
+    "score_max": 2047,
+    "weight_width": 16,
+    "weight_frac": 15,
+    "wsum_width": 24,
+    "shift_s_width": 5,
+    "scale_width": 18,
+    "shift_width": 7,
+    "requant_stages": 9,
+    "mv_depth_width": 13,
+    "mv_col_width": 13,
+    "mv_addr_width": 26,
+    "sm_index_width": 8,
+    "signed": true,
+    "pipeline_stages": 1,
+    "target_clock_mhz": 100
+  },
+  "derivation": {
+    "model": "qwen2_5_0p5b",
+    "rule": "head_dim from the model; capacity and the score and weight formats from the softmax block; the output requantizer and accumulator widths from the MAC and requantizer blocks"
+  },
+  "ports": [
+    {
+      "name": "clk",
+      "dir": "input",
+      "width": 1,
+      "desc": "clock, rising edge"
+    },
+    {
+      "name": "rst_n",
+      "dir": "input",
+      "width": 1,
+      "desc": "active-low synchronous reset"
+    },
+    {
+      "name": "load_valid",
+      "dir": "input",
+      "width": 1,
+      "desc": "write the next query element"
+    },
+    {
+      "name": "load_data",
+      "dir": "input",
+      "width": 8,
+      "signed": true,
+      "desc": "query element, int8"
+    },
+    {
+      "name": "start",
+      "dir": "input",
+      "width": 1,
+      "desc": "run the head over n cached positions"
+    },
+    {
+      "name": "n",
+      "dir": "input",
+      "width": 9,
+      "desc": "number of cached positions, 1..256"
+    },
+    {
+      "name": "shift_s",
+      "dir": "input",
+      "width": 5,
+      "desc": "score shift: q.k to the softmax score format"
+    },
+    {
+      "name": "scale_o",
+      "dir": "input",
+      "width": 18,
+      "desc": "output requantizer scale"
+    },
+    {
+      "name": "shift_o",
+      "dir": "input",
+      "width": 7,
+      "desc": "output requantizer shift"
+    },
+    {
+      "name": "k_addr",
+      "dir": "output",
+      "width": 14,
+      "desc": "key cache address"
+    },
+    {
+      "name": "k_data",
+      "dir": "input",
+      "width": 8,
+      "signed": true,
+      "desc": "key element, registered read"
+    },
+    {
+      "name": "v_addr",
+      "dir": "output",
+      "width": 14,
+      "desc": "value cache address"
+    },
+    {
+      "name": "v_data",
+      "dir": "input",
+      "width": 8,
+      "signed": true,
+      "desc": "value element, registered read"
+    },
+    {
+      "name": "o_valid",
+      "dir": "output",
+      "width": 1,
+      "desc": "an output element is on o_data"
+    },
+    {
+      "name": "o_index",
+      "dir": "output",
+      "width": 6,
+      "desc": "which element of the head's output"
+    },
+    {
+      "name": "o_data",
+      "dir": "output",
+      "width": 8,
+      "signed": true,
+      "desc": "output element, int8"
+    },
+    {
+      "name": "busy",
+      "dir": "output",
+      "width": 1,
+      "desc": "a head is being computed"
+    }
+  ],
+  "behavior": [
+    "Each cycle with load_valid high writes load_data into the query buffer at the next index, starting from 0 after reset and after every run, so q[0..63] are loaded in order before start.",
+    "start is a one-cycle pulse, with n, shift_s, scale_o and shift_o held stable for the whole run. busy must be high on the clock edge that samples start, so it already reads 1 one cycle later, and it stays high until the last output has been emitted.",
+    "The key and value caches are row-major: element d of position j is at address j*64 + d in both. k_data and v_data are registered reads: each carries the element at address a on the cycle after k_addr or v_addr = a. If the address is itself a register, that is two clock edges after the edge that loads a into it.",
+    "Scores: for j in 0..n-1, t_j = sum over d of q[d] * K[j][d], a signed 29-bit dot product. s_j = (t_j + 2**(shift_s-1)) >>> shift_s when shift_s > 0, else t_j, then clamped to [-2048, 2047]. The clamp is half the 13-bit score range so that a score minus the row maximum always fits the exponential's input.",
+    "Weights: w = softmax(s) over the n scores, exactly as the supplied softmax block computes it: 16-bit unsigned Q0.15, where 32768 is 1.0.",
+    "Output: for d in 0..63, a_d = sum over j of w_j * V[j][d], with w_j unsigned and V signed, then o_d = requant(a_d, scale_o, shift_o): multiply by scale_o, add 2**(shift_o-1) when shift_o > 0, arithmetic shift right by shift_o, saturate to [-128, 127]. The weights sum to under 2.0, so |a_d| stays under 2**23: a 24-bit signed sum, sign-extended into the requantizer's 29-bit input.",
+    "Emit each o_d with o_index = d and o_valid high for exactly that one cycle. Outputs may come in any order, but each index exactly once, and o_valid must be low at every other time.",
+    "The scores and weights are held in memories named sbuf and pbuf, declared reg signed [12:0] sbuf [0:255] and reg [15:0] pbuf [0:255], with position j at index j. The testbench reads them directly to check the scores and the softmax, so these names and layouts are part of the interface.",
+    "matvec, mac, softmax and requant are separate modules supplied as source files, not something to write. Instantiate them with exactly these ports, connected by name: matvec (input clk, input rst_n, input start, input [12:0] depth, input [12:0] cols, output [12:0] a_addr, output [25:0] w_addr, output mac_valid, output mac_clear, output col_valid, output [12:0] col_index, output busy); mac (input clk, input rst_n, input clear, input signed [7:0] a, input signed [7:0] b, input valid_in, output signed [28:0] acc, output valid_out); softmax (input clk, input rst_n, input start, input [8:0] n, output [7:0] s_addr, input signed [12:0] s_data, output w_valid, output [7:0] w_index, output [15:0] w_data, output busy); requant (input clk, input rst_n, input signed [28:0] acc_in, input [17:0] scale, input [6:0] shift, input valid_in, output signed [7:0] q_out, output sat, output valid_out).",
+    "matvec walks a_addr 0..depth-1 and w_addr col*depth onward for each of cols columns, drives mac_valid one cycle behind the address, pulses mac_clear between columns, and pulses col_valid with col_index when a column's sum is on the MAC's acc. Wire mac_valid to the MAC's valid_in and mac_clear to its clear. With depth = 64 and cols = n, matvec's w_addr is exactly the key address. softmax reads scores through s_addr and a registered s_data and emits w_valid, w_index and w_data. requant has a latency of exactly 9 cycles.",
+    "The weighted sum multiplies a 16-bit unsigned weight by an 8-bit signed value, which the 8-bit MAC cannot do, so it is its own multiply-accumulate.",
+    "All state resets to zero: busy and o_valid are 0 during reset."
+  ]
+}

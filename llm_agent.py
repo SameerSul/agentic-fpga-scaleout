@@ -260,7 +260,12 @@ def condense_feedback(history, rtl=None):
         if fb.get("phase"):
             rec["phase"] = fb["phase"]
         if fb.get("errors"):
-            errs = fb["errors"][:MAX_ERR_LINES]
+            # Errors before warnings. iverilog prints a width warning ahead
+            # of the syntax error that actually failed the build, and with a
+            # bounded number of lines the warning was taking the real
+            # error's slot: traced on the attention head.
+            errs = sorted(fb["errors"], key=lambda e: "warning" in e.lower())
+            errs = errs[:MAX_ERR_LINES]
             # Only the latest record matches the draft we are holding.
             rec["tool_errors"] = annotate_errors(
                 errs, rtl if i == len(recent) - 1 else None)

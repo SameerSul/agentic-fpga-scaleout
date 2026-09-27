@@ -9,7 +9,7 @@ is worth knowing and worth reporting.
 You give it a model spec, a small JSON file naming a transformer's
 dimensions and its quantization. It derives the hardware that model
 needs, writes the Verilog, and checks it with real tools until it passes.
-Nine blocks come out, each one sized from the model rather than written
+Eleven blocks come out, each one sized from the model rather than written
 for it. Point it at a different model and every block re-derives.
 
 ## The picture
@@ -44,7 +44,7 @@ for it. Point it at a different model and every block re-derives.
                            re-simulated against the same testbench
 ```
 
-## The nine blocks
+## The eleven blocks
 
 Arithmetic, bottom to top:
 
@@ -65,6 +65,8 @@ Sequencing, which is what makes the above into a layer:
    softmax    contains exp and recip, does the whole row
    mlp        two matmuls with requantize and relu between, owns the
               activation banks. This is the one that is a layer.
+   attn       one attention head for a decode step: q.k over the KV
+              cache, softmax, then the weighted sum of V
 ```
 
 ## Build it
@@ -120,6 +122,8 @@ Four blocks instantiate others, so bring their dependencies along:
    matvec.v   needs  mac.v      (at the top level, not inside)
    wmem.v     needs  nothing, but is driven by matvec and mac
    mlp.v      needs  matvec.v mac.v requant.v
+   attn.v     needs  matvec.v mac.v requant.v softmax.v expu.v recip.v
+                     exp_rom.v recip_rom.v
 ```
 
 The testbenches are in the repo root as `tb_*.v` if you want to run them
@@ -141,9 +145,13 @@ Measured here with yosys against a generic library, for Qwen2.5-0.5B:
    mlp        119 MHz   10396
    requant    115 MHz   10445
    softmax    103 MHz    1466
+   attn       112 MHz    1458     its own logic; the sub-blocks above
+                                  are counted in their own rows
 ```
 
-A Zynq 7020 has 53200 LUTs and 220 DSPs, so all nine fit with room over.
+A Zynq 7020 has 53200 LUTs and 220 DSPs. All eleven together map to about
+13500 LUTs and 51 DSPs on yosys's UltraScale+ mapping, a quarter of the
+part, even counting the attention head's sub-blocks twice.
 Expect better numbers than these: the generic library has no carry chain
 and no block RAM, and Vivado has both.
 
@@ -180,7 +188,7 @@ block, every time, for free, and it is what generated the RTL you are
 about to synthesise. Use it.
 
 `--agent llm` or `--agent swarm` puts a real LLM in the writing seat.
-Measured, it has now signed off all nine blocks, eight with Haiku and
+Measured, it has now signed off nine of the ten layer blocks, eight with Haiku and
 the requantizer with Sonnet. Build with the rules agent anyway: its
 output is what the numbers below were measured on, and it is
 reproducible and needs no network.

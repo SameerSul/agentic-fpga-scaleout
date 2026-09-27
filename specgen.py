@@ -1757,6 +1757,418 @@ def generate_softmax(ms=None, spec_file="spec_softmax.json",
     return spec
 
 
+
+# --------------------------------------------------------------------------
+# Attention head: scores against the K cache, softmax, weighted sum of V.
+# --------------------------------------------------------------------------
+
+def _round_shift(x, sh):
+    """Arithmetic right shift with round to nearest, ties toward plus
+    infinity: the requantizer's rounding with a scale of one."""
+    return (x + (1 << (sh - 1))) >> sh if sh > 0 else x
+
+
+def port_signature(spec):
+    """A supplied module's exact ports, generated from its own spec so a
+    composite's description cannot drift from what it instantiates.
+    Traced on the attention head, a model given only prose about its
+    sub-blocks guessed port names for eight drafts and never compiled."""
+    parts = []
+    for p in spec["ports"]:
+        rng = "[%d:0] " % (p["width"] - 1) if p["width"] > 1 else ""
+        parts.append("%s %s%s%s" % (p["dir"], "signed " if p.get("signed")
+                                     else "", rng, p["name"]))
+    return "%s (%s)" % (spec["top_module"], ", ".join(parts))
+
+
+def derive_attn_spec(ms):
+    """model spec -> single attention head spec, one decode step.
+
+    The last piece of a transformer layer that was still missing. The
+    query arrives as head_dim int8 values; keys and values come from a
+    KV cache through registered read ports, one row per past position.
+    Scores are q.k, requantized into the softmax's score format; the
+    softmax block turns them into weights; the output is the
+    weight-averaged value row, requantized back to int8.
+
+    Every part is an existing generated block: matvec and the MAC for the
+    scores, softmax for the weights, the requantizer for the output. The
+    new logic is the routing between them and a multiply-accumulate of
+    16-bit weights by 8-bit values, which the 8-bit MAC cannot do.
+    """
+    c = derive_chiplet_spec(ms)
+    mv = derive_matvec_spec(ms)
+    rq = derive_requant_spec(ms)
+    sm = derive_softmax_spec(ms)
+    dw, aw = c["parameters"]["data_width"], c["parameters"]["acc_width"]
+    hd = ms.get("head_dim") or ms["d_model"] // ms["n_head"]
+    cap = sm["parameters"]["capacity"]
+    sw = sm["parameters"]["score_width"]
+    ww = sm["parameters"]["weight_width"]
+    hdw = max(1, (hd - 1).bit_length())
+    addr_w = (cap * hd - 1).bit_length()
+    nw = sm["parameters"]["index_width"] + 1
+    smax = (1 << (sw - 2)) - 1              # scores clamp to +-(2**(sw-2))
+    wsum = dw + sm["parameters"]["weight_frac"] + 1
+    assert wsum <= aw, "the requantizer input is narrower than the weighted sum"
+    return {
+        "name": "attn_%s" % ms["name"],
+        "description": "Single attention head for one decode step: q.k "
+                       "scores over up to %d cached positions, softmax, "
+                       "and the weighted sum of V over head_dim %d"
+                       % (cap, hd),
+        "top_module": "attn",
+        "unit": "head",
+        "parameters": {
+            "data_width": dw, "acc_width": aw, "head_dim": hd,
+            "head_dim_width": hdw, "capacity": cap, "n_width": nw,
+            "addr_width": addr_w, "score_width": sw, "score_max": smax,
+            "weight_width": ww, "weight_frac": sm["parameters"]["weight_frac"],
+            # The weighted sum is bounded by the weights, not by the MAC's
+            # reduction depth: |a| <= sum(w) * 2**(dw-1), and the weights
+            # sum to under 2**(wf+1), so |a| < 2**(dw+wf) and dw+wf+1
+            # signed bits hold it. Sizing it from the MAC gave a 46-bit add
+            # at 16-bit operands that could not close timing.
+            "wsum_width": wsum,
+            "shift_s_width": 5,
+            "scale_width": rq["parameters"]["scale_width"],
+            "shift_width": rq["parameters"]["shift_width"],
+            "requant_stages": rq["parameters"]["pipeline_stages"],
+            "mv_depth_width": mv["parameters"]["depth_width"],
+            "mv_col_width": mv["parameters"]["col_width"],
+            "mv_addr_width": mv["parameters"]["addr_width"],
+            "sm_index_width": sm["parameters"]["index_width"],
+            "signed": True, "pipeline_stages": 1,
+            "target_clock_mhz": 100,
+        },
+        "derivation": {
+            "model": ms["name"],
+            "rule": "head_dim from the model; capacity and the score and "
+                    "weight formats from the softmax block; the output "
+                    "requantizer and accumulator widths from the MAC and "
+                    "requantizer blocks",
+        },
+        "ports": [
+            {"name": "clk", "dir": "input", "width": 1,
+             "desc": "clock, rising edge"},
+            {"name": "rst_n", "dir": "input", "width": 1,
+             "desc": "active-low synchronous reset"},
+            {"name": "load_valid", "dir": "input", "width": 1,
+             "desc": "write the next query element"},
+            {"name": "load_data", "dir": "input", "width": dw, "signed": True,
+             "desc": "query element, int8"},
+            {"name": "start", "dir": "input", "width": 1,
+             "desc": "run the head over n cached positions"},
+            {"name": "n", "dir": "input", "width": nw,
+             "desc": "number of cached positions, 1..%d" % cap},
+            {"name": "shift_s", "dir": "input", "width": 5,
+             "desc": "score shift: q.k to the softmax score format"},
+            {"name": "scale_o", "dir": "input",
+             "width": rq["parameters"]["scale_width"],
+             "desc": "output requantizer scale"},
+            {"name": "shift_o", "dir": "input",
+             "width": rq["parameters"]["shift_width"],
+             "desc": "output requantizer shift"},
+            {"name": "k_addr", "dir": "output", "width": addr_w,
+             "desc": "key cache address"},
+            {"name": "k_data", "dir": "input", "width": dw, "signed": True,
+             "desc": "key element, registered read"},
+            {"name": "v_addr", "dir": "output", "width": addr_w,
+             "desc": "value cache address"},
+            {"name": "v_data", "dir": "input", "width": dw, "signed": True,
+             "desc": "value element, registered read"},
+            {"name": "o_valid", "dir": "output", "width": 1,
+             "desc": "an output element is on o_data"},
+            {"name": "o_index", "dir": "output", "width": hdw,
+             "desc": "which element of the head's output"},
+            {"name": "o_data", "dir": "output", "width": dw, "signed": True,
+             "desc": "output element, int8"},
+            {"name": "busy", "dir": "output", "width": 1,
+             "desc": "a head is being computed"},
+        ],
+        "behavior": [
+            "Each cycle with load_valid high writes load_data into the "
+            "query buffer at the next index, starting from 0 after reset "
+            "and after every run, so q[0..%d] are loaded in order before "
+            "start." % (hd - 1),
+            "start is a one-cycle pulse, with n, shift_s, scale_o and "
+            "shift_o held stable for the whole run. busy must be high on "
+            "the clock edge that samples start, so it already reads 1 one "
+            "cycle later, and it stays high until the last output has been "
+            "emitted.",
+            "The key and value caches are row-major: element d of "
+            "position j is at address j*%d + d in both. k_data and v_data "
+            "are registered reads: each carries the element at address a "
+            "on the cycle after k_addr or v_addr = a. If the address is "
+            "itself a register, that is two clock edges after the edge "
+            "that loads a into it." % hd,
+            "Scores: for j in 0..n-1, t_j = sum over d of q[d] * K[j][d], "
+            "a signed %d-bit dot product. s_j = (t_j + 2**(shift_s-1)) >>> "
+            "shift_s when shift_s > 0, else t_j, then clamped to "
+            "[%d, %d]. The clamp is half the %d-bit score range so that a "
+            "score minus the row maximum always fits the exponential's "
+            "input." % (aw, -(smax + 1), smax, sw),
+            "Weights: w = softmax(s) over the n scores, exactly as the "
+            "supplied softmax block computes it: %d-bit unsigned Q0.%d, "
+            "where %d is 1.0." % (ww, sm["parameters"]["weight_frac"],
+                                   1 << sm["parameters"]["weight_frac"]),
+            "Output: for d in 0..%d, a_d = sum over j of w_j * V[j][d], "
+            "with w_j unsigned and V signed, then o_d = requant(a_d, "
+            "scale_o, shift_o): multiply by scale_o, add 2**(shift_o-1) "
+            "when shift_o > 0, arithmetic shift right by shift_o, "
+            "saturate to [%d, %d]. The weights sum to under 2.0, so |a_d| "
+            "stays under 2**%d: a %d-bit signed sum, sign-extended into "
+            "the requantizer's %d-bit input."
+            % (hd - 1, -(1 << (dw - 1)), (1 << (dw - 1)) - 1,
+               dw + sm["parameters"]["weight_frac"], wsum, aw),
+            "Emit each o_d with o_index = d and o_valid high for exactly "
+            "that one cycle. Outputs may come in any order, but each index "
+            "exactly once, and o_valid must be low at every other time.",
+            "The scores and weights are held in memories named sbuf and "
+            "pbuf, declared reg signed [%d:0] sbuf [0:%d] and reg [%d:0] "
+            "pbuf [0:%d], with position j at index j. The testbench reads "
+            "them directly to check the scores and the softmax, so these "
+            "names and layouts are part of the interface."
+            % (sw - 1, cap - 1, ww - 1, cap - 1),
+            "matvec, mac, softmax and requant are separate modules "
+            "supplied as source files, not something to write. Instantiate "
+            "them with exactly these ports, connected by name: "
+            + "; ".join(port_signature(x) for x in (mv, c, sm, rq)) + ".",
+            "matvec walks a_addr 0..depth-1 and w_addr col*depth onward "
+            "for each of cols columns, drives mac_valid one cycle behind "
+            "the address, pulses mac_clear between columns, and pulses "
+            "col_valid with col_index when a column's sum is on the MAC's "
+            "acc. Wire mac_valid to the MAC's valid_in and mac_clear to its "
+            "clear. With depth = %d and cols = n, matvec's w_addr is "
+            "exactly the key address. softmax reads scores through s_addr "
+            "and a registered s_data and emits w_valid, w_index and "
+            "w_data. requant has a latency of exactly %d cycles."
+            % (hd, rq["parameters"]["pipeline_stages"]),
+            "The weighted sum multiplies a %d-bit unsigned weight by an "
+            "%d-bit signed value, which the %d-bit MAC cannot do, so it "
+            "is its own multiply-accumulate."
+            % (ww, dw, dw),
+            "All state resets to zero: busy and o_valid are 0 during "
+            "reset.",
+        ],
+    }
+
+
+def attn_golden(q, K, V, n, shift_s, scale_o, shift_o, p, sm_p):
+    """Exact model of the head, built from the softmax and requantizer
+    models so the testbench checks the composition."""
+    smax = p["score_max"]
+    t = [sum(q[d] * K[j][d] for d in range(p["head_dim"])) for j in range(n)]
+    s = [max(-smax - 1, min(smax, _round_shift(v, shift_s))) for v in t]
+    mx = max(s)
+    assert all(-(1 << (p["score_width"] - 1)) <= v - mx <= 0 for v in s)
+    w = softmax_golden(s, sm_p)[0]
+    a = [sum(w[j] * V[j][d] for j in range(n)) for d in range(p["head_dim"])]
+    assert all(abs(v) < 1 << (p["wsum_width"] - 1) for v in a), \
+        "weighted sum exceeds its derived accumulator"
+    o = [requant_golden(v, scale_o, shift_o, p["data_width"])[0] for v in a]
+    return t, s, w, a, o
+
+
+def render_attn_testbench(spec):
+    """Rows chosen to exercise each part: one position (a weight of 1.0),
+    a few, a clamped score, and enough to stress the weight sum."""
+    ms = load_model_spec()
+    sm_p = derive_softmax_spec(ms)["parameters"]
+    p = spec["parameters"]
+    dw, hd = p["data_width"], p["head_dim"]
+    mw, sw_o = p["scale_width"], p["shift_width"]
+    half = ((1 << dw) - 5) // 2
+    rnd = random.Random(71)
+    cases = []
+    for n, clamp in ((1, False), (3, False), (8, True), (40, False)):
+        q = [rnd.randrange(-half, half) for _ in range(hd)]
+        K = [[rnd.randrange(-half, half) for _ in range(hd)] for _ in range(n)]
+        V = [[rnd.randrange(-half, half) for _ in range(hd)] for _ in range(n)]
+        if n > 1:
+            # One key aligned with the query, so one score dominates and
+            # the softmax has something to do.
+            K[1] = [half if x >= 0 else -half for x in q]
+        else:
+            # One position has a weight of exactly 1.0, and the most
+            # negative value everywhere puts the weighted sum at the bound
+            # its accumulator is sized for.
+            V[0] = [-(1 << (dw - 1))] * hd
+        t = [sum(q[d] * K[j][d] for d in range(hd)) for j in range(n)]
+        big = max(abs(v) for v in t)
+        sh = 0
+        while (big >> sh) > 1800:
+            sh += 1
+        if clamp:
+            sh = max(0, sh - 2)             # push the top scores to the clamp
+        _, s, w, a, _ = attn_golden(q, K, V, n, sh, 1, 0, p, sm_p)
+        sc, so = _mlp_scale(a, dw, mw, sw_o)
+        t, s, w, a, o = attn_golden(q, K, V, n, sh, sc, so, p, sm_p)
+        if clamp:
+            assert any(v == p["score_max"] for v in s), "clamp case did not clamp"
+        cases.append((n, q, K, V, sh, sc, so, s, w, o))
+    body = []
+    for ci, (n, q, K, V, sh, sc, so, s, w, o) in enumerate(cases):
+        body.append("    // case %d, n=%d" % (ci, n))
+        for d in range(hd):
+            body.append("    qvec[%d] = %s;" % (d, _slit(q[d], dw)))
+        for j in range(n):
+            for d in range(hd):
+                body.append("    kmem[%d] = %s; vmem[%d] = %s;"
+                            % (j * hd + d, _slit(K[j][d], dw),
+                               j * hd + d, _slit(V[j][d], dw)))
+            body.append("    expect_s[%d] = %s; expect_p[%d] = %d'd%d;"
+                        % (j, _slit(s[j], p["score_width"]), j,
+                           p["weight_width"], w[j]))
+        for d in range(hd):
+            body.append("    expect_o[%d] = %s;" % (d, _slit(o[d], dw)))
+        body.append("    run_head(%d, %d, %d, %d);" % (n, sh, sc, so))
+    return ATTN_TB.format(
+        dwm=dw - 1, hd=hd, hdwm=p["head_dim_width"] - 1,
+        cap=p["capacity"], mem=p["capacity"] * hd,
+        awm=p["addr_width"] - 1, nwm=p["n_width"] - 1,
+        swm=p["score_width"] - 1, wwm=p["weight_width"] - 1,
+        mwm=mw - 1, sowm=sw_o - 1, cases="\n".join(body),
+        ncases=len(cases))
+
+
+ATTN_TB = """`timescale 1ns/1ps
+// GENERATED by specgen.py: do not edit by hand.
+// Testbench for a single attention head over a KV cache. Golden values
+// come from the softmax and requantizer models, so the head is checked
+// against the arithmetic its parts are specified to do. The scores and
+// weights are checked directly, before the outputs, because they are
+// upstream of them.
+module tb_attn;
+  reg clk = 0, rst_n = 0, start = 0, load_valid = 0;
+  reg signed [{dwm}:0] load_data = 0;
+  reg [{nwm}:0] n = 0;
+  reg [4:0] shift_s = 0;
+  reg [{mwm}:0] scale_o = 0;
+  reg [{sowm}:0] shift_o = 0;
+  wire [{awm}:0] k_addr, v_addr;
+  wire o_valid, busy;
+  wire [{hdwm}:0] o_index;
+  wire signed [{dwm}:0] o_data;
+
+  reg signed [{dwm}:0] qvec [0:{hd}-1];
+  reg signed [{dwm}:0] kmem [0:{mem}-1];
+  reg signed [{dwm}:0] vmem [0:{mem}-1];
+  reg signed [{swm}:0] expect_s [0:{cap}-1];
+  reg        [{wwm}:0] expect_p [0:{cap}-1];
+  reg signed [{dwm}:0] expect_o [0:{hd}-1];
+  reg signed [{dwm}:0] k_data, v_data;
+  integer checks = 0, seen = 0, i, bad, nbad;
+  reg [255:0] testname;
+  reg [15:0] bad_idx [0:7];
+  reg signed [{dwm}:0] bad_exp [0:7], bad_got [0:7];
+
+  always @(posedge clk) begin
+    k_data <= kmem[k_addr];
+    v_data <= vmem[v_addr];
+  end
+
+  attn dut (.clk(clk), .rst_n(rst_n), .load_valid(load_valid),
+            .load_data(load_data), .start(start), .n(n),
+            .shift_s(shift_s), .scale_o(scale_o), .shift_o(shift_o),
+            .k_addr(k_addr), .k_data(k_data), .v_addr(v_addr),
+            .v_data(v_data), .o_valid(o_valid), .o_index(o_index),
+            .o_data(o_data), .busy(busy));
+
+  always #5 clk = ~clk;
+
+  always @(posedge clk) begin
+    if (rst_n && o_valid) begin
+      checks = checks + 1;
+      seen = seen + 1;
+      if (o_index >= {hd}) begin
+        $display("TB_FAIL test=%0s out=%0d head_dim={hd} expected=no_output_past_head_dim got_o=%0d",
+                 testname, o_index, o_data);
+        $display("TB_RESULT: FAIL");
+        $finish;
+      end
+      if (o_data !== expect_o[o_index]) begin
+        // Held: a wrong score or weight makes every output wrong, and the
+        // checks after the run name the upstream cause first.
+        if (nbad < 8) begin
+          bad_idx[nbad] = o_index; bad_exp[nbad] = expect_o[o_index];
+          bad_got[nbad] = o_data;
+        end
+        nbad = nbad + 1;
+      end
+    end
+  end
+
+  task run_head(input integer cnt, input integer sh, input integer sc,
+                input integer so);
+    begin
+      seen = 0; nbad = 0; bad = 0;
+      for (i = 0; i < {hd}; i = i + 1) begin
+        @(negedge clk); load_data = qvec[i]; load_valid = 1;
+      end
+      @(negedge clk); load_valid = 0;
+      n = cnt; shift_s = sh; scale_o = sc; shift_o = so;
+      @(negedge clk); start = 1;
+      @(negedge clk); start = 0;
+      while (busy) @(negedge clk);
+      repeat (8) @(negedge clk);
+      for (i = 0; i < cnt; i = i + 1) begin
+        checks = checks + 1;
+        if (dut.sbuf[i] !== expect_s[i]) begin
+          $display("TB_FAIL test=%0s score_index=%0d expected_s=%0d got_s=%0d",
+                   testname, i, expect_s[i], dut.sbuf[i]);
+          bad = bad + 1;
+        end
+      end
+      for (i = 0; i < cnt; i = i + 1) begin
+        checks = checks + 1;
+        if (dut.pbuf[i] !== expect_p[i]) begin
+          $display("TB_FAIL test=%0s weight_index=%0d expected_p=%0d got_p=%0d",
+                   testname, i, expect_p[i], dut.pbuf[i]);
+          bad = bad + 1;
+        end
+      end
+      for (i = 0; i < nbad && i < 8; i = i + 1)
+        $display("TB_FAIL test=%0s out=%0d expected_o=%0d got_o=%0d",
+                 testname, bad_idx[i], bad_exp[i], bad_got[i]);
+      checks = checks + 1;
+      if (!bad && !nbad && seen !== {hd})
+        $display("TB_FAIL test=%0s out=0 expected_o_count={hd} got_o_count=%0d",
+                 "output_count", seen);
+      if (bad || nbad || seen !== {hd}) begin
+        $display("TB_RESULT: FAIL");
+        $finish;
+      end
+    end
+  endtask
+
+  initial begin
+    testname = "attention";
+    repeat (3) @(negedge clk);
+    rst_n = 1;
+    @(negedge clk);
+{cases}
+
+    $display("TB_PROFILE heads=%0d span_cycles=%0d latency_cycles=%0d",
+             {ncases}, {ncases} * {hd} * 2, 16);
+    $display("TB_PASS checks=%0d", checks);
+    $display("TB_RESULT: PASS");
+    $finish;
+  end
+endmodule
+"""
+
+
+def generate_attn(ms=None, spec_file="spec_attn.json", tb_file="tb_attn.v"):
+    """Write the derived attention head spec and testbench."""
+    ms = ms or load_model_spec()
+    spec = derive_attn_spec(ms)
+    with open(os.path.join(ROOT, spec_file), "w") as f:
+        json.dump(spec, f, indent=2)
+    with open(os.path.join(ROOT, tb_file), "w") as f:
+        f.write(render_attn_testbench(spec))
+    return spec
+
 def requant_golden(acc, scale, sh, out_width):
     """Scale, round to nearest, saturate. Shared by the requantizer's own
     testbench and by anything that sequences it, so the two cannot

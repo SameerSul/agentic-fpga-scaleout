@@ -1054,6 +1054,65 @@ def test_mlp_layer():
           'extra' in inspect.signature(dv.prove_equivalent).parameters)
 
 
+def test_attention_head():
+    """The block that makes the rest a transformer layer: one attention
+    head for one decode step. Scores through matvec and the MAC, weights
+    through the softmax block, output through a weight-by-value sum and
+    the requantizer. The testbench checks the scores and the weights
+    directly before the outputs, since both are upstream of them."""
+    import math
+    import chiplet_flow as cf
+    ms = load_model_spec()
+    spec = specgen_mod.derive_attn_spec(ms)
+    p = spec['parameters']
+    sm_p = specgen_mod.derive_softmax_spec(ms)['parameters']
+    check('head_dim is taken from the model',
+          p['head_dim'] == ms.get('head_dim', ms['d_model'] // ms['n_head']))
+
+    # The fixed-point head against real attention on the same integers.
+    rnd = random.Random(3)
+    hd, n = p['head_dim'], 12
+    q = [rnd.randrange(-60, 60) for _ in range(hd)]
+    K = [[rnd.randrange(-60, 60) for _ in range(hd)] for _ in range(n)]
+    V = [[rnd.randrange(-60, 60) for _ in range(hd)] for _ in range(n)]
+    sh = 6
+    t, s_, w, a, o = specgen_mod.attn_golden(q, K, V, n, sh, 1, 0, p, sm_p)
+    fs = [x / (1 << sh) / (1 << sm_p['score_frac']) for x in t]
+    mx = max(fs)
+    e = [math.exp(x - mx) for x in fs]
+    z = sum(e)
+    fa = [sum(e[j] / z * V[j][d] for j in range(n)) for d in range(hd)]
+    err = max(abs(a[d] / (1 << sm_p['weight_frac']) - fa[d]) for d in range(hd))
+    check('the fixed-point head matches float attention to within 0.25 '
+          '(worst %.3f on values up to 60)' % err, err < 0.25)
+
+    work = os.path.join(ROOT, 'build_attntest')
+    shutil.rmtree(work, ignore_errors=True)
+    try:
+        cf.write_attn_deps(ms, work)
+        rr = RuleBasedAgent()
+        with open(os.path.join(work, 'tb.v'), 'w') as f:
+            f.write(specgen_mod.render_attn_testbench(spec))
+        res = {}
+        for label, fx in (('first', set()), ('fixed', {agent_mod.FIX_VLAT})):
+            with open(os.path.join(work, 'attn.v'), 'w') as f:
+                f.write(rr.render_attn(spec, fx))
+            r = subprocess.run(['iverilog', '-g2005', '-o', 's.out', 'tb.v',
+                                'attn.v'] + list(cf.ATTN_DEPS), cwd=work,
+                               capture_output=True, text=True)
+            assert r.returncode == 0, r.stdout + r.stderr
+            r = subprocess.run(['vvp', 's.out'], cwd=work,
+                               capture_output=True, text=True, timeout=900)
+            res[label] = r.stdout
+        check('the head computes scores, softmax and the weighted sum',
+              'TB_RESULT: PASS' in res['fixed'])
+        check('a value used before its registered read arrives is caught',
+              'TB_RESULT: PASS' not in res['first']
+              and 'expected_o' in res['first'])
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
 def test_requant_golden_is_shared():
     """One model of requantization, used by the requantizer's own
     testbench and by the layer that sequences it, so the two cannot
@@ -1360,6 +1419,12 @@ def test_compile_errors_quote_the_source_line():
              "errors": [path + ":2: syntax error"]},
             {"iteration": 2, "stage": "sim", "status": "fail",
              "errors": [path + ":148: syntax error"]}]
+    warn = llm_agent.condense_feedback(
+        [{"iteration": 1, "stage": "sim", "status": "fail",
+          "errors": ["/x/m.v:3: warning: Port 5 (cols) expects 13 bits",
+                     "/x/m.v:9: syntax error"]}], None)[0]["tool_errors"]
+    check('an error is reported ahead of a warning printed before it',
+          "syntax error" in warn[0])
     rec = llm_agent.condense_feedback(hist, rtl)
     check('only the latest record is quoted, against the draft it came from',
           "source:" not in rec[0]["tool_errors"][0]
@@ -1775,6 +1840,7 @@ if __name__ == '__main__':
     test_wmem_subsystem()
     test_softmax_sequencer()
     test_mlp_layer()
+    test_attention_head()
     test_requant_golden_is_shared()
     test_table_unit_specs_are_implementable()
     test_llm_transport_is_retried()

@@ -49,6 +49,47 @@ MLP_JOB = {
     "derive_from_model": "mlp",
     "extra_sources": ("mv_dep.v", "mac_dep.v", "rq_dep.v"),
 }
+ATTN_DEPS = ("mv_dep.v", "mac_dep.v", "rq_dep.v", "sm_dep.v",
+             "expu_dep.v", "recip_dep.v", "exp_rom.v", "recip_rom.v")
+ATTN_JOB = {
+    "spec_file": "spec_attn.json", "tb_file": "tb_attn.v",
+    "rtl_file": "attn.v", "profile_file": "attn_profile.json",
+    "report_file": "report_attn.json",
+    "derive_from_model": "attn",
+    # Four generated blocks under it, and the softmax brings two more
+    # and their tables: all of them are the design under test.
+    "extra_sources": ATTN_DEPS,
+}
+
+
+def write_attn_deps(ms, build):
+    """The reference sub-blocks an attention head instantiates, written
+    once here so the flow and the sweep cannot disagree about them."""
+    from agent import (RuleBasedAgent, FIX_WIDTH, FIX_CLEAR, FIX_CLRCOL,
+                       FIX_MEMLAT, FIX_SATURATE, FIX_SUBMAX, FIX_LUT,
+                       FIX_NORM)
+    r = RuleBasedAgent()
+    e, rc = specgen.derive_exp_spec(ms), specgen.derive_recip_spec(ms)
+    srcs = {
+        "mac_dep.v": r.render_mac(specgen.derive_chiplet_spec(ms),
+                                  {FIX_WIDTH, FIX_CLEAR}),
+        "mv_dep.v": r.render_matvec(specgen.derive_matvec_spec(ms),
+                                    {FIX_CLRCOL, FIX_MEMLAT}),
+        "rq_dep.v": r.render_requant(specgen.derive_requant_spec(ms),
+                                     {FIX_SATURATE}),
+        "sm_dep.v": r.render_softmax(specgen.derive_softmax_spec(ms),
+                                     {FIX_SUBMAX}),
+        "expu_dep.v": r.render_exp(e, {FIX_LUT}),
+        "recip_dep.v": r.render_recip(rc, {FIX_NORM}),
+        "exp_rom.v": specgen.exp_rom(e),
+        "recip_rom.v": specgen.recip_rom(rc),
+    }
+    os.makedirs(build, exist_ok=True)
+    for fn in ATTN_DEPS:
+        with open(os.path.join(build, fn), "w") as f:
+            f.write(srcs[fn])
+
+
 SOFTMAX_JOB = {
     "spec_file": "spec_softmax.json", "tb_file": "tb_softmax.v",
     "rtl_file": "softmax.v", "profile_file": "softmax_profile.json",
@@ -368,8 +409,11 @@ def summarize(res):
         if res.get("phase") == "compile":
             return "FAIL compile"
         m = res["mismatches"][0] if res["mismatches"] else {}
-        exp = m.get("expected_acc", m.get("expected_crc"))
-        got = m.get("got_acc", m.get("got_crc"))
+        # Whatever the testbench named its values: expected_acc for the
+        # MAC, expected_o for the head, expected_w for softmax. Looking
+        # for two fixed names printed "exp None got None" for the rest.
+        exp = next((v for k, v in m.items() if k.startswith("expected")), None)
+        got = next((v for k, v in m.items() if k.startswith("got")), None)
         return "FAIL {}: exp {} got {}".format(m.get("test", "?"), exp, got)
     if res["stage"] == "synth":
         return "pass ({} cells)".format(res["cell_count"]) if res["status"] == "pass" else "FAIL"
@@ -447,6 +491,10 @@ def derive_profile(spec, final):
     elif unit == "column":
         prof["sequencer"] = spec["name"]
         prof["mac_stages"] = spec["parameters"]["mac_stages"]
+    elif unit == "head":
+        prof["head"] = spec["name"]
+        prof["head_dim"] = spec["parameters"]["head_dim"]
+        prof["capacity"] = spec["parameters"]["capacity"]
     elif unit == "row":
         prof["row_unit"] = spec["name"]
         if "shift_bias" in spec["parameters"]:
@@ -536,6 +584,10 @@ def run_flow(job=None, verbose=True, agent=None, max_iters=None):
                     specgen.derive_requant_spec(_ms), {FIX_SATURATE}))):
             with open(os.path.join(BUILD, _fn), "w") as f:
                 f.write(_src)
+    elif job.get("derive_from_model") == "attn":
+        specgen.generate_attn(spec_file=job["spec_file"],
+                              tb_file=job["tb_file"])
+        write_attn_deps(specgen.load_model_spec(), BUILD)
     elif job.get("derive_from_model") == "softmax":
         specgen.generate_softmax(spec_file=job["spec_file"],
                                  tb_file=job["tb_file"])

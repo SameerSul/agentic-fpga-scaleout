@@ -47,7 +47,7 @@ Pure Python 3 stdlib, no dependencies. The RTL half runs real open tools (Icarus
                                  sizing, fabric, board fit
 ```
 
-The nine generated blocks, and what each is for:
+The eleven generated blocks, and what each is for:
 
 ```
   arithmetic
@@ -63,6 +63,8 @@ The nine generated blocks, and what each is for:
     wmem       the weight tile the matvec reads from
     softmax    drives exp and recip across a row
     mlp        two chained matmuls with requant between them
+    attn       one attention head: q.k scores over the KV cache,
+               softmax, then the weighted sum of V
 ```
 
 Four of those are composite: they instantiate the blocks below them
@@ -419,7 +421,7 @@ checked against another model. Read that list before quoting any number here.
 - Feeding 8601 MAC instances would need on-chip operand bandwidth the model does not check. DSP count is the right first-order capacity ceiling, not a claim that the array is routable at that size.
 - A 25 Gbps endpoint does not close timing in this flow at either standard datapath. Reaching it needs a pipelined or matrix-form CRC that the rule-based agent does not write, so the default target is 10 Gbps, which is also what the mid board class actually exposes.
 - There is no place-and-route anywhere; timing is real OpenSTA static timing but against a toy illustrative liberty, so fmax is an estimate of an estimate.
-- The derivation now covers nine blocks, not just the matmul datapath: the exponential, reciprocal and inverse square root are generated and signed off, and softmax and an MLP layer sequence them. What is still missing above that is attention sequencing and tiling. The weight tile holds 1024 entries and the activation bank 64, so a real matrix needs tiling logic that does not exist yet, and the blocks are the arithmetic of an inference engine rather than the whole of one.
+- The derivation now covers eleven blocks, not just the matmul datapath: the exponential, reciprocal and inverse square root are generated and signed off, softmax and an MLP layer sequence them, and an attention head composes matvec, the MAC, softmax and the requantizer. What is still missing above that is tiling and a sequencer that runs a whole layer, norms and residuals included. The weight tile holds 1024 entries and the activation bank 64, so a real matrix needs tiling logic that does not exist yet, and the blocks are the arithmetic of an inference engine rather than the whole of one.
 - Boards are simulated, not real: link rates, propagation delays, clock caps, and capacities are representative class parameters, not measured silicon.
 - The 30% fabric reservation for NIC and routing logic is a stated guess, not a floorplan; the endpoint reservation per link is real, from the synthesized cell count.
 - Decode compute time is charged from the measured chiplet profile at full model dimensions; the weights are not materialized. The sharded numerics (real arithmetic, bit-exactness across cluster shapes) are validated at reduced dimensions in stage 8 and in the test suite.
@@ -428,4 +430,4 @@ checked against another model. Read that list before quoting any number here.
 - Activations travel as 8-byte IEEE doubles end to end so every all-reduce check is exact; a real deployment would use fp16 or fp32 and halve or quarter the fabric traffic.
 - ACK/credit control packets share link bandwidth but are assumed error-free (in RTL they are short, heavily protected control words); topology is a full mesh of point-to-point links; payloads are fixed 1024 B with a 20 B header.
 - The compute cycle model charges cycles per unit from the profile; it ignores on-board operand distribution to the chiplet array and memory bandwidth limits.
-- The committed RTL and profiles come from the rule-based agent, so they are reproducible offline. The LLM agent is measured separately in `RESULTS.md`: it has signed off all nine blocks, eight with Haiku and the requantizer with Sonnet, once the specs stated their arithmetic and timing exactly and the tool feedback named what an engineer would look at.
+- The committed RTL and profiles come from the rule-based agent, so they are reproducible offline. The LLM agent is measured separately in `RESULTS.md`: it has signed off nine of the ten layer blocks, eight with Haiku and the requantizer with Sonnet, once the specs stated their arithmetic and timing exactly and the tool feedback named what an engineer would look at.
