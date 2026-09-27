@@ -9,7 +9,7 @@ is worth knowing and worth reporting.
 You give it a model spec, a small JSON file naming a transformer's
 dimensions and its quantization. It derives the hardware that model
 needs, writes the Verilog, and checks it with real tools until it passes.
-Sixteen blocks come out, each one sized from the model rather than written
+Seventeen blocks come out, each one sized from the model rather than written
 for it. Point it at a different model and every block re-derives.
 
 ## The picture
@@ -44,7 +44,7 @@ for it. Point it at a different model and every block re-derives.
                            re-simulated against the same testbench
 ```
 
-## The sixteen blocks
+## The seventeen blocks
 
 Arithmetic, bottom to top:
 
@@ -74,6 +74,14 @@ Sequencing, which is what makes the above into a layer:
    resadd     residual add of two scaled int8 tensors, streaming
    proj       a full-size projection, 896 by 4864 here, over external
               activation and weight memories
+```
+
+And the one that runs the model:
+
+```
+   decoder    one decode step of the trained 16-dimensional checkpoint,
+              embedding to argmax, over one instance each of proj,
+              rmsnorm, attn and resadd. The text it emits is its own.
 ```
 
 ## Build it
@@ -136,6 +144,8 @@ Four blocks instantiate others, so bring their dependencies along:
    gmlp.v     needs  matvec.v mac.v requant.v silu.v expu.v recip.v
                      exp_rom.v recip_rom.v
    proj.v     needs  matvec.v mac.v requant.v
+   decoder.v  needs  proj.v rmsnorm.v attn.v resadd.v and everything
+                     they need, all derived at the checkpoint's size
 ```
 
 The testbenches are in the repo root as `tb_*.v` if you want to run them
@@ -160,11 +170,11 @@ Measured here with yosys against a generic library, for Qwen2.5-0.5B:
    silu       120 MHz   11935
    gmlp       110 MHz   48418
    resadd     136 MHz    4894
-   proj       115 MHz   13989     3369 LUTs and 17 DSPs; its memories
+   proj       115 MHz   13989     1831 LUTs and 9 DSPs; its memories
                                   are outside it, on your part BRAM or DDR
    attn       112 MHz  115091     the score and weight buffers and the
                                   softmax's become flops here; on the
-                                  FPGA they map to 6 BRAMs, 6364 LUTs
+                                  FPGA they map to 3 BRAMs, 3182 LUTs
    softmax    103 MHz   40017     its exponential buffer, the same way
 
    Counts include each block's submodules. Before this, a composite
@@ -172,9 +182,18 @@ Measured here with yosys against a generic library, for Qwen2.5-0.5B:
    RMSNorm both showed the requantizer's 10396.
 ```
 
-A Zynq 7020 has 53200 LUTs and 220 DSPs. All sixteen together map to
-30631 LUTs and 128 DSPs on yosys's UltraScale+ mapping, about 58% of
+The decoder is sized for the checkpoint rather than Qwen: 111 MHz,
+13905 LUTs, 22 DSPs and 2 BRAMs on the UltraScale+ mapping. On the
+7-series mapping, the family of Vaibhav's Basys 3, it is 12802 LUTs and
+22 DSPs, 62% and 24% of an XC7A35T, so the whole decoder fits that board.
+
+A Zynq 7020 has 53200 LUTs and 220 DSPs. The sixteen Qwen-sized blocks map to
+18528 LUTs and 76 DSPs on yosys's UltraScale+ mapping, about 35% of
 the part in both, and that counts the composite blocks' sub-blocks twice.
+These are about half what this file reported before: the resource count
+read every submodule table yosys printed after the top module's, then the
+hierarchy totals on top, so every composite block was counted about
+twice. It now reads the hierarchy totals once.
 Expect better numbers than these: the generic library has no carry chain
 and no block RAM, and Vivado has both.
 

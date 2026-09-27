@@ -24,6 +24,22 @@ import zlib
 ROOT = os.path.dirname(os.path.abspath(__file__))
 
 
+def acc_width(ms):
+    """The datapath's accumulator width, shared by the MAC and the
+    requantizer so every block that instantiates them agrees.
+
+    The rule is weight_bits + activation_bits + ceil(log2(depth)), the
+    widest reduction the model has. The attention head's weighted sum goes
+    through the same requantizer, and it needs data_width + 16 bits (the
+    exponential's 15 fractional bits of weight, plus sign), so that is a
+    floor. Every model the sweep derives already clears it; the
+    16-dimensional checkpoint does not, at 21 bits against 24.
+    """
+    wb, ab = ms["weight_bits"], ms["activation_bits"]
+    depth = max(ms["d_model"], ms["d_ff"])
+    return max(wb + ab + math.ceil(math.log2(depth)), max(wb, ab) + 16)
+
+
 def derive_chiplet_spec(ms):
     """model spec -> chiplet spec. The derivation is recorded in the spec so
     the signed-off profile can carry its own provenance."""
@@ -32,7 +48,7 @@ def derive_chiplet_spec(ms):
     assert dw >= 4, "testbench stimulus assumes at least a 4-bit datapath"
     depth = max(ms["d_model"], ms["d_ff"])
     guard = math.ceil(math.log2(depth))
-    aw = wb + ab + guard
+    aw = acc_width(ms)
     # Quantized transformer weights and activations are symmetric signed
     # two's complement, so the datapath is signed. This is not cosmetic: an
     # unsigned multiplier turns every negative weight into a large positive
@@ -1462,7 +1478,11 @@ def derive_softmax_spec(ms):
     """
     e = derive_exp_spec(ms)
     r = derive_recip_spec(ms)
-    cap = 256                       # one attention row tile
+    # One attention row tile, and never more than the context holds: a
+    # 24-position model does not need 256-entry score buffers, and the
+    # attention head's matvec walks cached positions as columns, so a
+    # capacity past its column width cannot be addressed at all.
+    cap = min(256, 1 << max(1, (ms["seq_len"] - 1).bit_length()))
     nw = (cap - 1).bit_length()
     return {
         "name": "softmax_%s" % ms["name"],
@@ -1832,6 +1852,8 @@ def derive_attn_spec(ms):
     smax = (1 << (sw - 2)) - 1              # scores clamp to +-(2**(sw-2))
     wsum = dw + sm["parameters"]["weight_frac"] + 1
     assert wsum <= aw, "the requantizer input is narrower than the weighted sum"
+    assert nw <= mv["parameters"]["col_width"], \
+        "matvec cannot count as many cached positions as the head holds"
     return {
         "name": "attn_%s" % ms["name"],
         "description": "Single attention head for one decode step: q.k "
@@ -4044,7 +4066,7 @@ def derive_requant_spec(ms):
     wb, ab = ms["weight_bits"], ms["activation_bits"]
     dw = max(wb, ab)
     depth = max(ms["d_model"], ms["d_ff"])
-    aw = wb + ab + math.ceil(math.log2(depth))
+    aw = acc_width(ms)
     mw = 18                       # multiplier operand width for the scale
     shift_w = math.ceil(math.log2(aw + mw)) + 1
     # Partial products for the scale multiply. Depth grows with both

@@ -5,12 +5,16 @@ every command is named so it can be re-run.
 
 ## Short answer
 
-The flow turns a model spec into signed-off RTL for sixteen generated
-blocks, which now cover every operation in a Qwen layer: attention,
-RMSNorm, SiLU, the gated MLP and the residual add among them, and one
+The flow turns a model spec into signed-off RTL for seventeen generated
+blocks, which cover every operation in a Qwen layer but one: attention,
+RMSNorm, SiLU, the gated MLP and the residual add among them. The
+rotary position embedding Qwen applies to q and k is not generated yet,
+and an earlier version of this file said every operation was. One
 projection runs at the model's full size, 896 by 4864, bit-exact on every
-output. An LLM has written and signed off every block but the six newest
-through the same gates, and the multiply-accumulate unit's accumulator is formally proved
+output. A generated decoder sequences those blocks into a whole decode
+step, and the trained checkpoint runs on it in RTL, embedding to argmax,
+with every token of its output chosen by the hardware. An LLM has written
+and signed off every block but the seven newest through the same gates, and the multiply-accumulate unit's accumulator is formally proved
 never to overflow, for any input sequence, on the int8 targets. A trained
 language model decodes through the blocks' exact arithmetic and emits
 text. It still does not host a local LLM the way Architect Labs does:
@@ -23,7 +27,7 @@ The remaining gap is listed at the bottom rather than glossed over.
 ### The full suite
 
 ```
-python3 tests.py            # 312 tests, or 310 without OpenSTA
+python3 tests.py            # 321 tests, or 319 without OpenSTA
 ```
 
 ### Spec to RTL, across the spec space
@@ -220,6 +224,67 @@ model's own accuracy and logit margin next to the agreement, so an
 undertrained checkpoint cannot be mistaken for a quantization result
 again.
 
+## The model decodes in RTL
+
+```
+python3 decoder.py         # the integer reference, against float
+python3 tests.py           # includes the RTL decode below
+```
+
+`generate.py` runs the checkpoint through bit-accurate models of the
+blocks, but the host sequences it and picks each activation's scale at
+run time in floating point. A decoder on an FPGA can do neither, so
+`decoder.py` removes both. Every activation scale is fixed ahead of time
+by calibration over the corpus, every stage is one of the generated
+blocks' own golden models called with those constants, and nothing passes
+between two stages but an int8 code. That integer-only model agrees with
+the float checkpoint on all 93 teacher-forced corpus positions and
+greedy-decodes the same text.
+
+Then the hardware. `decoder.v` is one decode step, embedding lookup to
+argmax, as a sequencer over one instance each of the generated
+projection, RMSNorm, attention head and residual add, with every block
+beneath them (matvec, the MAC, the requantizer, softmax, the exponential,
+the reciprocal, the inverse square root) in the loop. One projection
+instance runs all seven matrices; one RMSNorm both norms; one residual
+add the embedding and both residuals. Weights, embeddings and gains sit
+behind one registered parameter port, as they would in DDR; activations
+and the KV cache are on chip. The testbench is the host: it feeds the
+prompt, then feeds back whichever token the hardware chose, and checks
+all 16 logits of every step against the integer reference.
+
+```
+  the agent writes the rtl
+  the tools decide. the ag
+TB_PROFILE tokens=46 span_cycles=174294 latency_cycles=4229
+TB_PASS checks=847
+```
+
+Every character after each prompt is the hardware's argmax, fed back as
+its next input, and all 736 logits are bit-exact. It closes the flow's
+gates like every other block: the rules agent's first cut, which leaves
+out the MLP's ReLU, fails on the first logit, and the second converges.
+110 MHz from OpenSTA, 3789 cycles per token, so about 29,000 tokens/s for
+this model, and 13905 LUTs, 22 DSPs and 2 BRAMs on yosys's UltraScale+
+mapping. On the 7-series mapping it is 12802 LUTs and 22 DSPs, 62% and
+24% of the XC7A35T on the team's Basys 3, so the decoder fits that
+board. Mutation testing kills every applicable operator. The one that
+first survived took the last maximum on a tie instead of the first: the
+model's logits never tie, so the testbench now ends with a step whose head
+weights are zeroed, and all sixteen logits tie at zero.
+
+Two derivation rules only showed up at this size, and neither changes any
+model the sweep runs. The attention head's weighted sum shares the
+datapath's requantizer and needs 24 bits, more than a 16-wide model's
+21-bit accumulator, so the accumulator now has that floor. And the
+softmax's capacity was fixed at 256 whatever the context, past what the
+head's matvec could count at this size; it is now bounded by the context.
+
+What this is not: the model is the 16-dimensional checkpoint, one layer
+and one head, in one 24-position window. Qwen's size needs the same
+sequencing over 14 heads sharing 2 KV heads, 24 layers, and weights
+streamed from DDR, and none of that exists yet.
+
 ## A real bitstream exists
 
 ```
@@ -383,6 +448,7 @@ Qwen2.5-0.5B:
 | gated MLP | not yet attempted | | |
 | residual add | not yet attempted | | |
 | full-size projection | not yet attempted | | |
+| decoder | not yet attempted | | |
 
 Every block the flow generated before the attention head has been
 written and signed off by an LLM through all four gates. The attention
@@ -505,8 +571,8 @@ the weighted sum, which the 8-bit MAC cannot do.
 
 Against real attention on the same integers the fixed-point head is
 within 0.08 on values up to 60. The rules agent converges in two
-iterations on every model variant, 112 MHz on Qwen2.5-0.5B, 6364 LUTs
-and 24 DSPs on yosys's UltraScale+ mapping with its sub-blocks, and
+iterations on every model variant, 112 MHz on Qwen2.5-0.5B, 3182 LUTs
+and 12 DSPs on yosys's UltraScale+ mapping with its sub-blocks, and
 mutation testing kills every mutant on all six. Its weighted-sum
 accumulator is sized from its own bound, the weights summing to under
 2.0, rather than from the MAC: at 16-bit operands the MAC's 46 bits made
@@ -607,7 +673,7 @@ multiply-accumulates, and checks all 4864 outputs against the Python
 golden: bit-exact, in 34 s of simulation. The testbench computes both
 operands from a hash of the address, so it needs no per-element
 initializer and a full-size case costs no more to write than a small
-one. 115 MHz on Qwen2.5-0.5B, 3369 LUTs and 17 DSPs.
+one. 115 MHz on Qwen2.5-0.5B, 1831 LUTs and 9 DSPs.
 
 The seeded first cut labels each result with matvec's current column
 index, which by the time the requantizer finishes belongs to the next
@@ -621,6 +687,20 @@ address, not the accumulator, and halving it survived: no case reached
 address 8192, so the address's top bits were never exercised outside the
 full-size test. The flow's testbench now ends with a case sized to reach
 past half the address width on every variant.
+
+## FPGA counts were double
+
+Every composite block's LUT and DSP count was about twice its real size.
+yosys prints one table per module, alphabetically, and then the totals
+for the whole hierarchy; the parser took everything after the top
+module's own table, which for any block that sorts early is most of the
+submodules and then the totals again. The attention head read 6364 LUTs
+and 24 DSPs and maps to 3182 and 12; the decoder read 25655 and maps to
+13905. The parser now reads only the final statistics pass and, when
+there is one, its hierarchy totals. A first version of that fix doubled
+the MAC instead, because synth_xilinx prints a hierarchy section of its
+own before the script's last pass; `tests.py` now checks both shapes.
+Single-module blocks were always counted correctly.
 
 ## Cycle counts are measured, not assumed
 
@@ -722,9 +802,13 @@ These are the distance between this repo and a local LLM host.
    and routes the activations between them, and one attention head over
    a KV cache, RMSNorm, and a projection at the model's full size over
    external memories. Softmax is hardware apart from
-   accumulating the sum. Every per-layer operation is now a generated
-   block, the residual add included, but nothing yet runs a whole
-   layer: the sequencing of heads and layers is still on the host. Qwen's MLP is the gated block,
+   accumulating the sum. Every per-layer operation but the rotary
+   position embedding is a generated block, the residual add included;
+   the checkpoint here uses learned positions, so it needs no rotation,
+   but Qwen does. The generated decoder runs a
+   whole decode step of the 16-dimensional checkpoint in RTL. At Qwen's
+   size nothing yet sequences a layer: many heads over shared KV heads,
+   24 layers and DDR-streamed weights are still on the host. Qwen's MLP is the gated block,
    down(SiLU(gate(x)) * up(x)); the older MLP block, two matmuls with a
    ReLU, is not Qwen's and remains as the simpler case. The composite
    layer blocks still hold 64-entry activation banks; only the

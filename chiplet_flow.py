@@ -207,6 +207,18 @@ def write_proj_deps(ms, build):
             f.write(srcs[fn])
 
 
+DECODER_JOB = {
+    "spec_file": "spec_decoder.json", "tb_file": "tb_decoder.v",
+    "rtl_file": "decoder.v", "profile_file": "decoder_profile.json",
+    "report_file": "report_decoder.json",
+    "derive_from_model": "decoder",
+    "extra_sources": ("mac_dep.v", "mv_dep.v", "rq_dep.v", "sm_dep.v",
+                      "expu_dep.v", "recip_dep.v", "exp_rom.v",
+                      "recip_rom.v", "rs_dep.v", "rsqrt_rom.v", "rn_dep.v",
+                      "at_dep.v", "pj_dep.v", "ra_dep.v"),
+}
+
+
 SOFTMAX_JOB = {
     "spec_file": "spec_softmax.json", "tb_file": "tb_softmax.v",
     "rtl_file": "softmax.v", "profile_file": "softmax_profile.json",
@@ -620,6 +632,10 @@ def derive_profile(spec, final):
     elif unit == "column":
         prof["sequencer"] = spec["name"]
         prof["mac_stages"] = spec["parameters"]["mac_stages"]
+    elif unit == "token":
+        prof["decoder"] = spec["name"]
+        prof["d_model"] = spec["parameters"]["d_model"]
+        prof["context"] = spec["parameters"]["context"]
     elif unit == "projection":
         prof["projection"] = spec["name"]
         prof["max_dim"] = spec["parameters"]["max_dim"]
@@ -721,6 +737,10 @@ def run_flow(job=None, verbose=True, agent=None, max_iters=None):
                     specgen.derive_requant_spec(_ms), {FIX_SATURATE}))):
             with open(os.path.join(BUILD, _fn), "w") as f:
                 f.write(_src)
+    elif job.get("derive_from_model") == "decoder":
+        import decoder
+        decoder.generate(spec_file=job["spec_file"], tb_file=job["tb_file"],
+                         build=BUILD)
     elif job.get("derive_from_model") == "proj":
         specgen.generate_proj(spec_file=job["spec_file"],
                               tb_file=job["tb_file"])

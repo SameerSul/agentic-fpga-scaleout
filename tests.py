@@ -1382,6 +1382,103 @@ def test_full_size_projection():
         shutil.rmtree(work, ignore_errors=True)
 
 
+def test_decoder_runs_the_model():
+    """The checkpoint decodes in RTL, every stage a generated block.
+
+    The integer reference first: static scales, fixed by calibration, and
+    every stage one of the blocks' golden models. It has to agree with the
+    float checkpoint, or the hardware would be bit-exact to the wrong
+    model. Then the decoder RTL runs two prompts with the testbench as the
+    host, feeding back whatever token the hardware chose, and every logit
+    of every step is checked."""
+    import decoder
+    dec = decoder.load_decoder()
+    same, total = decoder.agreement(dec.ck, dec)
+    check('integer decode agrees with the float checkpoint on every '
+          'corpus position (%d/%d)' % (same, total), same == total)
+    stoi = {c: i for i, c in enumerate(dec.ck['chars'])}
+    runs = [([stoi[c] for c in s], n) for s, n in decoder.RUNS]
+    work = os.path.join(ROOT, 'build_dectest')
+    shutil.rmtree(work, ignore_errors=True)
+    try:
+        rc, out = decoder.run_rtl(dec, runs, work)
+        check('the decoder RTL passes every logit of every step',
+              rc == 0 and 'TB_RESULT: PASS' in out)
+        check('the text it prints is the hardware choosing each token',
+              'the agent writes the rtl' in out
+              and 'the tools decide.' in out)
+        spec = decoder.derive_spec(dec)
+        with open(os.path.join(work, 'decoder.v'), 'w') as f:
+            f.write(decoder.render_decoder(spec, set()))
+        r = subprocess.run(['iverilog', '-g2005', '-o', 'm.out',
+                            'tb_decoder.v', 'decoder.v'] + list(decoder.DEPS),
+                           cwd=work, capture_output=True, text=True)
+        o = subprocess.run(['vvp', 'm.out'], cwd=work, capture_output=True,
+                           text=True, timeout=600).stdout
+        check('a decoder without the MLP ReLU fails on a logit',
+              r.returncode == 0 and 'TB_RESULT: PASS' not in o
+              and 'expected_lg' in o)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def test_small_model_derivation():
+    """Two derivation rules that only bind below the sizes the sweep runs.
+    The accumulator carries a floor for the attention head's weighted
+    sum, and the softmax's capacity never exceeds the context."""
+    ms = dict(load_model_spec(), name='small', d_model=16, d_ff=32,
+              head_dim=16, n_head=1, seq_len=24)
+    aw = derive_chiplet_spec(ms)['parameters']['acc_width']
+    check('a 16-wide model keeps a 24-bit accumulator for the weighted sum',
+          aw == 24 and specgen_mod.derive_requant_spec(ms)['parameters']
+          ['acc_width'] == aw)
+    sm = specgen_mod.derive_softmax_spec(ms)['parameters']
+    check('softmax capacity is bounded by a 24-position context',
+          sm['capacity'] == 32)
+    check('the Qwen derivation is unchanged by either rule',
+          derive_chiplet_spec(load_model_spec())['parameters']['acc_width']
+          == 29 and specgen_mod.derive_softmax_spec(load_model_spec())
+          ['parameters']['capacity'] == 256)
+
+
+def test_fpga_counts_the_hierarchy_once():
+    """A composite block's resources are its hierarchy's totals. yosys
+    prints module tables alphabetically and then those totals, so reading
+    everything after the top module's table counted every submodule that
+    sorts after it, and then everything again."""
+    import fpga
+    log = """
+2.50. Printing statistics.
+=== design hierarchy ===
+      999   LUT6
+4. Printing statistics.
+=== attn ===
+       10   LUT6
+        1   DSP48E1
+=== mac ===
+        2   LUT6
+        1   DSP48E1
+=== softmax ===
+        5   LUT6
+=== design hierarchy ===
+        +----------Count including submodules.
+       19 attn
+        2   mac
+        5   softmax
+       17   LUT6
+        2   DSP48E1
+"""
+    res, _ = fpga.parse_stat(log, "attn")
+    check('composite FPGA count is the hierarchy total, once',
+          res['luts'] == 17 and res['dsps'] == 2)
+    res, _ = fpga.parse_stat(
+        "2.50. Printing statistics.\n=== mac ===\n        2   LUT6\n"
+        "=== design hierarchy ===\n        2   LUT6\n"
+        "4. Printing statistics.\n=== mac ===\n        2   LUT6\n", "mac")
+    check('a single-module block reads only the final statistics pass',
+          res['luts'] == 2)
+
+
 def test_requant_golden_is_shared():
     """One model of requantization, used by the requantizer's own
     testbench and by the layer that sequences it, so the two cannot
@@ -2115,6 +2212,9 @@ if __name__ == '__main__':
     test_gated_mlp()
     test_residual_add()
     test_full_size_projection()
+    test_decoder_runs_the_model()
+    test_small_model_derivation()
+    test_fpga_counts_the_hierarchy_once()
     test_composite_cell_count()
     test_requant_golden_is_shared()
     test_table_unit_specs_are_implementable()

@@ -236,13 +236,13 @@
         "worst_slack_ns": 1.6
       },
       "fpga": {
-        "luts": 4773,
-        "ffs": 4331,
-        "dsps": 19,
+        "luts": 2533,
+        "ffs": 2241,
+        "dsps": 10,
         "brams": 0,
         "urams": 0,
-        "carry": 191,
-        "muxf": 779,
+        "carry": 111,
+        "muxf": 398,
         "status": "pass",
         "family": "xcup",
         "top": "mlp",

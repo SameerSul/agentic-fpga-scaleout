@@ -32,7 +32,10 @@ import subprocess
 import sys
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
-DVDIR = os.path.join(ROOT, "build_dv")   # never the flow's build dir
+# Never the flow's build dir. Overridable so a sweep and the test suite,
+# which both mutate RTL here, can run at the same time without one
+# deleting the other's mutant mid-simulation.
+DVDIR = os.path.join(ROOT, os.environ.get("CHIPLET_DV_DIR", "build_dv"))
 
 
 def _widen(m):

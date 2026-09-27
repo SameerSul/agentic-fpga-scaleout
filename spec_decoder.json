@@ -1,0 +1,187 @@
+{
+  "name": "decoder_tiny_llm",
+  "description": "One decode step of the 16-dimensional checkpoint, embedding lookup to argmax, sequencing the generated projection, RMSNorm, attention and residual add blocks",
+  "top_module": "decoder",
+  "unit": "token",
+  "parameters": {
+    "d_model": 16,
+    "d_ff": 32,
+    "vocab": 16,
+    "context": 24,
+    "region": 32,
+    "param_offsets": {
+      "tok": 0,
+      "pos": 256,
+      "g1": 640,
+      "g2": 656,
+      "wq": 672,
+      "wk": 928,
+      "wv": 1184,
+      "wo": 1440,
+      "w1": 1696,
+      "w2": 2208,
+      "head": 2720
+    },
+    "param_words": 2976,
+    "constants": {
+      "q": [
+        241332,
+        26
+      ],
+      "k": [
+        232346,
+        25
+      ],
+      "v": [
+        201113,
+        25
+      ],
+      "a": [
+        255513,
+        26
+      ],
+      "h": [
+        181363,
+        25
+      ],
+      "m": [
+        256608,
+        26
+      ],
+      "lg": [
+        156789,
+        25
+      ],
+      "ctx": [
+        187571,
+        32
+      ],
+      "n1": [
+        206424,
+        32
+      ],
+      "n2": [
+        259941,
+        32
+      ],
+      "emb": [
+        174221,
+        186345,
+        18
+      ],
+      "r1": [
+        203020,
+        248757,
+        18
+      ],
+      "r2": [
+        113115,
+        250052,
+        18
+      ]
+    },
+    "shift_s": 4,
+    "eps": 1,
+    "ports": {
+      "rn_addr": 4,
+      "rn_eps": 22,
+      "at_addr": 9,
+      "at_hd": 4,
+      "at_n": 6,
+      "at_shs": 5,
+      "pj_depth": 6,
+      "pj_col": 6,
+      "pj_addr": 12,
+      "sc": 18,
+      "sh": 7
+    },
+    "data_width": 8,
+    "signed": true,
+    "pipeline_stages": 1,
+    "target_clock_mhz": 100
+  },
+  "ports": [
+    {
+      "name": "clk",
+      "dir": "input",
+      "width": 1,
+      "desc": "clock, rising edge"
+    },
+    {
+      "name": "rst_n",
+      "dir": "input",
+      "width": 1,
+      "desc": "synchronous active-low reset"
+    },
+    {
+      "name": "start",
+      "dir": "input",
+      "width": 1,
+      "desc": "one-cycle pulse: decode tok at pos"
+    },
+    {
+      "name": "tok",
+      "dir": "input",
+      "width": 4,
+      "desc": "the token at this position"
+    },
+    {
+      "name": "pos",
+      "dir": "input",
+      "width": 5,
+      "desc": "its position; the KV cache slot"
+    },
+    {
+      "name": "p_addr",
+      "dir": "output",
+      "width": 12,
+      "desc": "parameter memory address"
+    },
+    {
+      "name": "p_data",
+      "dir": "input",
+      "width": 8,
+      "desc": "parameter word, one cycle after its address"
+    },
+    {
+      "name": "lg_valid",
+      "dir": "output",
+      "width": 1,
+      "desc": "a logit is on lg_index/lg_data"
+    },
+    {
+      "name": "lg_index",
+      "dir": "output",
+      "width": 4,
+      "desc": "which logit"
+    },
+    {
+      "name": "lg_data",
+      "dir": "output",
+      "width": 8,
+      "desc": "its int8 value"
+    },
+    {
+      "name": "next_tok",
+      "dir": "output",
+      "width": 4,
+      "desc": "argmax, lowest index on a tie"
+    },
+    {
+      "name": "done",
+      "dir": "output",
+      "width": 1,
+      "desc": "one-cycle pulse: next_tok is valid"
+    },
+    {
+      "name": "busy",
+      "dir": "output",
+      "width": 1,
+      "desc": "high from start to done"
+    }
+  ],
+  "derivation": {
+    "model": "tiny_llm",
+    "rule": "block specs derived at the checkpoint's own size; activation scales fixed by calibration over the corpus; every constant a (scale, shift) pair for the requantizer or residual add it drives"
+  }
+}

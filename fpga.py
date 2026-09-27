@@ -70,9 +70,33 @@ def synth_fpga(rtl_file, top, build_dir, family="xcup", extra=()):
         return {"status": "fail", "family": family,
                 "errors": [l for l in out.splitlines() if "ERROR" in l][:5]}
 
-    # The final stat block for the top module: take the last occurrence, so
-    # per-submodule tables earlier in the log cannot shadow the totals.
-    tail = out.rsplit("=== " + top + " ===", 1)[-1]
+    res, unknown = parse_stat(out, top)
+    res.update(status="pass", family=family, top=top,
+               lint=lint_findings(out))
+    if unknown:
+        res["unmapped_cells"] = unknown
+    return res
+
+
+def parse_stat(out, top):
+    """Resource totals from a yosys stat log, and any cells no bucket
+    claims."""
+    # A design with submodules gets a "design hierarchy" section whose
+    # totals count every instance of every submodule once. That is the
+    # number. Taking the text after the top module's own table instead
+    # picked up every module table yosys printed after it, alphabetically,
+    # and then the hierarchy totals as well: the decoder read 25655 LUTs
+    # where it maps to about half that, and every composite block was
+    # inflated by however many submodules sorted after its name.
+    # Only the last statistics pass counts: synth_xilinx prints its own
+    # before the script's, hierarchy section included, and a
+    # single-module design's final pass has no hierarchy section, so
+    # looking past it read the MAC's DSP twice.
+    last = out.rsplit("Printing statistics.", 1)[-1]
+    if "=== design hierarchy ===" in last:
+        tail = last.rsplit("=== design hierarchy ===", 1)[-1]
+    else:
+        tail = last.rsplit("=== " + top + " ===", 1)[-1]
     res = {k: 0 for k, _ in BUCKETS}
     unknown = {}
     for line in tail.splitlines():
@@ -88,11 +112,7 @@ def synth_fpga(rtl_file, top, build_dir, family="xcup", extra=()):
                 break
         else:
             unknown[cell] = unknown.get(cell, 0) + n
-    res.update(status="pass", family=family, top=top,
-               lint=lint_findings(out))
-    if unknown:
-        res["unmapped_cells"] = unknown
-    return res
+    return res, unknown
 
 
 def lint_findings(log):

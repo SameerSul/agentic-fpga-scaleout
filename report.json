@@ -88,7 +88,7 @@
     "iverilog": "/opt/homebrew/bin/iverilog",
     "vvp": "/opt/homebrew/bin/vvp",
     "yosys": "/opt/homebrew/bin/yosys",
-    "sta": null
+    "sta": "/Users/ssuleman/.local/bin/sta"
   },
   "agent": "RuleBasedAgent",
   "converged": true,
@@ -166,10 +166,9 @@
       "timing": {
         "stage": "timing",
         "status": "pass",
-        "method": "proxy_gate_depth",
-        "note": "OpenSTA unavailable or failed, gate depth is a timing proxy",
-        "gate_depth": 80,
-        "clock_period_ns": 10.0
+        "method": "opensta",
+        "clock_period_ns": 10.0,
+        "worst_slack_ns": 4.1
       },
       "fpga": {
         "luts": 47,
@@ -195,10 +194,9 @@
     "timing": {
       "stage": "timing",
       "status": "pass",
-      "method": "proxy_gate_depth",
-      "note": "OpenSTA unavailable or failed, gate depth is a timing proxy",
-      "gate_depth": 80,
-      "clock_period_ns": 10.0
+      "method": "opensta",
+      "clock_period_ns": 10.0,
+      "worst_slack_ns": 4.1
     }
   }
 }

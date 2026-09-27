@@ -349,19 +349,19 @@
         "worst_slack_ns": 0.92
       },
       "fpga": {
-        "luts": 6560,
-        "ffs": 3527,
-        "dsps": 27,
+        "luts": 3352,
+        "ffs": 1791,
+        "dsps": 14,
         "brams": 0,
         "urams": 0,
-        "carry": 310,
-        "muxf": 1194,
+        "carry": 160,
+        "muxf": 619,
         "status": "pass",
         "family": "xcup",
         "top": "gmlp",
         "lint": [],
         "unmapped_cells": {
-          "RAM64M8": 16
+          "RAM64M8": 8
         },
         "stage": "fpga"
       }

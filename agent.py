@@ -71,6 +71,9 @@ class RuleBasedAgent:
             return self.render_resadd(spec, fixes), sorted(fixes)
         if spec["top_module"] == "proj":
             return self.render_proj(spec, fixes), sorted(fixes)
+        if spec["top_module"] == "decoder":
+            import decoder
+            return decoder.render_decoder(spec, fixes), sorted(fixes)
         return self.render_mac(spec, fixes), sorted(fixes)
 
     def diagnose(self, spec, history):
@@ -86,6 +89,12 @@ class RuleBasedAgent:
             for m in fb.get("mismatches", []):
                 if "expected_crc" in m:
                     fixes.add(FIX_XOR)
+                elif "expected_lg" in m:
+                    # The decoder's only seeded bug: the up projection's
+                    # output went into the MLP without its ReLU, so the
+                    # first logit of the first step is already wrong.
+                    import decoder
+                    fixes.add(decoder.FIX_RELU)
                 elif "clear" in m.get("test", "").lower():
                     fixes.add(FIX_CLEAR)
                 elif "expected_proj" in m:

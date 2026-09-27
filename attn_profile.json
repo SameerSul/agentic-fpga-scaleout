@@ -12,13 +12,13 @@
   "sim_checks_passed": 364,
   "fpga": {
     "family": "xcup",
-    "luts": 6364,
-    "ffs": 3394,
-    "dsps": 24,
-    "brams": 6,
+    "luts": 3182,
+    "ffs": 1697,
+    "dsps": 12,
+    "brams": 3,
     "urams": 0,
-    "carry": 356,
-    "muxf": 912
+    "carry": 178,
+    "muxf": 456
   },
   "derivation": {
     "model": "qwen2_5_0p5b",
