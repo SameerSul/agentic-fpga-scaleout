@@ -2679,6 +2679,401 @@ def generate_silu(ms=None, spec_file="spec_silu.json", tb_file="tb_silu.v"):
         f.write(render_silu_testbench(spec))
     return spec
 
+
+# --------------------------------------------------------------------------
+# Gated MLP: down(SiLU(gate(x)) * up(x)), Qwen's MLP.
+# --------------------------------------------------------------------------
+
+def derive_gmlp_spec(ms):
+    """model spec -> gated MLP sequencer spec.
+
+    Qwen's MLP has three projections, not two: gate and up from the input,
+    their elementwise product with SiLU on the gate, and down from that.
+    This runs them through one matmul sequencer, the SiLU unit and one
+    shared requantizer, over one weight memory holding the three matrices
+    back to back.
+    """
+    c = derive_chiplet_spec(ms)
+    mv = derive_matvec_spec(ms)
+    rq = derive_requant_spec(ms)
+    si = derive_silu_spec(ms)
+    dw, aw = c["parameters"]["data_width"], c["parameters"]["acc_width"]
+    bank = 64
+    bw = (bank - 1).bit_length()
+    gw = si["parameters"]["width"]
+    addr_w = (3 * bank * bank - 1).bit_length()
+    mw, shw = rq["parameters"]["scale_width"], rq["parameters"]["shift_width"]
+    return {
+        "name": "gmlp_%s" % ms["name"],
+        "description": "Gated MLP, Qwen's: down(SiLU(gate(x)) * up(x)) over "
+                       "a %d-entry activation tile, three projections from "
+                       "one weight memory" % bank,
+        "top_module": "gmlp",
+        "unit": "layer",
+        "parameters": {
+            "data_width": dw, "acc_width": aw, "bank": bank,
+            "bank_width": bw, "gate_width": gw,
+            "gate_frac": si["parameters"]["frac"],
+            "depth_width": mv["parameters"]["depth_width"],
+            "col_width": mv["parameters"]["col_width"],
+            "mv_addr_width": mv["parameters"]["addr_width"],
+            "addr_width": addr_w, "scale_width": mw, "shift_width": shw,
+            "requant_stages": rq["parameters"]["pipeline_stages"],
+            "signed": True, "pipeline_stages": 1,
+            "target_clock_mhz": 100,
+        },
+        "derivation": {
+            "model": ms["name"],
+            "silu": si["derivation"],
+            "rule": "tile and address widths as the MLP layer, with room "
+                    "for three matrices; the gate format from the SiLU "
+                    "unit; the requantizer from that block",
+        },
+        "ports": [
+            {"name": "clk", "dir": "input", "width": 1,
+             "desc": "clock, rising edge"},
+            {"name": "rst_n", "dir": "input", "width": 1,
+             "desc": "active-low synchronous reset"},
+            {"name": "load_valid", "dir": "input", "width": 1,
+             "desc": "write the next input activation"},
+            {"name": "load_data", "dir": "input", "width": dw,
+             "signed": True, "desc": "input activation"},
+            {"name": "start", "dir": "input", "width": 1,
+             "desc": "run the layer"},
+            {"name": "depth", "dir": "input",
+             "width": mv["parameters"]["depth_width"],
+             "desc": "input width, the gate and up reduction length"},
+            {"name": "cols_ff", "dir": "input",
+             "width": mv["parameters"]["col_width"],
+             "desc": "hidden width: gate and up outputs, down reduction"},
+            {"name": "cols_out", "dir": "input",
+             "width": mv["parameters"]["col_width"],
+             "desc": "outputs of the down projection"},
+            {"name": "shift_g", "dir": "input", "width": 5,
+             "desc": "gate accumulator shift into the SiLU format"},
+            {"name": "scale_u", "dir": "input", "width": mw,
+             "desc": "up projection requantizer scale"},
+            {"name": "shift_u", "dir": "input", "width": shw,
+             "desc": "up projection requantizer shift"},
+            {"name": "scale_h", "dir": "input", "width": mw,
+             "desc": "SiLU(gate) * up requantizer scale"},
+            {"name": "shift_h", "dir": "input", "width": shw,
+             "desc": "SiLU(gate) * up requantizer shift"},
+            {"name": "scale_d", "dir": "input", "width": mw,
+             "desc": "down projection requantizer scale"},
+            {"name": "shift_d", "dir": "input", "width": shw,
+             "desc": "down projection requantizer shift"},
+            {"name": "w_addr", "dir": "output", "width": addr_w,
+             "desc": "weight address, into the weight memory"},
+            {"name": "w_data", "dir": "input", "width": dw, "signed": True,
+             "desc": "weight, registered read"},
+            {"name": "o_valid", "dir": "output", "width": 1,
+             "desc": "a layer output is on o_data"},
+            {"name": "o_index", "dir": "output", "width": bw,
+             "desc": "which output"},
+            {"name": "o_data", "dir": "output", "width": dw, "signed": True,
+             "desc": "layer output activation"},
+            {"name": "busy", "dir": "output", "width": 1,
+             "desc": "a layer is in progress"},
+        ],
+        "behavior": [
+            "Each cycle with load_valid high writes load_data into the "
+            "input buffer at the next index, starting from 0 after reset "
+            "and after every run, so x[0..depth-1] are loaded in order "
+            "before start.",
+            "start is a one-cycle pulse, with every width, scale and shift "
+            "input held stable for the whole layer. busy must be high on "
+            "the clock edge that samples start, so it already reads 1 one "
+            "cycle later, and it stays high until the last output has been "
+            "emitted.",
+            "Weights are column-major and packed back to back in one "
+            "memory: the gate matrix's weight for input r of hidden unit c "
+            "at c*depth + r; the up matrix's after it, at depth*cols_ff + "
+            "c*depth + r; the down matrix's after both, at 2*depth*cols_ff "
+            "+ c*cols_ff + r for hidden unit r of output c.",
+            "w_data is a registered read: it carries the weight at address "
+            "a on the cycle after w_addr = a. If w_addr is itself a "
+            "register, that is two clock edges after the edge that loads a "
+            "into it.",
+            "Gate: for c in 0..cols_ff-1, t_c = sum over r of x[r] * "
+            "Wgate[c][r]; g_c = (t_c + 2**(shift_g-1)) >>> shift_g when "
+            "shift_g > 0, else t_c, clamped to [%d, %d], the SiLU unit's "
+            "Q%d.%d input. gbuf[c] = silu(g_c), from the supplied SiLU unit."
+            % (-(1 << (gw - 1)), (1 << (gw - 1)) - 1,
+               gw - 1 - si["parameters"]["frac"], si["parameters"]["frac"]),
+            "Up: for c in 0..cols_ff-1, ubuf[c] = requant(sum over r of "
+            "x[r] * Wup[c][r], scale_u, shift_u).",
+            "Product: for c in 0..cols_ff-1, hbuf[c] = requant(gbuf[c] * "
+            "ubuf[c], scale_h, shift_h), the signed product of the Q%d.%d "
+            "SiLU output and the int8 up value."
+            % (gw - 1 - si["parameters"]["frac"], si["parameters"]["frac"]),
+            "Output: for c in 0..cols_out-1, y[c] = requant(sum over r of "
+            "hbuf[r] * Wdown[c][r], scale_d, shift_d), with reduction "
+            "length cols_ff.",
+            "requant is exactly the supplied requantizer: multiply by "
+            "scale, add 2**(shift-1) when shift > 0, arithmetic shift "
+            "right by shift, then saturate to [%d, %d]."
+            % (-(1 << (dw - 1)), (1 << (dw - 1)) - 1),
+            "Emit each y[c] with o_index = c and o_valid high for exactly "
+            "that one cycle. Outputs may come in any order, but each index "
+            "exactly once, and o_valid must be low at every other time.",
+            "The buffers are memories named gbuf, ubuf and hbuf, declared "
+            "reg signed [%d:0] gbuf [0:%d], reg signed [%d:0] ubuf "
+            "[0:%d] and reg signed [%d:0] hbuf [0:%d], with hidden unit c "
+            "at index c. The testbench reads them directly to check each "
+            "stage before the outputs, so these names and layouts are part "
+            "of the interface."
+            % (gw - 1, bank - 1, dw - 1, bank - 1, dw - 1, bank - 1),
+            "matvec, mac, silu and requant are separate modules supplied "
+            "as source files, not something to write. Instantiate them "
+            "with exactly these ports, connected by name: "
+            + "; ".join(port_signature(x) for x in (mv, c, si, rq)) + ".",
+            "matvec walks a_addr 0..depth-1 and w_addr col*depth onward "
+            "for each of cols columns, drives mac_valid one cycle behind "
+            "the address, pulses mac_clear between columns, and pulses "
+            "col_valid with col_index when a column's sum is on the MAC's "
+            "acc. Its w_addr starts from 0, so each projection adds its own "
+            "base. silu streams one value per cycle and returns results in "
+            "order, with a latency of its own. requant has a latency of "
+            "exactly %d cycles." % rq["parameters"]["pipeline_stages"],
+            "All state resets to zero: busy and o_valid are 0 during "
+            "reset.",
+        ],
+    }
+
+
+def gmlp_golden(x, Wg, Wu, Wd, sh_g, scu, shu, sch, shh, scd, shd, p):
+    """Exact model of the layer, from the SiLU and requantizer models."""
+    dw, gw = p["data_width"], p["gate_width"]
+    d, ff, out = len(x), len(Wg), len(Wd)
+    lo, hi = -(1 << (gw - 1)), (1 << (gw - 1)) - 1
+    tg = [sum(x[r] * Wg[c][r] for r in range(d)) for c in range(ff)]
+    g = [max(lo, min(hi, _round_shift(v, sh_g))) for v in tg]
+    gs = [silu_golden(v, p["silu"]) for v in g]
+    tu = [sum(x[r] * Wu[c][r] for r in range(d)) for c in range(ff)]
+    u = [requant_golden(v, scu, shu, dw)[0] for v in tu]
+    hp = [gs[c] * u[c] for c in range(ff)]
+    h = [requant_golden(v, sch, shh, dw)[0] for v in hp]
+    ty = [sum(h[r] * Wd[c][r] for r in range(ff)) for c in range(out)]
+    y = [requant_golden(v, scd, shd, dw)[0] for v in ty]
+    return {"tg": tg, "g": g, "gs": gs, "tu": tu, "u": u, "hp": hp,
+            "h": h, "ty": ty, "y": y}
+
+
+def _gmlp_case(p, gp, seed):
+    """One set of inputs and weights, with every scale derived from its own
+    stage's values."""
+    dw, gw, mw, sw_o = (p["data_width"], p["gate_width"], p["scale_width"],
+                        p["shift_width"])
+    d, ff, out = 8, 6, 5
+    half = ((1 << dw) - 5) // 2
+    rnd = random.Random(seed)
+    x = [rnd.randrange(-half, half) for _ in range(d)]
+    Wg = [[rnd.randrange(-half, half) for _ in range(d)] for _ in range(ff)]
+    Wu = [[rnd.randrange(-half, half) for _ in range(d)] for _ in range(ff)]
+    Wd = [[rnd.randrange(-half, half) for _ in range(ff)] for _ in range(out)]
+    # One column aligned per projection, so each accumulator is large by
+    # construction and a truncated one shows (as in the MLP testbench).
+    Wg[0] = [half if v >= 0 else -half for v in x]
+    Wu[1] = [half if v >= 0 else -half for v in x]
+    tg = [sum(x[r] * Wg[c][r] for r in range(d)) for c in range(ff)]
+    sh_g = 0
+    while max(abs(v) for v in tg) >> sh_g > (1 << (gw - 2)):
+        sh_g += 1
+    g0 = gmlp_golden(x, Wg, Wu, Wd, sh_g, 1, 0, 1, 0, 1, 0, gp)
+    scu, shu = _mlp_scale(g0["tu"], dw, mw, sw_o)
+    g1 = gmlp_golden(x, Wg, Wu, Wd, sh_g, scu, shu, 1, 0, 1, 0, gp)
+    sch, shh = _mlp_scale(g1["hp"], dw, mw, sw_o)
+    g2 = gmlp_golden(x, Wg, Wu, Wd, sh_g, scu, shu, sch, shh, 1, 0, gp)
+    Wd[0] = [half if v >= 0 else -half for v in g2["h"]]
+    g2 = gmlp_golden(x, Wg, Wu, Wd, sh_g, scu, shu, sch, shh, 1, 0, gp)
+    scd, shd = _mlp_scale(g2["ty"], dw, mw, sw_o)
+    G = gmlp_golden(x, Wg, Wu, Wd, sh_g, scu, shu, sch, shh, scd, shd, gp)
+    return (d, ff, out, x, Wg, Wu, Wd, sh_g, scu, shu, sch, shh, scd, shd, G)
+
+
+def render_gmlp_testbench(spec):
+    """Small dimensions, so the simulation stays fast, with scales derived
+    per stage from the stage's own values as the MLP testbench does.
+
+    The seed is searched until one hidden product sits on a rounding
+    boundary of its requantizer, so that an off-by-one in that product
+    changes a hidden value. Without it mutation testing showed the
+    mutant surviving: the product is shifted right about twenty bits and
+    six random hidden units almost never land on the boundary.
+    """
+    p = spec["parameters"]
+    gp = dict(p, silu=spec["derivation"]["silu"])
+    dw, gw, mw, sw_o = (p["data_width"], p["gate_width"], p["scale_width"],
+                        p["shift_width"])
+    for trial in range(5000):
+        (d, ff, out, x, Wg, Wu, Wd, sh_g, scu, shu, sch, shh, scd, shd,
+         G) = _gmlp_case(p, gp, 101 + trial)
+        if len(set(G["gs"])) <= 2:
+            continue
+        if any(requant_golden(G["hp"][c] + 1, sch, shh, dw)[0] != G["h"][c]
+               for c in range(ff)):
+            break
+    else:
+        raise AssertionError("no gated MLP case with a product on a "
+                             "rounding boundary")
+    wm = ([Wg[c][r] for c in range(ff) for r in range(d)]
+          + [Wu[c][r] for c in range(ff) for r in range(d)]
+          + [Wd[c][r] for c in range(out) for r in range(ff)])
+    init = "\n".join(
+        ["    acts[%d] = %s;" % (i, _slit(v, dw)) for i, v in enumerate(x)]
+        + ["    wmem_tb[%d] = %s;" % (i, _slit(v, dw)) for i, v in enumerate(wm)]
+        + ["    expect_g[%d] = %s; expect_u[%d] = %s; expect_h[%d] = %s;"
+           % (c, _slit(G["gs"][c], gw), c, _slit(G["u"][c], dw), c,
+              _slit(G["h"][c], dw)) for c in range(ff)]
+        + ["    expect_y[%d] = %s;" % (c, _slit(v, dw))
+           for c, v in enumerate(G["y"])])
+    return GMLP_TB.format(
+        dwm=dw - 1, gwm=gw - 1, mwm=mw - 1, swm=sw_o - 1,
+        bwm=p["bank_width"] - 1, depwm=p["depth_width"] - 1,
+        colwm=p["col_width"] - 1, addrwm=p["addr_width"] - 1,
+        d=d, ff=ff, out=out, nw=len(wm), shg=sh_g, scu=scu, shu=shu,
+        sch=sch, shh=shh, scd=scd, shd=shd, init=init)
+
+
+GMLP_TB = """`timescale 1ns/1ps
+// GENERATED by specgen.py: do not edit by hand.
+// Testbench for the gated MLP, with the real matmul sequencer, MAC, SiLU
+// unit and requantizer under it. Golden values come from their models.
+// The SiLU, up and product buffers are checked directly, in that order,
+// before the outputs, because each is upstream of the next.
+module tb_gmlp;
+  reg clk = 0, rst_n = 0, start = 0, load_valid = 0;
+  reg signed [{dwm}:0] load_data = 0;
+  reg [{depwm}:0] depth = 0;
+  reg [{colwm}:0] cols_ff = 0, cols_out = 0;
+  reg [4:0] shift_g = 0;
+  reg [{mwm}:0] scale_u = 0, scale_h = 0, scale_d = 0;
+  reg [{swm}:0] shift_u = 0, shift_h = 0, shift_d = 0;
+  wire [{addrwm}:0] w_addr;
+  wire o_valid, busy;
+  wire [{bwm}:0] o_index;
+  wire signed [{dwm}:0] o_data;
+
+  reg signed [{dwm}:0] acts [0:{d}-1];
+  reg signed [{dwm}:0] wmem_tb [0:{nw}-1];
+  reg signed [{gwm}:0] expect_g [0:{ff}-1];
+  reg signed [{dwm}:0] expect_u [0:{ff}-1];
+  reg signed [{dwm}:0] expect_h [0:{ff}-1];
+  reg signed [{dwm}:0] expect_y [0:{out}-1];
+  reg signed [{dwm}:0] w_data;
+  integer checks = 0, seen = 0, i, nbad = 0, bad = 0;
+  reg [255:0] testname;
+  reg [7:0] bad_idx [0:7];
+  reg signed [{dwm}:0] bad_exp [0:7], bad_got [0:7];
+
+  always @(posedge clk) w_data <= wmem_tb[w_addr];
+
+  gmlp dut (.clk(clk), .rst_n(rst_n), .load_valid(load_valid),
+            .load_data(load_data), .start(start), .depth(depth),
+            .cols_ff(cols_ff), .cols_out(cols_out), .shift_g(shift_g),
+            .scale_u(scale_u), .shift_u(shift_u), .scale_h(scale_h),
+            .shift_h(shift_h), .scale_d(scale_d), .shift_d(shift_d),
+            .w_addr(w_addr), .w_data(w_data), .o_valid(o_valid),
+            .o_index(o_index), .o_data(o_data), .busy(busy));
+
+  always #5 clk = ~clk;
+
+  always @(posedge clk) begin
+    if (rst_n && o_valid) begin
+      checks = checks + 1;
+      seen = seen + 1;
+      if (o_index >= {out}) begin
+        $display("TB_FAIL test=%0s out=%0d cols_out={out} expected=no_output_past_cols_out got_gy=%0d",
+                 testname, o_index, o_data);
+        $display("TB_RESULT: FAIL");
+        $finish;
+      end
+      if (o_data !== expect_y[o_index]) begin
+        if (nbad < 8) begin
+          bad_idx[nbad] = o_index; bad_exp[nbad] = expect_y[o_index];
+          bad_got[nbad] = o_data;
+        end
+        nbad = nbad + 1;
+      end
+    end
+  end
+
+  initial begin
+{init}
+    testname = "gated_layer";
+    repeat (3) @(negedge clk);
+    rst_n = 1;
+    @(negedge clk);
+    for (i = 0; i < {d}; i = i + 1) begin
+      load_data = acts[i]; load_valid = 1;
+      @(negedge clk);
+    end
+    load_valid = 0;
+    depth = {d}; cols_ff = {ff}; cols_out = {out};
+    shift_g = {shg}; scale_u = {scu}; shift_u = {shu};
+    scale_h = {sch}; shift_h = {shh}; scale_d = {scd}; shift_d = {shd};
+    @(negedge clk);
+    start = 1;
+    @(negedge clk);
+    start = 0;
+    while (busy) @(negedge clk);
+    repeat (8) @(negedge clk);
+    for (i = 0; i < {ff}; i = i + 1) begin
+      checks = checks + 1;
+      if (dut.gbuf[i] !== expect_g[i]) begin
+        $display("TB_FAIL test=%0s hidden=%0d expected_gs=%0d got_gs=%0d",
+                 testname, i, expect_g[i], dut.gbuf[i]);
+        bad = bad + 1;
+      end
+    end
+    for (i = 0; i < {ff}; i = i + 1) begin
+      checks = checks + 1;
+      if (dut.ubuf[i] !== expect_u[i]) begin
+        $display("TB_FAIL test=%0s hidden=%0d expected_u=%0d got_u=%0d",
+                 testname, i, expect_u[i], dut.ubuf[i]);
+        bad = bad + 1;
+      end
+    end
+    for (i = 0; i < {ff}; i = i + 1) begin
+      checks = checks + 1;
+      if (dut.hbuf[i] !== expect_h[i]) begin
+        $display("TB_FAIL test=%0s hidden=%0d expected_gh=%0d got_gh=%0d",
+                 testname, i, expect_h[i], dut.hbuf[i]);
+        bad = bad + 1;
+      end
+    end
+    for (i = 0; i < nbad && i < 8; i = i + 1)
+      $display("TB_FAIL test=%0s out=%0d expected_gy=%0d got_gy=%0d",
+               testname, bad_idx[i], bad_exp[i], bad_got[i]);
+    checks = checks + 1;
+    if (!bad && !nbad && seen !== {out})
+      $display("TB_FAIL test=output_count out=0 expected_gy_count={out} got_gy_count=%0d",
+               seen);
+    if (bad || nbad || seen !== {out}) begin
+      $display("TB_RESULT: FAIL");
+      $finish;
+    end
+    $display("TB_PROFILE layers=%0d span_cycles=%0d latency_cycles=%0d",
+             1, 2 * {d} * {ff} + {ff} * {out}, 16);
+    $display("TB_PASS checks=%0d", checks);
+    $display("TB_RESULT: PASS");
+    $finish;
+  end
+endmodule
+"""
+
+
+def generate_gmlp(ms=None, spec_file="spec_gmlp.json", tb_file="tb_gmlp.v"):
+    """Write the derived gated MLP spec and testbench."""
+    ms = ms or load_model_spec()
+    spec = derive_gmlp_spec(ms)
+    with open(os.path.join(ROOT, spec_file), "w") as f:
+        json.dump(spec, f, indent=2)
+    with open(os.path.join(ROOT, tb_file), "w") as f:
+        f.write(render_gmlp_testbench(spec))
+    return spec
+
 def requant_golden(acc, scale, sh, out_width):
     """Scale, round to nearest, saturate. Shared by the requantizer's own
     testbench and by anything that sequences it, so the two cannot

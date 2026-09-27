@@ -1247,6 +1247,60 @@ def test_silu():
         shutil.rmtree(work, ignore_errors=True)
 
 
+def test_gated_mlp():
+    """Qwen's MLP: down(SiLU(gate(x)) * up(x)), three projections on one
+    matmul sequencer, the SiLU unit and one shared requantizer. The
+    testbench checks the SiLU, up and product buffers directly, in order,
+    before the outputs."""
+    import math
+    import chiplet_flow as cf
+    ms = load_model_spec()
+    spec = specgen_mod.derive_gmlp_spec(ms)
+    p = spec['parameters']
+    sp = spec['derivation']['silu']
+    # SiLU's own error is at most 0.018 in absolute terms, so the product
+    # with up carries at most that times |u|. Relative error is the wrong
+    # yardstick: near a zero of the product it is huge while the error, in
+    # units of the int8 step the product is requantized to, is a tenth.
+    rnd = random.Random(5)
+    worst = 0.0
+    for _ in range(300):
+        g = rnd.randrange(-(1 << (p['gate_width'] - 1)), 1 << (p['gate_width'] - 1))
+        u = rnd.randrange(-127, 128)
+        fx = specgen_mod.silu_golden(g, sp) * u / (1 << p['gate_frac'])
+        gf = g / (1 << p['gate_frac'])
+        fl = gf / (1 + math.exp(-gf)) * u
+        worst = max(worst, abs(fx - fl) / max(1, abs(u)))
+    check('SiLU(gate) * up is within 0.02 * |up| of float '
+          '(worst %.4f * |up|)' % worst, worst < 0.02)
+
+    work = os.path.join(ROOT, 'build_gmlptest')
+    shutil.rmtree(work, ignore_errors=True)
+    try:
+        cf.write_gmlp_deps(ms, work)
+        rr = RuleBasedAgent()
+        with open(os.path.join(work, 'tb.v'), 'w') as f:
+            f.write(specgen_mod.render_gmlp_testbench(spec))
+        res = {}
+        for label, fx_ in (('first', set()), ('fixed', {agent_mod.FIX_UPBASE})):
+            with open(os.path.join(work, 'gmlp.v'), 'w') as f:
+                f.write(rr.render_gmlp(spec, fx_))
+            r = subprocess.run(['iverilog', '-g2005', '-o', 's.out', 'tb.v',
+                                'gmlp.v'] + list(cf.GMLP_DEPS), cwd=work,
+                               capture_output=True, text=True)
+            assert r.returncode == 0, r.stdout + r.stderr
+            r = subprocess.run(['vvp', 's.out'], cwd=work,
+                               capture_output=True, text=True, timeout=300)
+            res[label] = r.stdout
+        check('the gated layer computes gate, up, their product and down',
+              'TB_RESULT: PASS' in res['fixed'])
+        check('an up projection reading the gate matrix is caught at ubuf',
+              'TB_RESULT: PASS' not in res['first']
+              and 'expected_u=' in res['first'])
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
 def test_requant_golden_is_shared():
     """One model of requantization, used by the requantizer's own
     testbench and by the layer that sequences it, so the two cannot
@@ -1977,6 +2031,7 @@ if __name__ == '__main__':
     test_attention_head()
     test_rmsnorm()
     test_silu()
+    test_gated_mlp()
     test_composite_cell_count()
     test_requant_golden_is_shared()
     test_table_unit_specs_are_implementable()

@@ -26,6 +26,7 @@ FIX_CHAIN = "take_the_second_depth_from_the_first_count"
 FIX_VLAT = "pair_each_value_with_its_weight_after_the_two_edge_read"
 FIX_EPS = "start_the_sum_of_squares_from_epsilon"
 FIX_SIGN = "take_the_numerator_from_the_sign_of_x"
+FIX_UPBASE = "offset_the_up_weights_past_the_gate_weights"
 # One definition, in specgen, so the declared depth and the generated
 # depth cannot disagree.
 WIDE_ADD_BITS = specgen.WIDE_ADD_BITS
@@ -62,6 +63,8 @@ class RuleBasedAgent:
             return self.render_rmsnorm(spec, fixes), sorted(fixes)
         if spec["top_module"] == "silu":
             return self.render_silu(spec, fixes), sorted(fixes)
+        if spec["top_module"] == "gmlp":
+            return self.render_gmlp(spec, fixes), sorted(fixes)
         return self.render_mac(spec, fixes), sorted(fixes)
 
     def diagnose(self, spec, history):
@@ -79,6 +82,10 @@ class RuleBasedAgent:
                     fixes.add(FIX_XOR)
                 elif "clear" in m.get("test", "").lower():
                     fixes.add(FIX_CLEAR)
+                elif "expected_u" in m:
+                    # The gated layer's only seeded bug: the up projection
+                    # read from weight address zero, the gate's matrix.
+                    fixes.add(FIX_UPBASE)
                 elif "expected_silu" in m:
                     # The SiLU unit's only seeded bug: sigmoid of |x| for
                     # every x, which is right for positive x only.
@@ -137,6 +144,217 @@ class RuleBasedAgent:
                 elif m.get("got_acc") != m.get("expected_acc"):
                     fixes.add(FIX_WIDTH)
         return fixes
+
+    def render_gmlp(self, spec, fixes):
+        """Gated MLP: gate through the SiLU unit, up through the
+        requantizer, their product through the requantizer, and down
+        through it again, all on one matmul sequencer and one requantizer
+        with the scale chosen by phase.
+
+        The seeded first cut starts the up projection at weight address
+        zero, so it multiplies by the gate's matrix a second time. The
+        shapes match, so nothing looks wrong until the values are checked.
+        """
+        p = spec["parameters"]
+        dw, aw, bank, bw = (p["data_width"], p["acc_width"], p["bank"],
+                            p["bank_width"])
+        gw = p["gate_width"]
+        mw, shw, rqs = p["scale_width"], p["shift_width"], p["requant_stages"]
+        dep_w, col_w, adw, mva = (p["depth_width"], p["col_width"],
+                                  p["addr_width"], p["mv_addr_width"])
+        ubase = "base_u" if FIX_UPBASE in fixes else "%d'd0" % adw
+        return """module gmlp (
+  input                    clk,
+  input                    rst_n,
+  input                    load_valid,
+  input      signed [{dwm}:0] load_data,
+  input                    start,
+  input      [{depwm}:0] depth,
+  input      [{colwm}:0] cols_ff,
+  input      [{colwm}:0] cols_out,
+  input      [4:0]  shift_g,
+  input      [{mwm}:0] scale_u,
+  input      [{swm}:0] shift_u,
+  input      [{mwm}:0] scale_h,
+  input      [{swm}:0] shift_h,
+  input      [{mwm}:0] scale_d,
+  input      [{swm}:0] shift_d,
+  output     [{adwm}:0] w_addr,
+  input      signed [{dwm}:0] w_data,
+  output reg               o_valid,
+  output reg [{bwm}:0] o_index,
+  output reg signed [{dwm}:0] o_data,
+  output reg               busy
+);
+  reg signed [{dwm}:0] xbuf [0:{bankm}];
+  reg signed [{gwm}:0] gbuf [0:{bankm}];
+  reg signed [{dwm}:0] ubuf [0:{bankm}];
+  reg signed [{dwm}:0] hbuf [0:{bankm}];
+  reg [{bwm}:0] lptr;
+  reg [2:0] st;
+  localparam S_IDLE = 3'd0, S_G = 3'd1, S_U = 3'd2, S_H = 3'd3, S_D = 3'd4;
+
+  reg  mv_start;
+  reg  [{depwm}:0] mv_depth;
+  reg  [{colwm}:0] mv_cols;
+  wire [{depwm}:0] mv_a_addr;
+  wire [{mvam}:0] mv_w_addr;
+  wire mv_valid, mv_clear, mv_colv, mv_busy;
+  wire [{colwm}:0] mv_coli;
+  reg  [{adwm}:0] w_base, base_u;
+  assign w_addr = w_base + mv_w_addr[{adwm}:0];
+  // The down projection reads the product buffer; the others the input.
+  reg signed [{dwm}:0] a_data;
+  always @(posedge clk)
+    a_data <= (st == S_D) ? hbuf[mv_a_addr[{bwm}:0]] : xbuf[mv_a_addr[{bwm}:0]];
+  matvec mv (.clk(clk), .rst_n(rst_n), .start(mv_start),
+             .depth(mv_depth), .cols(mv_cols), .a_addr(mv_a_addr),
+             .w_addr(mv_w_addr), .mac_valid(mv_valid),
+             .mac_clear(mv_clear), .col_valid(mv_colv),
+             .col_index(mv_coli), .busy(mv_busy));
+  wire signed [{awm}:0] acc;
+  wire mac_vout;
+  mac mc (.clk(clk), .rst_n(rst_n), .clear(mv_clear), .a(a_data),
+          .b(w_data), .valid_in(mv_valid), .acc(acc),
+          .valid_out(mac_vout));
+
+  // Gate quantizer into the SiLU format, then the SiLU unit. SiLU keeps
+  // order, so its results land at a write pointer.
+  wire signed [{aw}:0] rnd_g = (shift_g == 5'd0) ? {aw1}'sd0
+                                : ({aw1}'sd1 <<< (shift_g - 5'd1));
+  reg  signed [{aw}:0] rnd_r, gq1;
+  reg  gv1, si_v;
+  wire signed [{aw}:0] gsh = gq1 >>> shift_g;
+  reg  signed [{gwm}:0] si_x;
+  wire signed [{gwm}:0] si_y;
+  wire si_vo;
+  silu si (.clk(clk), .rst_n(rst_n), .x(si_x), .valid_in(si_v),
+           .y(si_y), .valid_out(si_vo));
+  reg [{bwm}:0] gwp;
+  reg [{col1}:0] gcnt;
+
+  // One requantizer, its scale chosen by phase.
+  reg  rq_vin;
+  reg  signed [{awm}:0] rq_acc;
+  reg  [{bwm}:0] rq_idx;
+  wire signed [{dwm}:0] rq_q;
+  wire rq_sat, rq_vout;
+  wire [{mwm}:0] rq_scale = (st == S_U) ? scale_u : (st == S_H) ? scale_h
+                                                     : scale_d;
+  wire [{swm}:0] rq_shift = (st == S_U) ? shift_u : (st == S_H) ? shift_h
+                                                     : shift_d;
+  requant rq (.clk(clk), .rst_n(rst_n), .acc_in(rq_acc),
+              .scale(rq_scale), .shift(rq_shift), .valid_in(rq_vin),
+              .q_out(rq_q), .sat(rq_sat), .valid_out(rq_vout));
+  reg [{bwm}:0] idx_pipe [0:{rqsm}];
+  reg [7:0] outst;
+  reg ran;
+
+  // Product phase: read the SiLU and up buffers, multiply, requantize.
+  reg hissue, hv1;
+  reg [{colwm}:0] hj;
+  reg [{bwm}:0] hi1;
+  reg signed [{gwm}:0] hg;
+  reg signed [{dwm}:0] hu;
+  integer k;
+
+  always @(posedge clk) begin
+    if (!rst_n) begin
+      lptr <= 0; st <= S_IDLE; busy <= 1'b0; mv_start <= 1'b0;
+      mv_depth <= 0; mv_cols <= 0; w_base <= 0; base_u <= 0;
+      rnd_r <= 0; gq1 <= 0; gv1 <= 1'b0; si_v <= 1'b0; si_x <= 0;
+      gwp <= 0; gcnt <= 0; rq_vin <= 1'b0; rq_acc <= 0; rq_idx <= 0;
+      outst <= 0; ran <= 1'b0; hissue <= 1'b0; hv1 <= 1'b0; hj <= 0;
+      hi1 <= 0; hg <= 0; hu <= 0; o_valid <= 1'b0; o_index <= 0;
+      o_data <= 0;
+      for (k = 0; k <= {rqsm}; k = k + 1) idx_pipe[k] <= 0;
+    end else begin
+      mv_start <= 1'b0;
+      rq_vin   <= 1'b0;
+      si_v     <= 1'b0;
+      o_valid  <= 1'b0;
+      idx_pipe[0] <= rq_idx;
+      for (k = 1; k <= {rqsm}; k = k + 1) idx_pipe[k] <= idx_pipe[k-1];
+      if (mv_busy) ran <= 1'b1;
+      case ({{rq_vin, rq_vout}})
+        2'b10: outst <= outst + 1;
+        2'b01: outst <= outst - 1;
+        default: ;
+      endcase
+
+      if (load_valid && !busy) begin
+        xbuf[lptr] <= load_data;
+        lptr <= lptr + 1;
+      end
+
+      // Gate: quantize each column into the SiLU format.
+      gv1 <= (st == S_G) && mv_colv;
+      if (mv_colv) gq1 <= {{acc[{awm}], acc}} + rnd_r;
+      if (gv1) begin
+        si_v <= 1'b1;
+        if (gsh > {aw1}'sd{gmax}) si_x <= {gw}'sd{gmax};
+        else if (gsh < -{aw1}'sd{gmin}) si_x <= -{gw}'sd{gmin};
+        else si_x <= gsh[{gwm}:0];
+      end
+      if (si_vo) begin
+        gbuf[gwp] <= si_y; gwp <= gwp + 1; gcnt <= gcnt + 1;
+      end
+
+      // Up and down: every finished column into the requantizer.
+      if (mv_colv && (st == S_U || st == S_D)) begin
+        rq_acc <= acc; rq_idx <= mv_coli[{bwm}:0]; rq_vin <= 1'b1;
+      end
+
+      // Product: one hidden unit per cycle.
+      hv1 <= 1'b0;
+      if (hissue) begin
+        hg <= gbuf[hj[{bwm}:0]]; hu <= ubuf[hj[{bwm}:0]];
+        hi1 <= hj[{bwm}:0]; hv1 <= 1'b1;
+        if (hj == cols_ff - 1) hissue <= 1'b0;
+        hj <= hj + 1;
+      end
+      if (hv1) begin
+        rq_acc <= hg * hu; rq_idx <= hi1; rq_vin <= 1'b1;
+      end
+
+      if (rq_vout) begin
+        if (st == S_U) ubuf[idx_pipe[{rqsm}]] <= rq_q;
+        else if (st == S_H) hbuf[idx_pipe[{rqsm}]] <= rq_q;
+        else begin
+          o_valid <= 1'b1; o_index <= idx_pipe[{rqsm}]; o_data <= rq_q;
+        end
+      end
+
+      case (st)
+        S_IDLE: if (start) begin
+          st <= S_G; busy <= 1'b1; ran <= 1'b0; gwp <= 0; gcnt <= 0;
+          rnd_r <= rnd_g; base_u <= depth * cols_ff;
+          mv_depth <= depth; mv_cols <= cols_ff; w_base <= 0;
+          mv_start <= 1'b1;
+        end
+        S_G: if (gcnt == cols_ff) begin
+          st <= S_U; ran <= 1'b0; w_base <= {ubase}; mv_start <= 1'b1;
+        end
+        S_U: if (ran && !mv_busy && outst == 0 && !mv_colv && !rq_vin) begin
+          st <= S_H; hissue <= 1'b1; hj <= 0;
+        end
+        S_H: if (!hissue && !hv1 && outst == 0 && !rq_vin) begin
+          st <= S_D; ran <= 1'b0; w_base <= base_u + base_u;
+          mv_depth <= cols_ff; mv_cols <= cols_out; mv_start <= 1'b1;
+        end
+        S_D: if (ran && !mv_busy && outst == 0 && !mv_colv && !rq_vin) begin
+          st <= S_IDLE; busy <= 1'b0; lptr <= 0;
+        end
+        default: st <= S_IDLE;
+      endcase
+    end
+  end
+endmodule
+""".format(dwm=dw - 1, depwm=dep_w - 1, colwm=col_w - 1, col1=col_w,
+           mwm=mw - 1, swm=shw - 1, adwm=adw - 1, bwm=bw - 1,
+           bankm=bank - 1, gwm=gw - 1, gw=gw, mvam=mva - 1, awm=aw - 1,
+           aw=aw, aw1=aw + 1, rqsm=rqs - 1, gmax=(1 << (gw - 1)) - 1,
+           gmin=1 << (gw - 1), ubase=ubase)
 
     def render_silu(self, spec, fixes):
         """Streaming SiLU: |x| into the exponential, 1 + e into the

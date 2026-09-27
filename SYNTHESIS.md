@@ -9,7 +9,7 @@ is worth knowing and worth reporting.
 You give it a model spec, a small JSON file naming a transformer's
 dimensions and its quantization. It derives the hardware that model
 needs, writes the Verilog, and checks it with real tools until it passes.
-Thirteen blocks come out, each one sized from the model rather than written
+Fourteen blocks come out, each one sized from the model rather than written
 for it. Point it at a different model and every block re-derives.
 
 ## The picture
@@ -44,7 +44,7 @@ for it. Point it at a different model and every block re-derives.
                            re-simulated against the same testbench
 ```
 
-## The thirteen blocks
+## The fourteen blocks
 
 Arithmetic, bottom to top:
 
@@ -70,6 +70,7 @@ Sequencing, which is what makes the above into a layer:
    rmsnorm    RMSNorm over a d_model row: sum of squares, one rsqrt,
               a scaled product per element
    silu       x * sigmoid(x), streaming, from exp and recip
+   gmlp       Qwen's gated MLP: gate through SiLU, times up, then down
 ```
 
 ## Build it
@@ -129,6 +130,8 @@ Four blocks instantiate others, so bring their dependencies along:
                      exp_rom.v recip_rom.v
    rmsnorm.v  needs  rsqrt.v rsqrt_rom.v requant.v
    silu.v     needs  expu.v recip.v exp_rom.v recip_rom.v
+   gmlp.v     needs  matvec.v mac.v requant.v silu.v expu.v recip.v
+                     exp_rom.v recip_rom.v
 ```
 
 The testbenches are in the repo root as `tb_*.v` if you want to run them
@@ -151,6 +154,7 @@ Measured here with yosys against a generic library, for Qwen2.5-0.5B:
    requant    115 MHz   10445
    rmsnorm    115 MHz   19904
    silu       120 MHz   11935
+   gmlp       110 MHz   48418
    attn       112 MHz  115091     the score and weight buffers and the
                                   softmax's become flops here; on the
                                   FPGA they map to 6 BRAMs, 6364 LUTs
@@ -161,8 +165,8 @@ Measured here with yosys against a generic library, for Qwen2.5-0.5B:
    RMSNorm both showed the requantizer's 10396.
 ```
 
-A Zynq 7020 has 53200 LUTs and 220 DSPs. All thirteen together map to
-20337 LUTs and 82 DSPs on yosys's UltraScale+ mapping, about 38% and 37% of
+A Zynq 7020 has 53200 LUTs and 220 DSPs. All fourteen together map to
+26897 LUTs and 109 DSPs on yosys's UltraScale+ mapping, about 51% and 50% of
 the part, and that counts the composite blocks' sub-blocks twice.
 Expect better numbers than these: the generic library has no carry chain
 and no block RAM, and Vivado has both.

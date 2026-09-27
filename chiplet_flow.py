@@ -141,6 +141,39 @@ def write_silu_deps(ms, build):
             f.write(srcs[fn])
 
 
+GMLP_DEPS = ("mv_dep.v", "mac_dep.v", "rq_dep.v", "silu_dep.v",
+             "expu_dep.v", "recip_dep.v", "exp_rom.v", "recip_rom.v")
+GMLP_JOB = {
+    "spec_file": "spec_gmlp.json", "tb_file": "tb_gmlp.v",
+    "rtl_file": "gmlp.v", "profile_file": "gmlp_profile.json",
+    "report_file": "report_gmlp.json",
+    "derive_from_model": "gmlp",
+    "extra_sources": GMLP_DEPS,
+}
+
+
+def write_gmlp_deps(ms, build):
+    """matvec, the MAC, the requantizer, and the SiLU unit with its own
+    exponential, reciprocal and tables."""
+    from agent import (RuleBasedAgent, FIX_WIDTH, FIX_CLEAR, FIX_CLRCOL,
+                       FIX_MEMLAT, FIX_SATURATE, FIX_SIGN)
+    r = RuleBasedAgent()
+    write_silu_deps(ms, build)
+    srcs = {
+        "mac_dep.v": r.render_mac(specgen.derive_chiplet_spec(ms),
+                                  {FIX_WIDTH, FIX_CLEAR}),
+        "mv_dep.v": r.render_matvec(specgen.derive_matvec_spec(ms),
+                                    {FIX_CLRCOL, FIX_MEMLAT}),
+        "rq_dep.v": r.render_requant(specgen.derive_requant_spec(ms),
+                                     {FIX_SATURATE}),
+        "silu_dep.v": r.render_silu(specgen.derive_silu_spec(ms),
+                                    {FIX_SIGN}),
+    }
+    for fn, src in srcs.items():
+        with open(os.path.join(build, fn), "w") as f:
+            f.write(src)
+
+
 SOFTMAX_JOB = {
     "spec_file": "spec_softmax.json", "tb_file": "tb_softmax.v",
     "rtl_file": "softmax.v", "profile_file": "softmax_profile.json",
@@ -652,6 +685,10 @@ def run_flow(job=None, verbose=True, agent=None, max_iters=None):
                     specgen.derive_requant_spec(_ms), {FIX_SATURATE}))):
             with open(os.path.join(BUILD, _fn), "w") as f:
                 f.write(_src)
+    elif job.get("derive_from_model") == "gmlp":
+        specgen.generate_gmlp(spec_file=job["spec_file"],
+                              tb_file=job["tb_file"])
+        write_gmlp_deps(specgen.load_model_spec(), BUILD)
     elif job.get("derive_from_model") == "silu":
         specgen.generate_silu(spec_file=job["spec_file"],
                               tb_file=job["tb_file"])

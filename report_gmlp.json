@@ -1,0 +1,383 @@
+{
+  "spec": {
+    "name": "gmlp_qwen2_5_0p5b",
+    "description": "Gated MLP, Qwen's: down(SiLU(gate(x)) * up(x)) over a 64-entry activation tile, three projections from one weight memory",
+    "top_module": "gmlp",
+    "unit": "layer",
+    "parameters": {
+      "data_width": 8,
+      "acc_width": 29,
+      "bank": 64,
+      "bank_width": 6,
+      "gate_width": 13,
+      "gate_frac": 8,
+      "depth_width": 13,
+      "col_width": 13,
+      "mv_addr_width": 26,
+      "addr_width": 14,
+      "scale_width": 18,
+      "shift_width": 7,
+      "requant_stages": 9,
+      "signed": true,
+      "pipeline_stages": 1,
+      "target_clock_mhz": 100
+    },
+    "derivation": {
+      "model": "qwen2_5_0p5b",
+      "silu": {
+        "model": "qwen2_5_0p5b",
+        "exp": {
+          "in_width": 13,
+          "in_frac": 8,
+          "out_width": 16,
+          "out_frac": 15,
+          "lut_bits": 8,
+          "signed": true,
+          "pipeline_stages": 3,
+          "target_clock_mhz": 100
+        },
+        "recip": {
+          "in_width": 26,
+          "out_width": 17,
+          "lut_bits": 8,
+          "shift_bias": 42,
+          "signed": false,
+          "pipeline_stages": 3,
+          "target_clock_mhz": 100
+        },
+        "rule": "input and output format from the exponential unit's score format; sigmoid through that unit and the reciprocal"
+      },
+      "rule": "tile and address widths as the MLP layer, with room for three matrices; the gate format from the SiLU unit; the requantizer from that block"
+    },
+    "ports": [
+      {
+        "name": "clk",
+        "dir": "input",
+        "width": 1,
+        "desc": "clock, rising edge"
+      },
+      {
+        "name": "rst_n",
+        "dir": "input",
+        "width": 1,
+        "desc": "active-low synchronous reset"
+      },
+      {
+        "name": "load_valid",
+        "dir": "input",
+        "width": 1,
+        "desc": "write the next input activation"
+      },
+      {
+        "name": "load_data",
+        "dir": "input",
+        "width": 8,
+        "signed": true,
+        "desc": "input activation"
+      },
+      {
+        "name": "start",
+        "dir": "input",
+        "width": 1,
+        "desc": "run the layer"
+      },
+      {
+        "name": "depth",
+        "dir": "input",
+        "width": 13,
+        "desc": "input width, the gate and up reduction length"
+      },
+      {
+        "name": "cols_ff",
+        "dir": "input",
+        "width": 13,
+        "desc": "hidden width: gate and up outputs, down reduction"
+      },
+      {
+        "name": "cols_out",
+        "dir": "input",
+        "width": 13,
+        "desc": "outputs of the down projection"
+      },
+      {
+        "name": "shift_g",
+        "dir": "input",
+        "width": 5,
+        "desc": "gate accumulator shift into the SiLU format"
+      },
+      {
+        "name": "scale_u",
+        "dir": "input",
+        "width": 18,
+        "desc": "up projection requantizer scale"
+      },
+      {
+        "name": "shift_u",
+        "dir": "input",
+        "width": 7,
+        "desc": "up projection requantizer shift"
+      },
+      {
+        "name": "scale_h",
+        "dir": "input",
+        "width": 18,
+        "desc": "SiLU(gate) * up requantizer scale"
+      },
+      {
+        "name": "shift_h",
+        "dir": "input",
+        "width": 7,
+        "desc": "SiLU(gate) * up requantizer shift"
+      },
+      {
+        "name": "scale_d",
+        "dir": "input",
+        "width": 18,
+        "desc": "down projection requantizer scale"
+      },
+      {
+        "name": "shift_d",
+        "dir": "input",
+        "width": 7,
+        "desc": "down projection requantizer shift"
+      },
+      {
+        "name": "w_addr",
+        "dir": "output",
+        "width": 14,
+        "desc": "weight address, into the weight memory"
+      },
+      {
+        "name": "w_data",
+        "dir": "input",
+        "width": 8,
+        "signed": true,
+        "desc": "weight, registered read"
+      },
+      {
+        "name": "o_valid",
+        "dir": "output",
+        "width": 1,
+        "desc": "a layer output is on o_data"
+      },
+      {
+        "name": "o_index",
+        "dir": "output",
+        "width": 6,
+        "desc": "which output"
+      },
+      {
+        "name": "o_data",
+        "dir": "output",
+        "width": 8,
+        "signed": true,
+        "desc": "layer output activation"
+      },
+      {
+        "name": "busy",
+        "dir": "output",
+        "width": 1,
+        "desc": "a layer is in progress"
+      }
+    ],
+    "behavior": [
+      "Each cycle with load_valid high writes load_data into the input buffer at the next index, starting from 0 after reset and after every run, so x[0..depth-1] are loaded in order before start.",
+      "start is a one-cycle pulse, with every width, scale and shift input held stable for the whole layer. busy must be high on the clock edge that samples start, so it already reads 1 one cycle later, and it stays high until the last output has been emitted.",
+      "Weights are column-major and packed back to back in one memory: the gate matrix's weight for input r of hidden unit c at c*depth + r; the up matrix's after it, at depth*cols_ff + c*depth + r; the down matrix's after both, at 2*depth*cols_ff + c*cols_ff + r for hidden unit r of output c.",
+      "w_data is a registered read: it carries the weight at address a on the cycle after w_addr = a. If w_addr is itself a register, that is two clock edges after the edge that loads a into it.",
+      "Gate: for c in 0..cols_ff-1, t_c = sum over r of x[r] * Wgate[c][r]; g_c = (t_c + 2**(shift_g-1)) >>> shift_g when shift_g > 0, else t_c, clamped to [-4096, 4095], the SiLU unit's Q4.8 input. gbuf[c] = silu(g_c), from the supplied SiLU unit.",
+      "Up: for c in 0..cols_ff-1, ubuf[c] = requant(sum over r of x[r] * Wup[c][r], scale_u, shift_u).",
+      "Product: for c in 0..cols_ff-1, hbuf[c] = requant(gbuf[c] * ubuf[c], scale_h, shift_h), the signed product of the Q4.8 SiLU output and the int8 up value.",
+      "Output: for c in 0..cols_out-1, y[c] = requant(sum over r of hbuf[r] * Wdown[c][r], scale_d, shift_d), with reduction length cols_ff.",
+      "requant is exactly the supplied requantizer: multiply by scale, add 2**(shift-1) when shift > 0, arithmetic shift right by shift, then saturate to [-128, 127].",
+      "Emit each y[c] with o_index = c and o_valid high for exactly that one cycle. Outputs may come in any order, but each index exactly once, and o_valid must be low at every other time.",
+      "The buffers are memories named gbuf, ubuf and hbuf, declared reg signed [12:0] gbuf [0:63], reg signed [7:0] ubuf [0:63] and reg signed [7:0] hbuf [0:63], with hidden unit c at index c. The testbench reads them directly to check each stage before the outputs, so these names and layouts are part of the interface.",
+      "matvec, mac, silu and requant are separate modules supplied as source files, not something to write. Instantiate them with exactly these ports, connected by name: matvec (input clk, input rst_n, input start, input [12:0] depth, input [12:0] cols, output [12:0] a_addr, output [25:0] w_addr, output mac_valid, output mac_clear, output col_valid, output [12:0] col_index, output busy); mac (input clk, input rst_n, input clear, input signed [7:0] a, input signed [7:0] b, input valid_in, output signed [28:0] acc, output valid_out); silu (input clk, input rst_n, input signed [12:0] x, input valid_in, output signed [12:0] y, output valid_out); requant (input clk, input rst_n, input signed [28:0] acc_in, input [17:0] scale, input [6:0] shift, input valid_in, output signed [7:0] q_out, output sat, output valid_out).",
+      "matvec walks a_addr 0..depth-1 and w_addr col*depth onward for each of cols columns, drives mac_valid one cycle behind the address, pulses mac_clear between columns, and pulses col_valid with col_index when a column's sum is on the MAC's acc. Its w_addr starts from 0, so each projection adds its own base. silu streams one value per cycle and returns results in order, with a latency of its own. requant has a latency of exactly 9 cycles.",
+      "All state resets to zero: busy and o_valid are 0 during reset."
+    ]
+  },
+  "tools": {
+    "iverilog": "/opt/homebrew/bin/iverilog",
+    "vvp": "/opt/homebrew/bin/vvp",
+    "yosys": "/opt/homebrew/bin/yosys",
+    "sta": "/Users/ssuleman/.local/bin/sta"
+  },
+  "agent": "RuleBasedAgent",
+  "converged": true,
+  "iterations_used": 2,
+  "history": [
+    {
+      "iteration": 1,
+      "fixes_applied": [],
+      "sim": {
+        "stage": "sim",
+        "status": "fail",
+        "checks": null,
+        "mismatches": [
+          {
+            "test": "gated_layer",
+            "hidden": "0",
+            "expected_u": "-6",
+            "got_u": "126"
+          },
+          {
+            "test": "gated_layer",
+            "hidden": "1",
+            "expected_u": "126",
+            "got_u": "-1"
+          },
+          {
+            "test": "gated_layer",
+            "hidden": "2",
+            "expected_u": "6",
+            "got_u": "10"
+          },
+          {
+            "test": "gated_layer",
+            "hidden": "3",
+            "expected_u": "28",
+            "got_u": "19"
+          },
+          {
+            "test": "gated_layer",
+            "hidden": "4",
+            "expected_u": "2",
+            "got_u": "3"
+          },
+          {
+            "test": "gated_layer",
+            "hidden": "5",
+            "expected_u": "3",
+            "got_u": "-7"
+          },
+          {
+            "test": "gated_layer",
+            "hidden": "0",
+            "expected_gh": "-126",
+            "got_gh": "127"
+          },
+          {
+            "test": "gated_layer",
+            "hidden": "1",
+            "expected_gh": "-15",
+            "got_gh": "0"
+          },
+          {
+            "test": "gated_layer",
+            "hidden": "2",
+            "expected_gh": "6",
+            "got_gh": "11"
+          },
+          {
+            "test": "gated_layer",
+            "hidden": "3",
+            "expected_gh": "63",
+            "got_gh": "43"
+          },
+          {
+            "test": "gated_layer",
+            "hidden": "5",
+            "expected_gh": "-1",
+            "got_gh": "3"
+          },
+          {
+            "test": "gated_layer",
+            "out": "0",
+            "expected_gy": "126",
+            "got_gy": "-45"
+          },
+          {
+            "test": "gated_layer",
+            "out": "1",
+            "expected_gy": "-89",
+            "got_gy": "40"
+          },
+          {
+            "test": "gated_layer",
+            "out": "2",
+            "expected_gy": "-57",
+            "got_gy": "25"
+          },
+          {
+            "test": "gated_layer",
+            "out": "3",
+            "expected_gy": "-78",
+            "got_gy": "54"
+          },
+          {
+            "test": "gated_layer",
+            "out": "4",
+            "expected_gy": "22",
+            "got_gy": "-39"
+          }
+        ]
+      },
+      "synth": null,
+      "timing": null,
+      "fpga": null
+    },
+    {
+      "iteration": 2,
+      "fixes_applied": [
+        "offset_the_up_weights_past_the_gate_weights"
+      ],
+      "sim": {
+        "stage": "sim",
+        "status": "pass",
+        "checks": 24,
+        "mismatches": [],
+        "throughput": {
+          "layers": 1,
+          "span_cycles": 126,
+          "latency_cycles": 16,
+          "units": 1,
+          "cycles_per_unit": 126.0
+        }
+      },
+      "synth": {
+        "stage": "synth",
+        "status": "pass",
+        "cell_count": 48418,
+        "area": 108325.0
+      },
+      "timing": {
+        "stage": "timing",
+        "status": "pass",
+        "method": "opensta",
+        "clock_period_ns": 10.0,
+        "worst_slack_ns": 0.92
+      },
+      "fpga": {
+        "luts": 6560,
+        "ffs": 3527,
+        "dsps": 27,
+        "brams": 0,
+        "urams": 0,
+        "carry": 310,
+        "muxf": 1194,
+        "status": "pass",
+        "family": "xcup",
+        "top": "gmlp",
+        "lint": [],
+        "unmapped_cells": {
+          "RAM64M8": 16
+        },
+        "stage": "fpga"
+      }
+    }
+  ],
+  "final_metrics": {
+    "sim_pass": true,
+    "sim_checks": 24,
+    "cell_count": 48418,
+    "area": 108325.0,
+    "timing": {
+      "stage": "timing",
+      "status": "pass",
+      "method": "opensta",
+      "clock_period_ns": 10.0,
+      "worst_slack_ns": 0.92
+    }
+  }
+}

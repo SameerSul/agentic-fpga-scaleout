@@ -5,10 +5,10 @@ every command is named so it can be re-run.
 
 ## Short answer
 
-The flow turns a model spec into signed-off RTL for thirteen generated
-blocks, an attention head, RMSNorm and SiLU now among them. An LLM has
-written and signed off every block but those three newest through the
-same gates, and the multiply-accumulate unit's accumulator is formally proved
+The flow turns a model spec into signed-off RTL for fourteen generated
+blocks, an attention head, RMSNorm, SiLU and Qwen's gated MLP now among
+them. An LLM has written and signed off every block but those four
+newest through the same gates, and the multiply-accumulate unit's accumulator is formally proved
 never to overflow, for any input sequence, on the int8 targets. A trained
 language model decodes through the blocks' exact arithmetic and emits
 text. It still does not host a local LLM the way Architect Labs does:
@@ -21,7 +21,7 @@ The remaining gap is listed at the bottom rather than glossed over.
 ### The full suite
 
 ```
-python3 tests.py            # 303 tests, or 301 without OpenSTA
+python3 tests.py            # 306 tests, or 304 without OpenSTA
 ```
 
 ### Spec to RTL, across the spec space
@@ -378,6 +378,7 @@ Qwen2.5-0.5B:
 | attention head | not converged | 8 | Haiku |
 | RMSNorm | not yet attempted | | |
 | SiLU | not yet attempted | | |
+| gated MLP | not yet attempted | | |
 
 Every block the flow generated before the attention head has been
 written and signed off by an LLM through all four gates. The attention
@@ -549,6 +550,26 @@ comes from the reciprocal table amplified by x near 5. The seeded first
 cut takes the positive-x numerator for every x, which is right for half
 the range, and the testbench catches it at x = -1.
 
+## Qwen's gated MLP
+
+down(SiLU(gate(x)) * up(x)): three projections, not two. One matmul
+sequencer, the SiLU unit and one requantizer run all of it, over one
+weight memory holding the three matrices back to back, with the
+requantizer's scale chosen by phase. The gate is rounded and clamped
+into SiLU's input format and streamed through it in order; the up
+projection is requantized; their product is requantized again; and the
+down projection runs over that. The testbench checks the SiLU, up and
+product buffers directly, in that order, before the outputs, and the
+seeded first cut, whose up projection reads the gate's matrix, fails at
+the up buffer. 110 MHz on Qwen2.5-0.5B, 6/6 variants clean.
+
+Mutation testing found one hole on the way. An off-by-one in the
+SiLU-times-up product survived on one variant and could not be decided
+on the rest: the product is shifted right about twenty bits and six
+random hidden units almost never land on a rounding boundary. The
+generator now searches the seed until one does, and the mutant dies on
+every variant.
+
 ## Formal proof: the accumulator cannot overflow
 
 The accumulator width comes from a closed-form rule, and until now every
@@ -617,11 +638,9 @@ These are the distance between this repo and a local LLM host.
    a KV cache, and RMSNorm. Softmax is hardware apart from
    accumulating the sum. Nothing yet runs a whole layer: the residual
    adds, the tiling of real matrices, and the sequencing of heads and
-   layers are still on the host. And the MLP block is not Qwen's MLP:
-   Qwen's is gated, down(SiLU(gate(x)) * up(x)) over three projections,
-   where this one is two matmuls with a ReLU between. SiLU is now
-   generated; the gated sequencer that runs three projections and the
-   elementwise product is not yet. The weight
+   layers are still on the host. Qwen's MLP is the gated block,
+   down(SiLU(gate(x)) * up(x)); the older MLP block, two matmuls with a
+   ReLU, is not Qwen's and remains as the simpler case. The weight
    tile holds 1024 entries and the activation bank 64, so a real matrix
    needs tiling logic that does not exist yet. In `generate.py` those run on the host, and the
    output says so each run.
