@@ -27,6 +27,7 @@ FIX_VLAT = "pair_each_value_with_its_weight_after_the_two_edge_read"
 FIX_EPS = "start_the_sum_of_squares_from_epsilon"
 FIX_SIGN = "take_the_numerator_from_the_sign_of_x"
 FIX_UPBASE = "offset_the_up_weights_past_the_gate_weights"
+FIX_RRND = "round_the_residual_sum_before_the_shift"
 # One definition, in specgen, so the declared depth and the generated
 # depth cannot disagree.
 WIDE_ADD_BITS = specgen.WIDE_ADD_BITS
@@ -65,6 +66,8 @@ class RuleBasedAgent:
             return self.render_silu(spec, fixes), sorted(fixes)
         if spec["top_module"] == "gmlp":
             return self.render_gmlp(spec, fixes), sorted(fixes)
+        if spec["top_module"] == "resadd":
+            return self.render_resadd(spec, fixes), sorted(fixes)
         return self.render_mac(spec, fixes), sorted(fixes)
 
     def diagnose(self, spec, history):
@@ -82,6 +85,10 @@ class RuleBasedAgent:
                     fixes.add(FIX_XOR)
                 elif "clear" in m.get("test", "").lower():
                     fixes.add(FIX_CLEAR)
+                elif "expected_res" in m:
+                    # The residual add's only seeded bug: it truncated,
+                    # which only shows on an exact rounding tie.
+                    fixes.add(FIX_RRND)
                 elif "expected_u" in m:
                     # The gated layer's only seeded bug: the up projection
                     # read from weight address zero, the gate's matrix.
@@ -144,6 +151,57 @@ class RuleBasedAgent:
                 elif m.get("got_acc") != m.get("expected_acc"):
                     fixes.add(FIX_WIDTH)
         return fixes
+
+    def render_resadd(self, spec, fixes):
+        """Residual add: two scaled products, their rounded sum, a shift
+        and a clamp, one pair per cycle.
+
+        The seeded first cut adds no rounding term, so it truncates,
+        which is one low whenever the dropped fraction is at least a half.
+        """
+        p = spec["parameters"]
+        dw, mw, shw, sw = (p["data_width"], p["scale_width"],
+                           p["shift_width"], p["sum_width"])
+        rnd = ("(shift == 0) ? {sw}'sd0 : ({sw}'sd1 <<< (shift - 1))"
+               if FIX_RRND in fixes else "{sw}'sd0").format(sw=sw)
+        return """module resadd (
+  input                    clk,
+  input                    rst_n,
+  input      signed [{dwm}:0] a,
+  input      signed [{dwm}:0] b,
+  input      [{mwm}:0] scale_a,
+  input      [{mwm}:0] scale_b,
+  input      [{shwm}:0] shift,
+  input                    valid_in,
+  output reg signed [{dwm}:0] y,
+  output reg               valid_out
+);
+  // Registered once per stream would do, but the inputs are held, so the
+  // rounding constant is registered each cycle to keep it off the adder.
+  reg signed [{swm}:0] pa, pb, rnd_r, v;
+  reg v1, v2;
+  wire signed [{swm}:0] rnd = {rnd};
+  wire signed [{swm}:0] r = v >>> shift;
+  always @(posedge clk) begin
+    if (!rst_n) begin
+      pa <= 0; pb <= 0; rnd_r <= 0; v <= 0; v1 <= 1'b0; v2 <= 1'b0;
+      y <= 0; valid_out <= 1'b0;
+    end else begin
+      v1 <= valid_in;
+      pa <= a * $signed({{1'b0, scale_a}});
+      pb <= b * $signed({{1'b0, scale_b}});
+      rnd_r <= rnd;
+      v2 <= v1;
+      v <= pa + pb + rnd_r;
+      valid_out <= v2;
+      if (r > {sw}'sd{hi}) y <= {dw}'sd{hi};
+      else if (r < -{sw}'sd{lo}) y <= -{dw}'sd{lo};
+      else y <= r[{dwm}:0];
+    end
+  end
+endmodule
+""".format(dwm=dw - 1, dw=dw, mwm=mw - 1, shwm=shw - 1, swm=sw - 1, sw=sw,
+           rnd=rnd, hi=(1 << (dw - 1)) - 1, lo=1 << (dw - 1))
 
     def render_gmlp(self, spec, fixes):
         """Gated MLP: gate through the SiLU unit, up through the

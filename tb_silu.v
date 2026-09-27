@@ -351,12 +351,18 @@ module tb_silu;
     xs[311] = 13'sd2137; ys[311] = 13'sd2136;
     xs[312] = -13'sd566; ys[312] = -13'sd56;
     xs[313] = 13'sd229; ys[313] = 13'sd162;
-    repeat (3) @(negedge clk);
-    checks = checks + 1;
-    if (valid_out !== 1'b0) begin
-      $display("TB_FAIL test=reset_init expected_vout=0 got_vout=%b", valid_out);
-      $display("TB_RESULT: FAIL");
-      $finish;
+    // valid_out must be low from the first cycle of reset, not merely
+    // after enough idle cycles to flush the pipeline: checked only after
+    // three, a shallow design with no reset at all passed.
+    for (i = 0; i < 3; i = i + 1) begin
+      @(negedge clk);
+      checks = checks + 1;
+      if (valid_out !== 1'b0) begin
+        $display("TB_FAIL test=reset_init cycle=%0d expected_vout=0 got_vout=%b",
+                 i, valid_out);
+        $display("TB_RESULT: FAIL");
+        $finish;
+      end
     end
     rst_n = 1;
     for (i = 0; i < 314; i = i + 1) begin

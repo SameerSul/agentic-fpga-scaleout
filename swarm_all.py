@@ -31,6 +31,7 @@ BLOCKS = [
     ("rmsnorm",  cf.RMSNORM_JOB),
     ("silu",     cf.SILU_JOB),
     ("gmlp",     cf.GMLP_JOB),
+    ("resadd",   cf.RESADD_JOB),
 ]
 
 

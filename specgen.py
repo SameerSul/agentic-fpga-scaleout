@@ -2636,12 +2636,18 @@ module tb_silu;
 
   initial begin
 {cases}
-    repeat (3) @(negedge clk);
-    checks = checks + 1;
-    if (valid_out !== 1'b0) begin
-      $display("TB_FAIL test=reset_init expected_vout=0 got_vout=%b", valid_out);
-      $display("TB_RESULT: FAIL");
-      $finish;
+    // valid_out must be low from the first cycle of reset, not merely
+    // after enough idle cycles to flush the pipeline: checked only after
+    // three, a shallow design with no reset at all passed.
+    for (i = 0; i < 3; i = i + 1) begin
+      @(negedge clk);
+      checks = checks + 1;
+      if (valid_out !== 1'b0) begin
+        $display("TB_FAIL test=reset_init cycle=%0d expected_vout=0 got_vout=%b",
+                 i, valid_out);
+        $display("TB_RESULT: FAIL");
+        $finish;
+      end
     end
     rst_n = 1;
     for (i = 0; i < {n}; i = i + 1) begin
@@ -3072,6 +3078,219 @@ def generate_gmlp(ms=None, spec_file="spec_gmlp.json", tb_file="tb_gmlp.v"):
         json.dump(spec, f, indent=2)
     with open(os.path.join(ROOT, tb_file), "w") as f:
         f.write(render_gmlp_testbench(spec))
+    return spec
+
+
+# --------------------------------------------------------------------------
+# Residual add: two int8 tensors at different scales, into a third.
+# --------------------------------------------------------------------------
+
+def derive_resadd_spec(ms):
+    """model spec -> residual add spec.
+
+    Each layer adds its attention output back onto its input and its MLP
+    output back onto that. The two operands carry different quantization
+    scales, so the add is y = sat(round((a*scale_a + b*scale_b) >> shift)),
+    the requantizer's arithmetic over two terms.
+    """
+    c = derive_chiplet_spec(ms)
+    rq = derive_requant_spec(ms)
+    dw = c["parameters"]["data_width"]
+    mw, shw = rq["parameters"]["scale_width"], rq["parameters"]["shift_width"]
+    sw = dw + mw + 2
+    return {
+        "name": "resadd_%s" % ms["name"],
+        "description": "Streaming residual add of two %d-bit tensors at "
+                       "different scales, rounded and saturated" % dw,
+        "top_module": "resadd",
+        "unit": "element",
+        "parameters": {
+            "data_width": dw, "scale_width": mw, "shift_width": shw,
+            "sum_width": sw, "signed": True, "pipeline_stages": 1,
+            "target_clock_mhz": 100,
+        },
+        "derivation": {
+            "model": ms["name"],
+            "rule": "operand width from the MAC; scale and shift widths "
+                    "from the requantizer; the sum is two scaled operands, "
+                    "dw+mw+1 bits each, plus a carry",
+        },
+        "ports": [
+            {"name": "clk", "dir": "input", "width": 1,
+             "desc": "clock, rising edge"},
+            {"name": "rst_n", "dir": "input", "width": 1,
+             "desc": "active-low synchronous reset"},
+            {"name": "a", "dir": "input", "width": dw, "signed": True,
+             "desc": "residual stream element"},
+            {"name": "b", "dir": "input", "width": dw, "signed": True,
+             "desc": "block output element"},
+            {"name": "scale_a", "dir": "input", "width": mw,
+             "desc": "scale for a"},
+            {"name": "scale_b", "dir": "input", "width": mw,
+             "desc": "scale for b"},
+            {"name": "shift", "dir": "input", "width": shw,
+             "desc": "shift after the scaled sum"},
+            {"name": "valid_in", "dir": "input", "width": 1,
+             "desc": "a and b valid"},
+            {"name": "y", "dir": "output", "width": dw, "signed": True,
+             "desc": "sum, saturated"},
+            {"name": "valid_out", "dir": "output", "width": 1,
+             "desc": "y valid"},
+        ],
+        "behavior": [
+            "Fully pipelined: a new pair may arrive on every cycle, and "
+            "each valid_in produces exactly one valid_out, in the same "
+            "order. The latency is fixed but is the design's choice. "
+            "scale_a, scale_b and shift are held stable while a stream "
+            "runs.",
+            "v = a * scale_a + b * scale_b. scale_a and scale_b are "
+            "non-negative magnitudes, so each product has the sign of its "
+            "operand, and v is a signed %d-bit value." % sw,
+            "If shift > 0, r = (v + 2**(shift-1)) >>> shift, an arithmetic "
+            "shift, which rounds to nearest with ties toward plus infinity. "
+            "If shift is 0, r = v with no rounding term.",
+            "y = r clamped to [%d, %d]." % (-(1 << (dw - 1)),
+                                            (1 << (dw - 1)) - 1),
+            "All state resets to zero: valid_out is 0 during reset.",
+        ],
+    }
+
+
+def resadd_golden(a, b, sa, sb, sh, dw):
+    v = a * sa + b * sb
+    r = _round_shift(v, sh)
+    return max(-(1 << (dw - 1)), min((1 << (dw - 1)) - 1, r))
+
+
+def render_resadd_testbench(spec):
+    """Streams with gaps, checked in order off valid_out. Includes both
+    saturation rails and exact rounding ties. Truncation is caught by any
+    value whose dropped fraction is at least a half; the ties are there
+    for the direction a tie rounds, toward plus infinity, which a design
+    rounding half away from zero gets wrong only on negative ties."""
+    p = spec["parameters"]
+    dw, mw = p["data_width"], p["scale_width"]
+    top = (1 << (dw - 1)) - 1
+    rnd = random.Random(113)
+    sh = 12
+    sa, sb = rnd.randrange(1 << 9, 1 << 11), rnd.randrange(1 << 9, 1 << 11)
+    pairs = [(0, 0), (top, top), (-top - 1, -top - 1), (top, -top - 1),
+             (1, 0), (-1, 0), (0, 1), (0, -1)]
+    # Rounding ties: v an odd multiple of 2**(sh-1).
+    # A random pair is a tie about once in 2**sh, so the search runs far
+    # enough to find six.
+    found = 0
+    for _ in range(400000):
+        a, b = rnd.randrange(-top - 1, top + 1), rnd.randrange(-top - 1, top + 1)
+        if (a * sa + b * sb) % (1 << sh) == 1 << (sh - 1):
+            pairs.append((a, b))
+            found += 1
+            if found >= 6:
+                break
+    pairs += [(rnd.randrange(-top - 1, top + 1), rnd.randrange(-top - 1, top + 1))
+              for _ in range(200)]
+    ties = sum(1 for a, b in pairs
+               if (a * sa + b * sb) % (1 << sh) == 1 << (sh - 1))
+    assert ties >= 3, "no rounding ties in the residual testbench"
+    body = []
+    for i, (a, b) in enumerate(pairs):
+        body.append("    as_[%d] = %s; bs_[%d] = %s; ys[%d] = %s;"
+                    % (i, _slit(a, dw), i, _slit(b, dw), i,
+                       _slit(resadd_golden(a, b, sa, sb, sh, dw), dw)))
+    return RESADD_TB.format(dwm=dw - 1, mwm=mw - 1,
+                            swm=p["shift_width"] - 1, n=len(pairs),
+                            sa=sa, sb=sb, sh=sh, cases="\n".join(body))
+
+
+RESADD_TB = """`timescale 1ns/1ps
+// GENERATED by specgen.py: do not edit by hand.
+// Testbench for the residual add. Pairs stream one per cycle with gaps
+// and are checked in order off valid_out.
+module tb_resadd;
+  reg clk = 0, rst_n = 0, valid_in = 0;
+  reg signed [{dwm}:0] a = 0, b = 0;
+  reg [{mwm}:0] scale_a = {sa}, scale_b = {sb};
+  reg [{swm}:0] shift = {sh};
+  wire signed [{dwm}:0] y;
+  wire valid_out;
+  reg signed [{dwm}:0] as_ [0:{n}-1];
+  reg signed [{dwm}:0] bs_ [0:{n}-1];
+  reg signed [{dwm}:0] ys [0:{n}-1];
+  integer checks = 0, got = 0, i;
+
+  resadd dut (.clk(clk), .rst_n(rst_n), .a(a), .b(b), .scale_a(scale_a),
+              .scale_b(scale_b), .shift(shift), .valid_in(valid_in),
+              .y(y), .valid_out(valid_out));
+  always #5 clk = ~clk;
+
+  always @(posedge clk) begin
+    if (rst_n && valid_out) begin
+      checks = checks + 1;
+      if (got >= {n}) begin
+        $display("TB_FAIL test=resadd idx=%0d expected=no_more_outputs got_res=%0d", got, y);
+        $display("TB_RESULT: FAIL");
+        $finish;
+      end
+      if (y !== ys[got]) begin
+        $display("TB_FAIL test=resadd idx=%0d a=%0d b=%0d expected_res=%0d got_res=%0d",
+                 got, as_[got], bs_[got], ys[got], y);
+        $display("TB_RESULT: FAIL");
+        $finish;
+      end
+      got = got + 1;
+    end
+  end
+
+  initial begin
+{cases}
+    // valid_out must be low from the first cycle of reset, not merely
+    // after enough idle cycles to flush the pipeline: checked only after
+    // three, a shallow design with no reset at all passed.
+    for (i = 0; i < 3; i = i + 1) begin
+      @(negedge clk);
+      checks = checks + 1;
+      if (valid_out !== 1'b0) begin
+        $display("TB_FAIL test=reset_init cycle=%0d expected_vout=0 got_vout=%b",
+                 i, valid_out);
+        $display("TB_RESULT: FAIL");
+        $finish;
+      end
+    end
+    rst_n = 1;
+    for (i = 0; i < {n}; i = i + 1) begin
+      @(negedge clk);
+      a = as_[i]; b = bs_[i]; valid_in = 1;
+      if (i % 29 == 28) begin
+        @(negedge clk); valid_in = 0;
+      end
+    end
+    @(negedge clk); valid_in = 0;
+    repeat (20) @(negedge clk);
+    checks = checks + 1;
+    if (got !== {n}) begin
+      $display("TB_FAIL test=resadd idx=0 expected_count={n} got_count=%0d", got);
+      $display("TB_RESULT: FAIL");
+      $finish;
+    end
+    $display("TB_PROFILE elements=%0d span_cycles=%0d latency_cycles=%0d",
+             {n}, {n} + {n} / 29, 4);
+    $display("TB_PASS checks=%0d", checks);
+    $display("TB_RESULT: PASS");
+    $finish;
+  end
+endmodule
+"""
+
+
+def generate_resadd(ms=None, spec_file="spec_resadd.json",
+                    tb_file="tb_resadd.v"):
+    """Write the derived residual add spec and testbench."""
+    ms = ms or load_model_spec()
+    spec = derive_resadd_spec(ms)
+    with open(os.path.join(ROOT, spec_file), "w") as f:
+        json.dump(spec, f, indent=2)
+    with open(os.path.join(ROOT, tb_file), "w") as f:
+        f.write(render_resadd_testbench(spec))
     return spec
 
 def requant_golden(acc, scale, sh, out_width):

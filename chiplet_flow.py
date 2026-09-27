@@ -174,6 +174,12 @@ def write_gmlp_deps(ms, build):
             f.write(src)
 
 
+RESADD_JOB = {
+    "spec_file": "spec_resadd.json", "tb_file": "tb_resadd.v",
+    "rtl_file": "resadd.v", "profile_file": "resadd_profile.json",
+    "report_file": "report_resadd.json",
+    "derive_from_model": "resadd",
+}
 SOFTMAX_JOB = {
     "spec_file": "spec_softmax.json", "tb_file": "tb_softmax.v",
     "rtl_file": "softmax.v", "profile_file": "softmax_profile.json",
@@ -685,6 +691,9 @@ def run_flow(job=None, verbose=True, agent=None, max_iters=None):
                     specgen.derive_requant_spec(_ms), {FIX_SATURATE}))):
             with open(os.path.join(BUILD, _fn), "w") as f:
                 f.write(_src)
+    elif job.get("derive_from_model") == "resadd":
+        specgen.generate_resadd(spec_file=job["spec_file"],
+                                tb_file=job["tb_file"])
     elif job.get("derive_from_model") == "gmlp":
         specgen.generate_gmlp(spec_file=job["spec_file"],
                               tb_file=job["tb_file"])

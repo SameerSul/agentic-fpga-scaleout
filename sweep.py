@@ -196,7 +196,7 @@ def main():
     ap.add_argument("--only", default="all",
                     choices=["all", "both", "chiplet", "requant", "exp",
                              "recip", "rsqrt", "matvec",
-                             "wmem", "softmax", "mlp", "attn", "rmsnorm", "silu", "gmlp",
+                             "wmem", "softmax", "mlp", "attn", "rmsnorm", "silu", "gmlp", "resadd",
                              "endpoint"])
     ap.add_argument("--skip-dv", action="store_true")
     a = ap.parse_args()
@@ -391,6 +391,19 @@ def main():
             label = "mlp %s bank%d" % (ms["name"], p["bank"])
             r, d = one_case(label, spec, "layer", a.agent, do_dv,
                             extra=("mv_dep.v", "mac_dep.v", "rq_dep.v"))
+            rows.append(r)
+            details.append((label, d))
+            if any(r[c] not in ("ok", "skip", "-") for c in COLS):
+                failures.append(label)
+
+    if a.only in ("all", "resadd"):
+        base = specgen.load_model_spec()
+        for ms in _models(base):
+            spec = specgen.generate_resadd(ms, spec_file=JOB["spec_file"],
+                                           tb_file=JOB["tb_file"])
+            label = "resadd %s dw%d" % (ms["name"],
+                                        spec["parameters"]["data_width"])
+            r, d = one_case(label, spec, "element", a.agent, do_dv)
             rows.append(r)
             details.append((label, d))
             if any(r[c] not in ("ok", "skip", "-") for c in COLS):

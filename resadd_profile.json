@@ -1,0 +1,29 @@
+{
+  "block": "resadd_qwen2_5_0p5b",
+  "top_module": "resadd",
+  "unit": "element",
+  "cycles_per_element": 1.0327102803738317,
+  "latency_cycles": 4,
+  "cell_count": 4894,
+  "area": 9455.0,
+  "fmax_estimate_mhz": 135.8695652173913,
+  "fmax_method": "opensta_slack",
+  "target_clock_mhz": 100,
+  "sim_checks_passed": 218,
+  "fpga": {
+    "family": "xcup",
+    "luts": 365,
+    "ffs": 121,
+    "dsps": 2,
+    "brams": 0,
+    "urams": 0,
+    "carry": 13,
+    "muxf": 102
+  },
+  "derivation": {
+    "model": "qwen2_5_0p5b",
+    "rule": "operand width from the MAC; scale and shift widths from the requantizer; the sum is two scaled operands, dw+mw+1 bits each, plus a carry"
+  },
+  "pointwise": "resadd_qwen2_5_0p5b",
+  "agent": "RuleBasedAgent"
+}

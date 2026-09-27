@@ -5,10 +5,11 @@ every command is named so it can be re-run.
 
 ## Short answer
 
-The flow turns a model spec into signed-off RTL for fourteen generated
-blocks, an attention head, RMSNorm, SiLU and Qwen's gated MLP now among
-them. An LLM has written and signed off every block but those four
-newest through the same gates, and the multiply-accumulate unit's accumulator is formally proved
+The flow turns a model spec into signed-off RTL for fifteen generated
+blocks, which now cover every operation in a Qwen layer: attention,
+RMSNorm, SiLU, the gated MLP and the residual add among them. An LLM has
+written and signed off every block but those five newest through the
+same gates, and the multiply-accumulate unit's accumulator is formally proved
 never to overflow, for any input sequence, on the int8 targets. A trained
 language model decodes through the blocks' exact arithmetic and emits
 text. It still does not host a local LLM the way Architect Labs does:
@@ -21,7 +22,7 @@ The remaining gap is listed at the bottom rather than glossed over.
 ### The full suite
 
 ```
-python3 tests.py            # 306 tests, or 304 without OpenSTA
+python3 tests.py            # 309 tests, or 307 without OpenSTA
 ```
 
 ### Spec to RTL, across the spec space
@@ -379,6 +380,7 @@ Qwen2.5-0.5B:
 | RMSNorm | not yet attempted | | |
 | SiLU | not yet attempted | | |
 | gated MLP | not yet attempted | | |
+| residual add | not yet attempted | | |
 
 Every block the flow generated before the attention head has been
 written and signed off by an LLM through all four gates. The attention
@@ -570,6 +572,21 @@ random hidden units almost never land on a rounding boundary. The
 generator now searches the seed until one does, and the mutant dies on
 every variant.
 
+## Residual add
+
+The add that closes each half of a layer, attention's output onto its
+input and the MLP's onto that. The operands carry different scales, so
+it is the requantizer's arithmetic over two terms: y = sat(round((a *
+scale_a + b * scale_b) >> shift)), one pair per cycle at 136 MHz. The
+testbench plants exact rounding ties, negative ones among them, so the
+direction a tie rounds is checked and not only that it rounds, and the
+seeded first cut that truncates is caught.
+
+Mutation testing found a reset hole here that the deeper SiLU pipeline
+had been hiding. Both streaming testbenches checked valid_out once,
+after three idle cycles; a three-stage pipeline has flushed by then with
+no reset at all. They now check it from the first cycle of reset.
+
 ## Formal proof: the accumulator cannot overflow
 
 The accumulator width comes from a closed-form rule, and until now every
@@ -636,8 +653,9 @@ These are the distance between this repo and a local LLM host.
    sequenced block, an MLP layer that drives two matmuls in order
    and routes the activations between them, and one attention head over
    a KV cache, and RMSNorm. Softmax is hardware apart from
-   accumulating the sum. Nothing yet runs a whole layer: the residual
-   adds, the tiling of real matrices, and the sequencing of heads and
+   accumulating the sum. Every per-layer operation is now a generated
+   block, the residual add included, but nothing yet runs a whole
+   layer: the tiling of real matrices and the sequencing of heads and
    layers are still on the host. Qwen's MLP is the gated block,
    down(SiLU(gate(x)) * up(x)); the older MLP block, two matmuls with a
    ReLU, is not Qwen's and remains as the simpler case. The weight

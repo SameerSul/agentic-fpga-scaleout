@@ -1301,6 +1301,41 @@ def test_gated_mlp():
         shutil.rmtree(work, ignore_errors=True)
 
 
+def test_residual_add():
+    """The add that closes each half of a layer: two int8 tensors at
+    different scales, rounded and saturated. The testbench plants exact
+    rounding ties, negative ones included, so the direction a tie rounds
+    is checked and not only that it rounds."""
+    spec = specgen_mod.derive_resadd_spec(load_model_spec())
+    work = os.path.join(ROOT, 'build_restest')
+    shutil.rmtree(work, ignore_errors=True)
+    os.makedirs(work)
+    try:
+        with open(os.path.join(work, 'tb.v'), 'w') as f:
+            f.write(specgen_mod.render_resadd_testbench(spec))
+        res = {}
+        for label, fx in (('first', set()), ('fixed', {agent_mod.FIX_RRND})):
+            with open(os.path.join(work, 'r.v'), 'w') as f:
+                f.write(RuleBasedAgent().render_resadd(spec, fx))
+            r = subprocess.run(['iverilog', '-g2005', '-o', 's.out', 'tb.v',
+                                'r.v'], cwd=work, capture_output=True,
+                               text=True)
+            assert r.returncode == 0, r.stdout + r.stderr
+            res[label] = subprocess.run(['vvp', 's.out'], cwd=work,
+                                        capture_output=True, text=True,
+                                        timeout=120).stdout
+        check('the residual add rounds, saturates and streams in order',
+              'TB_RESULT: PASS' in res['fixed'])
+        check('a residual add that truncates is caught',
+              'TB_RESULT: PASS' not in res['first']
+              and 'expected_res' in res['first'])
+        check('ties round toward plus infinity, as the requantizer does',
+              specgen_mod.resadd_golden(1, 0, 1 << 11, 1, 12, 8) == 1
+              and specgen_mod.resadd_golden(-1, 0, 1 << 11, 1, 12, 8) == 0)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
 def test_requant_golden_is_shared():
     """One model of requantization, used by the requantizer's own
     testbench and by the layer that sequences it, so the two cannot
@@ -2032,6 +2067,7 @@ if __name__ == '__main__':
     test_rmsnorm()
     test_silu()
     test_gated_mlp()
+    test_residual_add()
     test_composite_cell_count()
     test_requant_golden_is_shared()
     test_table_unit_specs_are_implementable()

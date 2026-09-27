@@ -129,7 +129,7 @@
       "sim": {
         "stage": "sim",
         "status": "pass",
-        "checks": 316,
+        "checks": 318,
         "mismatches": [],
         "throughput": {
           "elements": 314,
@@ -170,7 +170,7 @@
   ],
   "final_metrics": {
     "sim_pass": true,
-    "sim_checks": 316,
+    "sim_checks": 318,
     "cell_count": 11935,
     "area": 24109.0,
     "timing": {
