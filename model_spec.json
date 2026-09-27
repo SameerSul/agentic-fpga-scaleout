@@ -16,9 +16,11 @@
     "Qwen2.5-0.5B: 24 layers, hidden 896, intermediate 4864, 14 query heads over 2 key/value heads. The heavy grouped-query ratio, 7 to 1, is why its KV cache is small for its size, which matters more on a 1 GB board than the parameter count does.",
     "d_ff 4864 is the longest reduction, so the accumulator is 8 + 8 + ceil(log2(4864)) = 29 bits. Every block re-derives from that: nothing here is written for a particular model.",
     "494 MB of int8 weights on 1 GB of DDR3L. Batch-1 decode reads all of them per token, so one board at 2 GB/s sustained is bounded near 4 tokens/s and two boards splitting the weights near 8. That ceiling is memory bandwidth: the MAC chiplet is idle most of the time and adding arithmetic does not move it.",
-    "Megatron tensor parallelism: QKV and the gate/up projections are column-parallel, the output and down projections row-parallel, so each layer ends with one all-reduce of a [1, d_model] activation."
+    "Megatron tensor parallelism: QKV and the gate/up projections are column-parallel, the output and down projections row-parallel, so each layer ends with one all-reduce of a [1, d_model] activation.",
+    "rope_theta 1e6: Qwen2.5's rotary base. Each head's pairs turn by pos * 1e6**(-2i/64), so the slowest pair barely moves over the context and the fastest wraps every six tokens."
   ],
   "batch_size": 8,
   "n_kv_head": 2,
-  "head_dim": 64
+  "head_dim": 64,
+  "rope_theta": 1000000.0
 }

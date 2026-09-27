@@ -196,7 +196,7 @@ def main():
     ap.add_argument("--only", default="all",
                     choices=["all", "both", "chiplet", "requant", "exp",
                              "recip", "rsqrt", "matvec",
-                             "wmem", "softmax", "mlp", "attn", "rmsnorm", "silu", "gmlp", "resadd", "proj",
+                             "wmem", "softmax", "mlp", "attn", "rmsnorm", "silu", "gmlp", "resadd", "proj", "rope",
                              "endpoint"])
     ap.add_argument("--skip-dv", action="store_true")
     a = ap.parse_args()
@@ -405,6 +405,21 @@ def main():
             label = "proj %s max%d" % (ms["name"], spec["parameters"]["max_dim"])
             r, d = one_case(label, spec, "projection", a.agent, do_dv,
                             extra=chiplet_flow.PROJ_DEPS)
+            rows.append(r)
+            details.append((label, d))
+            if any(r[c] not in ("ok", "skip", "-") for c in COLS):
+                failures.append(label)
+
+    if a.only in ("all", "rope"):
+        base = specgen.load_model_spec()
+        for ms in _models(base):
+            spec = specgen.generate_rope(ms, spec_file=JOB["spec_file"],
+                                         tb_file=JOB["tb_file"])
+            chiplet_flow.write_rope_deps(spec, BUILD)
+            label = "rope %s dw%d" % (ms["name"],
+                                      spec["parameters"]["data_width"])
+            r, d = one_case(label, spec, "pair", a.agent, do_dv,
+                            extra=("rope_rom.v",))
             rows.append(r)
             details.append((label, d))
             if any(r[c] not in ("ok", "skip", "-") for c in COLS):

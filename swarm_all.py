@@ -33,6 +33,7 @@ BLOCKS = [
     ("gmlp",     cf.GMLP_JOB),
     ("resadd",   cf.RESADD_JOB),
     ("proj",     cf.PROJ_JOB),
+    ("rope",     cf.ROPE_JOB),
 ]
 
 

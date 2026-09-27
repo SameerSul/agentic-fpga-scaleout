@@ -47,7 +47,7 @@ Pure Python 3 stdlib, no dependencies. The RTL half runs real open tools (Icarus
                                  sizing, fabric, board fit
 ```
 
-The seventeen generated blocks, and what each is for:
+The eighteen generated blocks, and what each is for:
 
 ```
   arithmetic
@@ -73,6 +73,8 @@ The seventeen generated blocks, and what each is for:
                projections through one sequencer
     resadd     the residual add after attention and after the MLP,
                two int8 tensors at different scales
+    rope       Qwen's rotary position embedding on q and k: each pair
+               of a head turns by pos * theta_i
     proj       a projection at the model's full size, 896 by 4864 on
                Qwen2.5-0.5B, reading activations and weights through
                external memory ports instead of holding them
@@ -437,7 +439,7 @@ checked against another model. Read that list before quoting any number here.
 - Feeding 8601 MAC instances would need on-chip operand bandwidth the model does not check. DSP count is the right first-order capacity ceiling, not a claim that the array is routable at that size.
 - A 25 Gbps endpoint does not close timing in this flow at either standard datapath. Reaching it needs a pipelined or matrix-form CRC that the rule-based agent does not write, so the default target is 10 Gbps, which is also what the mid board class actually exposes.
 - There is no place-and-route anywhere; timing is real OpenSTA static timing but against a toy illustrative liberty, so fmax is an estimate of an estimate.
-- The derivation now covers seventeen blocks, not just the matmul datapath: the exponential, reciprocal and inverse square root are generated and signed off, softmax and an MLP layer sequence them, an attention head composes matvec, the MAC, softmax and the requantizer, RMSNorm drives the inverse square root, SiLU is built from the exponential and the reciprocal, the gated MLP runs Qwen's three projections through it, the residual add closes each half of a layer, and the projection block runs a matrix at the model's full size over external memories. A generated decoder sequences them into a whole decode step, and the trained 16-dimensional checkpoint runs on it in RTL, every output token the hardware's argmax. What is still missing is that sequencing at Qwen's size: many heads over shared KV heads, 24 layers, and weights streamed from DDR. The composite layer blocks still hold 64-entry activation banks; the projection shows the way past that, streaming activations from memory the way the weights already are, but the attention and MLP blocks have not been moved onto it, and the blocks are the arithmetic of an inference engine rather than the whole of one.
+- The derivation now covers eighteen blocks, not just the matmul datapath: the exponential, reciprocal and inverse square root are generated and signed off, softmax and an MLP layer sequence them, an attention head composes matvec, the MAC, softmax and the requantizer, RMSNorm drives the inverse square root, SiLU is built from the exponential and the reciprocal, the gated MLP runs Qwen's three projections through it, the residual add closes each half of a layer, the rotary unit turns q and k by position, and the projection block runs a matrix at the model's full size over external memories. A generated decoder sequences them into a whole decode step, and the trained 16-dimensional checkpoint runs on it in RTL, every output token the hardware's argmax. What is still missing is that sequencing at Qwen's size: many heads over shared KV heads, 24 layers, and weights streamed from DDR. The composite layer blocks still hold 64-entry activation banks; the projection shows the way past that, streaming activations from memory the way the weights already are, but the attention and MLP blocks have not been moved onto it, and the blocks are the arithmetic of an inference engine rather than the whole of one.
 - Boards are simulated, not real: link rates, propagation delays, clock caps, and capacities are representative class parameters, not measured silicon.
 - The 30% fabric reservation for NIC and routing logic is a stated guess, not a floorplan; the endpoint reservation per link is real, from the synthesized cell count.
 - Decode compute time is charged from the measured chiplet profile at full model dimensions; the weights are not materialized. The sharded numerics (real arithmetic, bit-exactness across cluster shapes) are validated at reduced dimensions in stage 8 and in the test suite.

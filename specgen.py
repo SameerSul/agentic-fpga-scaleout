@@ -2751,6 +2751,316 @@ def generate_silu(ms=None, spec_file="spec_silu.json", tb_file="tb_silu.v"):
 
 
 # --------------------------------------------------------------------------
+# Rotary position embedding: the rotation Qwen applies to q and k.
+# --------------------------------------------------------------------------
+
+def derive_rope_spec(ms):
+    """model spec -> rotary position embedding spec.
+
+    Qwen encodes position by rotating q and k before the scores, not by
+    adding a learned vector: each pair (x[i], x[i + d/2]) of a head turns
+    by pos * theta_i with theta_i = base**(-2i/d). This is Qwen's rotate
+    half pairing, so both halves of a pair share one angle.
+
+    The angle is carried in turns, as a fixed-point fraction, so wrapping
+    past a full turn is free: pos * F_i is taken modulo 2**phase_bits.
+    It has pos_width + 2 bits more than the table index, so the rounding
+    in F_i cannot walk the angle off by a table step anywhere in the
+    context. The sine table has 2**lut_bits entries over a full turn, and
+    cosine is the same table a quarter turn on. 4096 entries puts the
+    angle within pi/4096 of exact, a quarter of an int8 step on the
+    largest pair; the table's own values carry data_width + 6 fraction
+    bits so their rounding is smaller than that again.
+    """
+    ab = ms["activation_bits"]
+    dw = ab
+    hd = ms.get("head_dim") or ms["d_model"] // ms["n_head"]
+    assert hd % 2 == 0, "rotary pairs need an even head dimension"
+    npair = hd // 2
+    iw = max(1, (npair - 1).bit_length())
+    pw = max(1, (ms["seq_len"] - 1).bit_length())
+    lb = 12
+    ph = lb + pw + 2
+    cf = dw + 6
+    base = float(ms.get("rope_theta", 10000.0))
+    freqs = [int(round(base ** (-2.0 * i / hd) / (2 * math.pi) * (1 << ph)))
+             for i in range(npair)]
+    fw = max(f.bit_length() for f in freqs)
+    return {
+        "name": "rope_%s" % ms["name"],
+        "description": "Streaming rotary position embedding for a %d-wide "
+                       "head: one (x[i], x[i+%d]) pair per cycle, rotated "
+                       "by pos * theta_i, theta base %g"
+                       % (hd, npair, base),
+        "top_module": "rope",
+        "unit": "pair",
+        "parameters": {
+            "data_width": dw, "head_dim": hd, "pairs": npair,
+            "index_width": iw, "pos_width": pw, "lut_bits": lb,
+            "phase_bits": ph, "freq_width": fw, "coef_frac": cf,
+            "coef_width": cf + 2, "rope_theta": base,
+            "signed": True, "pipeline_stages": 1, "target_clock_mhz": 100,
+        },
+        "derivation": {
+            "model": ms["name"],
+            "freqs": freqs,
+            "rule": "pairs from head_dim; phase bits from the table index "
+                    "plus the position width plus two guard bits; table "
+                    "fraction bits from the activation width",
+        },
+        "ports": [
+            {"name": "clk", "dir": "input", "width": 1,
+             "desc": "clock, rising edge"},
+            {"name": "rst_n", "dir": "input", "width": 1,
+             "desc": "active-low synchronous reset"},
+            {"name": "x1", "dir": "input", "width": dw, "signed": True,
+             "desc": "x[i]"},
+            {"name": "x2", "dir": "input", "width": dw, "signed": True,
+             "desc": "x[i + %d]" % npair},
+            {"name": "idx", "dir": "input", "width": iw,
+             "desc": "the pair index i"},
+            {"name": "pos", "dir": "input", "width": pw,
+             "desc": "the token's position"},
+            {"name": "valid_in", "dir": "input", "width": 1,
+             "desc": "x1, x2, idx, pos valid"},
+            {"name": "y1", "dir": "output", "width": dw, "signed": True,
+             "desc": "x1 cos - x2 sin"},
+            {"name": "y2", "dir": "output", "width": dw, "signed": True,
+             "desc": "x2 cos + x1 sin"},
+            {"name": "valid_out", "dir": "output", "width": 1,
+             "desc": "y1, y2 valid"},
+        ],
+        "behavior": [
+            "Fully pipelined: a new pair may arrive on every cycle, and each "
+            "valid_in produces exactly one valid_out, in the same order. "
+            "The latency is fixed but is the design's choice.",
+            "phase = (pos * F[idx]) mod 2**%d, where F comes from the "
+            "supplied rope_freq table: rope_freq (input [%d:0] idx, output "
+            "[%d:0] val), combinational." % (ph, iw - 1, fw - 1),
+            "t = ((phase + 2**%d) >> %d) mod 2**%d, the nearest table entry; "
+            "s = SIN[t] and c = SIN[(t + %d) mod 2**%d], from the supplied "
+            "rope_sin table: rope_sin (input [%d:0] idx, output [%d:0] "
+            "val), combinational, val a %d-bit two's complement value "
+            "with %d fraction bits. Instantiate it twice."
+            % (ph - lb - 1, ph - lb, lb, 1 << (lb - 2), lb, lb - 1,
+               cf + 1, cf + 2, cf),
+            "y1 = sat((x1 * c - x2 * s + 2**%d) >>> %d) and "
+            "y2 = sat((x2 * c + x1 * s + 2**%d) >>> %d): signed products, "
+            "round half up, an arithmetic shift, saturate to %d bits."
+            % (cf - 1, cf, cf - 1, cf, dw),
+            "All state resets to zero: valid_out is 0 during reset.",
+        ],
+    }
+
+
+def rope_sin_table(p):
+    lb, cf = p["lut_bits"], p["coef_frac"]
+    return [int(round(math.sin(2 * math.pi * k / (1 << lb)) * (1 << cf)))
+            for k in range(1 << lb)]
+
+
+def rope_golden(x1, x2, i, pos, p, freqs, dphase=0):
+    """Exact model of the unit. dphase offsets the angle by that many
+    counts, which is how the testbench finds cases that tell an angle one
+    count off from the right one."""
+    lb, ph, cf, dw = (p["lut_bits"], p["phase_bits"], p["coef_frac"],
+                      p["data_width"])
+    tab = rope_sin_table(p)
+    phase = (pos * freqs[i] + dphase) & ((1 << ph) - 1)
+    k = ((phase + (1 << (ph - lb - 1))) >> (ph - lb)) & ((1 << lb) - 1)
+    s = tab[k]
+    c = tab[(k + (1 << (lb - 2))) & ((1 << lb) - 1)]
+    hi, lo = (1 << (dw - 1)) - 1, -(1 << (dw - 1))
+    sat = lambda v: max(lo, min(hi, v))
+    y1 = sat((x1 * c - x2 * s + (1 << (cf - 1))) >> cf)
+    y2 = sat((x2 * c + x1 * s + (1 << (cf - 1))) >> cf)
+    return y1, y2
+
+
+def rope_roms(spec):
+    p = spec["parameters"]
+    mask = (1 << p["coef_width"]) - 1
+    return (render_rom("rope_freq", spec["derivation"]["freqs"],
+                       p["index_width"], p["freq_width"])
+            + render_rom("rope_sin", [v & mask for v in rope_sin_table(p)],
+                         p["lut_bits"], p["coef_width"]))
+
+
+def _rope_cases(p, freqs, rnd):
+    """Pairs that pin down the rotation, not only its magnitude."""
+    dw, npair = p["data_width"], p["pairs"]
+    pmax = (1 << p["pos_width"]) - 1
+    lo, hi = -(1 << (dw - 1)), (1 << (dw - 1)) - 1
+    cases = []
+    # Position 0 is the identity: sin is 0, cos is one.
+    for i in range(npair):
+        cases.append((rnd.randrange(lo, hi + 1), rnd.randrange(lo, hi + 1),
+                      i, 0))
+    # The fastest pair over many positions: the direction of the turn.
+    for pos in range(1, 40):
+        cases.append((hi // 2, 0, 0, pos))
+        cases.append((0, hi // 2, 0, pos))
+    # The slowest pairs at the end of the context, where phase error in
+    # F would have accumulated.
+    for i in (npair - 1, npair - 2, npair // 2):
+        cases.append((hi, lo, i, pmax))
+    # Saturation: both halves at full scale, near an eighth of a turn.
+    best = None
+    for i in range(npair):
+        for pos in range(1, pmax + 1, 7):
+            y1, y2 = rope_golden(hi, hi, i, pos, p, freqs)
+            if y2 == hi and (best is None or y1 > best[0]):
+                best = (y1, i, pos)
+    if best:
+        cases.append((hi, hi, best[1], best[2]))
+        cases.append((lo, lo, best[1], best[2]))
+    # An angle one count off moves the table index only when pos * F_i
+    # sits one count below a rounding boundary, about one position in
+    # 4096, so random pairs never find it: mutation testing showed a
+    # phase off by one surviving on every int8 variant. Search the grid
+    # for such a point and values that make the neighbouring entry show.
+    ph, lb = p["phase_bits"], p["lut_bits"]
+    edge = (1 << (ph - lb - 1)) - 1
+    mask = (1 << (ph - lb)) - 1
+    found = 0
+    for i in range(npair):
+        for pos in range(pmax + 1):
+            if (pos * freqs[i]) & mask != edge:
+                continue
+            for a, b in ((hi, hi), (hi, lo), (lo, hi), (hi, 0), (0, hi)):
+                if (rope_golden(a, b, i, pos, p, freqs)
+                        != rope_golden(a, b, i, pos, p, freqs, 1)):
+                    cases.append((a, b, i, pos))
+                    found += 1
+                    break
+            if found >= 3:
+                break
+        if found >= 3:
+            break
+    for _ in range(400):
+        cases.append((rnd.randrange(lo, hi + 1), rnd.randrange(lo, hi + 1),
+                      rnd.randrange(npair), rnd.randrange(pmax + 1)))
+    return cases
+
+
+def render_rope_testbench(spec):
+    p = spec["parameters"]
+    freqs = spec["derivation"]["freqs"]
+    dw = p["data_width"]
+    cases = _rope_cases(p, freqs, random.Random(131))
+    body = []
+    for n_, (a, b, i, pos) in enumerate(cases):
+        y1, y2 = rope_golden(a, b, i, pos, p, freqs)
+        body.append("    x1s[%d] = %s; x2s[%d] = %s; ids[%d] = %d; ps[%d] = %d;"
+                    " y1s[%d] = %s; y2s[%d] = %s;"
+                    % (n_, _slit(a, dw), n_, _slit(b, dw), n_, i, n_, pos,
+                       n_, _slit(y1, dw), n_, _slit(y2, dw)))
+    return ROPE_TB.format(dwm=dw - 1, iwm=p["index_width"] - 1,
+                          pwm=p["pos_width"] - 1, n=len(cases),
+                          cases="\n".join(body))
+
+
+ROPE_TB = """`timescale 1ns/1ps
+// GENERATED by specgen.py: do not edit by hand.
+// Testbench for the rotary position embedding. Golden values come from
+// specgen.rope_golden. Pairs stream one per cycle with occasional gaps
+// and are checked in order off valid_out.
+module tb_rope;
+  reg clk = 0, rst_n = 0, valid_in = 0;
+  reg signed [{dwm}:0] x1 = 0, x2 = 0;
+  reg [{iwm}:0] idx = 0;
+  reg [{pwm}:0] pos = 0;
+  wire signed [{dwm}:0] y1, y2;
+  wire valid_out;
+  reg signed [{dwm}:0] x1s [0:{n}-1];
+  reg signed [{dwm}:0] x2s [0:{n}-1];
+  reg [{iwm}:0] ids [0:{n}-1];
+  reg [{pwm}:0] ps [0:{n}-1];
+  reg signed [{dwm}:0] y1s [0:{n}-1];
+  reg signed [{dwm}:0] y2s [0:{n}-1];
+  integer checks = 0, got = 0, i;
+  // Cycles measured, not computed: the profile's cycles_per_unit and
+  // latency come from here.
+  integer cyc = 0, span = 0, t0 = 0, lat = 0;
+  always @(posedge clk) cyc = cyc + 1;
+
+  rope dut (.clk(clk), .rst_n(rst_n), .x1(x1), .x2(x2), .idx(idx),
+            .pos(pos), .valid_in(valid_in), .y1(y1), .y2(y2),
+            .valid_out(valid_out));
+  always #5 clk = ~clk;
+
+  always @(posedge clk) begin
+    if (rst_n && valid_out) begin
+      checks = checks + 2;
+      if (got >= {n}) begin
+        $display("TB_FAIL test=rope idx=%0d expected=no_more_outputs got_rope=%0d",
+                 got, y1);
+        $display("TB_RESULT: FAIL");
+        $finish;
+      end
+      if (y1 !== y1s[got] || y2 !== y2s[got]) begin
+        $display("TB_FAIL test=rope n=%0d pair=%0d pos=%0d x1=%0d x2=%0d expected_rope=%0d,%0d got_rope=%0d,%0d",
+                 got, ids[got], ps[got], x1s[got], x2s[got], y1s[got], y2s[got], y1, y2);
+        $display("TB_RESULT: FAIL");
+        $finish;
+      end
+      if (got == 0) lat = cyc - t0;
+      got = got + 1;
+      span = cyc - t0 + 1;
+    end
+  end
+
+  initial begin
+{cases}
+    for (i = 0; i < 3; i = i + 1) begin
+      @(negedge clk);
+      checks = checks + 1;
+      if (valid_out !== 1'b0) begin
+        $display("TB_FAIL test=reset_init cycle=%0d expected_vout=0 got_vout=%b",
+                 i, valid_out);
+        $display("TB_RESULT: FAIL");
+        $finish;
+      end
+    end
+    rst_n = 1;
+    t0 = cyc + 1;
+    for (i = 0; i < {n}; i = i + 1) begin
+      @(negedge clk);
+      x1 = x1s[i]; x2 = x2s[i]; idx = ids[i]; pos = ps[i]; valid_in = 1;
+      if (i % 41 == 40) begin
+        @(negedge clk); valid_in = 0;
+      end
+    end
+    @(negedge clk); valid_in = 0;
+    repeat (40) @(negedge clk);
+    checks = checks + 1;
+    if (got !== {n}) begin
+      $display("TB_FAIL test=rope idx=0 expected_count={n} got_count=%0d", got);
+      $display("TB_RESULT: FAIL");
+      $finish;
+    end
+    $display("TB_PROFILE pairs=%0d span_cycles=%0d latency_cycles=%0d",
+             {n}, span, lat);
+    $display("TB_PASS checks=%0d", checks);
+    $display("TB_RESULT: PASS");
+    $finish;
+  end
+endmodule
+"""
+
+
+def generate_rope(ms=None, spec_file="spec_rope.json", tb_file="tb_rope.v"):
+    """Write the derived RoPE spec and testbench."""
+    ms = ms or load_model_spec()
+    spec = derive_rope_spec(ms)
+    with open(os.path.join(ROOT, spec_file), "w") as f:
+        json.dump(spec, f, indent=2)
+    with open(os.path.join(ROOT, tb_file), "w") as f:
+        f.write(render_rope_testbench(spec))
+    return spec
+
+
+# --------------------------------------------------------------------------
 # Gated MLP: down(SiLU(gate(x)) * up(x)), Qwen's MLP.
 # --------------------------------------------------------------------------
 

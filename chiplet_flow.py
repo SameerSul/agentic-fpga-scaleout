@@ -190,6 +190,13 @@ PROJ_JOB = {
 }
 
 
+def write_rope_deps(spec, build):
+    """The frequency and sine tables: generated constants, not RTL."""
+    os.makedirs(build, exist_ok=True)
+    with open(os.path.join(build, "rope_rom.v"), "w") as f:
+        f.write(specgen.rope_roms(spec))
+
+
 def write_proj_deps(ms, build):
     """matvec, the MAC and the requantizer, which the projection drives."""
     from agent import (RuleBasedAgent, FIX_WIDTH, FIX_CLEAR, FIX_CLRCOL,
@@ -205,6 +212,15 @@ def write_proj_deps(ms, build):
     for fn in PROJ_DEPS:
         with open(os.path.join(build, fn), "w") as f:
             f.write(srcs[fn])
+
+
+ROPE_JOB = {
+    "spec_file": "spec_rope.json", "tb_file": "tb_rope.v",
+    "rtl_file": "rope.v", "profile_file": "rope_profile.json",
+    "report_file": "report_rope.json",
+    "derive_from_model": "rope",
+    "extra_sources": ("rope_rom.v",),
+}
 
 
 DECODER_JOB = {
@@ -632,6 +648,10 @@ def derive_profile(spec, final):
     elif unit == "column":
         prof["sequencer"] = spec["name"]
         prof["mac_stages"] = spec["parameters"]["mac_stages"]
+    elif unit == "pair":
+        prof["rotary"] = spec["name"]
+        prof["head_dim"] = spec["parameters"]["head_dim"]
+        prof["rope_theta"] = spec["parameters"]["rope_theta"]
     elif unit == "token":
         prof["decoder"] = spec["name"]
         prof["d_model"] = spec["parameters"]["d_model"]
@@ -737,6 +757,10 @@ def run_flow(job=None, verbose=True, agent=None, max_iters=None):
                     specgen.derive_requant_spec(_ms), {FIX_SATURATE}))):
             with open(os.path.join(BUILD, _fn), "w") as f:
                 f.write(_src)
+    elif job.get("derive_from_model") == "rope":
+        sp = specgen.generate_rope(spec_file=job["spec_file"],
+                                   tb_file=job["tb_file"])
+        write_rope_deps(sp, BUILD)
     elif job.get("derive_from_model") == "decoder":
         import decoder
         decoder.generate(spec_file=job["spec_file"], tb_file=job["tb_file"],

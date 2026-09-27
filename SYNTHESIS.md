@@ -9,7 +9,7 @@ is worth knowing and worth reporting.
 You give it a model spec, a small JSON file naming a transformer's
 dimensions and its quantization. It derives the hardware that model
 needs, writes the Verilog, and checks it with real tools until it passes.
-Seventeen blocks come out, each one sized from the model rather than written
+Eighteen blocks come out, each one sized from the model rather than written
 for it. Point it at a different model and every block re-derives.
 
 ## The picture
@@ -44,7 +44,7 @@ for it. Point it at a different model and every block re-derives.
                            re-simulated against the same testbench
 ```
 
-## The seventeen blocks
+## The eighteen blocks
 
 Arithmetic, bottom to top:
 
@@ -72,6 +72,7 @@ Sequencing, which is what makes the above into a layer:
    silu       x * sigmoid(x), streaming, from exp and recip
    gmlp       Qwen's gated MLP: gate through SiLU, times up, then down
    resadd     residual add of two scaled int8 tensors, streaming
+   rope       rotary position embedding on q and k, one pair a cycle
    proj       a full-size projection, 896 by 4864 here, over external
               activation and weight memories
 ```
@@ -144,6 +145,7 @@ Four blocks instantiate others, so bring their dependencies along:
    gmlp.v     needs  matvec.v mac.v requant.v silu.v expu.v recip.v
                      exp_rom.v recip_rom.v
    proj.v     needs  matvec.v mac.v requant.v
+   rope.v     needs  rope_rom.v, its frequency and sine tables
    decoder.v  needs  proj.v rmsnorm.v attn.v resadd.v and everything
                      they need, all derived at the checkpoint's size
 ```
@@ -170,6 +172,8 @@ Measured here with yosys against a generic library, for Qwen2.5-0.5B:
    silu       120 MHz   11935
    gmlp       110 MHz   48418
    resadd     136 MHz    4894
+   rope       129 MHz   21224     1874 LUTs, most of them the sine
+                                  table; on your part that is a BRAM
    proj       115 MHz   13989     1831 LUTs and 9 DSPs; its memories
                                   are outside it, on your part BRAM or DDR
    attn       112 MHz  115091     the score and weight buffers and the
@@ -187,9 +191,9 @@ The decoder is sized for the checkpoint rather than Qwen: 111 MHz,
 7-series mapping, the family of Vaibhav's Basys 3, it is 12802 LUTs and
 22 DSPs, 62% and 24% of an XC7A35T, so the whole decoder fits that board.
 
-A Zynq 7020 has 53200 LUTs and 220 DSPs. The sixteen Qwen-sized blocks map to
-18528 LUTs and 76 DSPs on yosys's UltraScale+ mapping, about 35% of
-the part in both, and that counts the composite blocks' sub-blocks twice.
+A Zynq 7020 has 53200 LUTs and 220 DSPs. The seventeen Qwen-sized blocks map to
+20402 LUTs and 81 DSPs on yosys's UltraScale+ mapping, about 38% and
+37% of the part, and that counts the composite blocks' sub-blocks twice.
 These are about half what this file reported before: the resource count
 read every submodule table yosys printed after the top module's, then the
 hierarchy totals on top, so every composite block was counted about

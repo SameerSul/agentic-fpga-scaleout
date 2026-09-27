@@ -29,6 +29,7 @@ FIX_SIGN = "take_the_numerator_from_the_sign_of_x"
 FIX_UPBASE = "offset_the_up_weights_past_the_gate_weights"
 FIX_RRND = "round_the_residual_sum_before_the_shift"
 FIX_PIDX = "carry_the_column_index_through_the_requantizer"
+FIX_ROTDIR = "rotate_by_plus_the_angle"
 # One definition, in specgen, so the declared depth and the generated
 # depth cannot disagree.
 WIDE_ADD_BITS = specgen.WIDE_ADD_BITS
@@ -71,6 +72,8 @@ class RuleBasedAgent:
             return self.render_resadd(spec, fixes), sorted(fixes)
         if spec["top_module"] == "proj":
             return self.render_proj(spec, fixes), sorted(fixes)
+        if spec["top_module"] == "rope":
+            return self.render_rope(spec, fixes), sorted(fixes)
         if spec["top_module"] == "decoder":
             import decoder
             return decoder.render_decoder(spec, fixes), sorted(fixes)
@@ -97,6 +100,10 @@ class RuleBasedAgent:
                     fixes.add(decoder.FIX_RELU)
                 elif "clear" in m.get("test", "").lower():
                     fixes.add(FIX_CLEAR)
+                elif "expected_rope" in m:
+                    # The rotation's only seeded bug: it turned each pair
+                    # by minus the angle, the transpose of the rotation.
+                    fixes.add(FIX_ROTDIR)
                 elif "expected_proj" in m:
                     # The projection's only seeded bug: the output index
                     # was taken as the requantizer finished, not carried
@@ -260,6 +267,120 @@ class RuleBasedAgent:
 endmodule
 """.format(dwm=dw - 1, depwm=dep_w - 1, colwm=col_w - 1, mvam=mva - 1,
            mwm=mw - 1, swm=shw - 1, awm=aw - 1, rqsm=rqs - 1, oidx=oidx)
+
+    def render_rope(self, spec, fixes):
+        """Four stages: the phase, the table, the four products, then
+        round and saturate. x1 and x2 travel with the angle.
+
+        The seeded first cut rotates by minus the angle: the sine terms
+        carry the wrong signs, which is the transpose of the rotation and
+        identical to it at position zero.
+        """
+        p = spec["parameters"]
+        dw, iw, pw = p["data_width"], p["index_width"], p["pos_width"]
+        lb, ph, fw = p["lut_bits"], p["phase_bits"], p["freq_width"]
+        cf, cw = p["coef_frac"], p["coef_width"]
+        pr = dw + cw
+        if FIX_ROTDIR in fixes:
+            s1, s2 = "p_xc1 - p_ys", "p_yc2 + p_xs"
+        else:
+            s1, s2 = "p_xc1 + p_ys", "p_yc2 - p_xs"
+        # Past 8-bit data the product is 16 by 24 bits and missed a 100 MHz
+        # clock by 0.78 ns as one multiply, so each coefficient is split in
+        # two and the partial products are added a stage later.
+        split = dw > 8
+        h = cw // 2
+        if split:
+            prod = """  reg signed [{prm}:0] q_xc1h, q_xc1l, q_ysh, q_ysl, q_yc2h, q_yc2l,
+                     q_xsh, q_xsl;
+  reg v2a;
+  wire signed [{hcm}:0] c_hi = c1[{cwm}:{h}], s_hi = s1[{cwm}:{h}];
+  wire signed [{h}:0] c_lo = {{1'b0, c1[{hm}:0]}}, s_lo = {{1'b0, s1[{hm}:0]}};
+"""
+            prod_seq = """      q_xc1h <= a1 * c_hi; q_xc1l <= a1 * c_lo;
+      q_ysh <= b1 * s_hi; q_ysl <= b1 * s_lo;
+      q_yc2h <= b1 * c_hi; q_yc2l <= b1 * c_lo;
+      q_xsh <= a1 * s_hi; q_xsl <= a1 * s_lo;
+      v2a <= v1;
+      p_xc1 <= (q_xc1h <<< {h}) + q_xc1l; p_ys <= (q_ysh <<< {h}) + q_ysl;
+      p_yc2 <= (q_yc2h <<< {h}) + q_yc2l; p_xs <= (q_xsh <<< {h}) + q_xsl;
+      v2 <= v2a;
+"""
+            prod_rst = """      q_xc1h <= 0; q_xc1l <= 0; q_ysh <= 0; q_ysl <= 0; q_yc2h <= 0;
+      q_yc2l <= 0; q_xsh <= 0; q_xsl <= 0; v2a <= 1'b0;
+"""
+        else:
+            prod = ""
+            prod_seq = """      p_xc1 <= a1 * c1; p_ys <= b1 * s1; p_yc2 <= b1 * c1; p_xs <= a1 * s1;
+      v2 <= v1;
+"""
+            prod_rst = ""
+        fmt = dict(prm=dw + cw - 1, hcm=cw - h - 1, cwm=cw - 1, h=h, hm=h - 1)
+        prod, prod_seq, prod_rst = (s_.format(**fmt) for s_ in
+                                    (prod, prod_seq, prod_rst))
+        return """module rope (
+  input                    clk,
+  input                    rst_n,
+  input      signed [{dwm}:0] x1,
+  input      signed [{dwm}:0] x2,
+  input      [{iwm}:0] idx,
+  input      [{pwm}:0] pos,
+  input                    valid_in,
+  output reg signed [{dwm}:0] y1,
+  output reg signed [{dwm}:0] y2,
+  output reg               valid_out
+);
+  // Stage 0: the angle, in turns, modulo one turn.
+  wire [{fwm}:0] f;
+  rope_freq fq (.idx(idx), .val(f));
+  wire [{prodm}:0] turn = pos * f;
+  reg [{phm}:0] ph0;
+  reg signed [{dwm}:0] a0, b0;
+  reg v0;
+
+  // Stage 1: the nearest table entry, and a quarter turn on for cosine.
+  wire [{ph}:0] rph = {{1'b0, ph0}} + {ph1}'d{half};
+  wire [{lbm}:0] ts = rph[{phm}:{drop}];
+  wire [{lbm}:0] tc = ts + {lb}'d{quarter};
+  wire [{cwm}:0] s_raw, c_raw;
+  rope_sin rs (.idx(ts), .val(s_raw));
+  rope_sin rc (.idx(tc), .val(c_raw));
+  reg signed [{cwm}:0] s1, c1;
+  reg signed [{dwm}:0] a1, b1;
+  reg v1;
+
+  // Stage 2: the four products.
+  reg signed [{prm}:0] p_xc1, p_ys, p_yc2, p_xs;
+  reg v2;
+{prod}
+  // Stage 3: sum, round half up, shift, saturate.
+  wire signed [{pr}:0] sum1 = {s1e} + {rnd};
+  wire signed [{pr}:0] sum2 = {s2e} + {rnd};
+  wire signed [{pr}:0] r1 = sum1 >>> {cf};
+  wire signed [{pr}:0] r2 = sum2 >>> {cf};
+
+  always @(posedge clk) begin
+    if (!rst_n) begin
+      ph0 <= 0; a0 <= 0; b0 <= 0; v0 <= 1'b0;
+      s1 <= 0; c1 <= 0; a1 <= 0; b1 <= 0; v1 <= 1'b0;
+      p_xc1 <= 0; p_ys <= 0; p_yc2 <= 0; p_xs <= 0; v2 <= 1'b0;
+{prod_rst}      y1 <= 0; y2 <= 0; valid_out <= 1'b0;
+    end else begin
+      ph0 <= turn[{phm}:0]; a0 <= x1; b0 <= x2; v0 <= valid_in;
+      s1 <= s_raw; c1 <= c_raw; a1 <= a0; b1 <= b0; v1 <= v0;
+{prod_seq}      y1 <= (r1 > {hi}) ? {dw}'sd{hi} : (r1 < -{lo}) ? -{dw}'sd{lo} : r1[{dwm}:0];
+      y2 <= (r2 > {hi}) ? {dw}'sd{hi} : (r2 < -{lo}) ? -{dw}'sd{lo} : r2[{dwm}:0];
+      valid_out <= v2;
+    end
+  end
+endmodule
+""".format(dwm=dw - 1, iwm=iw - 1, pwm=pw - 1, fwm=fw - 1,
+           prodm=pw + fw - 1, phm=ph - 1, ph=ph, ph1=ph + 1,
+           half=1 << (ph - lb - 1), lbm=lb - 1, lb=lb, drop=ph - lb,
+           quarter=1 << (lb - 2), cwm=cw - 1, prm=pr - 1, pr=pr,
+           s1e=s1, s2e=s2, rnd="%d'sd%d" % (pr + 1, 1 << (cf - 1)),
+           cf=cf, hi=(1 << (dw - 1)) - 1, lo=1 << (dw - 1), dw=dw,
+           prod=prod, prod_seq=prod_seq, prod_rst=prod_rst)
 
     def render_resadd(self, spec, fixes):
         """Residual add: two scaled products, their rounded sum, a shift

@@ -1,0 +1,133 @@
+{
+  "name": "rope_qwen2_5_0p5b",
+  "description": "Streaming rotary position embedding for a 64-wide head: one (x[i], x[i+32]) pair per cycle, rotated by pos * theta_i, theta base 1e+06",
+  "top_module": "rope",
+  "unit": "pair",
+  "parameters": {
+    "data_width": 8,
+    "head_dim": 64,
+    "pairs": 32,
+    "index_width": 5,
+    "pos_width": 10,
+    "lut_bits": 12,
+    "phase_bits": 24,
+    "freq_width": 22,
+    "coef_frac": 14,
+    "coef_width": 16,
+    "rope_theta": 1000000.0,
+    "signed": true,
+    "pipeline_stages": 1,
+    "target_clock_mhz": 100
+  },
+  "derivation": {
+    "model": "qwen2_5_0p5b",
+    "freqs": [
+      2670177,
+      1733964,
+      1126004,
+      731206,
+      474832,
+      308347,
+      200235,
+      130029,
+      84438,
+      54833,
+      35607,
+      23123,
+      15016,
+      9751,
+      6332,
+      4112,
+      2670,
+      1734,
+      1126,
+      731,
+      475,
+      308,
+      200,
+      130,
+      84,
+      55,
+      36,
+      23,
+      15,
+      10,
+      6,
+      4
+    ],
+    "rule": "pairs from head_dim; phase bits from the table index plus the position width plus two guard bits; table fraction bits from the activation width"
+  },
+  "ports": [
+    {
+      "name": "clk",
+      "dir": "input",
+      "width": 1,
+      "desc": "clock, rising edge"
+    },
+    {
+      "name": "rst_n",
+      "dir": "input",
+      "width": 1,
+      "desc": "active-low synchronous reset"
+    },
+    {
+      "name": "x1",
+      "dir": "input",
+      "width": 8,
+      "signed": true,
+      "desc": "x[i]"
+    },
+    {
+      "name": "x2",
+      "dir": "input",
+      "width": 8,
+      "signed": true,
+      "desc": "x[i + 32]"
+    },
+    {
+      "name": "idx",
+      "dir": "input",
+      "width": 5,
+      "desc": "the pair index i"
+    },
+    {
+      "name": "pos",
+      "dir": "input",
+      "width": 10,
+      "desc": "the token's position"
+    },
+    {
+      "name": "valid_in",
+      "dir": "input",
+      "width": 1,
+      "desc": "x1, x2, idx, pos valid"
+    },
+    {
+      "name": "y1",
+      "dir": "output",
+      "width": 8,
+      "signed": true,
+      "desc": "x1 cos - x2 sin"
+    },
+    {
+      "name": "y2",
+      "dir": "output",
+      "width": 8,
+      "signed": true,
+      "desc": "x2 cos + x1 sin"
+    },
+    {
+      "name": "valid_out",
+      "dir": "output",
+      "width": 1,
+      "desc": "y1, y2 valid"
+    }
+  ],
+  "behavior": [
+    "Fully pipelined: a new pair may arrive on every cycle, and each valid_in produces exactly one valid_out, in the same order. The latency is fixed but is the design's choice.",
+    "phase = (pos * F[idx]) mod 2**24, where F comes from the supplied rope_freq table: rope_freq (input [4:0] idx, output [21:0] val), combinational.",
+    "t = ((phase + 2**11) >> 12) mod 2**12, the nearest table entry; s = SIN[t] and c = SIN[(t + 1024) mod 2**12], from the supplied rope_sin table: rope_sin (input [11:0] idx, output [15:0] val), combinational, val a 16-bit two's complement value with 14 fraction bits. Instantiate it twice.",
+    "y1 = sat((x1 * c - x2 * s + 2**13) >>> 14) and y2 = sat((x2 * c + x1 * s + 2**13) >>> 14): signed products, round half up, an arithmetic shift, saturate to 8 bits.",
+    "All state resets to zero: valid_out is 0 during reset."
+  ]
+}

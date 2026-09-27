@@ -1479,6 +1479,65 @@ def test_fpga_counts_the_hierarchy_once():
           res['luts'] == 2)
 
 
+def test_rotary_embedding():
+    """Qwen's rotary position embedding, generated. The integer model has
+    to track float RoPE, the rules agent's first cut has to fail on the
+    direction of the turn, and the testbench has to contain an angle on a
+    rounding boundary, or a phase one count off passes."""
+    import chiplet_flow as cf
+    ms = load_model_spec()
+    spec = specgen_mod.derive_rope_spec(ms)
+    p, fr = spec['parameters'], spec['derivation']['freqs']
+    rnd = random.Random(5)
+    worst = 0.0
+    for _ in range(4000):
+        a, b = rnd.randrange(-128, 128), rnd.randrange(-128, 128)
+        i, pos = rnd.randrange(p['pairs']), rnd.randrange(1 << p['pos_width'])
+        th = pos * p['rope_theta'] ** (-2.0 * i / p['head_dim'])
+        f1 = a * math.cos(th) - b * math.sin(th)
+        f2 = b * math.cos(th) + a * math.sin(th)
+        y1, y2 = specgen_mod.rope_golden(a, b, i, pos, p, fr)
+        for y, f in ((y1, f1), (y2, f2)):
+            if -128 <= f <= 127:
+                worst = max(worst, abs(y - f))
+    check('RoPE is within 0.65 of float on every unsaturated output',
+          worst < 0.65)
+    check('position 0 is the identity',
+          all(specgen_mod.rope_golden(a, b, i, 0, p, fr) == (a, b)
+              for a, b, i in ((127, -128, 0), (-5, 77, 31), (1, 1, 7))))
+    work = os.path.join(ROOT, 'build_ropetest')
+    shutil.rmtree(work, ignore_errors=True)
+    os.makedirs(work)
+    try:
+        cf.write_rope_deps(spec, work)
+        with open(os.path.join(work, 'tb.v'), 'w') as f:
+            f.write(specgen_mod.render_rope_testbench(spec))
+        rr = RuleBasedAgent()
+        good = rr.render_rope(spec, {agent_mod.FIX_ROTDIR})
+        out = {}
+        for label, src in (('first', rr.render_rope(spec, set())),
+                           ('good', good),
+                           ('phase', good.replace('pos * f', '(pos * f + 1)'))):
+            with open(os.path.join(work, 'r.v'), 'w') as f:
+                f.write(src)
+            r = subprocess.run(['iverilog', '-g2005', '-o', 's.out', 'tb.v',
+                                'r.v', 'rope_rom.v'], cwd=work,
+                               capture_output=True, text=True)
+            assert r.returncode == 0, r.stdout + r.stderr
+            out[label] = subprocess.run(['vvp', 's.out'], cwd=work,
+                                        capture_output=True, text=True,
+                                        timeout=300).stdout
+        check('the rotary unit passes its testbench',
+              'TB_RESULT: PASS' in out['good'])
+        check('a rotation by minus the angle is caught',
+              'TB_RESULT: PASS' not in out['first']
+              and 'expected_rope' in out['first'])
+        check('an angle one count off is caught on a rounding boundary',
+              'TB_RESULT: PASS' not in out['phase'])
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
 def test_requant_golden_is_shared():
     """One model of requantization, used by the requantizer's own
     testbench and by the layer that sequences it, so the two cannot
@@ -2215,6 +2274,7 @@ if __name__ == '__main__':
     test_decoder_runs_the_model()
     test_small_model_derivation()
     test_fpga_counts_the_hierarchy_once()
+    test_rotary_embedding()
     test_composite_cell_count()
     test_requant_golden_is_shared()
     test_table_unit_specs_are_implementable()

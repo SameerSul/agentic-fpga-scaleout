@@ -5,16 +5,16 @@ every command is named so it can be re-run.
 
 ## Short answer
 
-The flow turns a model spec into signed-off RTL for seventeen generated
-blocks, which cover every operation in a Qwen layer but one: attention,
-RMSNorm, SiLU, the gated MLP and the residual add among them. The
-rotary position embedding Qwen applies to q and k is not generated yet,
-and an earlier version of this file said every operation was. One
+The flow turns a model spec into signed-off RTL for eighteen generated
+blocks, which cover every operation in a Qwen layer: attention, RMSNorm,
+SiLU, the gated MLP, the residual add and the rotary position embedding
+among them. An earlier version of this file claimed that before the
+rotary embedding existed. One
 projection runs at the model's full size, 896 by 4864, bit-exact on every
 output. A generated decoder sequences those blocks into a whole decode
 step, and the trained checkpoint runs on it in RTL, embedding to argmax,
 with every token of its output chosen by the hardware. An LLM has written
-and signed off every block but the seven newest through the same gates, and the multiply-accumulate unit's accumulator is formally proved
+and signed off every block but the eight newest through the same gates, and the multiply-accumulate unit's accumulator is formally proved
 never to overflow, for any input sequence, on the int8 targets. A trained
 language model decodes through the blocks' exact arithmetic and emits
 text. It still does not host a local LLM the way Architect Labs does:
@@ -27,7 +27,7 @@ The remaining gap is listed at the bottom rather than glossed over.
 ### The full suite
 
 ```
-python3 tests.py            # 321 tests, or 319 without OpenSTA
+python3 tests.py            # 326 tests, or 324 without OpenSTA
 ```
 
 ### Spec to RTL, across the spec space
@@ -449,6 +449,7 @@ Qwen2.5-0.5B:
 | residual add | not yet attempted | | |
 | full-size projection | not yet attempted | | |
 | decoder | not yet attempted | | |
+| rotary embedding | not yet attempted | | |
 
 Every block the flow generated before the attention head has been
 written and signed off by an LLM through all four gates. The attention
@@ -640,6 +641,30 @@ random hidden units almost never land on a rounding boundary. The
 generator now searches the seed until one does, and the mutant dies on
 every variant.
 
+## Rotary position embedding
+
+Qwen does not add a position vector; it rotates q and k. Each pair
+(x[i], x[i + d/2]) of a head turns by pos * theta_i, with theta_i =
+1e6**(-2i/64) on Qwen2.5, so the fastest pair wraps every six tokens and
+the slowest barely moves across the context. The unit streams one pair
+per cycle. The angle is kept in turns as a 24-bit fraction, so wrapping
+past a full turn is free, from a generated table of the 32 frequencies;
+it indexes a generated 4096-entry sine table, cosine a quarter turn on,
+and four products give y1 = x1 cos - x2 sin and y2 = x2 cos + x1 sin,
+rounded and saturated. Against float RoPE the worst error on any
+unsaturated output is 0.61 of an int8 step, 0.5 of which is the final
+rounding. 129 MHz, 4 cycles, 1874 LUTs and 5 DSPs, and all six model
+variants converge; at 16-bit data the 16 by 24 product missed timing by
+0.78 ns and is split into two partial products.
+
+The seeded first cut rotates by minus the angle, the transpose of the
+rotation, which is identical to it at position zero; the testbench walks
+the fastest pair through forty positions and catches it. Mutation testing
+found one hole first: a phase one count off moves the table index only
+when pos * F_i sits one count below a rounding boundary, about one
+position in 4096, so random pairs never land there. The testbench now
+searches the grid for such points, and the mutant dies on every variant.
+
 ## Residual add
 
 The add that closes each half of a layer, attention's output onto its
@@ -802,10 +827,10 @@ These are the distance between this repo and a local LLM host.
    and routes the activations between them, and one attention head over
    a KV cache, RMSNorm, and a projection at the model's full size over
    external memories. Softmax is hardware apart from
-   accumulating the sum. Every per-layer operation but the rotary
-   position embedding is a generated block, the residual add included;
-   the checkpoint here uses learned positions, so it needs no rotation,
-   but Qwen does. The generated decoder runs a
+   accumulating the sum. Every per-layer operation is a generated block,
+   the residual add and the rotary position embedding included; the
+   checkpoint here uses learned positions, so the decoder has no use for
+   the rotary unit, but Qwen does. The generated decoder runs a
    whole decode step of the 16-dimensional checkpoint in RTL. At Qwen's
    size nothing yet sequences a layer: many heads over shared KV heads,
    24 layers and DDR-streamed weights are still on the host. Qwen's MLP is the gated block,
