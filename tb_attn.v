@@ -28,6 +28,10 @@ module tb_attn;
   reg [255:0] testname;
   reg [15:0] bad_idx [0:7];
   reg signed [7:0] bad_exp [0:7], bad_got [0:7];
+  // Cycles measured, not computed: the profile's cycles_per_unit and
+  // latency come from here.
+  integer cyc = 0, span = 0, t0 = 0, first_out = -1, lat = 0;
+  always @(posedge clk) cyc = cyc + 1;
 
   always @(posedge clk) begin
     k_data <= kmem[k_addr];
@@ -47,6 +51,7 @@ module tb_attn;
     if (rst_n && o_valid) begin
       checks = checks + 1;
       seen = seen + 1;
+      if (first_out < 0) begin first_out = cyc; if (cyc - t0 > lat) lat = cyc - t0; end
       if (o_index >= 64) begin
         $display("TB_FAIL test=%0s out=%0d head_dim=64 expected=no_output_past_head_dim got_o=%0d",
                  testname, o_index, o_data);
@@ -75,8 +80,10 @@ module tb_attn;
       @(negedge clk); load_valid = 0;
       n = cnt; shift_s = sh; scale_o = sc; shift_o = so;
       @(negedge clk); start = 1;
+      t0 = cyc; first_out = -1;
       @(negedge clk); start = 0;
       while (busy) @(negedge clk);
+      span = span + (cyc - t0);
       repeat (8) @(negedge clk);
       for (i = 0; i < cnt; i = i + 1) begin
         checks = checks + 1;
@@ -4015,7 +4022,7 @@ module tb_attn;
     run_head(40, 9, 99841, 31);
 
     $display("TB_PROFILE heads=%0d span_cycles=%0d latency_cycles=%0d",
-             4, 4 * 64 * 2, 16);
+             4, span, lat);
     $display("TB_PASS checks=%0d", checks);
     $display("TB_RESULT: PASS");
     $finish;

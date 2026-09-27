@@ -329,10 +329,10 @@
         "mismatches": [],
         "throughput": {
           "layers": 1,
-          "span_cycles": 126,
-          "latency_cycles": 16,
+          "span_cycles": 269,
+          "latency_cycles": 225,
           "units": 1,
-          "cycles_per_unit": 126.0
+          "cycles_per_unit": 269.0
         }
       },
       "synth": {

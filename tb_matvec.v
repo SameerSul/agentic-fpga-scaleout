@@ -29,7 +29,9 @@ module tb_matvec;
   wire signed [28:0] acc;
   wire mac_vout;
   integer checks = 0, seen = 0, i;
+  integer cyc = 0, t0 = 0, load0 = 0, first_col = -1, last_col = 0;
   reg [255:0] testname;
+  always @(posedge clk) cyc = cyc + 1;
 
   matvec seq (.clk(clk), .rst_n(rst_n), .start(start), .depth(depth),
               .cols(cols), .a_addr(a_addr), .w_addr(w_addr),
@@ -47,6 +49,8 @@ module tb_matvec;
     if (rst_n && col_valid) begin
       checks = checks + 1;
       seen = seen + 1;
+      if (first_col < 0) first_col = cyc;
+      last_col = cyc;
       if (acc !== expect_col[col_index]) begin
         $display("TB_FAIL test=%0s col=%0d expected_acc=%0d got_acc=%0d",
                  testname, col_index, expect_col[col_index], acc);
@@ -191,6 +195,7 @@ module tb_matvec;
     cols = 122;
     @(negedge clk);
     start = 1;
+    t0 = cyc;
     @(negedge clk);
     start = 0;
     // Generous bound: depth+drain per column, plus slack.
@@ -210,8 +215,9 @@ module tb_matvec;
       $display("TB_RESULT: FAIL");
       $finish;
     end
+    // Measured: start to the last flagged column, and to the first.
     $display("TB_PROFILE columns=%0d span_cycles=%0d latency_cycles=%0d",
-             122, 122 * 68, 68);
+             122, last_col - t0, first_col - t0);
     $display("TB_PASS checks=%0d", checks);
     $display("TB_RESULT: PASS");
     $finish;

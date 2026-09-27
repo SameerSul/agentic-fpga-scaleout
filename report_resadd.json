@@ -134,10 +134,10 @@
         "mismatches": [],
         "throughput": {
           "elements": 214,
-          "span_cycles": 221,
+          "span_cycles": 225,
           "latency_cycles": 4,
           "units": 214,
-          "cycles_per_unit": 1.0327102803738317
+          "cycles_per_unit": 1.0514018691588785
         }
       },
       "synth": {

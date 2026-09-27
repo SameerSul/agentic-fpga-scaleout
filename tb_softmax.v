@@ -17,6 +17,10 @@ module tb_softmax;
   reg signed [12:0] s_data;
   integer checks = 0, seen = 0, i, j, other, best, dist, own;
   reg [255:0] testname;
+  // Cycles measured, not computed: the profile's cycles_per_unit and
+  // latency come from here.
+  integer cyc = 0, span = 0, t0 = 0, first_out = -1, lat = 0;
+  always @(posedge clk) cyc = cyc + 1;
 
   always @(posedge clk) s_data <= smem[s_addr];
 
@@ -30,6 +34,7 @@ module tb_softmax;
     if (rst_n && w_valid) begin
       checks = checks + 1;
       seen = seen + 1;
+      if (first_out < 0) begin first_out = cyc; if (cyc - t0 > lat) lat = cyc - t0; end
       // A weight for an index past the row has no expected value, and
       // comparing against one printed expected_w=x, which a traced agent
       // read as a datapath fault for three drafts running.
@@ -73,8 +78,10 @@ module tb_softmax;
       seen = 0;
       n = cnt;
       @(negedge clk); start = 1;
+      t0 = cyc; first_out = -1;
       @(negedge clk); start = 0;
       while (busy) @(negedge clk);
+      span = span + (cyc - t0);
       repeat (4) @(negedge clk);
       checks = checks + 1;
       if (seen !== cnt) begin
@@ -335,7 +342,7 @@ module tb_softmax;
     run_row(9'd4);
 
     $display("TB_PROFILE rows=%0d span_cycles=%0d latency_cycles=%0d",
-             9, 9 * 64, 8);
+             9, span, lat);
     $display("TB_PASS checks=%0d", checks);
     $display("TB_RESULT: PASS");
     $finish;

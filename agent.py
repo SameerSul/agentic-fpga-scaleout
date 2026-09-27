@@ -28,6 +28,7 @@ FIX_EPS = "start_the_sum_of_squares_from_epsilon"
 FIX_SIGN = "take_the_numerator_from_the_sign_of_x"
 FIX_UPBASE = "offset_the_up_weights_past_the_gate_weights"
 FIX_RRND = "round_the_residual_sum_before_the_shift"
+FIX_PIDX = "carry_the_column_index_through_the_requantizer"
 # One definition, in specgen, so the declared depth and the generated
 # depth cannot disagree.
 WIDE_ADD_BITS = specgen.WIDE_ADD_BITS
@@ -68,6 +69,8 @@ class RuleBasedAgent:
             return self.render_gmlp(spec, fixes), sorted(fixes)
         if spec["top_module"] == "resadd":
             return self.render_resadd(spec, fixes), sorted(fixes)
+        if spec["top_module"] == "proj":
+            return self.render_proj(spec, fixes), sorted(fixes)
         return self.render_mac(spec, fixes), sorted(fixes)
 
     def diagnose(self, spec, history):
@@ -85,6 +88,11 @@ class RuleBasedAgent:
                     fixes.add(FIX_XOR)
                 elif "clear" in m.get("test", "").lower():
                     fixes.add(FIX_CLEAR)
+                elif "expected_proj" in m:
+                    # The projection's only seeded bug: the output index
+                    # was taken as the requantizer finished, not carried
+                    # through it, so values land under a later column.
+                    fixes.add(FIX_PIDX)
                 elif "expected_res" in m:
                     # The residual add's only seeded bug: it truncated,
                     # which only shows on an exact rounding tie.
@@ -151,6 +159,98 @@ class RuleBasedAgent:
                 elif m.get("got_acc") != m.get("expected_acc"):
                     fixes.add(FIX_WIDTH)
         return fixes
+
+    def render_proj(self, spec, fixes):
+        """A projection over external memories: matvec's addresses are the
+        block's, the MAC reduces, and each finished column goes through the
+        requantizer with its index carried alongside.
+
+        The seeded first cut labels each result with the column index at
+        the moment the requantizer finishes, which by then belongs to a
+        later column.
+        """
+        p = spec["parameters"]
+        dw, aw = p["data_width"], p["acc_width"]
+        dep_w, col_w, mva = p["depth_width"], p["col_width"], p["addr_width"]
+        mw, shw, rqs = p["scale_width"], p["shift_width"], p["requant_stages"]
+        oidx = "idx_pipe[%d]" % (rqs - 1) if FIX_PIDX in fixes else "mv_coli"
+        return """module proj (
+  input                    clk,
+  input                    rst_n,
+  input                    start,
+  input      [{depwm}:0] depth,
+  input      [{colwm}:0] cols,
+  input      [{mwm}:0] scale,
+  input      [{swm}:0] shift,
+  output     [{depwm}:0] a_addr,
+  input      signed [{dwm}:0] a_data,
+  output     [{mvam}:0] w_addr,
+  input      signed [{dwm}:0] w_data,
+  output reg               o_valid,
+  output reg [{colwm}:0] o_index,
+  output reg signed [{dwm}:0] o_data,
+  output reg               busy
+);
+  reg  mv_start;
+  wire mv_valid, mv_clear, mv_colv, mv_busy;
+  wire [{colwm}:0] mv_coli;
+  matvec mv (.clk(clk), .rst_n(rst_n), .start(mv_start), .depth(depth),
+             .cols(cols), .a_addr(a_addr), .w_addr(w_addr),
+             .mac_valid(mv_valid), .mac_clear(mv_clear),
+             .col_valid(mv_colv), .col_index(mv_coli), .busy(mv_busy));
+  wire signed [{awm}:0] acc;
+  wire mac_vout;
+  mac mc (.clk(clk), .rst_n(rst_n), .clear(mv_clear), .a(a_data),
+          .b(w_data), .valid_in(mv_valid), .acc(acc),
+          .valid_out(mac_vout));
+  reg  rq_vin;
+  reg  signed [{awm}:0] rq_acc;
+  reg  [{colwm}:0] rq_idx;
+  wire signed [{dwm}:0] rq_q;
+  wire rq_sat, rq_vout;
+  requant rq (.clk(clk), .rst_n(rst_n), .acc_in(rq_acc), .scale(scale),
+              .shift(shift), .valid_in(rq_vin), .q_out(rq_q),
+              .sat(rq_sat), .valid_out(rq_vout));
+  reg [{colwm}:0] idx_pipe [0:{rqsm}];
+  reg [7:0] outst;
+  reg ran;
+  integer k;
+
+  always @(posedge clk) begin
+    if (!rst_n) begin
+      mv_start <= 1'b0; rq_vin <= 1'b0; rq_acc <= 0; rq_idx <= 0;
+      outst <= 0; ran <= 1'b0; busy <= 1'b0; o_valid <= 1'b0;
+      o_index <= 0; o_data <= 0;
+      for (k = 0; k <= {rqsm}; k = k + 1) idx_pipe[k] <= 0;
+    end else begin
+      mv_start <= 1'b0;
+      rq_vin   <= 1'b0;
+      o_valid  <= 1'b0;
+      idx_pipe[0] <= rq_idx;
+      for (k = 1; k <= {rqsm}; k = k + 1) idx_pipe[k] <= idx_pipe[k-1];
+      if (mv_busy) ran <= 1'b1;
+      case ({{rq_vin, rq_vout}})
+        2'b10: outst <= outst + 1;
+        2'b01: outst <= outst - 1;
+        default: ;
+      endcase
+      if (mv_colv) begin
+        rq_acc <= acc; rq_idx <= mv_coli; rq_vin <= 1'b1;
+      end
+      if (rq_vout) begin
+        o_valid <= 1'b1; o_index <= {oidx}; o_data <= rq_q;
+      end
+      if (!busy && start) begin
+        busy <= 1'b1; ran <= 1'b0; mv_start <= 1'b1;
+      end else if (busy && ran && !mv_busy && outst == 0 && !mv_colv
+                   && !rq_vin) begin
+        busy <= 1'b0;
+      end
+    end
+  end
+endmodule
+""".format(dwm=dw - 1, depwm=dep_w - 1, colwm=col_w - 1, mvam=mva - 1,
+           mwm=mw - 1, swm=shw - 1, awm=aw - 1, rqsm=rqs - 1, oidx=oidx)
 
     def render_resadd(self, spec, fixes):
         """Residual add: two scaled products, their rounded sum, a shift

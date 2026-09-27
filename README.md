@@ -47,7 +47,7 @@ Pure Python 3 stdlib, no dependencies. The RTL half runs real open tools (Icarus
                                  sizing, fabric, board fit
 ```
 
-The fifteen generated blocks, and what each is for:
+The sixteen generated blocks, and what each is for:
 
 ```
   arithmetic
@@ -73,10 +73,13 @@ The fifteen generated blocks, and what each is for:
                projections through one sequencer
     resadd     the residual add after attention and after the MLP,
                two int8 tensors at different scales
+    proj       a projection at the model's full size, 896 by 4864 on
+               Qwen2.5-0.5B, reading activations and weights through
+               external memory ports instead of holding them
 ```
 
-Four of those are composite: they instantiate the blocks below them
-rather than reimplementing the arithmetic, and the flow feeds the
+Most of the sequencing blocks are composite: they instantiate the
+blocks below them rather than reimplementing the arithmetic, and the flow feeds the
 dependencies in as extra sources. The three table-driven units (exp,
 recip, rsqrt) also take a generated constant ROM as a dependency, since
 emitting 256 exact table entries is a job for a generator and not for a
@@ -429,7 +432,7 @@ checked against another model. Read that list before quoting any number here.
 - Feeding 8601 MAC instances would need on-chip operand bandwidth the model does not check. DSP count is the right first-order capacity ceiling, not a claim that the array is routable at that size.
 - A 25 Gbps endpoint does not close timing in this flow at either standard datapath. Reaching it needs a pipelined or matrix-form CRC that the rule-based agent does not write, so the default target is 10 Gbps, which is also what the mid board class actually exposes.
 - There is no place-and-route anywhere; timing is real OpenSTA static timing but against a toy illustrative liberty, so fmax is an estimate of an estimate.
-- The derivation now covers fifteen blocks, not just the matmul datapath: the exponential, reciprocal and inverse square root are generated and signed off, softmax and an MLP layer sequence them, an attention head composes matvec, the MAC, softmax and the requantizer, RMSNorm drives the inverse square root, SiLU is built from the exponential and the reciprocal, the gated MLP runs Qwen's three projections through it, and the residual add closes each half of a layer. What is still missing above that is tiling, the residual adds, and a sequencer that runs heads and layers into a whole model. The weight tile holds 1024 entries and the activation bank 64, so a real matrix needs tiling logic that does not exist yet, and the blocks are the arithmetic of an inference engine rather than the whole of one.
+- The derivation now covers sixteen blocks, not just the matmul datapath: the exponential, reciprocal and inverse square root are generated and signed off, softmax and an MLP layer sequence them, an attention head composes matvec, the MAC, softmax and the requantizer, RMSNorm drives the inverse square root, SiLU is built from the exponential and the reciprocal, the gated MLP runs Qwen's three projections through it, the residual add closes each half of a layer, and the projection block runs a matrix at the model's full size over external memories. What is still missing above that is a sequencer that runs heads and layers into a whole model. The composite layer blocks still hold 64-entry activation banks; the projection shows the way past that, streaming activations from memory the way the weights already are, but the attention and MLP blocks have not been moved onto it, and the blocks are the arithmetic of an inference engine rather than the whole of one.
 - Boards are simulated, not real: link rates, propagation delays, clock caps, and capacities are representative class parameters, not measured silicon.
 - The 30% fabric reservation for NIC and routing logic is a stated guess, not a floorplan; the endpoint reservation per link is real, from the synthesized cell count.
 - Decode compute time is charged from the measured chiplet profile at full model dimensions; the weights are not materialized. The sharded numerics (real arithmetic, bit-exactness across cluster shapes) are validated at reduced dimensions in stage 8 and in the test suite.

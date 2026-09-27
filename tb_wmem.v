@@ -25,7 +25,9 @@ module tb_wmem;
   reg signed [28:0] expect_col [0:16-1];
   reg signed [7:0] a_data;
   integer checks = 0, seen = 0, i;
+  integer cyc = 0, t0 = 0, load0 = 0, first_col = -1, last_col = 0;
   reg [255:0] testname;
+  always @(posedge clk) cyc = cyc + 1;
 
   // The activation side stays a simple registered read; the weight side
   // is the generated memory.
@@ -51,6 +53,8 @@ module tb_wmem;
     if (rst_n && col_valid) begin
       checks = checks + 1;
       seen = seen + 1;
+      if (first_col < 0) first_col = cyc;
+      last_col = cyc;
       if (acc !== expect_col[col_index]) begin
         $display("TB_FAIL test=%0s col=%0d expected_acc=%0d got_acc=%0d",
                  testname, col_index, expect_col[col_index], acc);
@@ -104,6 +108,7 @@ module tb_wmem;
 
     // Stream the tile in, as a host or a DMA engine would.
     load_start = 1;
+    load0 = cyc;
     @(negedge clk);
     load_start = 0;
     for (i = 0; i < 1024; i = i + 1) begin
@@ -126,6 +131,7 @@ module tb_wmem;
     cols = 16;
     @(negedge clk);
     start = 1;
+    t0 = cyc;
     @(negedge clk);
     start = 0;
     for (i = 0; i < 16 * (64 + 10) + 60; i = i + 1)
@@ -137,8 +143,10 @@ module tb_wmem;
       $display("TB_RESULT: FAIL");
       $finish;
     end
+    // Measured: the whole tile, load start to the last column, and the
+    // compute latency from start to the first column.
     $display("TB_PROFILE tiles=%0d span_cycles=%0d latency_cycles=%0d",
-             1, 1024, 64);
+             1, last_col - load0, first_col - t0);
     $display("TB_PASS checks=%0d", checks);
     $display("TB_RESULT: PASS");
     $finish;

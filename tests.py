@@ -1336,6 +1336,52 @@ def test_residual_add():
         shutil.rmtree(work, ignore_errors=True)
 
 
+def test_full_size_projection():
+    """A projection at the model's full size, not a tile of it. The
+    composite layers hold activations in 64-entry banks; a Qwen layer's
+    rows run to d_ff. This block reads activations and weights through
+    external memory ports, so the up projection runs at 896 by 4864,
+    4.36 million multiply-accumulates, and every output is checked. The
+    testbench computes both operands from a hash of the address, so it
+    needs no initializer per element."""
+    import chiplet_flow as cf
+    ms = load_model_spec()
+    spec = specgen_mod.derive_proj_spec(ms)
+    D, F = ms['d_model'], ms['d_ff']
+    work = os.path.join(ROOT, 'build_projfull')
+    shutil.rmtree(work, ignore_errors=True)
+    try:
+        cf.write_proj_deps(ms, work)
+        rr = RuleBasedAgent()
+        with open(os.path.join(work, 'small.v'), 'w') as f:
+            f.write(specgen_mod.render_proj_testbench(spec))
+        with open(os.path.join(work, 'full.v'), 'w') as f:
+            f.write(specgen_mod.render_proj_testbench(spec, cases=((D, F, 9),)))
+        out = {}
+        for label, tb, fx in (('first', 'small.v', set()),
+                              ('small', 'small.v', {agent_mod.FIX_PIDX}),
+                              ('full', 'full.v', {agent_mod.FIX_PIDX})):
+            with open(os.path.join(work, 'p.v'), 'w') as f:
+                f.write(rr.render_proj(spec, fx))
+            r = subprocess.run(['iverilog', '-g2005', '-o', 's.out', tb, 'p.v']
+                               + list(cf.PROJ_DEPS), cwd=work,
+                               capture_output=True, text=True)
+            assert r.returncode == 0, r.stdout + r.stderr
+            out[label] = subprocess.run(['vvp', 's.out'], cwd=work,
+                                        capture_output=True, text=True,
+                                        timeout=1200).stdout
+        check('the projection passes its small cases', 'TB_RESULT: PASS' in out['small'])
+        check('an output index not carried through the requantizer is '
+              'caught on a short reduction',
+              'TB_RESULT: PASS' not in out['first']
+              and 'expected_proj' in out['first'])
+        check('a full-size %d by %d projection is bit-exact on every output'
+              % (D, F), 'TB_RESULT: PASS' in out['full']
+              and ('checks=%d' % (F + 1)) in out['full'])
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
 def test_requant_golden_is_shared():
     """One model of requantization, used by the requantizer's own
     testbench and by the layer that sequences it, so the two cannot
@@ -2068,6 +2114,7 @@ if __name__ == '__main__':
     test_silu()
     test_gated_mlp()
     test_residual_add()
+    test_full_size_projection()
     test_composite_cell_count()
     test_requant_golden_is_shared()
     test_table_unit_specs_are_implementable()

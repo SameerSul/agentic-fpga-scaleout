@@ -118,10 +118,10 @@
         "mismatches": [],
         "throughput": {
           "tiles": 1,
-          "span_cycles": 1024,
-          "latency_cycles": 64,
+          "span_cycles": 2132,
+          "latency_cycles": 69,
           "units": 1,
-          "cycles_per_unit": 1024.0
+          "cycles_per_unit": 2132.0
         }
       },
       "synth": {

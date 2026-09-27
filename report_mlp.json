@@ -216,10 +216,10 @@
         "mismatches": [],
         "throughput": {
           "layers": 1,
-          "span_cycles": 78,
-          "latency_cycles": 16,
+          "span_cycles": 158,
+          "latency_cycles": 113,
           "units": 1,
-          "cycles_per_unit": 78.0
+          "cycles_per_unit": 158.0
         }
       },
       "synth": {

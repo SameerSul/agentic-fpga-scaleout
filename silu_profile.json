@@ -2,7 +2,7 @@
   "block": "silu_qwen2_5_0p5b",
   "top_module": "silu",
   "unit": "element",
-  "cycles_per_element": 1.0254777070063694,
+  "cycles_per_element": 1.0605095541401275,
   "latency_cycles": 12,
   "cell_count": 11935,
   "area": 24109.0,

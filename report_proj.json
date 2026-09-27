@@ -1,0 +1,245 @@
+{
+  "spec": {
+    "name": "proj_qwen2_5_0p5b",
+    "description": "Full-size projection y = requant(W x) over external activation and weight memories, up to 4864 by 4864",
+    "top_module": "proj",
+    "unit": "projection",
+    "parameters": {
+      "data_width": 8,
+      "acc_width": 29,
+      "depth_width": 13,
+      "col_width": 13,
+      "addr_width": 26,
+      "scale_width": 18,
+      "shift_width": 7,
+      "requant_stages": 9,
+      "max_dim": 4864,
+      "signed": true,
+      "pipeline_stages": 1,
+      "target_clock_mhz": 100
+    },
+    "derivation": {
+      "model": "qwen2_5_0p5b",
+      "rule": "depth, column and address widths from the matmul sequencer, which is sized from the model's largest dimension; the requantizer from that block"
+    },
+    "ports": [
+      {
+        "name": "clk",
+        "dir": "input",
+        "width": 1,
+        "desc": "clock, rising edge"
+      },
+      {
+        "name": "rst_n",
+        "dir": "input",
+        "width": 1,
+        "desc": "active-low synchronous reset"
+      },
+      {
+        "name": "start",
+        "dir": "input",
+        "width": 1,
+        "desc": "run one projection"
+      },
+      {
+        "name": "depth",
+        "dir": "input",
+        "width": 13,
+        "desc": "input length, the reduction depth"
+      },
+      {
+        "name": "cols",
+        "dir": "input",
+        "width": 13,
+        "desc": "outputs"
+      },
+      {
+        "name": "scale",
+        "dir": "input",
+        "width": 18,
+        "desc": "requantizer scale"
+      },
+      {
+        "name": "shift",
+        "dir": "input",
+        "width": 7,
+        "desc": "requantizer shift"
+      },
+      {
+        "name": "a_addr",
+        "dir": "output",
+        "width": 13,
+        "desc": "activation address"
+      },
+      {
+        "name": "a_data",
+        "dir": "input",
+        "width": 8,
+        "signed": true,
+        "desc": "activation, registered read"
+      },
+      {
+        "name": "w_addr",
+        "dir": "output",
+        "width": 26,
+        "desc": "weight address"
+      },
+      {
+        "name": "w_data",
+        "dir": "input",
+        "width": 8,
+        "signed": true,
+        "desc": "weight, registered read"
+      },
+      {
+        "name": "o_valid",
+        "dir": "output",
+        "width": 1,
+        "desc": "an output is on o_data"
+      },
+      {
+        "name": "o_index",
+        "dir": "output",
+        "width": 13,
+        "desc": "which output"
+      },
+      {
+        "name": "o_data",
+        "dir": "output",
+        "width": 8,
+        "signed": true,
+        "desc": "output activation"
+      },
+      {
+        "name": "busy",
+        "dir": "output",
+        "width": 1,
+        "desc": "a projection is in progress"
+      }
+    ],
+    "behavior": [
+      "start is a one-cycle pulse, with depth, cols, scale and shift held stable for the whole projection. busy must be high on the clock edge that samples start, so it already reads 1 one cycle later, and it stays high until the last output is emitted.",
+      "Activations and weights live outside the block. a_data and w_data are registered reads: each carries the element at address a on the cycle after a_addr or w_addr = a. Weights are column-major: W[c][r] is at c*depth + r.",
+      "y[c] = requant(sum over r in 0..depth-1 of x[r] * W[c][r], scale, shift) for c in 0..cols-1. requant is exactly the supplied requantizer: multiply by scale, add 2**(shift-1) when shift > 0, arithmetic shift right by shift, saturate to [-128, 127].",
+      "Emit each y[c] with o_index = c and o_valid high for exactly that one cycle. Outputs may come in any order, but each index exactly once, and o_valid must be low at every other time.",
+      "matvec, mac and requant are separate modules supplied as source files, not something to write. Instantiate them with exactly these ports, connected by name: matvec (input clk, input rst_n, input start, input [12:0] depth, input [12:0] cols, output [12:0] a_addr, output [25:0] w_addr, output mac_valid, output mac_clear, output col_valid, output [12:0] col_index, output busy); mac (input clk, input rst_n, input clear, input signed [7:0] a, input signed [7:0] b, input valid_in, output signed [28:0] acc, output valid_out); requant (input clk, input rst_n, input signed [28:0] acc_in, input [17:0] scale, input [6:0] shift, input valid_in, output signed [7:0] q_out, output sat, output valid_out).",
+      "matvec walks a_addr 0..depth-1 and w_addr c*depth onward for each of cols columns, drives mac_valid one cycle behind the address, pulses mac_clear between columns, and pulses col_valid with col_index when a column's sum is on the MAC's acc: its a_addr and w_addr are exactly this block's. requant has a latency of exactly 9 cycles.",
+      "All state resets to zero: busy and o_valid are 0 during reset."
+    ]
+  },
+  "tools": {
+    "iverilog": "/opt/homebrew/bin/iverilog",
+    "vvp": "/opt/homebrew/bin/vvp",
+    "yosys": "/opt/homebrew/bin/yosys",
+    "sta": "/Users/ssuleman/.local/bin/sta"
+  },
+  "agent": "RuleBasedAgent",
+  "converged": true,
+  "iterations_used": 2,
+  "history": [
+    {
+      "iteration": 1,
+      "fixes_applied": [],
+      "sim": {
+        "stage": "sim",
+        "status": "fail",
+        "checks": null,
+        "mismatches": [
+          {
+            "test": "projection",
+            "out": "1",
+            "expected_proj": "73",
+            "got_proj": "-69"
+          },
+          {
+            "test": "projection",
+            "out": "2",
+            "expected_proj": "12",
+            "got_proj": "73"
+          },
+          {
+            "test": "projection",
+            "out": "3",
+            "expected_proj": "-50",
+            "got_proj": "12"
+          },
+          {
+            "test": "projection",
+            "out": "4",
+            "expected_proj": "-8",
+            "got_proj": "-50"
+          },
+          {
+            "test": "projection",
+            "out": "59",
+            "cols": "60",
+            "expected": "each_index_once",
+            "got_proj": "-22"
+          }
+        ]
+      },
+      "synth": null,
+      "timing": null,
+      "fpga": null
+    },
+    {
+      "iteration": 2,
+      "fixes_applied": [
+        "carry_the_column_index_through_the_requantizer"
+      ],
+      "sim": {
+        "stage": "sim",
+        "status": "pass",
+        "checks": 372,
+        "mismatches": [],
+        "throughput": {
+          "projections": 5,
+          "span_cycles": 23630,
+          "latency_cycles": 145,
+          "units": 5,
+          "cycles_per_unit": 4726.0
+        }
+      },
+      "synth": {
+        "stage": "synth",
+        "status": "pass",
+        "cell_count": 13989,
+        "area": 30490.0
+      },
+      "timing": {
+        "stage": "timing",
+        "status": "pass",
+        "method": "opensta",
+        "clock_period_ns": 10.0,
+        "worst_slack_ns": 1.28
+      },
+      "fpga": {
+        "luts": 3369,
+        "ffs": 2375,
+        "dsps": 17,
+        "brams": 0,
+        "urams": 0,
+        "carry": 171,
+        "muxf": 103,
+        "status": "pass",
+        "family": "xcup",
+        "top": "proj",
+        "lint": [],
+        "stage": "fpga"
+      }
+    }
+  ],
+  "final_metrics": {
+    "sim_pass": true,
+    "sim_checks": 372,
+    "cell_count": 13989,
+    "area": 30490.0,
+    "timing": {
+      "stage": "timing",
+      "status": "pass",
+      "method": "opensta",
+      "clock_period_ns": 10.0,
+      "worst_slack_ns": 1.28
+    }
+  }
+}

@@ -23,6 +23,10 @@ module tb_mlp;
   integer nbad = 0, hbad = 0;
   reg [7:0] bad_idx [0:7];
   reg signed [7:0] bad_exp [0:7], bad_got [0:7];
+  // Cycles measured, not computed: the profile's cycles_per_unit and
+  // latency come from here.
+  integer cyc = 0, span = 0, t0 = 0, first_out = -1, lat = 0;
+  always @(posedge clk) cyc = cyc + 1;
   reg signed [7:0] w_data;
   integer checks = 0, seen = 0, i;
   reg [255:0] testname;
@@ -42,6 +46,7 @@ module tb_mlp;
     if (rst_n && o_valid) begin
       checks = checks + 1;
       seen = seen + 1;
+      if (first_out < 0) begin first_out = cyc; if (cyc - t0 > lat) lat = cyc - t0; end
       if (o_index >= 5) begin
         $display("TB_FAIL test=%0s out=%0d cols2=%0d expected=no_output_past_cols2 got_y=%0d",
                  testname, o_index, 5, o_data);
@@ -171,9 +176,11 @@ module tb_mlp;
     scale1 = 75329; shift1 = 25; scale2 = 114266; shift2 = 24;
     @(negedge clk);
     start = 1;
+      t0 = cyc; first_out = -1;
     @(negedge clk);
     start = 0;
     while (busy) @(negedge clk);
+      span = span + (cyc - t0);
     repeat (8) @(negedge clk);
     // Whitebox check of the hidden layer, which the spec places in act at
     // 64..64+cols1-1. Reported before the outputs because it is
@@ -202,7 +209,7 @@ module tb_mlp;
       $finish;
     end
     $display("TB_PROFILE layers=%0d span_cycles=%0d latency_cycles=%0d",
-             1, 8 * 6 + 6 * 5, 16);
+             1, span, lat);
     $display("TB_PASS checks=%0d", checks);
     $display("TB_RESULT: PASS");
     $finish;

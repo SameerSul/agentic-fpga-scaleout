@@ -9,7 +9,7 @@ is worth knowing and worth reporting.
 You give it a model spec, a small JSON file naming a transformer's
 dimensions and its quantization. It derives the hardware that model
 needs, writes the Verilog, and checks it with real tools until it passes.
-Fifteen blocks come out, each one sized from the model rather than written
+Sixteen blocks come out, each one sized from the model rather than written
 for it. Point it at a different model and every block re-derives.
 
 ## The picture
@@ -44,7 +44,7 @@ for it. Point it at a different model and every block re-derives.
                            re-simulated against the same testbench
 ```
 
-## The fifteen blocks
+## The sixteen blocks
 
 Arithmetic, bottom to top:
 
@@ -72,6 +72,8 @@ Sequencing, which is what makes the above into a layer:
    silu       x * sigmoid(x), streaming, from exp and recip
    gmlp       Qwen's gated MLP: gate through SiLU, times up, then down
    resadd     residual add of two scaled int8 tensors, streaming
+   proj       a full-size projection, 896 by 4864 here, over external
+              activation and weight memories
 ```
 
 ## Build it
@@ -133,6 +135,7 @@ Four blocks instantiate others, so bring their dependencies along:
    silu.v     needs  expu.v recip.v exp_rom.v recip_rom.v
    gmlp.v     needs  matvec.v mac.v requant.v silu.v expu.v recip.v
                      exp_rom.v recip_rom.v
+   proj.v     needs  matvec.v mac.v requant.v
 ```
 
 The testbenches are in the repo root as `tb_*.v` if you want to run them
@@ -157,6 +160,8 @@ Measured here with yosys against a generic library, for Qwen2.5-0.5B:
    silu       120 MHz   11935
    gmlp       110 MHz   48418
    resadd     136 MHz    4894
+   proj       115 MHz   13989     3369 LUTs and 17 DSPs; its memories
+                                  are outside it, on your part BRAM or DDR
    attn       112 MHz  115091     the score and weight buffers and the
                                   softmax's become flops here; on the
                                   FPGA they map to 6 BRAMs, 6364 LUTs
@@ -167,9 +172,9 @@ Measured here with yosys against a generic library, for Qwen2.5-0.5B:
    RMSNorm both showed the requantizer's 10396.
 ```
 
-A Zynq 7020 has 53200 LUTs and 220 DSPs. All fifteen together map to
-27262 LUTs and 111 DSPs on yosys's UltraScale+ mapping, about 51% and 50% of
-the part, and that counts the composite blocks' sub-blocks twice.
+A Zynq 7020 has 53200 LUTs and 220 DSPs. All sixteen together map to
+30631 LUTs and 128 DSPs on yosys's UltraScale+ mapping, about 58% of
+the part in both, and that counts the composite blocks' sub-blocks twice.
 Expect better numbers than these: the generic library has no carry chain
 and no block RAM, and Vivado has both.
 

@@ -19,6 +19,10 @@ module tb_rmsnorm;
   reg [255:0] testname;
   reg [15:0] bad_idx [0:7];
   reg signed [7:0] bad_exp [0:7], bad_got [0:7];
+  // Cycles measured, not computed: the profile's cycles_per_unit and
+  // latency come from here.
+  integer cyc = 0, span = 0, t0 = 0, first_out = -1, lat = 0;
+  always @(posedge clk) cyc = cyc + 1;
 
   always @(posedge clk) begin
     x_data <= xmem[x_addr];
@@ -37,6 +41,7 @@ module tb_rmsnorm;
     if (rst_n && o_valid) begin
       checks = checks + 1;
       seen = seen + 1;
+      if (first_out < 0) begin first_out = cyc; if (cyc - t0 > lat) lat = cyc - t0; end
       if (o_index >= 896) begin
         $display("TB_FAIL test=%0s out=%0d d_model=896 expected=no_output_past_the_row got_norm=%0d",
                  testname, o_index, o_data);
@@ -60,8 +65,10 @@ module tb_rmsnorm;
       seen = 0; nbad = 0; bad = 0;
       eps = ep; scale_o = sc; shift_o = so;
       @(negedge clk); start = 1;
+      t0 = cyc; first_out = -1;
       @(negedge clk); start = 0;
       while (busy) @(negedge clk);
+      span = span + (cyc - t0);
       repeat (8) @(negedge clk);
       checks = checks + 3;
       if (dut.ssq !== want_ssq) begin
@@ -3689,7 +3696,7 @@ module tb_rmsnorm;
     run_row(0, 71672, 29, 4848644, 122727, 11);
 
     $display("TB_PROFILE rows=%0d span_cycles=%0d latency_cycles=%0d",
-             4, 4 * 896 * 2, 16);
+             4, span, lat);
     $display("TB_PASS checks=%0d", checks);
     $display("TB_RESULT: PASS");
     $finish;

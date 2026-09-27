@@ -13,6 +13,10 @@ module tb_resadd;
   reg signed [7:0] bs_ [0:214-1];
   reg signed [7:0] ys [0:214-1];
   integer checks = 0, got = 0, i;
+  // Cycles measured, not computed: the profile's cycles_per_unit and
+  // latency come from here.
+  integer cyc = 0, span = 0, t0 = 0, first_out = -1, lat = 0;
+  always @(posedge clk) cyc = cyc + 1;
 
   resadd dut (.clk(clk), .rst_n(rst_n), .a(a), .b(b), .scale_a(scale_a),
               .scale_b(scale_b), .shift(shift), .valid_in(valid_in),
@@ -33,7 +37,9 @@ module tb_resadd;
         $display("TB_RESULT: FAIL");
         $finish;
       end
+      if (got == 0) lat = cyc - t0;
       got = got + 1;
+      span = cyc - t0 + 1;
     end
   end
 
@@ -266,6 +272,7 @@ module tb_resadd;
       end
     end
     rst_n = 1;
+    t0 = cyc + 1;
     for (i = 0; i < 214; i = i + 1) begin
       @(negedge clk);
       a = as_[i]; b = bs_[i]; valid_in = 1;
@@ -282,7 +289,7 @@ module tb_resadd;
       $finish;
     end
     $display("TB_PROFILE elements=%0d span_cycles=%0d latency_cycles=%0d",
-             214, 214 + 214 / 29, 4);
+             214, span, lat);
     $display("TB_PASS checks=%0d", checks);
     $display("TB_RESULT: PASS");
     $finish;

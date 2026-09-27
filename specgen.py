@@ -1097,7 +1097,9 @@ module tb_matvec;
   wire signed [{awm}:0] acc;
   wire mac_vout;
   integer checks = 0, seen = 0, i;
+  integer cyc = 0, t0 = 0, load0 = 0, first_col = -1, last_col = 0;
   reg [255:0] testname;
+  always @(posedge clk) cyc = cyc + 1;
 
   matvec seq (.clk(clk), .rst_n(rst_n), .start(start), .depth(depth),
               .cols(cols), .a_addr(a_addr), .w_addr(w_addr),
@@ -1115,6 +1117,8 @@ module tb_matvec;
     if (rst_n && col_valid) begin
       checks = checks + 1;
       seen = seen + 1;
+      if (first_col < 0) first_col = cyc;
+      last_col = cyc;
       if (acc !== expect_col[col_index]) begin
         $display("TB_FAIL test=%0s col=%0d expected_acc=%0d got_acc=%0d",
                  testname, col_index, expect_col[col_index], acc);
@@ -1138,6 +1142,7 @@ module tb_matvec;
     cols = {cols};
     @(negedge clk);
     start = 1;
+    t0 = cyc;
     @(negedge clk);
     start = 0;
     // Generous bound: depth+drain per column, plus slack.
@@ -1157,8 +1162,9 @@ module tb_matvec;
       $display("TB_RESULT: FAIL");
       $finish;
     end
+    // Measured: start to the last flagged column, and to the first.
     $display("TB_PROFILE columns=%0d span_cycles=%0d latency_cycles=%0d",
-             {cols}, {cols} * {depth}, {depth});
+             {cols}, last_col - t0, first_col - t0);
     $display("TB_PASS checks=%0d", checks);
     $display("TB_RESULT: PASS");
     $finish;
@@ -1317,7 +1323,9 @@ module tb_wmem;
   reg signed [{accwm}:0] expect_col [0:{cols}-1];
   reg signed [{dwm}:0] a_data;
   integer checks = 0, seen = 0, i;
+  integer cyc = 0, t0 = 0, load0 = 0, first_col = -1, last_col = 0;
   reg [255:0] testname;
+  always @(posedge clk) cyc = cyc + 1;
 
   // The activation side stays a simple registered read; the weight side
   // is the generated memory.
@@ -1343,6 +1351,8 @@ module tb_wmem;
     if (rst_n && col_valid) begin
       checks = checks + 1;
       seen = seen + 1;
+      if (first_col < 0) first_col = cyc;
+      last_col = cyc;
       if (acc !== expect_col[col_index]) begin
         $display("TB_FAIL test=%0s col=%0d expected_acc=%0d got_acc=%0d",
                  testname, col_index, expect_col[col_index], acc);
@@ -1381,6 +1391,7 @@ module tb_wmem;
 
     // Stream the tile in, as a host or a DMA engine would.
     load_start = 1;
+    load0 = cyc;
     @(negedge clk);
     load_start = 0;
     for (i = 0; i < {nmem}; i = i + 1) begin
@@ -1403,6 +1414,7 @@ module tb_wmem;
     cols = {cols};
     @(negedge clk);
     start = 1;
+    t0 = cyc;
     @(negedge clk);
     start = 0;
     for (i = 0; i < {cols} * ({depth} + 10) + 60; i = i + 1)
@@ -1414,8 +1426,10 @@ module tb_wmem;
       $display("TB_RESULT: FAIL");
       $finish;
     end
+    // Measured: the whole tile, load start to the last column, and the
+    // compute latency from start to the first column.
     $display("TB_PROFILE tiles=%0d span_cycles=%0d latency_cycles=%0d",
-             1, {nmem}, {depth});
+             1, last_col - load0, first_col - t0);
     $display("TB_PASS checks=%0d", checks);
     $display("TB_RESULT: PASS");
     $finish;
@@ -1659,6 +1673,10 @@ module tb_softmax;
   reg signed [{swm}:0] s_data;
   integer checks = 0, seen = 0, i, j, other, best, dist, own;
   reg [255:0] testname;
+  // Cycles measured, not computed: the profile's cycles_per_unit and
+  // latency come from here.
+  integer cyc = 0, span = 0, t0 = 0, first_out = -1, lat = 0;
+  always @(posedge clk) cyc = cyc + 1;
 
   always @(posedge clk) s_data <= smem[s_addr];
 
@@ -1672,6 +1690,7 @@ module tb_softmax;
     if (rst_n && w_valid) begin
       checks = checks + 1;
       seen = seen + 1;
+      if (first_out < 0) begin first_out = cyc; if (cyc - t0 > lat) lat = cyc - t0; end
       // A weight for an index past the row has no expected value, and
       // comparing against one printed expected_w=x, which a traced agent
       // read as a datapath fault for three drafts running.
@@ -1715,8 +1734,10 @@ module tb_softmax;
       seen = 0;
       n = cnt;
       @(negedge clk); start = 1;
+      t0 = cyc; first_out = -1;
       @(negedge clk); start = 0;
       while (busy) @(negedge clk);
+      span = span + (cyc - t0);
       repeat (4) @(negedge clk);
       checks = checks + 1;
       if (seen !== cnt) begin
@@ -1736,7 +1757,7 @@ module tb_softmax;
 {rows}
 
     $display("TB_PROFILE rows=%0d span_cycles=%0d latency_cycles=%0d",
-             {nrows}, {nrows} * 64, 8);
+             {nrows}, span, lat);
     $display("TB_PASS checks=%0d", checks);
     $display("TB_RESULT: PASS");
     $finish;
@@ -2062,6 +2083,10 @@ module tb_attn;
   reg [255:0] testname;
   reg [15:0] bad_idx [0:7];
   reg signed [{dwm}:0] bad_exp [0:7], bad_got [0:7];
+  // Cycles measured, not computed: the profile's cycles_per_unit and
+  // latency come from here.
+  integer cyc = 0, span = 0, t0 = 0, first_out = -1, lat = 0;
+  always @(posedge clk) cyc = cyc + 1;
 
   always @(posedge clk) begin
     k_data <= kmem[k_addr];
@@ -2081,6 +2106,7 @@ module tb_attn;
     if (rst_n && o_valid) begin
       checks = checks + 1;
       seen = seen + 1;
+      if (first_out < 0) begin first_out = cyc; if (cyc - t0 > lat) lat = cyc - t0; end
       if (o_index >= {hd}) begin
         $display("TB_FAIL test=%0s out=%0d head_dim={hd} expected=no_output_past_head_dim got_o=%0d",
                  testname, o_index, o_data);
@@ -2109,8 +2135,10 @@ module tb_attn;
       @(negedge clk); load_valid = 0;
       n = cnt; shift_s = sh; scale_o = sc; shift_o = so;
       @(negedge clk); start = 1;
+      t0 = cyc; first_out = -1;
       @(negedge clk); start = 0;
       while (busy) @(negedge clk);
+      span = span + (cyc - t0);
       repeat (8) @(negedge clk);
       for (i = 0; i < cnt; i = i + 1) begin
         checks = checks + 1;
@@ -2150,7 +2178,7 @@ module tb_attn;
 {cases}
 
     $display("TB_PROFILE heads=%0d span_cycles=%0d latency_cycles=%0d",
-             {ncases}, {ncases} * {hd} * 2, 16);
+             {ncases}, span, lat);
     $display("TB_PASS checks=%0d", checks);
     $display("TB_RESULT: PASS");
     $finish;
@@ -2386,6 +2414,10 @@ module tb_rmsnorm;
   reg [255:0] testname;
   reg [15:0] bad_idx [0:7];
   reg signed [{dwm}:0] bad_exp [0:7], bad_got [0:7];
+  // Cycles measured, not computed: the profile's cycles_per_unit and
+  // latency come from here.
+  integer cyc = 0, span = 0, t0 = 0, first_out = -1, lat = 0;
+  always @(posedge clk) cyc = cyc + 1;
 
   always @(posedge clk) begin
     x_data <= xmem[x_addr];
@@ -2404,6 +2436,7 @@ module tb_rmsnorm;
     if (rst_n && o_valid) begin
       checks = checks + 1;
       seen = seen + 1;
+      if (first_out < 0) begin first_out = cyc; if (cyc - t0 > lat) lat = cyc - t0; end
       if (o_index >= {D}) begin
         $display("TB_FAIL test=%0s out=%0d d_model={D} expected=no_output_past_the_row got_norm=%0d",
                  testname, o_index, o_data);
@@ -2427,8 +2460,10 @@ module tb_rmsnorm;
       seen = 0; nbad = 0; bad = 0;
       eps = ep; scale_o = sc; shift_o = so;
       @(negedge clk); start = 1;
+      t0 = cyc; first_out = -1;
       @(negedge clk); start = 0;
       while (busy) @(negedge clk);
+      span = span + (cyc - t0);
       repeat (8) @(negedge clk);
       checks = checks + 3;
       if (dut.ssq !== want_ssq) begin
@@ -2461,7 +2496,7 @@ module tb_rmsnorm;
 {cases}
 
     $display("TB_PROFILE rows=%0d span_cycles=%0d latency_cycles=%0d",
-             {ncases}, {ncases} * {D} * 2, 16);
+             {ncases}, span, lat);
     $display("TB_PASS checks=%0d", checks);
     $display("TB_RESULT: PASS");
     $finish;
@@ -2610,6 +2645,10 @@ module tb_silu;
   reg signed [{iwm}:0] xs [0:{n}-1];
   reg signed [{iwm}:0] ys [0:{n}-1];
   integer checks = 0, got = 0, i;
+  // Cycles measured, not computed: the profile's cycles_per_unit and
+  // latency come from here.
+  integer cyc = 0, span = 0, t0 = 0, first_out = -1, lat = 0;
+  always @(posedge clk) cyc = cyc + 1;
 
   silu dut (.clk(clk), .rst_n(rst_n), .x(x), .valid_in(valid_in),
             .y(y), .valid_out(valid_out));
@@ -2630,7 +2669,9 @@ module tb_silu;
         $display("TB_RESULT: FAIL");
         $finish;
       end
+      if (got == 0) lat = cyc - t0;
       got = got + 1;
+      span = cyc - t0 + 1;
     end
   end
 
@@ -2650,6 +2691,7 @@ module tb_silu;
       end
     end
     rst_n = 1;
+    t0 = cyc + 1;
     for (i = 0; i < {n}; i = i + 1) begin
       @(negedge clk);
       x = xs[i]; valid_in = 1;
@@ -2666,7 +2708,7 @@ module tb_silu;
       $finish;
     end
     $display("TB_PROFILE elements=%0d span_cycles=%0d latency_cycles=%0d",
-             {n}, {n} + {n} / 37, 12);
+             {n}, span, lat);
     $display("TB_PASS checks=%0d", checks);
     $display("TB_RESULT: PASS");
     $finish;
@@ -2972,6 +3014,10 @@ module tb_gmlp;
   reg [255:0] testname;
   reg [7:0] bad_idx [0:7];
   reg signed [{dwm}:0] bad_exp [0:7], bad_got [0:7];
+  // Cycles measured, not computed: the profile's cycles_per_unit and
+  // latency come from here.
+  integer cyc = 0, span = 0, t0 = 0, first_out = -1, lat = 0;
+  always @(posedge clk) cyc = cyc + 1;
 
   always @(posedge clk) w_data <= wmem_tb[w_addr];
 
@@ -2989,6 +3035,7 @@ module tb_gmlp;
     if (rst_n && o_valid) begin
       checks = checks + 1;
       seen = seen + 1;
+      if (first_out < 0) begin first_out = cyc; if (cyc - t0 > lat) lat = cyc - t0; end
       if (o_index >= {out}) begin
         $display("TB_FAIL test=%0s out=%0d cols_out={out} expected=no_output_past_cols_out got_gy=%0d",
                  testname, o_index, o_data);
@@ -3021,9 +3068,11 @@ module tb_gmlp;
     scale_h = {sch}; shift_h = {shh}; scale_d = {scd}; shift_d = {shd};
     @(negedge clk);
     start = 1;
+      t0 = cyc; first_out = -1;
     @(negedge clk);
     start = 0;
     while (busy) @(negedge clk);
+      span = span + (cyc - t0);
     repeat (8) @(negedge clk);
     for (i = 0; i < {ff}; i = i + 1) begin
       checks = checks + 1;
@@ -3061,7 +3110,7 @@ module tb_gmlp;
       $finish;
     end
     $display("TB_PROFILE layers=%0d span_cycles=%0d latency_cycles=%0d",
-             1, 2 * {d} * {ff} + {ff} * {out}, 16);
+             1, span, lat);
     $display("TB_PASS checks=%0d", checks);
     $display("TB_RESULT: PASS");
     $finish;
@@ -3217,6 +3266,10 @@ module tb_resadd;
   reg signed [{dwm}:0] bs_ [0:{n}-1];
   reg signed [{dwm}:0] ys [0:{n}-1];
   integer checks = 0, got = 0, i;
+  // Cycles measured, not computed: the profile's cycles_per_unit and
+  // latency come from here.
+  integer cyc = 0, span = 0, t0 = 0, first_out = -1, lat = 0;
+  always @(posedge clk) cyc = cyc + 1;
 
   resadd dut (.clk(clk), .rst_n(rst_n), .a(a), .b(b), .scale_a(scale_a),
               .scale_b(scale_b), .shift(shift), .valid_in(valid_in),
@@ -3237,7 +3290,9 @@ module tb_resadd;
         $display("TB_RESULT: FAIL");
         $finish;
       end
+      if (got == 0) lat = cyc - t0;
       got = got + 1;
+      span = cyc - t0 + 1;
     end
   end
 
@@ -3257,6 +3312,7 @@ module tb_resadd;
       end
     end
     rst_n = 1;
+    t0 = cyc + 1;
     for (i = 0; i < {n}; i = i + 1) begin
       @(negedge clk);
       a = as_[i]; b = bs_[i]; valid_in = 1;
@@ -3273,7 +3329,7 @@ module tb_resadd;
       $finish;
     end
     $display("TB_PROFILE elements=%0d span_cycles=%0d latency_cycles=%0d",
-             {n}, {n} + {n} / 29, 4);
+             {n}, span, lat);
     $display("TB_PASS checks=%0d", checks);
     $display("TB_RESULT: PASS");
     $finish;
@@ -3291,6 +3347,302 @@ def generate_resadd(ms=None, spec_file="spec_resadd.json",
         json.dump(spec, f, indent=2)
     with open(os.path.join(ROOT, tb_file), "w") as f:
         f.write(render_resadd_testbench(spec))
+    return spec
+
+
+# --------------------------------------------------------------------------
+# Projection: y = requant(W x) at full model size, over external memories.
+# --------------------------------------------------------------------------
+
+def derive_proj_spec(ms):
+    """model spec -> full-size projection spec.
+
+    The composite layers hold their activations in 64-entry banks, and a
+    Qwen layer's rows run to d_ff = 4864. Growing those banks is not the
+    answer: a real accelerator keeps activations in SRAM outside the
+    compute and streams them in, exactly as the weights already are here.
+    This block does that. It holds no activation buffer: it reads x and W
+    through registered memory ports sized from the model, so a projection
+    of any size the model has runs through it.
+    """
+    c = derive_chiplet_spec(ms)
+    mv = derive_matvec_spec(ms)
+    rq = derive_requant_spec(ms)
+    dw, aw = c["parameters"]["data_width"], c["parameters"]["acc_width"]
+    dep_w, col_w = mv["parameters"]["depth_width"], mv["parameters"]["col_width"]
+    mva = mv["parameters"]["addr_width"]
+    mw, shw = rq["parameters"]["scale_width"], rq["parameters"]["shift_width"]
+    top = max(ms["d_model"], ms["d_ff"])
+    assert top < 1 << dep_w and top * top < 1 << mva, "projection too large"
+    return {
+        "name": "proj_%s" % ms["name"],
+        "description": "Full-size projection y = requant(W x) over external "
+                       "activation and weight memories, up to %d by %d"
+                       % (top, top),
+        "top_module": "proj",
+        "unit": "projection",
+        "parameters": {
+            "data_width": dw, "acc_width": aw, "depth_width": dep_w,
+            "col_width": col_w, "addr_width": mva, "scale_width": mw,
+            "shift_width": shw,
+            "requant_stages": rq["parameters"]["pipeline_stages"],
+            "max_dim": top, "signed": True, "pipeline_stages": 1,
+            "target_clock_mhz": 100,
+        },
+        "derivation": {
+            "model": ms["name"],
+            "rule": "depth, column and address widths from the matmul "
+                    "sequencer, which is sized from the model's largest "
+                    "dimension; the requantizer from that block",
+        },
+        "ports": [
+            {"name": "clk", "dir": "input", "width": 1,
+             "desc": "clock, rising edge"},
+            {"name": "rst_n", "dir": "input", "width": 1,
+             "desc": "active-low synchronous reset"},
+            {"name": "start", "dir": "input", "width": 1,
+             "desc": "run one projection"},
+            {"name": "depth", "dir": "input", "width": dep_w,
+             "desc": "input length, the reduction depth"},
+            {"name": "cols", "dir": "input", "width": col_w,
+             "desc": "outputs"},
+            {"name": "scale", "dir": "input", "width": mw,
+             "desc": "requantizer scale"},
+            {"name": "shift", "dir": "input", "width": shw,
+             "desc": "requantizer shift"},
+            {"name": "a_addr", "dir": "output", "width": dep_w,
+             "desc": "activation address"},
+            {"name": "a_data", "dir": "input", "width": dw, "signed": True,
+             "desc": "activation, registered read"},
+            {"name": "w_addr", "dir": "output", "width": mva,
+             "desc": "weight address"},
+            {"name": "w_data", "dir": "input", "width": dw, "signed": True,
+             "desc": "weight, registered read"},
+            {"name": "o_valid", "dir": "output", "width": 1,
+             "desc": "an output is on o_data"},
+            {"name": "o_index", "dir": "output", "width": col_w,
+             "desc": "which output"},
+            {"name": "o_data", "dir": "output", "width": dw, "signed": True,
+             "desc": "output activation"},
+            {"name": "busy", "dir": "output", "width": 1,
+             "desc": "a projection is in progress"},
+        ],
+        "behavior": [
+            "start is a one-cycle pulse, with depth, cols, scale and shift "
+            "held stable for the whole projection. busy must be high on the "
+            "clock edge that samples start, so it already reads 1 one cycle "
+            "later, and it stays high until the last output is emitted.",
+            "Activations and weights live outside the block. a_data and "
+            "w_data are registered reads: each carries the element at "
+            "address a on the cycle after a_addr or w_addr = a. Weights are "
+            "column-major: W[c][r] is at c*depth + r.",
+            "y[c] = requant(sum over r in 0..depth-1 of x[r] * W[c][r], "
+            "scale, shift) for c in 0..cols-1. requant is exactly the "
+            "supplied requantizer: multiply by scale, add 2**(shift-1) when "
+            "shift > 0, arithmetic shift right by shift, saturate to [%d, %d]."
+            % (-(1 << (dw - 1)), (1 << (dw - 1)) - 1),
+            "Emit each y[c] with o_index = c and o_valid high for exactly "
+            "that one cycle. Outputs may come in any order, but each index "
+            "exactly once, and o_valid must be low at every other time.",
+            "matvec, mac and requant are separate modules supplied as source "
+            "files, not something to write. Instantiate them with exactly "
+            "these ports, connected by name: "
+            + "; ".join(port_signature(x) for x in (mv, c, rq)) + ".",
+            "matvec walks a_addr 0..depth-1 and w_addr c*depth onward for "
+            "each of cols columns, drives mac_valid one cycle behind the "
+            "address, pulses mac_clear between columns, and pulses "
+            "col_valid with col_index when a column's sum is on the MAC's "
+            "acc: its a_addr and w_addr are exactly this block's. requant "
+            "has a latency of exactly %d cycles."
+            % rq["parameters"]["pipeline_stages"],
+            "All state resets to zero: busy and o_valid are 0 during reset.",
+        ],
+    }
+
+
+_HMASK = (1 << 32) - 1
+
+
+def proj_x(i, seed, dw):
+    """The activation at address i, a hash the testbench computes the same
+    way, so a full-size test needs no initializer per element."""
+    v = ((i * 2246822519 + seed * 97 + 7) & _HMASK) >> 16
+    v &= (1 << dw) - 1
+    return v - (1 << dw) if v >> (dw - 1) else v
+
+
+def proj_w(i, seed, dw):
+    v = ((i * 2654435761 + seed * 131 + 12345) & _HMASK) >> 13
+    v &= (1 << dw) - 1
+    return v - (1 << dw) if v >> (dw - 1) else v
+
+
+def proj_golden(depth, cols, seed, dw, scale, shift):
+    x = [proj_x(r, seed, dw) for r in range(depth)]
+    acc = [sum(x[r] * proj_w(c * depth + r, seed, dw) for r in range(depth))
+           for c in range(cols)]
+    return acc, [requant_golden(a, scale, shift, dw)[0] for a in acc]
+
+
+def render_proj_testbench(spec, cases=None):
+    """Cases are (depth, cols, seed). The default is small, for the flow;
+    tests.py renders one at the model's full size.
+
+    The depth-3 case is there because a column takes depth + 3 cycles, and
+    only when that is shorter than the requantizer's latency does an output
+    index taken at the wrong moment land under a different column. Without
+    it a design with exactly that bug passed every case.
+
+    The last case reaches past half the weight address width. The small
+    ones stop at address 4000, so a design that dropped the address's top
+    bits passed them: mutation testing found it on the int4 variant, where
+    the 26-bit address is the widest vector and halving it went unseen.
+    """
+    p = spec["parameters"]
+    if cases is None:
+        dwide = min(p["max_dim"], 128)
+        cwide = min(p["max_dim"], (1 << (p["addr_width"] // 2 + 1)) // dwide + 1)
+        cases = ((16, 8, 1), (100, 40, 2), (7, 130, 3), (3, 60, 4),
+                 (dwide, cwide, 5))
+    dw, mw, sw_o = p["data_width"], p["scale_width"], p["shift_width"]
+    body, maxc = [], max(c for _, c, _ in cases)
+    for depth, cols, seed in cases:
+        acc, _ = proj_golden(depth, cols, seed, dw, 1, 0)
+        sc, sh = _mlp_scale(acc, dw, mw, sw_o)
+        _, y = proj_golden(depth, cols, seed, dw, sc, sh)
+        body.append("    // depth %d, cols %d" % (depth, cols))
+        for c, v in enumerate(y):
+            body.append("    expect_y[%d] = %s;" % (c, _slit(v, dw)))
+        body.append("    run_proj(%d, %d, %d, %d, %d);"
+                    % (depth, cols, seed, sc, sh))
+    return PROJ_TB.format(
+        dwm=dw - 1, depwm=p["depth_width"] - 1, colwm=p["col_width"] - 1,
+        addrwm=p["addr_width"] - 1, mwm=mw - 1, swm=sw_o - 1, maxc=maxc,
+        dw=dw, cases="\n".join(body), ncases=len(cases))
+
+
+PROJ_TB = """`timescale 1ns/1ps
+// GENERATED by specgen.py: do not edit by hand.
+// Testbench for the full-size projection. Activations and weights are a
+// hash of their address, computed here and in specgen.proj_x/proj_w the
+// same way, so a projection of any size needs no memory initializer.
+module tb_proj;
+  reg clk = 0, rst_n = 0, start = 0;
+  reg [{depwm}:0] depth = 0;
+  reg [{colwm}:0] cols = 0;
+  reg [{mwm}:0] scale = 0;
+  reg [{swm}:0] shift = 0;
+  reg [31:0] seed = 0;
+  wire [{depwm}:0] a_addr;
+  wire [{addrwm}:0] w_addr;
+  wire o_valid, busy;
+  wire [{colwm}:0] o_index;
+  wire signed [{dwm}:0] o_data;
+  reg signed [{dwm}:0] a_data, w_data;
+  reg signed [{dwm}:0] expect_y [0:{maxc}-1];
+  reg [{maxc}-1:0] seen_bits;
+  integer checks = 0, seen = 0, nbad = 0;
+  reg [255:0] testname;
+  // Cycles measured, not computed: the profile's cycles_per_unit and
+  // latency come from here.
+  integer cyc = 0, span = 0, t0 = 0, first_out = -1, lat = 0;
+  always @(posedge clk) cyc = cyc + 1;
+
+  function signed [{dwm}:0] hx(input [31:0] i, input [31:0] s);
+    reg [31:0] h;
+    begin
+      h = i * 32'd2246822519 + s * 32'd97 + 32'd7;
+      hx = h[16 + {dw} - 1:16];
+    end
+  endfunction
+  function signed [{dwm}:0] hw(input [31:0] i, input [31:0] s);
+    reg [31:0] h;
+    begin
+      h = i * 32'd2654435761 + s * 32'd131 + 32'd12345;
+      hw = h[13 + {dw} - 1:13];
+    end
+  endfunction
+
+  always @(posedge clk) begin
+    a_data <= hx(a_addr, seed);
+    w_data <= hw(w_addr, seed);
+  end
+
+  proj dut (.clk(clk), .rst_n(rst_n), .start(start), .depth(depth),
+            .cols(cols), .scale(scale), .shift(shift), .a_addr(a_addr),
+            .a_data(a_data), .w_addr(w_addr), .w_data(w_data),
+            .o_valid(o_valid), .o_index(o_index), .o_data(o_data),
+            .busy(busy));
+
+  always #5 clk = ~clk;
+
+  always @(posedge clk) begin
+    if (rst_n && o_valid) begin
+      checks = checks + 1;
+      seen = seen + 1;
+      if (first_out < 0) begin first_out = cyc; if (cyc - t0 > lat) lat = cyc - t0; end
+      if (o_index >= cols || seen_bits[o_index]) begin
+        $display("TB_FAIL test=%0s out=%0d cols=%0d expected=each_index_once got_proj=%0d",
+                 testname, o_index, cols, o_data);
+        $display("TB_RESULT: FAIL");
+        $finish;
+      end
+      seen_bits[o_index] = 1'b1;
+      if (o_data !== expect_y[o_index] && nbad < 4) begin
+        $display("TB_FAIL test=%0s out=%0d expected_proj=%0d got_proj=%0d",
+                 testname, o_index, expect_y[o_index], o_data);
+        nbad = nbad + 1;
+      end
+    end
+  end
+
+  task run_proj(input integer d, input integer c, input integer s,
+                input integer sc, input integer sh);
+    begin
+      seen = 0; nbad = 0; seen_bits = 0;
+      depth = d; cols = c; seed = s; scale = sc; shift = sh;
+      @(negedge clk); start = 1;
+      t0 = cyc; first_out = -1;
+      @(negedge clk); start = 0;
+      while (busy) @(negedge clk);
+      span = span + (cyc - t0);
+      repeat (8) @(negedge clk);
+      checks = checks + 1;
+      if (!nbad && seen !== c)
+        $display("TB_FAIL test=%0s out=0 expected_count=%0d got_count=%0d",
+                 testname, c, seen);
+      if (nbad || seen !== c) begin
+        $display("TB_RESULT: FAIL");
+        $finish;
+      end
+    end
+  endtask
+
+  initial begin
+    testname = "projection";
+    repeat (3) @(negedge clk);
+    rst_n = 1;
+    @(negedge clk);
+{cases}
+
+    $display("TB_PROFILE projections=%0d span_cycles=%0d latency_cycles=%0d",
+             {ncases}, span, lat);
+    $display("TB_PASS checks=%0d", checks);
+    $display("TB_RESULT: PASS");
+    $finish;
+  end
+endmodule
+"""
+
+
+def generate_proj(ms=None, spec_file="spec_proj.json", tb_file="tb_proj.v"):
+    """Write the derived projection spec and its small testbench."""
+    ms = ms or load_model_spec()
+    spec = derive_proj_spec(ms)
+    with open(os.path.join(ROOT, spec_file), "w") as f:
+        json.dump(spec, f, indent=2)
+    with open(os.path.join(ROOT, tb_file), "w") as f:
+        f.write(render_proj_testbench(spec))
     return spec
 
 def requant_golden(acc, scale, sh, out_width):
@@ -3564,6 +3916,10 @@ module tb_mlp;
   integer nbad = 0, hbad = 0;
   reg [7:0] bad_idx [0:7];
   reg signed [{dwm}:0] bad_exp [0:7], bad_got [0:7];
+  // Cycles measured, not computed: the profile's cycles_per_unit and
+  // latency come from here.
+  integer cyc = 0, span = 0, t0 = 0, first_out = -1, lat = 0;
+  always @(posedge clk) cyc = cyc + 1;
   reg signed [{dwm}:0] w_data;
   integer checks = 0, seen = 0, i;
   reg [255:0] testname;
@@ -3583,6 +3939,7 @@ module tb_mlp;
     if (rst_n && o_valid) begin
       checks = checks + 1;
       seen = seen + 1;
+      if (first_out < 0) begin first_out = cyc; if (cyc - t0 > lat) lat = cyc - t0; end
       if (o_index >= {c2}) begin
         $display("TB_FAIL test=%0s out=%0d cols2=%0d expected=no_output_past_cols2 got_y=%0d",
                  testname, o_index, {c2}, o_data);
@@ -3616,9 +3973,11 @@ module tb_mlp;
     scale1 = {sc1}; shift1 = {sh1}; scale2 = {sc2}; shift2 = {sh2};
     @(negedge clk);
     start = 1;
+      t0 = cyc; first_out = -1;
     @(negedge clk);
     start = 0;
     while (busy) @(negedge clk);
+      span = span + (cyc - t0);
     repeat (8) @(negedge clk);
     // Whitebox check of the hidden layer, which the spec places in act at
     // {bank}..{bank}+cols1-1. Reported before the outputs because it is
@@ -3647,7 +4006,7 @@ module tb_mlp;
       $finish;
     end
     $display("TB_PROFILE layers=%0d span_cycles=%0d latency_cycles=%0d",
-             1, {d1} * {c1} + {c1} * {c2}, 16);
+             1, span, lat);
     $display("TB_PASS checks=%0d", checks);
     $display("TB_RESULT: PASS");
     $finish;

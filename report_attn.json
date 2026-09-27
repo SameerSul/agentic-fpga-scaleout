@@ -256,10 +256,10 @@
         "mismatches": [],
         "throughput": {
           "heads": 4,
-          "span_cycles": 512,
-          "latency_cycles": 16,
+          "span_cycles": 7208,
+          "latency_cycles": 2954,
           "units": 4,
-          "cycles_per_unit": 128.0
+          "cycles_per_unit": 1802.0
         }
       },
       "synth": {

@@ -12,6 +12,10 @@ module tb_silu;
   reg signed [12:0] xs [0:314-1];
   reg signed [12:0] ys [0:314-1];
   integer checks = 0, got = 0, i;
+  // Cycles measured, not computed: the profile's cycles_per_unit and
+  // latency come from here.
+  integer cyc = 0, span = 0, t0 = 0, first_out = -1, lat = 0;
+  always @(posedge clk) cyc = cyc + 1;
 
   silu dut (.clk(clk), .rst_n(rst_n), .x(x), .valid_in(valid_in),
             .y(y), .valid_out(valid_out));
@@ -32,7 +36,9 @@ module tb_silu;
         $display("TB_RESULT: FAIL");
         $finish;
       end
+      if (got == 0) lat = cyc - t0;
       got = got + 1;
+      span = cyc - t0 + 1;
     end
   end
 
@@ -365,6 +371,7 @@ module tb_silu;
       end
     end
     rst_n = 1;
+    t0 = cyc + 1;
     for (i = 0; i < 314; i = i + 1) begin
       @(negedge clk);
       x = xs[i]; valid_in = 1;
@@ -381,7 +388,7 @@ module tb_silu;
       $finish;
     end
     $display("TB_PROFILE elements=%0d span_cycles=%0d latency_cycles=%0d",
-             314, 314 + 314 / 37, 12);
+             314, span, lat);
     $display("TB_PASS checks=%0d", checks);
     $display("TB_RESULT: PASS");
     $finish;

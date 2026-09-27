@@ -1,15 +1,16 @@
 # What is verified, and what is not
 
-Last run 2026-09-25. Every number here came from a command in this repo, and
+Last run 2026-09-27. Every number here came from a command in this repo, and
 every command is named so it can be re-run.
 
 ## Short answer
 
-The flow turns a model spec into signed-off RTL for fifteen generated
+The flow turns a model spec into signed-off RTL for sixteen generated
 blocks, which now cover every operation in a Qwen layer: attention,
-RMSNorm, SiLU, the gated MLP and the residual add among them. An LLM has
-written and signed off every block but those five newest through the
-same gates, and the multiply-accumulate unit's accumulator is formally proved
+RMSNorm, SiLU, the gated MLP and the residual add among them, and one
+projection runs at the model's full size, 896 by 4864, bit-exact on every
+output. An LLM has written and signed off every block but the six newest
+through the same gates, and the multiply-accumulate unit's accumulator is formally proved
 never to overflow, for any input sequence, on the int8 targets. A trained
 language model decodes through the blocks' exact arithmetic and emits
 text. It still does not host a local LLM the way Architect Labs does:
@@ -22,7 +23,7 @@ The remaining gap is listed at the bottom rather than glossed over.
 ### The full suite
 
 ```
-python3 tests.py            # 309 tests, or 307 without OpenSTA
+python3 tests.py            # 312 tests, or 310 without OpenSTA
 ```
 
 ### Spec to RTL, across the spec space
@@ -381,6 +382,7 @@ Qwen2.5-0.5B:
 | SiLU | not yet attempted | | |
 | gated MLP | not yet attempted | | |
 | residual add | not yet attempted | | |
+| full-size projection | not yet attempted | | |
 
 Every block the flow generated before the attention head has been
 written and signed off by an LLM through all four gates. The attention
@@ -587,6 +589,72 @@ had been hiding. Both streaming testbenches checked valid_out once,
 after three idle cycles; a three-stage pipeline has flushed by then with
 no reset at all. They now check it from the first cycle of reset.
 
+## A projection at full size
+
+Every composite layer block holds its activations in a 64-entry bank, so
+until now no block had run a matrix at the size the model actually has.
+A Qwen2.5-0.5B layer's up projection is 896 by 4864. Growing the banks is
+not the answer: a real accelerator keeps activations in SRAM outside the
+compute and streams them in, as the weights already are here. The
+projection block does that. It holds no activation buffer; it drives
+matvec, the MAC and the requantizer over registered activation and weight
+memory ports sized from the model's largest dimension, and labels each
+output with its column index, carried through the requantizer's pipeline
+alongside the value.
+
+`tests.py` runs the full 896 by 4864 projection, 4,358,144
+multiply-accumulates, and checks all 4864 outputs against the Python
+golden: bit-exact, in 34 s of simulation. The testbench computes both
+operands from a hash of the address, so it needs no per-element
+initializer and a full-size case costs no more to write than a small
+one. 115 MHz on Qwen2.5-0.5B, 3369 LUTs and 17 DSPs.
+
+The seeded first cut labels each result with matvec's current column
+index, which by the time the requantizer finishes belongs to the next
+column. On a long reduction the next column has not started yet, so the
+label happens to be right; the testbench includes a reduction shorter
+than the requantizer's pipeline, and the bug fails there.
+
+Mutation testing found a hole in the first version of that testbench.
+On the int4 variant the widest vector in the design is the 26-bit weight
+address, not the accumulator, and halving it survived: no case reached
+address 8192, so the address's top bits were never exercised outside the
+full-size test. The flow's testbench now ends with a case sized to reach
+past half the address width on every variant.
+
+## Cycle counts are measured, not assumed
+
+The sequencing blocks' profiles used to report cycle counts the
+testbench computed from a formula, not ones it counted. They were close
+for the streaming blocks and far off for the layer blocks: the attention
+head reported 128 cycles per head and a 16-cycle latency, and measures
+1802 and 2954. Every sequencing testbench now counts clock edges from
+start to the last output and to the first, and the profile carries what
+it counted:
+
+| block | unit | was | measured | latency was | measured |
+|---|---|---|---|---|---|
+| attention head | head | 128 | 1802 | 16 | 2954 |
+| RMSNorm | norm | 1792 | 1818 | 16 | 923 |
+| gated MLP | layer | 126 | 269 | 16 | 225 |
+| MLP layer | layer | 78 | 158 | 16 | 113 |
+| softmax | row | 64 | 52.3 | 8 | 143 |
+| matmul sequencer | column | 68 | 73 | 68 | 74 |
+| weight tile | tile | 1024 | 2132 | 64 | 69 |
+| SiLU | element | 1.03 | 1.05 | | |
+| residual add | element | 1.03 | 1.06 | | |
+
+The matmul sequencer's five extra cycles per column are real overhead
+the formula hid. The weight tile's unit is now the whole tile, loading
+it and computing over it, where before it was the load alone. The
+tokens/s predictions do not move: the sizing model reads only the MAC's
+and the link endpoint's profiles, and both were already measured. The four
+pipelined units (exp, recip, rsqrt, requant) still print their
+testbench's pacing. Their latency is exact, since each check requires
+valid_out high on precisely that cycle, but their cycles per input is the
+testbench feeding one input at a time and waiting, not the unit's
+throughput.
+
 ## Formal proof: the accumulator cannot overflow
 
 The accumulator width comes from a closed-form rule, and until now every
@@ -652,15 +720,16 @@ These are the distance between this repo and a local LLM host.
    a matrix, the weight tile and its loader, softmax as a single
    sequenced block, an MLP layer that drives two matmuls in order
    and routes the activations between them, and one attention head over
-   a KV cache, and RMSNorm. Softmax is hardware apart from
+   a KV cache, RMSNorm, and a projection at the model's full size over
+   external memories. Softmax is hardware apart from
    accumulating the sum. Every per-layer operation is now a generated
    block, the residual add included, but nothing yet runs a whole
-   layer: the tiling of real matrices and the sequencing of heads and
-   layers are still on the host. Qwen's MLP is the gated block,
+   layer: the sequencing of heads and layers is still on the host. Qwen's MLP is the gated block,
    down(SiLU(gate(x)) * up(x)); the older MLP block, two matmuls with a
-   ReLU, is not Qwen's and remains as the simpler case. The weight
-   tile holds 1024 entries and the activation bank 64, so a real matrix
-   needs tiling logic that does not exist yet. In `generate.py` those run on the host, and the
+   ReLU, is not Qwen's and remains as the simpler case. The composite
+   layer blocks still hold 64-entry activation banks; only the
+   projection block streams activations from memory at full size, and
+   the attention and MLP blocks have not been moved onto it. In `generate.py` those run on the host, and the
    output says so each run.
 3. **The model is small and its weights are its own.** Qwen3-0.6B is not
    loaded; there is no numeric stack here to load it with and no network

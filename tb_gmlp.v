@@ -28,6 +28,10 @@ module tb_gmlp;
   reg [255:0] testname;
   reg [7:0] bad_idx [0:7];
   reg signed [7:0] bad_exp [0:7], bad_got [0:7];
+  // Cycles measured, not computed: the profile's cycles_per_unit and
+  // latency come from here.
+  integer cyc = 0, span = 0, t0 = 0, first_out = -1, lat = 0;
+  always @(posedge clk) cyc = cyc + 1;
 
   always @(posedge clk) w_data <= wmem_tb[w_addr];
 
@@ -45,6 +49,7 @@ module tb_gmlp;
     if (rst_n && o_valid) begin
       checks = checks + 1;
       seen = seen + 1;
+      if (first_out < 0) begin first_out = cyc; if (cyc - t0 > lat) lat = cyc - t0; end
       if (o_index >= 5) begin
         $display("TB_FAIL test=%0s out=%0d cols_out=5 expected=no_output_past_cols_out got_gy=%0d",
                  testname, o_index, o_data);
@@ -221,9 +226,11 @@ module tb_gmlp;
     scale_h = 101183; shift_h = 23; scale_d = 79770; shift_d = 24;
     @(negedge clk);
     start = 1;
+      t0 = cyc; first_out = -1;
     @(negedge clk);
     start = 0;
     while (busy) @(negedge clk);
+      span = span + (cyc - t0);
     repeat (8) @(negedge clk);
     for (i = 0; i < 6; i = i + 1) begin
       checks = checks + 1;
@@ -261,7 +268,7 @@ module tb_gmlp;
       $finish;
     end
     $display("TB_PROFILE layers=%0d span_cycles=%0d latency_cycles=%0d",
-             1, 2 * 8 * 6 + 6 * 5, 16);
+             1, span, lat);
     $display("TB_PASS checks=%0d", checks);
     $display("TB_RESULT: PASS");
     $finish;

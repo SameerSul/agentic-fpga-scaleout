@@ -172,10 +172,10 @@
         "mismatches": [],
         "throughput": {
           "columns": 122,
-          "span_cycles": 8296,
-          "latency_cycles": 68,
+          "span_cycles": 8906,
+          "latency_cycles": 74,
           "units": 122,
-          "cycles_per_unit": 68.0
+          "cycles_per_unit": 73.0
         }
       },
       "synth": {
