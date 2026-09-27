@@ -122,7 +122,16 @@ def derive_chiplet_spec(ms):
             "a %s multiply and the product must be sign-extended into the "
             "accumulator." % (("signed two's complement", "signed") if signed
                               else ("unsigned", "unsigned")),
-        ],
+        ] + ([
+            # The accumulator is sized for the quantized widths, not the
+            # port width. The formal proof found that with int4 weights on
+            # an 8-bit port, a full-range value on b overflows it, so the
+            # range the rule depends on is stated rather than implied.
+            "a carries %d-bit activations and b carries %d-bit weights, "
+            "sign-extended to the %d-bit ports. The accumulator width "
+            "depends on those ranges: a wider value on either port can "
+            "overflow it." % (ab, wb, dw)
+        ] if (wb < dw or ab < dw) else []),
     }
 
 

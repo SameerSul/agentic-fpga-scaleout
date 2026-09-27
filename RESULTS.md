@@ -5,19 +5,22 @@ every command is named so it can be re-run.
 
 ## Short answer
 
-The flow turns a model spec into signed-off RTL for three generated blocks,
-and a trained language model now decodes through those blocks' exact
-arithmetic and emits text. It still does not host a local LLM the way
-Architect Labs does: nothing has been put on a board, and the generated
-blocks are the arithmetic of an inference engine rather than the whole of
-one. The remaining gap is listed at the bottom rather than glossed over.
+The flow turns a model spec into signed-off RTL for ten generated blocks.
+An LLM has written and signed off every one of them through the same
+gates, and the multiply-accumulate unit's accumulator is formally proved
+never to overflow, for any input sequence, on the int8 targets. A trained
+language model decodes through the blocks' exact arithmetic and emits
+text. It still does not host a local LLM the way Architect Labs does:
+nothing in this repo has been put on a board, and the generated blocks
+are the arithmetic of an inference engine rather than the whole of one.
+The remaining gap is listed at the bottom rather than glossed over.
 
 ## Verified
 
 ### The full suite
 
 ```
-python3 tests.py            # 201 tests, or 199 without OpenSTA
+python3 tests.py            # 290 tests, or 288 without OpenSTA
 ```
 
 ### Spec to RTL, across the spec space
@@ -469,6 +472,50 @@ The deterministic agent is still what generated the committed RTL, and
 it is still the right default for anyone who wants hardware reproducibly
 and offline. The LLM path is no longer only a demonstration of the loop.
 
+## Formal proof: the accumulator cannot overflow
+
+The accumulator width comes from a closed-form rule, and until now every
+check of it was a testbench driving some vectors. `formal.py` proves it
+for all of them. A wrapper keeps the exact sum of the products the MAC is
+given, in a register two bits wider than the accumulator, and counts the
+accumulations since the last clear. It assumes at most the reduction
+depth of them per clear and operands within their quantized ranges, and
+proves by k-induction with yosys-smtbmc and z3 that the sum always fits
+and that `acc` always equals it.
+
+```
+python3 formal.py
+```
+
+| variant | depth | acc bits | result |
+|---|---|---|---|
+| Qwen2.5-0.5B, int8 | 4864 | 29 | proved |
+| Qwen3-0.6B, int8 | 3072 | 28 | proved |
+| int4 weights | 4864 | 25 | proved |
+| tiny model | 256 | 24 | proved |
+| 16-bit operands (two variants) | 11008, 8192 | 46, 37 | not proved: timeout |
+
+It is stated on the spec's ports, so it applies to whoever wrote the RTL:
+the MAC Haiku wrote in one draft is proved by the same run. And it can
+fail: it rejects a truncated accumulator, a width two bits under the
+rule, and six of the other seven mutation operators that apply.
+
+It found three things.
+
+- **The rule is one bit conservative unless the depth is a power of
+  two.** It rounds log2(depth) up. At depth 4864 the worst case is
+  4864 x 2^14, which fits 28 signed bits, and the proof holds at 28 and
+  fails at 27. At depth 8192 the rule is exact: 29 holds, 28 fails. Safe
+  either way; the rule is left as it is.
+- **The rule depends on an operand range the spec never stated.** With
+  int4 weights the accumulator is sized for 4-bit weights, but the weight
+  port is 8 bits wide, and the proof produced a counterexample with a
+  full-range value on it. The MAC spec now states the range wherever a
+  quantization is narrower than its port.
+- **It cannot see a flipped clock edge.** The formal model advances every
+  flop once per step whichever edge it is written on. The testbench's
+  edge-discipline check covers that one.
+
 ## Not verified, and not claimed
 
 These are the distance between this repo and a local LLM host.
@@ -504,6 +551,12 @@ These are the distance between this repo and a local LLM host.
    model checked against a fabric simulation, agreeing within 15% and at
    ratio 1.00 on the current configuration. Both are models. Neither is a
    board.
+
+5. **Formal coverage is one property of one block.** The accumulator
+   proof holds for the int8 targets; with 16-bit operands the MAC splits
+   its multiplier, the proof becomes multiplier equivalence, and z3 runs
+   out of time. Those variants rest on the closed-form bound, the
+   testbenches and mutation testing. No other block has a formal proof.
 
 Item 1 is the one that would let this claim what Architect Labs
 demonstrated, and it is blocked on tooling rather than on design. Items 2

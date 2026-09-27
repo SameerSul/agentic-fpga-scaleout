@@ -1462,6 +1462,74 @@ def test_hung_simulation_is_feedback_not_a_crash():
           and 'never finished' in r['errors'][0])
 
 
+def test_accumulator_overflow_proof():
+    """The accumulator width rule, proved for every input sequence rather
+    than tested on some. formal.py wraps the MAC in an exact wider sum
+    and a count of accumulations, assumes at most the reduction depth of
+    them per clear, and proves by k-induction that the sum always fits
+    and that acc always equals it.
+
+    A proof that cannot fail proves nothing, so this also checks that it
+    does fail: on a truncated accumulator, and on a width two bits
+    narrower than the rule. And it pins what the proof found about the
+    rule itself: exact when the depth is a power of two, one bit
+    conservative otherwise.
+    """
+    import copy
+    import formal
+    import agent as agent_m
+    if not formal.available():
+        print('%-55s %s' % ('accumulator proof (needs yosys-smtbmc, z3)',
+                            'SKIP'))
+        return
+    import sweep as sweep_mod
+    fixes = {getattr(agent_m, n) for n in dir(agent_m) if n.startswith('FIX_')}
+    ref = agent_m.RuleBasedAgent()
+    work = os.path.join(ROOT, 'build_formaltest')
+    os.makedirs(work, exist_ok=True)
+
+    def prove(spec, rtl_text=None):
+        rtl = os.path.join(work, 'mac.v')
+        with open(rtl, 'w') as f:
+            f.write(rtl_text if rtl_text is not None
+                    else ref.render_mac(spec, fixes))
+        return formal.prove_mac(spec, rtl, work)['status']
+
+    try:
+        for ms in sweep_mod._models(load_model_spec()):
+            spec = derive_chiplet_spec(ms)
+            # 16-bit operands put a split multiplier against a*b, which is
+            # multiplier equivalence and past z3's budget here. Those are
+            # not claimed as proved; the int8 targets are.
+            if spec['parameters']['data_width'] > 8:
+                continue
+            check('accumulator cannot overflow, proved (%s)' % ms['name'],
+                  prove(spec) == 'proved')
+        spec = derive_chiplet_spec(load_model_spec())
+        import dv
+        trunc = dv.mut_trunc(ref.render_mac(spec, fixes))
+        check('the proof fails on a truncated accumulator',
+              prove(spec, trunc) == 'failed')
+        narrow = copy.deepcopy(spec)
+        narrow['parameters']['acc_width'] -= 2
+        check('the proof fails two bits below the rule',
+              prove(narrow) == 'failed')
+        # Depth 4864 is not a power of two: the rule rounds log2 up.
+        one = copy.deepcopy(spec)
+        one['parameters']['acc_width'] -= 1
+        check('the rule is one bit conservative at depth %d, proved'
+              % spec['derivation']['reduction_depth'],
+              prove(one) == 'proved')
+        pow2 = dict(load_model_spec(), d_model=896, d_ff=8192)
+        exact = derive_chiplet_spec(pow2)
+        tight = copy.deepcopy(exact)
+        tight['parameters']['acc_width'] -= 1
+        check('the rule is exact at a power-of-two depth, proved',
+              prove(exact) == 'proved' and prove(tight) == 'failed')
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
 def test_fpga_backend(profile, fp):
     """Real device mapping, not generic cells: the two generated blocks land
     on different resources, which is what makes a single capacity proxy
@@ -1713,6 +1781,7 @@ if __name__ == '__main__':
     test_sequencer_specs_are_implementable()
     test_compile_errors_quote_the_source_line()
     test_hung_simulation_is_feedback_not_a_crash()
+    test_accumulator_overflow_proof()
     test_generation()
     test_bitstream()
     test_fit_monotonic(profile)
