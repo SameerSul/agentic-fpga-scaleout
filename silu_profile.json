@@ -1,0 +1,48 @@
+{
+  "block": "silu_qwen2_5_0p5b",
+  "top_module": "silu",
+  "unit": "element",
+  "cycles_per_element": 1.0254777070063694,
+  "latency_cycles": 12,
+  "cell_count": 11935,
+  "area": 24109.0,
+  "fmax_estimate_mhz": 120.48192771084337,
+  "fmax_method": "opensta_slack",
+  "target_clock_mhz": 100,
+  "sim_checks_passed": 316,
+  "fpga": {
+    "family": "xcup",
+    "luts": 1471,
+    "ffs": 675,
+    "dsps": 5,
+    "brams": 0,
+    "urams": 0,
+    "carry": 32,
+    "muxf": 532
+  },
+  "derivation": {
+    "model": "qwen2_5_0p5b",
+    "exp": {
+      "in_width": 13,
+      "in_frac": 8,
+      "out_width": 16,
+      "out_frac": 15,
+      "lut_bits": 8,
+      "signed": true,
+      "pipeline_stages": 3,
+      "target_clock_mhz": 100
+    },
+    "recip": {
+      "in_width": 26,
+      "out_width": 17,
+      "lut_bits": 8,
+      "shift_bias": 42,
+      "signed": false,
+      "pipeline_stages": 3,
+      "target_clock_mhz": 100
+    },
+    "rule": "input and output format from the exponential unit's score format; sigmoid through that unit and the reciprocal"
+  },
+  "pointwise": "silu_qwen2_5_0p5b",
+  "agent": "RuleBasedAgent"
+}

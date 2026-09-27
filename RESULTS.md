@@ -5,9 +5,10 @@ every command is named so it can be re-run.
 
 ## Short answer
 
-The flow turns a model spec into signed-off RTL for twelve generated
-blocks, an attention head and RMSNorm now among them. An LLM has written
-and signed off every block but those two newest through the same gates, and the multiply-accumulate unit's accumulator is formally proved
+The flow turns a model spec into signed-off RTL for thirteen generated
+blocks, an attention head, RMSNorm and SiLU now among them. An LLM has
+written and signed off every block but those three newest through the
+same gates, and the multiply-accumulate unit's accumulator is formally proved
 never to overflow, for any input sequence, on the int8 targets. A trained
 language model decodes through the blocks' exact arithmetic and emits
 text. It still does not host a local LLM the way Architect Labs does:
@@ -20,7 +21,7 @@ The remaining gap is listed at the bottom rather than glossed over.
 ### The full suite
 
 ```
-python3 tests.py            # 300 tests, or 298 without OpenSTA
+python3 tests.py            # 303 tests, or 301 without OpenSTA
 ```
 
 ### Spec to RTL, across the spec space
@@ -376,6 +377,7 @@ Qwen2.5-0.5B:
 | MLP layer | converged | 3 | Haiku |
 | attention head | not converged | 8 | Haiku |
 | RMSNorm | not yet attempted | | |
+| SiLU | not yet attempted | | |
 
 Every block the flow generated before the attention head has been
 written and signed off by an LLM through all four gates. The attention
@@ -534,6 +536,19 @@ At 16-bit operands the product is 50 bits wide and missed timing by
 1.54 ns as one multiply; splitting both factors into four partial
 products closes it on every variant.
 
+## SiLU
+
+The nonlinearity in Qwen's gated MLP, x * sigmoid(x), built from two
+units that already exist. With a = |x| and e = exp(-a), which the
+exponential handles because its argument is non-positive, sigmoid(x) is
+1/(1+e) for x >= 0 and e/(1+e) for x < 0, and the reciprocal supplies
+the division. It streams one element per cycle at 120 MHz. Against float
+SiLU on all 8192 inputs of its Q4.8 format the worst error is 0.018,
+under a seventh of an int8 step at typical activation scales, and it
+comes from the reciprocal table amplified by x near 5. The seeded first
+cut takes the positive-x numerator for every x, which is right for half
+the range, and the testbench catches it at x = -1.
+
 ## Formal proof: the accumulator cannot overflow
 
 The accumulator width comes from a closed-form rule, and until now every
@@ -604,9 +619,9 @@ These are the distance between this repo and a local LLM host.
    adds, the tiling of real matrices, and the sequencing of heads and
    layers are still on the host. And the MLP block is not Qwen's MLP:
    Qwen's is gated, down(SiLU(gate(x)) * up(x)) over three projections,
-   where this one is two matmuls with a ReLU between. The routing is
-   the same kind of problem; the SiLU and the elementwise product are
-   not generated yet. The weight
+   where this one is two matmuls with a ReLU between. SiLU is now
+   generated; the gated sequencer that runs three projections and the
+   elementwise product is not yet. The weight
    tile holds 1024 entries and the activation bank 64, so a real matrix
    needs tiling logic that does not exist yet. In `generate.py` those run on the host, and the
    output says so each run.

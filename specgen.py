@@ -2481,6 +2481,204 @@ def generate_rmsnorm(ms=None, spec_file="spec_rmsnorm.json",
         f.write(render_rmsnorm_testbench(spec))
     return spec
 
+
+# --------------------------------------------------------------------------
+# SiLU: x * sigmoid(x), from the exponential and the reciprocal.
+# --------------------------------------------------------------------------
+
+def derive_silu_spec(ms):
+    """model spec -> SiLU unit spec.
+
+    Qwen's MLP is gated, down(SiLU(gate(x)) * up(x)), and SiLU is the one
+    nonlinearity in it. It needs nothing new: with a = |x| and
+    e = exp(-a), which the exponential unit handles because its argument
+    is non-positive, sigmoid(x) is 1/(1+e) for x >= 0 and e/(1+e) for
+    x < 0, and the reciprocal unit supplies the division.
+    """
+    e = derive_exp_spec(ms)
+    r = derive_recip_spec(ms)
+    iw, fi = e["parameters"]["in_width"], e["parameters"]["in_frac"]
+    wf = e["parameters"]["out_frac"]
+    return {
+        "name": "silu_%s" % ms["name"],
+        "description": "Streaming SiLU, x * sigmoid(x), on Q%d.%d in and out, "
+                       "built from the exponential and reciprocal units"
+                       % (iw - 1 - fi, fi),
+        "top_module": "silu",
+        "unit": "element",
+        "parameters": {
+            "width": iw, "frac": fi, "weight_frac": wf,
+            "recip_in_width": r["parameters"]["in_width"],
+            "recip_out_width": r["parameters"]["out_width"],
+            "shift_bias": r["parameters"]["shift_bias"],
+            "recip_k_width": [q["width"] for q in r["ports"]
+                              if q["name"] == "k"][0],
+            "signed": True, "pipeline_stages": 1,
+            "target_clock_mhz": 100,
+        },
+        "derivation": {
+            "model": ms["name"],
+            "exp": e["parameters"], "recip": r["parameters"],
+            "rule": "input and output format from the exponential unit's "
+                    "score format; sigmoid through that unit and the "
+                    "reciprocal",
+        },
+        "ports": [
+            {"name": "clk", "dir": "input", "width": 1,
+             "desc": "clock, rising edge"},
+            {"name": "rst_n", "dir": "input", "width": 1,
+             "desc": "active-low synchronous reset"},
+            {"name": "x", "dir": "input", "width": iw, "signed": True,
+             "desc": "input, Q%d.%d" % (iw - 1 - fi, fi)},
+            {"name": "valid_in", "dir": "input", "width": 1,
+             "desc": "x valid"},
+            {"name": "y", "dir": "output", "width": iw, "signed": True,
+             "desc": "SiLU(x), Q%d.%d" % (iw - 1 - fi, fi)},
+            {"name": "valid_out", "dir": "output", "width": 1,
+             "desc": "y valid"},
+        ],
+        "behavior": [
+            "Fully pipelined: a new x may arrive on every cycle, and each "
+            "valid_in produces exactly one valid_out, in the same order. "
+            "The latency is fixed but is the design's choice.",
+            "a = |x|, clamped to %d so that -a fits the exponential's "
+            "%d-bit signed input (x = %d is the one value that needs it)."
+            % ((1 << (iw - 1)) - 1, iw, -(1 << (iw - 1))),
+            "e = expu(-a), a Q0.%d value from the supplied exponential "
+            "unit." % wf,
+            "d = 2**%d + e, then (m, k) = recip(d) from the supplied "
+            "reciprocal unit, d zero-extended to its %d-bit input."
+            % (wf, r["parameters"]["in_width"]),
+            "num = 2**%d when x >= 0 and num = e when x < 0: sigmoid(x) is "
+            "1/(1+e) for non-negative x and e/(1+e) for negative x. "
+            "sig = min(2**%d, ((num << %d) * m) >> (%d - k)), a Q0.%d "
+            "sigmoid." % (wf, wf, wf, r["parameters"]["shift_bias"], wf),
+            "y = (x * sig) >>> %d, an arithmetic shift of the signed "
+            "product, which floors." % wf,
+            "expu and recip are separate modules supplied as source files, "
+            "not something to write. Instantiate them with exactly these "
+            "ports, connected by name: %s; %s. Each has a latency of %d "
+            "cycles." % (port_signature(e), port_signature(r),
+                         e["parameters"]["pipeline_stages"]),
+            "All state resets to zero: valid_out is 0 during reset.",
+        ],
+    }
+
+
+def silu_golden(x, p):
+    """Exact model of the unit, from the exponential and reciprocal
+    models."""
+    e_p, r_p = p["exp"], p["recip"]
+    iw, wf = e_p["in_width"], e_p["out_frac"]
+    a = min(abs(x), (1 << (iw - 1)) - 1)
+    e = exp_golden(-a, e_p)
+    m, k = recip_golden((1 << wf) + e, r_p)
+    num = (1 << wf) if x >= 0 else e
+    sig = min(1 << wf, recip_apply(num << wf, m, k, r_p))
+    return (x * sig) >> wf
+
+
+def render_silu_testbench(spec):
+    """Inputs across the whole range, streamed back to back with gaps, and
+    checked in order off valid_out."""
+    p = spec["parameters"]
+    d = spec["derivation"]
+    iw, fi = p["width"], p["frac"]
+    lo, hi = -(1 << (iw - 1)), (1 << (iw - 1)) - 1
+    rnd = random.Random(97)
+    xs = [0, 1, -1, 1 << fi, -(1 << fi), 2 << fi, -(2 << fi), 5 << fi,
+          -(5 << fi), lo, hi, lo + 1, -(1 << (fi - 1)), 1 << (fi - 1)]
+    xs += [rnd.randrange(lo, hi + 1) for _ in range(300)]
+    body = []
+    for i, x in enumerate(xs):
+        body.append("    xs[%d] = %s; ys[%d] = %s;"
+                    % (i, _slit(x, iw), i, _slit(silu_golden(x, d), iw)))
+    return SILU_TB.format(iwm=iw - 1, n=len(xs), cases="\n".join(body))
+
+
+SILU_TB = """`timescale 1ns/1ps
+// GENERATED by specgen.py: do not edit by hand.
+// Testbench for the streaming SiLU unit. Golden values come from the
+// exponential and reciprocal models. Inputs stream one per cycle with
+// occasional gaps, and outputs are checked in order off valid_out, so the
+// latency is the design's choice but the order and the count are not.
+module tb_silu;
+  reg clk = 0, rst_n = 0, valid_in = 0;
+  reg signed [{iwm}:0] x = 0;
+  wire signed [{iwm}:0] y;
+  wire valid_out;
+  reg signed [{iwm}:0] xs [0:{n}-1];
+  reg signed [{iwm}:0] ys [0:{n}-1];
+  integer checks = 0, got = 0, i;
+
+  silu dut (.clk(clk), .rst_n(rst_n), .x(x), .valid_in(valid_in),
+            .y(y), .valid_out(valid_out));
+  always #5 clk = ~clk;
+
+  always @(posedge clk) begin
+    if (rst_n && valid_out) begin
+      checks = checks + 1;
+      if (got >= {n}) begin
+        $display("TB_FAIL test=silu idx=%0d expected=no_more_outputs got_silu=%0d",
+                 got, y);
+        $display("TB_RESULT: FAIL");
+        $finish;
+      end
+      if (y !== ys[got]) begin
+        $display("TB_FAIL test=silu idx=%0d x=%0d expected_silu=%0d got_silu=%0d",
+                 got, xs[got], ys[got], y);
+        $display("TB_RESULT: FAIL");
+        $finish;
+      end
+      got = got + 1;
+    end
+  end
+
+  initial begin
+{cases}
+    repeat (3) @(negedge clk);
+    checks = checks + 1;
+    if (valid_out !== 1'b0) begin
+      $display("TB_FAIL test=reset_init expected_vout=0 got_vout=%b", valid_out);
+      $display("TB_RESULT: FAIL");
+      $finish;
+    end
+    rst_n = 1;
+    for (i = 0; i < {n}; i = i + 1) begin
+      @(negedge clk);
+      x = xs[i]; valid_in = 1;
+      if (i % 37 == 36) begin
+        @(negedge clk); valid_in = 0;
+      end
+    end
+    @(negedge clk); valid_in = 0;
+    repeat (40) @(negedge clk);
+    checks = checks + 1;
+    if (got !== {n}) begin
+      $display("TB_FAIL test=silu idx=0 expected_count={n} got_count=%0d", got);
+      $display("TB_RESULT: FAIL");
+      $finish;
+    end
+    $display("TB_PROFILE elements=%0d span_cycles=%0d latency_cycles=%0d",
+             {n}, {n} + {n} / 37, 12);
+    $display("TB_PASS checks=%0d", checks);
+    $display("TB_RESULT: PASS");
+    $finish;
+  end
+endmodule
+"""
+
+
+def generate_silu(ms=None, spec_file="spec_silu.json", tb_file="tb_silu.v"):
+    """Write the derived SiLU spec and testbench."""
+    ms = ms or load_model_spec()
+    spec = derive_silu_spec(ms)
+    with open(os.path.join(ROOT, spec_file), "w") as f:
+        json.dump(spec, f, indent=2)
+    with open(os.path.join(ROOT, tb_file), "w") as f:
+        f.write(render_silu_testbench(spec))
+    return spec
+
 def requant_golden(acc, scale, sh, out_width):
     """Scale, round to nearest, saturate. Shared by the requantizer's own
     testbench and by anything that sequences it, so the two cannot

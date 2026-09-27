@@ -196,7 +196,7 @@ def main():
     ap.add_argument("--only", default="all",
                     choices=["all", "both", "chiplet", "requant", "exp",
                              "recip", "rsqrt", "matvec",
-                             "wmem", "softmax", "mlp", "attn", "rmsnorm",
+                             "wmem", "softmax", "mlp", "attn", "rmsnorm", "silu",
                              "endpoint"])
     ap.add_argument("--skip-dv", action="store_true")
     a = ap.parse_args()
@@ -391,6 +391,22 @@ def main():
             label = "mlp %s bank%d" % (ms["name"], p["bank"])
             r, d = one_case(label, spec, "layer", a.agent, do_dv,
                             extra=("mv_dep.v", "mac_dep.v", "rq_dep.v"))
+            rows.append(r)
+            details.append((label, d))
+            if any(r[c] not in ("ok", "skip", "-") for c in COLS):
+                failures.append(label)
+
+    if a.only in ("all", "silu"):
+        base = specgen.load_model_spec()
+        for ms in _models(base):
+            spec = specgen.generate_silu(ms, spec_file=JOB["spec_file"],
+                                         tb_file=JOB["tb_file"])
+            chiplet_flow.write_silu_deps(ms, BUILD)
+            p = spec["parameters"]
+            label = "silu %s Q%d.%d" % (ms["name"], p["width"] - 1 - p["frac"],
+                                        p["frac"])
+            r, d = one_case(label, spec, "element", a.agent, do_dv,
+                            extra=chiplet_flow.SILU_DEPS)
             rows.append(r)
             details.append((label, d))
             if any(r[c] not in ("ok", "skip", "-") for c in COLS):

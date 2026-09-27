@@ -25,6 +25,7 @@ FIX_SUBMAX = "subtract_the_row_maximum"
 FIX_CHAIN = "take_the_second_depth_from_the_first_count"
 FIX_VLAT = "pair_each_value_with_its_weight_after_the_two_edge_read"
 FIX_EPS = "start_the_sum_of_squares_from_epsilon"
+FIX_SIGN = "take_the_numerator_from_the_sign_of_x"
 # One definition, in specgen, so the declared depth and the generated
 # depth cannot disagree.
 WIDE_ADD_BITS = specgen.WIDE_ADD_BITS
@@ -59,6 +60,8 @@ class RuleBasedAgent:
             return self.render_attn(spec, fixes), sorted(fixes)
         if spec["top_module"] == "rmsnorm":
             return self.render_rmsnorm(spec, fixes), sorted(fixes)
+        if spec["top_module"] == "silu":
+            return self.render_silu(spec, fixes), sorted(fixes)
         return self.render_mac(spec, fixes), sorted(fixes)
 
     def diagnose(self, spec, history):
@@ -76,6 +79,10 @@ class RuleBasedAgent:
                     fixes.add(FIX_XOR)
                 elif "clear" in m.get("test", "").lower():
                     fixes.add(FIX_CLEAR)
+                elif "expected_silu" in m:
+                    # The SiLU unit's only seeded bug: sigmoid of |x| for
+                    # every x, which is right for positive x only.
+                    fixes.add(FIX_SIGN)
                 elif "expected_ssq" in m:
                     # The norm's only seeded bug: the sum of squares started
                     # from zero, so epsilon never reached the rsqrt.
@@ -130,6 +137,117 @@ class RuleBasedAgent:
                 elif m.get("got_acc") != m.get("expected_acc"):
                     fixes.add(FIX_WIDTH)
         return fixes
+
+    def render_silu(self, spec, fixes):
+        """Streaming SiLU: |x| into the exponential, 1 + e into the
+        reciprocal, then the sigmoid and the product. Every stage carries
+        its own copy of x and the sign, delayed to line up.
+
+        The seeded first cut uses the positive-x numerator for every x,
+        which computes x * sigmoid(|x|): right for half the range.
+        """
+        p = spec["parameters"]
+        d = spec["derivation"]
+        iw, wf = p["width"], p["weight_frac"]
+        riw, row, bias = (p["recip_in_width"], p["recip_out_width"],
+                          p["shift_bias"])
+        es, rs = d["exp"]["pipeline_stages"], d["recip"]["pipeline_stages"]
+        kwid = p["recip_k_width"]
+        num = ("neg_r[{rs}] ? {{1'b0, e_r[{rs}]}} : {one}"
+               if FIX_SIGN in fixes else "{one}")
+        num = num.format(rs=rs - 1, one="%d'd%d" % (wf + 2, 1 << wf))
+        lat = 1 + es + 1 + rs + 2
+        return """module silu (
+  input                    clk,
+  input                    rst_n,
+  input      signed [{iwm}:0] x,
+  input                    valid_in,
+  output reg signed [{iwm}:0] y,
+  output reg               valid_out
+);
+  // Stage 0: |x|, clamped so that -|x| fits the exponential's input.
+  reg signed [{iwm}:0] na;
+  reg v0, neg0;
+  reg signed [{iwm}:0] x0;
+  wire [{iwm}:0] ax = x[{iwm}] ? -x : x;
+  wire [{wwm}:0] e_y;
+  wire e_v;
+  expu ex (.clk(clk), .rst_n(rst_n), .x(na), .valid_in(v0), .y(e_y),
+           .valid_out(e_v));
+
+  // x and its sign travel alongside the exponential.
+  reg signed [{iwm}:0] xe [0:{esm}];
+  reg nege [0:{esm}];
+
+  // 1 + e into the reciprocal; e, x and the sign travel alongside it.
+  reg [{riwm}:0] dd;
+  reg vd;
+  reg [{wwm}:0] e_r [0:{rsm}];
+  reg signed [{iwm}:0] x_r [0:{rsm}];
+  reg neg_r [0:{rsm}];
+  reg [{wwm}:0] ed;
+  reg signed [{iwm}:0] xd;
+  reg negd;
+  wire [{rowm}:0] r_m;
+  wire [{kwm}:0] r_k;
+  wire r_v;
+  recip rc (.clk(clk), .rst_n(rst_n), .x(dd), .valid_in(vd), .y(r_m),
+            .k(r_k), .valid_out(r_v));
+
+  // The sigmoid, then the product.
+  reg [{nmm}:0] prod;
+  reg [{kwm}:0] k1;
+  reg v1;
+  reg signed [{iwm}:0] x1;
+  reg [{wf1}:0] sig;
+  reg v2;
+  reg signed [{iwm}:0] x2;
+  wire [{nmm}:0] sh = prod >> ({shb} - k1);
+  wire signed [{pw}:0] xy = x2 * $signed({{1'b0, sig}});
+  integer n;
+
+  always @(posedge clk) begin
+    if (!rst_n) begin
+      na <= 0; v0 <= 1'b0; neg0 <= 1'b0; x0 <= 0; dd <= 0; vd <= 1'b0;
+      ed <= 0; xd <= 0; negd <= 1'b0; prod <= 0; k1 <= 0; v1 <= 1'b0;
+      x1 <= 0; sig <= 0; v2 <= 1'b0; x2 <= 0; y <= 0; valid_out <= 1'b0;
+      for (n = 0; n <= {esm}; n = n + 1) begin xe[n] <= 0; nege[n] <= 1'b0; end
+      for (n = 0; n <= {rsm}; n = n + 1) begin
+        e_r[n] <= 0; x_r[n] <= 0; neg_r[n] <= 1'b0;
+      end
+    end else begin
+      v0 <= valid_in; x0 <= x; neg0 <= x[{iwm}];
+      na <= (x == {{1'b1, {iwm1}'d0}}) ? -{iw}'sd{amax} : -$signed(ax);
+
+      xe[0] <= x0; nege[0] <= neg0;
+      for (n = 1; n <= {esm}; n = n + 1) begin
+        xe[n] <= xe[n-1]; nege[n] <= nege[n-1];
+      end
+
+      vd <= e_v;
+      dd <= {riw}'d{one_v} + e_y;
+      ed <= e_y; xd <= xe[{esm}]; negd <= nege[{esm}];
+      e_r[0] <= ed; x_r[0] <= xd; neg_r[0] <= negd;
+      for (n = 1; n <= {rsm}; n = n + 1) begin
+        e_r[n] <= e_r[n-1]; x_r[n] <= x_r[n-1]; neg_r[n] <= neg_r[n-1];
+      end
+
+      v1 <= r_v; k1 <= r_k; x1 <= x_r[{rsm}];
+      prod <= ({num}) * r_m;
+
+      v2 <= v1; x2 <= x1;
+      sig <= (sh > {nmw}'d{one_v}) ? {wf2}'d{one_v} : sh[{wf1}:0];
+
+      valid_out <= v2;
+      y <= xy >>> {wf};
+    end
+  end
+endmodule
+""".format(iwm=iw - 1, iw=iw, wwm=wf, esm=es - 1, rsm=rs - 1,
+           riwm=riw - 1, riw=riw, rowm=row - 1, kwm=kwid - 1, iwm1=iw - 1,
+           nmm=wf + 2 + row - 1, nmw=wf + 2 + row, wf1=wf, wf2=wf + 1,
+           shb=bias - wf, pw=iw + wf + 1, wf=wf, one_v=1 << wf,
+           lo_neg=1 << (iw - 1), amax=(1 << (iw - 1)) - 1, num=num)
 
     def render_rmsnorm(self, spec, fixes):
         """RMSNorm: a sum of squares, one rsqrt, then a scaled product per

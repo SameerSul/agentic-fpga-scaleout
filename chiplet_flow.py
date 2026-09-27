@@ -115,6 +115,32 @@ def write_rmsnorm_deps(ms, build):
             f.write(srcs[fn])
 
 
+SILU_DEPS = ("expu_dep.v", "recip_dep.v", "exp_rom.v", "recip_rom.v")
+SILU_JOB = {
+    "spec_file": "spec_silu.json", "tb_file": "tb_silu.v",
+    "rtl_file": "silu.v", "profile_file": "silu_profile.json",
+    "report_file": "report_silu.json",
+    "derive_from_model": "silu",
+    "extra_sources": SILU_DEPS,
+}
+
+
+def write_silu_deps(ms, build):
+    """The exponential and reciprocal units and their tables, which SiLU
+    instantiates."""
+    from agent import RuleBasedAgent, FIX_LUT, FIX_NORM
+    r = RuleBasedAgent()
+    e, rc = specgen.derive_exp_spec(ms), specgen.derive_recip_spec(ms)
+    srcs = {"expu_dep.v": r.render_exp(e, {FIX_LUT}),
+            "recip_dep.v": r.render_recip(rc, {FIX_NORM}),
+            "exp_rom.v": specgen.exp_rom(e),
+            "recip_rom.v": specgen.recip_rom(rc)}
+    os.makedirs(build, exist_ok=True)
+    for fn in SILU_DEPS:
+        with open(os.path.join(build, fn), "w") as f:
+            f.write(srcs[fn])
+
+
 SOFTMAX_JOB = {
     "spec_file": "spec_softmax.json", "tb_file": "tb_softmax.v",
     "rtl_file": "softmax.v", "profile_file": "softmax_profile.json",
@@ -528,6 +554,8 @@ def derive_profile(spec, final):
     elif unit == "column":
         prof["sequencer"] = spec["name"]
         prof["mac_stages"] = spec["parameters"]["mac_stages"]
+    elif unit == "element":
+        prof["pointwise"] = spec["name"]
     elif unit == "norm":
         prof["norm"] = spec["name"]
         prof["d_model"] = spec["parameters"]["d_model"]
@@ -624,6 +652,10 @@ def run_flow(job=None, verbose=True, agent=None, max_iters=None):
                     specgen.derive_requant_spec(_ms), {FIX_SATURATE}))):
             with open(os.path.join(BUILD, _fn), "w") as f:
                 f.write(_src)
+    elif job.get("derive_from_model") == "silu":
+        specgen.generate_silu(spec_file=job["spec_file"],
+                              tb_file=job["tb_file"])
+        write_silu_deps(specgen.load_model_spec(), BUILD)
     elif job.get("derive_from_model") == "rmsnorm":
         specgen.generate_rmsnorm(spec_file=job["spec_file"],
                                  tb_file=job["tb_file"])

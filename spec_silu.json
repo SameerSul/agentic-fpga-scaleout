@@ -1,0 +1,91 @@
+{
+  "name": "silu_qwen2_5_0p5b",
+  "description": "Streaming SiLU, x * sigmoid(x), on Q4.8 in and out, built from the exponential and reciprocal units",
+  "top_module": "silu",
+  "unit": "element",
+  "parameters": {
+    "width": 13,
+    "frac": 8,
+    "weight_frac": 15,
+    "recip_in_width": 26,
+    "recip_out_width": 17,
+    "shift_bias": 42,
+    "recip_k_width": 5,
+    "signed": true,
+    "pipeline_stages": 1,
+    "target_clock_mhz": 100
+  },
+  "derivation": {
+    "model": "qwen2_5_0p5b",
+    "exp": {
+      "in_width": 13,
+      "in_frac": 8,
+      "out_width": 16,
+      "out_frac": 15,
+      "lut_bits": 8,
+      "signed": true,
+      "pipeline_stages": 3,
+      "target_clock_mhz": 100
+    },
+    "recip": {
+      "in_width": 26,
+      "out_width": 17,
+      "lut_bits": 8,
+      "shift_bias": 42,
+      "signed": false,
+      "pipeline_stages": 3,
+      "target_clock_mhz": 100
+    },
+    "rule": "input and output format from the exponential unit's score format; sigmoid through that unit and the reciprocal"
+  },
+  "ports": [
+    {
+      "name": "clk",
+      "dir": "input",
+      "width": 1,
+      "desc": "clock, rising edge"
+    },
+    {
+      "name": "rst_n",
+      "dir": "input",
+      "width": 1,
+      "desc": "active-low synchronous reset"
+    },
+    {
+      "name": "x",
+      "dir": "input",
+      "width": 13,
+      "signed": true,
+      "desc": "input, Q4.8"
+    },
+    {
+      "name": "valid_in",
+      "dir": "input",
+      "width": 1,
+      "desc": "x valid"
+    },
+    {
+      "name": "y",
+      "dir": "output",
+      "width": 13,
+      "signed": true,
+      "desc": "SiLU(x), Q4.8"
+    },
+    {
+      "name": "valid_out",
+      "dir": "output",
+      "width": 1,
+      "desc": "y valid"
+    }
+  ],
+  "behavior": [
+    "Fully pipelined: a new x may arrive on every cycle, and each valid_in produces exactly one valid_out, in the same order. The latency is fixed but is the design's choice.",
+    "a = |x|, clamped to 4095 so that -a fits the exponential's 13-bit signed input (x = -4096 is the one value that needs it).",
+    "e = expu(-a), a Q0.15 value from the supplied exponential unit.",
+    "d = 2**15 + e, then (m, k) = recip(d) from the supplied reciprocal unit, d zero-extended to its 26-bit input.",
+    "num = 2**15 when x >= 0 and num = e when x < 0: sigmoid(x) is 1/(1+e) for non-negative x and e/(1+e) for negative x. sig = min(2**15, ((num << 15) * m) >> (42 - k)), a Q0.15 sigmoid.",
+    "y = (x * sig) >>> 15, an arithmetic shift of the signed product, which floors.",
+    "expu and recip are separate modules supplied as source files, not something to write. Instantiate them with exactly these ports, connected by name: expu (input clk, input rst_n, input signed [12:0] x, input valid_in, output [15:0] y, output valid_out); recip (input clk, input rst_n, input [25:0] x, input valid_in, output [16:0] y, output [4:0] k, output valid_out). Each has a latency of 3 cycles.",
+    "All state resets to zero: valid_out is 0 during reset."
+  ]
+}

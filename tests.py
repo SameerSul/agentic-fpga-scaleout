@@ -1201,6 +1201,52 @@ def test_composite_cell_count():
         shutil.rmtree(work, ignore_errors=True)
 
 
+def test_silu():
+    """SiLU, the nonlinearity in Qwen's gated MLP, built from the
+    exponential and reciprocal units: sigmoid(x) is 1/(1+e) for x >= 0 and
+    e/(1+e) for x < 0, with e = exp(-|x|). Checked against float SiLU on
+    every input the format can represent."""
+    import math
+    import chiplet_flow as cf
+    ms = load_model_spec()
+    spec = specgen_mod.derive_silu_spec(ms)
+    p, d = spec['parameters'], spec['derivation']
+    iw, fi = p['width'], p['frac']
+    worst = 0.0
+    for x in range(-(1 << (iw - 1)), 1 << (iw - 1)):
+        xf = x / (1 << fi)
+        worst = max(worst, abs(specgen_mod.silu_golden(x, d) / (1 << fi)
+                               - xf / (1 + math.exp(-xf))))
+    check('fixed-point SiLU matches float on all %d inputs to within 0.05 '
+          '(worst %.4f)' % (1 << iw, worst), worst < 0.05)
+
+    work = os.path.join(ROOT, 'build_silutest')
+    shutil.rmtree(work, ignore_errors=True)
+    try:
+        cf.write_silu_deps(ms, work)
+        rr = RuleBasedAgent()
+        with open(os.path.join(work, 'tb.v'), 'w') as f:
+            f.write(specgen_mod.render_silu_testbench(spec))
+        res = {}
+        for label, fx in (('first', set()), ('fixed', {agent_mod.FIX_SIGN})):
+            with open(os.path.join(work, 'silu.v'), 'w') as f:
+                f.write(rr.render_silu(spec, fx))
+            r = subprocess.run(['iverilog', '-g2005', '-o', 's.out', 'tb.v',
+                                'silu.v'] + list(cf.SILU_DEPS), cwd=work,
+                               capture_output=True, text=True)
+            assert r.returncode == 0, r.stdout + r.stderr
+            r = subprocess.run(['vvp', 's.out'], cwd=work,
+                               capture_output=True, text=True, timeout=300)
+            res[label] = r.stdout
+        check('the SiLU unit streams one element per cycle, in order',
+              'TB_RESULT: PASS' in res['fixed'])
+        check('sigmoid of |x| for negative x is caught',
+              'TB_RESULT: PASS' not in res['first']
+              and 'expected_silu' in res['first'])
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
 def test_requant_golden_is_shared():
     """One model of requantization, used by the requantizer's own
     testbench and by the layer that sequences it, so the two cannot
@@ -1930,6 +1976,7 @@ if __name__ == '__main__':
     test_mlp_layer()
     test_attention_head()
     test_rmsnorm()
+    test_silu()
     test_composite_cell_count()
     test_requant_golden_is_shared()
     test_table_unit_specs_are_implementable()
