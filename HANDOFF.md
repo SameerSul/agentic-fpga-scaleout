@@ -10,7 +10,7 @@ part that needs the hardware. Nothing below needs this repo's author.
 |---|---|
 | Qwen2.5-0.5B on the generated blocks' integer arithmetic | 14/16 teacher-forced against float |
 | the generated sequencer, 24 layers + head, in iverilog | chooses " Paris", the integer model's token |
-| the Zybo top level (`board_zybo/rtl/fpgai_zybo.v`) driven only through its AXI-Lite registers, DDR model with random stalls | same token, same core cycles, 1.20 bus cycles per core cycle |
+| the Zybo top level (`board_zybo/rtl/fpgai_zybo.v`) driven only through its AXI-Lite registers, DDR model with random stalls | all 24 layers + head: " Paris", same core cycles, 1.18 bus cycles per core cycle |
 | fits the XC7Z020 (Yosys) | 33169 LUTs + 7380 LUT RAM, 148 DSPs, 36 BRAMs |
 | places and routes on the XC7Z020 in the open flow (nextpnr-xilinx) | closes 50 MHz: core 53.4, bus 50.9 MHz; bitstream round-trips |
 | Vivado block design, Vivado timing, the ARM program | **not run** |

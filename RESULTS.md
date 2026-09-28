@@ -531,6 +531,15 @@ run the core's 9,510,162 cycles; the core counter they print is a few
 higher because it is read before the AXI-Lite write that starts the
 step, and the idle core ticks through that write.
 
+The whole model then ran the same way: all 24 layers and the head,
+the prompt's five positions, through the registers only, against the
+stalling DDR model. It chose token 12095, " Paris", as the direct run
+and the integer model do, each prompt position in the direct run's
+22.81 million core cycles and 26.7 to 27.0 million bus cycles, the head
+step in 31,375,557 core cycles and 37,457,732 bus cycles: 1.18 bus
+cycles a core cycle, 0.54 s a position and 0.75 s for the head at
+50 MHz. Four hours of simulation.
+
 Two tests keep it: `test_weight_streamer_survives_stalls` runs the
 streamer alone on four stalling ports under an address stream of 122
 runs and jumps, checks every word it hands the core, and fails on the
