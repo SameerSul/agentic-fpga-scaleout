@@ -302,6 +302,46 @@ What this is not: the model is the 16-dimensional checkpoint, one layer
 and one head, in one 24-position window, with learned positions and a
 ReLU MLP. The next section runs Qwen's structure.
 
+## The real Qwen2.5-0.5B on the blocks' arithmetic
+
+```
+python3 fetch_qwen.py      # once: Qwen2.5-0.5B from Hugging Face, ~1 GB, git-ignored
+python3 qwen_real.py       # the checkpoint in float, pure Python
+python3 qwen_int.py --act-bits 16 --per-channel
+```
+
+The checkpoints above are trained here. This is Qwen's own: its 494
+million weights, its byte-level BPE tokenizer, loaded and run in pure
+Python, about 11 seconds a token in float. `qwen_real.py` completes "The
+capital of France is" with " Paris. It is the".
+
+`qwen_int.py` runs the same checkpoint the way the hardware does. The
+weights are int8 with a scale per output channel, the activations a fixed
+width with every scale fixed by calibration over a paragraph of text, and
+each stage is a generated block's golden model derived at Qwen's own
+size: RMSNorm over 896, heads of 64 with the wide score path, RoPE with
+theta 1e6, SiLU, the residual add, the requantizer. The q, k and v biases
+are added to the accumulator, in its own units, before requantization.
+
+| activations | teacher-forced agreement with float | greedy continuation |
+|---|---|---|
+| int8 | 0 of the first 5 positions | unrelated tokens |
+| int16 | **14 of 16** | "The capital of France is Paris. Paris is" |
+
+int8 activations fail for a reason every int8 LLM deployment meets:
+Qwen's residual stream carries a few massive activations, about 700 in
+layer 2 where typical values are near 1, and one static scale per tensor
+leaves a handful of levels for everything else. Every stage of layer 0
+was already 10 to 20% off. At 16 bits the stages are within about 2%, and
+the model decodes. The w8/a16 datapath is not new: it is the sweep's
+asym_w8_a16 variant, which every block derives and signs off.
+
+Two things that run uses are not yet in the RTL: a requantizer scale per
+output channel, where the projection has one per call, and the biases.
+The one stage still well off at 16 bits is SiLU times up, 9% in layer 1,
+from SiLU's fixed Q4.8 output. This is the arithmetic, run in Python; no
+RTL simulation runs a 494-million-weight token.
+
 ## Qwen's structure decodes in RTL
 
 ```
@@ -1016,12 +1056,13 @@ These are the distance between this repo and a local LLM host.
    projection block streams activations from memory at full size, and
    the attention and MLP blocks have not been moved onto it. In `generate.py` those run on the host, and the
    output says so each run.
-3. **The model is small and its weights are its own.** Qwen3-0.6B is not
-   loaded; there is no numeric stack here to load it with and no network
-   dependency wanted in a capstone repo. The committed checkpoints are
-   real trained transformers with a real tokenizer, one 16 dimensional
-   and one with Qwen's structure at 32 dimensions and 2 layers, both
-   trained on two sentences.
+3. **The RTL has run small models; the real one runs as arithmetic.**
+   Qwen2.5-0.5B's own weights run through the blocks' golden models in
+   Python, 14 of 16 positions against float at int16 activations, but
+   the RTL decoders run the checkpoints trained here, one 16 dimensional
+   and one with Qwen's structure at 32 dimensions and 2 layers. Per
+   channel requantizer scales and biases, which the real model needs,
+   are not in the projection RTL yet.
 4. **Throughput is predicted, not measured.** tokens/s comes from a sizing
    model checked against a fabric simulation, agreeing within 15% and at
    ratio 1.00 on the current configuration. Both are models. Neither is a

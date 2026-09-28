@@ -10,3 +10,6 @@ __pycache__/
 *_bench.v
 *_dbg.json
 *_dbg.v
+
+# Real model weights, fetched on request by fetch_qwen.py, never committed.
+qwen_weights/
