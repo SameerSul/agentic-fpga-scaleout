@@ -1,0 +1,694 @@
+"""A real Qwen2.5-0.5B token, decoded by generated RTL.
+
+Every earlier RTL result for the real model ran one block at a time. This
+generates one sequencer for the whole decode step at Qwen's own size, over
+the same generated blocks (the per-column multi-lane projection, RMSNorm,
+the multi-lane attention head, RoPE, SiLU, the requantizer and the
+residual add, all derived for 8-bit weights and 16-bit activations), and
+simulates it in iverilog on the checkpoint's own weights.
+
+What would be DDR on a board is outside the design, behind ports: a
+256-bit weight word per cycle, served by the testbench from a 1 GB binary
+image with $fread; a constant memory with each projection column's bias,
+scale and shift; the norm gains; and the KV cache, read and written a
+lane at a time. The embedding lookup reads the tied head's weight words.
+The head runs as 32 projection chunks with a streaming argmax, so the
+151936 logits are never stored.
+
+The token it chooses has to be the integer model's.
+
+Needs fetch_qwen.py. Run: python3 qwen_full.py [--prompt "..."]
+"""
+import argparse
+import math
+import os
+import subprocess
+import sys
+import time
+
+import agent
+import chiplet_flow as cf
+import qwen_cosim as qc
+import qwen_int as qi
+import qwen_real as qr
+import specgen
+
+ROOT = os.path.dirname(os.path.abspath(__file__))
+WORK = os.path.join(ROOT, "build_qfull")
+N = 16                       # projection lanes at 16-bit data
+CHUNK = 4864                 # head columns per projection call
+
+
+def _clog2(n):
+    return max(1, (n - 1).bit_length())
+
+
+class Layout:
+    """Where every matrix, column constant and gain lives."""
+
+    MATS = (("q", "self_attn.q_proj"), ("k", "self_attn.k_proj"),
+            ("v", "self_attn.v_proj"), ("o", "self_attn.o_proj"),
+            ("g", "mlp.gate_proj"), ("u", "mlp.up_proj"),
+            ("d", "mlp.down_proj"))
+
+    def __init__(self, im):
+        D, F, H, KV, hd = im.D, im.F, im.H, im.KV, im.hd
+        self.shape = {"q": (H * hd, D), "k": (KV * hd, D), "v": (KV * hd, D),
+                      "o": (D, H * hd), "g": (F, D), "u": (F, D), "d": (D, F)}
+        self.woff, self.coff = {}, {}
+        w = c = 0
+        for m, _ in self.MATS:
+            rows, depth = self.shape[m]
+            self.woff[m], self.coff[m] = w, c
+            w += (rows // N) * depth
+            c += rows
+        self.lw, self.lc = w, c
+        self.headw = im.NL * self.lw
+        self.headc = im.NL * self.lc
+        self.embc = self.headc + im.V
+        self.words = self.headw + (im.V // N) * D
+        self.cwords = self.embc + im.V
+
+
+def write_images(im, lay, work, log=print):
+    """weights.bin, cparams.hex, gains.hex. Weight words are what $fread
+    reads, most significant byte first: lane 15's high byte leads."""
+    s = im.s
+    t0 = time.time()
+    sign = bytes((0xff if b >= 128 else 0) for b in range(256))
+    with open(os.path.join(work, "weights.bin"), "wb") as f:
+        def put(key, rows, depth):
+            Q = im.Q[key]
+            for g in range(rows // N):
+                buf = bytearray(depth * 32)
+                for j in range(N):
+                    c = g * N + j
+                    lo = Q[c * depth:(c + 1) * depth].tobytes()
+                    buf[(15 - j) * 2::32] = lo.translate(sign)
+                    buf[(15 - j) * 2 + 1::32] = lo
+                f.write(buf)
+        for li in range(im.NL):
+            for m, name in lay.MATS:
+                rows, depth = lay.shape[m]
+                put("model.layers.%d.%s.weight" % (li, name), rows, depth)
+        put("model.embed_tokens.weight", im.V, im.D)
+    log("weights.bin: %.0f MB in %.0f s"
+        % (os.path.getsize(os.path.join(work, "weights.bin")) / 1e6,
+           time.time() - t0))
+    aw = im.sp["requant"]["parameters"]["acc_width"]
+    mw, sw = im.mw, im.sw
+    W = im.Wf
+
+    def word(b, sc, sh):
+        return ((b & ((1 << aw) - 1)) << (sw + mw)) | (sh << mw) | sc
+    with open(os.path.join(work, "cparams.hex"), "w") as f:
+        for li in range(im.NL):
+            P = "model.layers.%d." % li
+            src = {"q": ("xn", "q"), "k": ("xn", "k"), "v": ("xn", "v"),
+                   "o": ("ctx", "a"), "g": ("xn2", "g"), "u": ("xn2", "u"),
+                   "d": ("m", "dn")}
+            for m, name in lay.MATS:
+                sx, dst = src[m]
+                bias = (W[P + name + ".bias"][0]
+                        if m in "qkv" else None)
+                for b, sc, sh in im.proj_consts(P + name + ".weight",
+                                                s[(sx, li)], s[(dst, li)],
+                                                bias):
+                    f.write("%x\n" % word(b, sc, sh))
+        for b, sc, sh in im.proj_consts("model.embed_tokens.weight",
+                                        s["xf"], s["lg"]):
+            f.write("%x\n" % word(b, sc, sh))
+        for t in range(im.V):
+            sc, sh = im.embed_consts(t)
+            f.write("%x\n" % word(0, sc, sh))
+    consts = []
+    with open(os.path.join(work, "gains.hex"), "w") as f:
+        for li in range(im.NL):
+            P = "model.layers.%d." % li
+            for gname, dst in (("input_layernorm", "xn"),
+                               ("post_attention_layernorm", "xn2")):
+                gq, sc, sh = im.norm_consts(P + gname + ".weight",
+                                            s[(dst, li)])
+                f.write("\n".join("%x" % (v & 0xffff) for v in gq) + "\n")
+                consts.append((sc, sh))
+        gq, sc, sh = im.norm_consts("model.norm.weight", s["xf"])
+        f.write("\n".join("%x" % (v & 0xffff) for v in gq) + "\n")
+        consts.append((sc, sh))
+    return consts
+
+
+def layer_consts(im, norms):
+    """Per layer: the norms' and adds' constants, the attention's shift and
+    output requantizer, the gate's shift into SiLU, the product's
+    requantizer."""
+    s = im.s
+    at = im.sp["attn"]["parameters"]
+    out = []
+    for li in range(im.NL):
+        sx = s["x0"] if li == 0 else s[("x2", li - 1)]
+        ctx = qi.pick(2.0 ** -at["weight_frac"] * s[("v", li)] / s[("ctx", li)],
+                      at["scale_width"], at["shift_width"])
+        out.append(dict(
+            n1=norms[2 * li], n2=norms[2 * li + 1],
+            r1=im.add_consts(sx, s[("a", li)], s[("x1", li)]),
+            r2=im.add_consts(s[("x1", li)], s[("dn", li)], s[("x2", li)]),
+            shs=im.shs[li], ctx=ctx, gsh=im.gsh[li],
+            m=qi.pick(2.0 ** -8 * s[("u", li)] / s[("m", li)], im.mw, im.sw)))
+    return out, norms[-1]
+
+
+def render(im, lay, lc, nf):
+    """The sequencer."""
+    D, F, H, KV, hd, NL, V = im.D, im.F, im.H, im.KV, im.hd, im.NL, im.V
+    L = im.ms["seq_len"]
+    grp, h2 = H // KV, hd // 2
+    ps = specgen.derive_projn_spec(im.ms, per_column=True)["parameters"]
+    rn = im.sp["rmsnorm"]["parameters"]
+    ap = specgen.derive_attnn_spec(im.ms)["parameters"]
+    ro = im.sp["rope"]["parameters"]
+    sl = im.sp["silu"]["parameters"]
+    rq = im.sp["requant"]["parameters"]
+    ra = im.sp["resadd"]["parameters"]
+    assert ps["lanes"] == N and ap["lanes"] == N
+    tw, pw = _clog2(V), ro["pos_width"]
+    WA, CA = _clog2(lay.words), _clog2(lay.cwords)
+    GA = _clog2((2 * NL + 1) * D)
+    KWN = NL * KV * (L // N) * hd
+    VWN = NL * KV * L * (hd // N)
+    KA, VA = _clog2(KWN), _clog2(VWN)
+    CW = ps["col_word_width"]
+    mw, sw, aw = rq["scale_width"], rq["shift_width"], rq["acc_width"]
+    siw = sl["width"]
+    cw_ = 13
+    states = ["S_IDLE", "S_EMB", "S_N1", "S_Q", "S_K", "S_V", "S_RQ", "S_RK",
+              "S_LQ", "S_ATT", "S_O", "S_R1", "S_N2", "S_G", "S_U", "S_GLU",
+              "S_DN", "S_R2", "S_NF", "S_HD"]
+    stw = _clog2(len(states))
+    A = []
+    a = A.append
+    a("// GENERATED by qwen_full.py: do not edit by hand.")
+    a("// One Qwen2.5-0.5B decode step, embedding to argmax, over the")
+    a("// generated blocks; weights, constants and the KV cache are external.")
+    a("module qwen_full (")
+    a("  input clk, input rst_n, input start, input head_en,")
+    a("  input [%d:0] tok, input [%d:0] pos," % (tw - 1, pw - 1))
+    a("  output [%d:0] w_addr, input [%d:0] w_data," % (WA - 1, N * 16 - 1))
+    a("  output [%d:0] c_addr, input [%d:0] c_data," % (CA - 1, CW - 1))
+    a("  output [%d:0] g_addr, input signed [15:0] g_data," % (GA - 1))
+    a("  output [%d:0] k_raddr, input [%d:0] k_rdata," % (KA - 1, N * 16 - 1))
+    a("  output [%d:0] v_raddr, input [%d:0] v_rdata," % (VA - 1, N * 16 - 1))
+    a("  output reg kw0_en, output reg [%d:0] kw0_addr, output reg [3:0] kw0_lane," % (KA - 1))
+    a("  output reg signed [15:0] kw0_data,")
+    a("  output reg kw1_en, output reg [%d:0] kw1_addr, output reg [3:0] kw1_lane," % (KA - 1))
+    a("  output reg signed [15:0] kw1_data,")
+    a("  output reg vw_en, output reg [%d:0] vw_addr, output reg [3:0] vw_lane," % (VA - 1))
+    a("  output reg signed [15:0] vw_data,")
+    a("  output reg [%d:0] next_tok, output reg signed [15:0] best," % (tw - 1))
+    a("  output reg done, output reg busy")
+    a(");")
+    a("  localparam " + ", ".join("%s = %d'd%d" % (x, stw, i)
+                                  for i, x in enumerate(states)) + ";")
+    a("  reg [%d:0] st;" % (stw - 1))
+    a("  reg ph, hen;")
+    a("  reg [4:0] lyr;")
+    a("  reg [3:0] hh;")
+    a("  reg [5:0] hk;")
+    a("  reg [%d:0] tok_r;" % (tw - 1))
+    a("  reg [%d:0] pos_r;" % (pw - 1))
+    for name, size in (("xm", D), ("nm", D), ("qlo", H * h2), ("qhi", H * h2),
+                       ("klo", KV * h2), ("khi", KV * h2), ("cm", H * hd),
+                       ("am", D), ("gm", F), ("um", F), ("mm", F)):
+        a("  reg signed [15:0] %s [0:%d];" % (name, size - 1))
+    a("  reg [%d:0] fj, ocnt, gcnt;" % (cw_ - 1))
+    a("")
+    # ---- projection
+    a("  reg pj_start;")
+    a("  reg [12:0] pj_depth, pj_cols;")
+    a("  wire [12:0] pj_a_addr, pj_c_addr, pj_index;")
+    a("  wire [%d:0] pj_w_addr;" % (ps["word_addr_width"] - 1))
+    a("  reg signed [15:0] pj_a_data;")
+    a("  wire pj_valid, pj_busy;")
+    a("  wire signed [15:0] pj_data;")
+    a("  projn u_proj (.clk(clk), .rst_n(rst_n), .start(pj_start),")
+    a("    .depth(pj_depth), .cols(pj_cols), .scale(%d'd0), .shift(%d'd0)," % (mw, sw))
+    a("    .a_addr(pj_a_addr), .a_data(pj_a_data), .w_addr(pj_w_addr),")
+    a("    .w_data(w_data), .c_addr(pj_c_addr), .c_data(c_data),")
+    a("    .o_valid(pj_valid), .o_index(pj_index), .o_data(pj_data), .busy(pj_busy));")
+    # ---- norm
+    a("  reg rn_start;")
+    a("  reg [%d:0] rn_scale;" % (rn["scale_width"] - 1))
+    a("  reg [%d:0] rn_shift;" % (rn["shift_width"] - 1))
+    a("  wire [%d:0] rn_x_addr, rn_g_addr, rn_index;" % (rn["addr_width"] - 1))
+    a("  reg signed [15:0] rn_x_data;")
+    a("  wire rn_valid, rn_busy;")
+    a("  wire signed [15:0] rn_data;")
+    a("  rmsnorm u_norm (.clk(clk), .rst_n(rst_n), .start(rn_start),")
+    a("    .eps(%d'd1), .scale_o(rn_scale), .shift_o(rn_shift)," % rn["rsqrt_in_width"])
+    a("    .x_addr(rn_x_addr), .x_data(rn_x_data), .g_addr(rn_g_addr),")
+    a("    .g_data(g_data), .o_valid(rn_valid), .o_index(rn_index),")
+    a("    .o_data(rn_data), .busy(rn_busy));")
+    # ---- attention
+    a("  reg at_start, at_load_valid;")
+    a("  reg signed [15:0] at_load_data;")
+    a("  reg [4:0] at_shs;")
+    a("  reg [%d:0] at_scale;" % (ap["scale_width"] - 1))
+    a("  reg [%d:0] at_shift;" % (ap["shift_width"] - 1))
+    a("  wire [%d:0] at_k_addr;" % (ap["k_addr_width"] - 1))
+    a("  wire [%d:0] at_v_addr;" % (ap["v_addr_width"] - 1))
+    a("  wire at_valid, at_busy;")
+    a("  wire [%d:0] at_index;" % (ap["head_dim_width"] - 1))
+    a("  wire signed [15:0] at_data;")
+    a("  attnn u_attn (.clk(clk), .rst_n(rst_n), .load_valid(at_load_valid),")
+    a("    .load_data(at_load_data), .start(at_start),")
+    a("    .n({%d'd0, pos_r} + %d'd1), .shift_s(at_shs)," % (ap["n_width"] - pw, ap["n_width"]))
+    a("    .scale_o(at_scale), .shift_o(at_shift), .k_addr(at_k_addr),")
+    a("    .k_data(k_rdata), .v_addr(at_v_addr), .v_data(v_rdata),")
+    a("    .o_valid(at_valid), .o_index(at_index), .o_data(at_data), .busy(at_busy));")
+    # ---- residual add, rope, silu, requant
+    a("  reg signed [15:0] ra_a, ra_b;")
+    a("  reg ra_v;")
+    a("  reg [%d:0] ra_sa, ra_sb;" % (ra["scale_width"] - 1))
+    a("  reg [%d:0] ra_sh;" % (ra["shift_width"] - 1))
+    a("  wire signed [15:0] ra_y;")
+    a("  wire ra_vout;")
+    a("  resadd u_add (.clk(clk), .rst_n(rst_n), .a(ra_a), .b(ra_b),")
+    a("    .scale_a(ra_sa), .scale_b(ra_sb), .shift(ra_sh), .valid_in(ra_v),")
+    a("    .y(ra_y), .valid_out(ra_vout));")
+    a("  reg signed [15:0] ro_x1, ro_x2;")
+    a("  reg [%d:0] ro_idx;" % (ro["index_width"] - 1))
+    a("  reg ro_v;")
+    a("  wire signed [15:0] ro_y1, ro_y2;")
+    a("  wire ro_vout;")
+    a("  rope u_rope (.clk(clk), .rst_n(rst_n), .x1(ro_x1), .x2(ro_x2),")
+    a("    .idx(ro_idx), .pos(pos_r), .valid_in(ro_v), .y1(ro_y1), .y2(ro_y2),")
+    a("    .valid_out(ro_vout));")
+    a("  reg signed [%d:0] si_x;" % (siw - 1))
+    a("  reg si_v;")
+    a("  wire signed [%d:0] si_y;" % (siw - 1))
+    a("  wire si_vout;")
+    a("  silu u_silu (.clk(clk), .rst_n(rst_n), .x(si_x), .valid_in(si_v),")
+    a("    .y(si_y), .valid_out(si_vout));")
+    a("  reg signed [%d:0] rq_acc;" % (aw - 1))
+    a("  reg rq_v;")
+    a("  reg [%d:0] rq_scale;" % (mw - 1))
+    a("  reg [%d:0] rq_shift;" % (sw - 1))
+    a("  wire signed [15:0] rq_q;")
+    a("  wire rq_sat, rq_vout;")
+    a("  requant u_rq (.clk(clk), .rst_n(rst_n), .acc_in(rq_acc), .scale(rq_scale),")
+    a("    .shift(rq_shift), .valid_in(rq_v), .q_out(rq_q), .sat(rq_sat),")
+    a("    .valid_out(rq_vout));")
+    a("")
+    # ---- per-layer constants
+    a("  reg [%d:0] c_n1s, c_n2s, c_ctxs, c_ms, c_r1a, c_r1b, c_r2a, c_r2b;" % (mw - 1))
+    a("  reg [%d:0] c_n1h, c_n2h, c_ctxh, c_mh, c_r1h, c_r2h;" % (sw - 1))
+    a("  reg [4:0] c_shs;")
+    a("  reg signed [4:0] c_gsh;")
+    a("  always @(*) begin")
+    a("    case (lyr)")
+    for li, c in enumerate(lc):
+        a("      %d: begin c_n1s = %d; c_n1h = %d; c_n2s = %d; c_n2h = %d;"
+          % ((li,) + tuple(c["n1"]) + tuple(c["n2"])))
+        a("        c_r1a = %d; c_r1b = %d; c_r1h = %d; c_r2a = %d; c_r2b = %d; c_r2h = %d;"
+          % (tuple(c["r1"]) + tuple(c["r2"])))
+        a("        c_shs = %d; c_ctxs = %d; c_ctxh = %d; c_gsh = %d; c_ms = %d; c_mh = %d; end"
+          % ((c["shs"],) + tuple(c["ctx"]) + (c["gsh"],) + tuple(c["m"])))
+    a("      default: begin c_n1s = 0; c_n1h = 0; c_n2s = 0; c_n2h = 0; c_r1a = 0;")
+    a("        c_r1b = 0; c_r1h = 0; c_r2a = 0; c_r2b = 0; c_r2h = 0; c_shs = 0;")
+    a("        c_ctxs = 0; c_ctxh = 0; c_gsh = 0; c_ms = 0; c_mh = 0; end")
+    a("    endcase")
+    a("  end")
+    a("")
+    # ---- bases
+    a("  wire [%d:0] lw = lyr * %d;" % (WA - 1, lay.lw))
+    a("  wire [%d:0] lcb = lyr * %d;" % (CA - 1, lay.lc))
+    a("  reg [%d:0] wbase;" % (WA - 1))
+    a("  reg [%d:0] cbase;" % (CA - 1))
+    a("  reg [%d:0] gbase;" % (GA - 1))
+    a("  reg [12:0] expect_n;")
+    a("  wire [%d:0] hcols = (hk == %d) ? %d : %d;"
+      % (12, V // CHUNK, V - (V // CHUNK) * CHUNK, CHUNK))
+    a("  always @(*) begin")
+    a("    wbase = 0; cbase = 0; gbase = 0; pj_depth = %d; pj_cols = %d;" % (D, D))
+    a("    expect_n = %d; rn_scale = 0; rn_shift = 0; ra_sa = 0; ra_sb = 0; ra_sh = 0;" % D)
+    a("    at_shs = c_shs; at_scale = c_ctxs; at_shift = c_ctxh;")
+    a("    case (st)")
+    a("      S_EMB: begin wbase = %d + (tok_r >> 4) * %d; cbase = %d + tok_r; end"
+      % (lay.headw, D, lay.embc))
+    a("      S_N1: begin gbase = lyr * %d; rn_scale = c_n1s; rn_shift = c_n1h; end" % (2 * D))
+    a("      S_N2: begin gbase = lyr * %d + %d; rn_scale = c_n2s; rn_shift = c_n2h; end" % (2 * D, D))
+    a("      S_NF: begin gbase = %d; rn_scale = %d; rn_shift = %d; end"
+      % ((2 * NL * D,) + tuple(nf)))
+    for s_, m in (("S_Q", "q"), ("S_K", "k"), ("S_V", "v"), ("S_O", "o"),
+                  ("S_G", "g"), ("S_U", "u"), ("S_DN", "d")):
+        rows, depth = lay.shape[m]
+        a("      %s: begin wbase = lw + %d; cbase = lcb + %d; pj_depth = %d;"
+          " pj_cols = %d; expect_n = %d; end"
+          % (s_, lay.woff[m], lay.coff[m], depth, rows, rows))
+    a("      S_HD: begin wbase = %d + hk * %d; cbase = %d + hk * %d;"
+      " pj_cols = hcols; expect_n = hcols; end"
+      % (lay.headw, (CHUNK // N) * D, lay.headc, CHUNK))
+    a("      S_R1: begin ra_sa = c_r1a; ra_sb = c_r1b; ra_sh = c_r1h; end")
+    a("      S_R2: begin ra_sa = c_r2a; ra_sb = c_r2b; ra_sh = c_r2h; end")
+    a("      S_ATT: expect_n = %d;" % hd)
+    a("      S_RQ: expect_n = %d;" % (H * h2))
+    a("      S_RK: expect_n = %d;" % (KV * h2))
+    a("      S_GLU: expect_n = %d;" % F)
+    a("      default: ;")
+    a("    endcase")
+    a("  end")
+    a("  wire in_norm = (st == S_N1) || (st == S_N2) || (st == S_NF);")
+    a("  reg [12:0] ed;")
+    a("  assign w_addr = wbase + ((st == S_EMB) ? ed : pj_w_addr);")
+    a("  assign c_addr = cbase + ((st == S_EMB) ? 13'd0 : pj_c_addr);")
+    a("  assign g_addr = gbase + rn_g_addr;")
+    a("  // The KV head this query head reads.")
+    a("  wire [%d:0] kvsel = lyr * %d + hh / %d;" % (KA - 1, KV, grp))
+    a("  assign k_raddr = kvsel * %d + at_k_addr;" % ((L // N) * hd))
+    a("  assign v_raddr = kvsel * %d + at_v_addr;" % (L * (hd // N)))
+    a("  always @(posedge clk) begin")
+    a("    rn_x_data <= xm[rn_x_addr];")
+    a("    pj_a_data <= (st == S_O) ? cm[pj_a_addr] : (st == S_DN) ? mm[pj_a_addr] : nm[pj_a_addr];")
+    a("  end")
+    a("  wire run_proj = (st == S_Q) || (st == S_K) || (st == S_V) || (st == S_O) ||")
+    a("                  (st == S_G) || (st == S_U) || (st == S_DN) || (st == S_HD);")
+    a("  wire blk_busy = run_proj ? pj_busy : in_norm ? rn_busy : at_busy;")
+    a("  wire pj_half = pj_index[%d];" % _clog2(h2))
+    a("  wire [12:0] pj_hadr = ((pj_index >> %d) << %d) | (pj_index & %d);"
+      % (_clog2(hd), _clog2(h2), h2 - 1))
+    a("  wire [12:0] fh = fj >> %d, fp = fj & %d;" % (_clog2(h2), h2 - 1))
+    a("  wire [12:0] oh = ocnt >> %d, op = ocnt & %d;" % (_clog2(h2), h2 - 1))
+    a("  // KV cache words: keys interleaved by position, values by dimension.")
+    a("  wire [%d:0] kslot = (lyr * %d + oh) * %d + (pos_r >> 4) * %d;"
+      % (KA - 1, KV, (L // N) * hd, hd))
+    a("  wire [%d:0] vslot = ((lyr * %d + (pj_index >> %d)) * %d + pos_r) * %d"
+      " + ((pj_index & %d) >> 4);" % (VA - 1, KV, _clog2(hd), L, hd // N, hd - 1))
+    a("  reg ev1;")
+    a("  reg [3:0] lane_r;")
+    a("  wire signed [15:0] ew = w_data[lane_r * 16 +: 16];")
+    a("  reg [%d:0] hbase;" % (tw - 1))
+    a("")
+    a("  always @(posedge clk) begin")
+    a("    if (!rst_n) begin")
+    a("      st <= S_IDLE; ph <= 1'b0; busy <= 1'b0; done <= 1'b0; hen <= 1'b0;")
+    a("      lyr <= 0; hh <= 0; hk <= 0; tok_r <= 0; pos_r <= 0; next_tok <= 0;")
+    a("      best <= 0; fj <= 0; ocnt <= 0; gcnt <= 0; ed <= 0; ev1 <= 1'b0; lane_r <= 0;")
+    a("      pj_start <= 1'b0; rn_start <= 1'b0; at_start <= 1'b0; at_load_valid <= 1'b0;")
+    a("      at_load_data <= 0; ra_a <= 0; ra_b <= 0; ra_v <= 1'b0; ro_x1 <= 0;")
+    a("      ro_x2 <= 0; ro_idx <= 0; ro_v <= 1'b0; si_x <= 0; si_v <= 1'b0;")
+    a("      rq_acc <= 0; rq_v <= 1'b0; rq_scale <= 0; rq_shift <= 0;")
+    a("      kw0_en <= 1'b0; kw1_en <= 1'b0; vw_en <= 1'b0; kw0_addr <= 0; kw1_addr <= 0;")
+    a("      vw_addr <= 0; kw0_lane <= 0; kw1_lane <= 0; vw_lane <= 0; kw0_data <= 0;")
+    a("      kw1_data <= 0; vw_data <= 0; hbase <= 0;")
+    a("    end else begin")
+    a("      done <= 1'b0; pj_start <= 1'b0; rn_start <= 1'b0; at_start <= 1'b0;")
+    a("      at_load_valid <= 1'b0; ra_v <= 1'b0; ro_v <= 1'b0; si_v <= 1'b0;")
+    a("      rq_v <= 1'b0; kw0_en <= 1'b0; kw1_en <= 1'b0; vw_en <= 1'b0;")
+    a("      if (run_proj && pj_valid) begin")
+    a("        ocnt <= ocnt + 1;")
+    a("        case (st)")
+    a("          S_Q: if (pj_half) qhi[pj_hadr] <= pj_data; else qlo[pj_hadr] <= pj_data;")
+    a("          S_K: if (pj_half) khi[pj_hadr] <= pj_data; else klo[pj_hadr] <= pj_data;")
+    a("          S_V: begin vw_en <= 1'b1; vw_addr <= vslot; vw_lane <= pj_index[3:0];")
+    a("                 vw_data <= pj_data; end")
+    a("          S_O, S_DN: am[pj_index] <= pj_data;")
+    a("          S_G: gm[pj_index] <= pj_data;")
+    a("          S_U: um[pj_index] <= pj_data;")
+    a("          S_HD: if ((hk == 0 && ocnt == 0) || pj_data > best) begin")
+    a("                  best <= pj_data; next_tok <= hbase + pj_index; end")
+    a("          default: ;")
+    a("        endcase")
+    a("      end")
+    a("      if (in_norm && rn_valid) begin nm[rn_index] <= rn_data; ocnt <= ocnt + 1; end")
+    a("      if (st == S_ATT && at_valid) begin")
+    a("        cm[hh * %d + at_index] <= at_data; ocnt <= ocnt + 1; end" % hd)
+    a("      if ((st == S_R1 || st == S_R2) && ra_vout) begin xm[ocnt] <= ra_y; ocnt <= ocnt + 1; end")
+    a("      if (st == S_RQ && ro_vout) begin qlo[ocnt] <= ro_y1; qhi[ocnt] <= ro_y2; ocnt <= ocnt + 1; end")
+    a("      if (st == S_RK && ro_vout) begin")
+    a("        kw0_en <= 1'b1; kw0_addr <= kslot + op; kw0_lane <= pos_r[3:0]; kw0_data <= ro_y1;")
+    a("        kw1_en <= 1'b1; kw1_addr <= kslot + op + %d; kw1_lane <= pos_r[3:0]; kw1_data <= ro_y2;" % h2)
+    a("        ocnt <= ocnt + 1;")
+    a("      end")
+    a("      if (st == S_GLU && si_vout) begin")
+    a("        rq_acc <= si_y * um[gcnt]; rq_v <= 1'b1; gcnt <= gcnt + 1; end")
+    a("      if ((st == S_GLU || st == S_EMB) && rq_vout) begin")
+    a("        if (st == S_GLU) mm[ocnt] <= rq_q; else xm[ocnt] <= rq_q;")
+    a("        ocnt <= ocnt + 1;")
+    a("      end")
+    a("")
+    a("      case (st)")
+    a("        S_IDLE: if (start) begin")
+    a("          tok_r <= tok; pos_r <= pos; hen <= head_en; busy <= 1'b1; lyr <= 0;")
+    a("          hh <= 0; hk <= 0; st <= S_EMB; ed <= 0; ev1 <= 1'b0; ocnt <= 0; ph <= 1'b0;")
+    a("          lane_r <= tok[3:0];")
+    a("        end")
+    a("        // The embedding row out of the head's weight words, requantized")
+    a("        // with this token's own constants.")
+    a("        S_EMB: begin")
+    a("          rq_scale <= c_data[%d:0]; rq_shift <= c_data[%d:%d];" % (mw - 1, sw + mw - 1, mw))
+    a("          if (ed < %d) ed <= ed + 1;" % D)
+    a("          ev1 <= (ed < %d);" % D)
+    a("          if (ev1) begin rq_acc <= ew; rq_v <= 1'b1; end")
+    a("          if (ocnt == %d) begin ocnt <= 0; fj <= 0; ph <= 1'b0; st <= S_N1; end" % D)
+    a("        end")
+    a("        S_R1, S_R2: begin")
+    a("          if (fj < %d) begin ra_a <= xm[fj]; ra_b <= am[fj]; ra_v <= 1'b1; fj <= fj + 1; end" % D)
+    a("          if (ocnt == %d) begin" % D)
+    a("            fj <= 0; ocnt <= 0; ph <= 1'b0;")
+    a("            if (st == S_R1) st <= S_N2;")
+    a("            else if (lyr + 1 < %d) begin lyr <= lyr + 1; st <= S_N1; end" % NL)
+    a("            else if (hen) begin st <= S_NF; end")
+    a("            else begin busy <= 1'b0; done <= 1'b1; st <= S_IDLE; end")
+    a("          end")
+    a("        end")
+    a("        S_RQ, S_RK: begin")
+    a("          if (fj < expect_n) begin")
+    a("            ro_x1 <= (st == S_RQ) ? qlo[fj] : klo[fj];")
+    a("            ro_x2 <= (st == S_RQ) ? qhi[fj] : khi[fj];")
+    a("            ro_idx <= fp[%d:0]; ro_v <= 1'b1; fj <= fj + 1;" % (ro["index_width"] - 1))
+    a("          end")
+    a("          if (ocnt == expect_n) begin fj <= 0; ocnt <= 0; ph <= 1'b0;")
+    a("            st <= (st == S_RQ) ? S_RK : S_LQ; end")
+    a("        end")
+    a("        S_LQ: begin")
+    a("          if (fj < %d) begin" % hd)
+    a("            at_load_valid <= 1'b1;")
+    a("            at_load_data <= fj[%d] ? qhi[hh * %d + fj[%d:0]] : qlo[hh * %d + fj[%d:0]];"
+      % (_clog2(h2), h2, _clog2(h2) - 1, h2, _clog2(h2) - 1))
+    a("            fj <= fj + 1;")
+    a("          end else begin fj <= 0; ocnt <= 0; ph <= 1'b0; st <= S_ATT; end")
+    a("        end")
+    a("        S_GLU: begin")
+    a("          rq_scale <= c_ms; rq_shift <= c_mh;")
+    a("          if (fj < %d) begin" % F)
+    a("            si_x <= (c_gsh >= 0) ? (gm[fj] <<< c_gsh) : (gm[fj] >>> (-c_gsh));")
+    a("            si_v <= 1'b1; fj <= fj + 1;")
+    a("          end")
+    a("          if (ocnt == %d) begin fj <= 0; ocnt <= 0; gcnt <= 0; ph <= 1'b0; st <= S_DN; end" % F)
+    a("        end")
+    a("        default: begin")
+    a("          if (!ph) begin")
+    a("            ph <= 1'b1; ocnt <= 0;")
+    a("            if (run_proj) pj_start <= 1'b1;")
+    a("            else if (in_norm) rn_start <= 1'b1;")
+    a("            else at_start <= 1'b1;")
+    a("            if (st == S_HD) hbase <= hk * %d;" % CHUNK)
+    a("          end else if (!blk_busy && ocnt == expect_n && !pj_start && !rn_start && !at_start) begin")
+    a("            ph <= 1'b0; ocnt <= 0; fj <= 0;")
+    a("            case (st)")
+    a("              S_N1: st <= S_Q;")
+    a("              S_Q: st <= S_K;")
+    a("              S_K: st <= S_V;")
+    a("              S_V: st <= S_RQ;")
+    a("              S_ATT: if (hh + 1 < %d) begin hh <= hh + 1; st <= S_LQ; end" % H)
+    a("                     else begin hh <= 0; st <= S_O; end")
+    a("              S_O: st <= S_R1;")
+    a("              S_N2: st <= S_G;")
+    a("              S_G: st <= S_U;")
+    a("              S_U: st <= S_GLU;")
+    a("              S_DN: st <= S_R2;")
+    a("              S_NF: st <= S_HD;")
+    a("              S_HD: if (hk < %d) hk <= hk + 1;" % (V // CHUNK))
+    a("                    else begin busy <= 1'b0; done <= 1'b1; st <= S_IDLE; end")
+    a("              default: st <= S_IDLE;")
+    a("            endcase")
+    a("          end")
+    a("        end")
+    a("      endcase")
+    a("    end")
+    a("  end")
+    a("endmodule")
+    return "\n".join(A) + "\n", dict(WA=WA, CA=CA, GA=GA, KA=KA, VA=VA,
+                                     KWN=KWN, VWN=VWN, CW=CW, tw=tw, pw=pw)
+
+
+TB = """`timescale 1ns/1ps
+module tb_qfull;
+  reg clk = 0, rst_n = 0, start = 0, head_en = 0;
+  reg [%(tw)d:0] tok = 0;
+  reg [%(pw)d:0] pos = 0;
+  wire [%(WA)d:0] w_addr;
+  reg [255:0] w_data, wtmp;
+  wire [%(CA)d:0] c_addr;
+  reg [%(CW)d:0] c_data;
+  wire [%(GA)d:0] g_addr;
+  reg signed [15:0] g_data;
+  wire [%(KA)d:0] k_raddr, kw0_addr, kw1_addr;
+  wire [%(VA)d:0] v_raddr, vw_addr;
+  reg [255:0] k_rdata, v_rdata, kt;
+  wire kw0_en, kw1_en, vw_en;
+  wire [3:0] kw0_lane, kw1_lane, vw_lane;
+  wire signed [15:0] kw0_data, kw1_data, vw_data;
+  wire [%(tw)d:0] next_tok;
+  wire signed [15:0] best;
+  wire done, busy;
+  reg [%(CW)d:0] cmem [0:%(cn)d];
+  reg signed [15:0] gmem [0:%(gn)d];
+  reg [255:0] km [0:%(kn)d];
+  reg [255:0] vm [0:%(vn)d];
+  integer fd, r, cyc = 0, t0 = 0, i;
+  reg [%(WA)d:0] wlast;
+  always #5 clk = ~clk;
+  always @(posedge clk) cyc = cyc + 1;
+  // What would be DDR: one weight word a cycle, from the image on disk.
+  always @(posedge clk) begin
+    if (w_addr !== wlast) begin
+      if (w_addr !== wlast + 1) r = $fseek(fd, w_addr * 32, 0);
+      r = $fread(wtmp, fd);
+      wlast = w_addr;
+    end
+    w_data <= wtmp;
+    c_data <= cmem[c_addr];
+    g_data <= gmem[g_addr];
+    k_rdata <= km[k_raddr];
+    v_rdata <= vm[v_raddr];
+    if (kw0_en) begin kt = km[kw0_addr]; kt[kw0_lane * 16 +: 16] = kw0_data; km[kw0_addr] = kt; end
+    if (kw1_en) begin kt = km[kw1_addr]; kt[kw1_lane * 16 +: 16] = kw1_data; km[kw1_addr] = kt; end
+    if (vw_en) begin kt = vm[vw_addr]; kt[vw_lane * 16 +: 16] = vw_data; vm[vw_addr] = kt; end
+  end
+  qwen_full dut (.clk(clk), .rst_n(rst_n), .start(start), .head_en(head_en),
+    .tok(tok), .pos(pos), .w_addr(w_addr), .w_data(w_data), .c_addr(c_addr),
+    .c_data(c_data), .g_addr(g_addr), .g_data(g_data), .k_raddr(k_raddr),
+    .k_rdata(k_rdata), .v_raddr(v_raddr), .v_rdata(v_rdata),
+    .kw0_en(kw0_en), .kw0_addr(kw0_addr), .kw0_lane(kw0_lane), .kw0_data(kw0_data),
+    .kw1_en(kw1_en), .kw1_addr(kw1_addr), .kw1_lane(kw1_lane), .kw1_data(kw1_data),
+    .vw_en(vw_en), .vw_addr(vw_addr), .vw_lane(vw_lane), .vw_data(vw_data),
+    .next_tok(next_tok), .best(best), .done(done), .busy(busy));
+  task step(input integer t, input integer p, input integer he);
+    begin
+      tok = t; pos = p; head_en = he;
+      @(negedge clk); start = 1; t0 = cyc; @(negedge clk); start = 0;
+      while (!done) @(negedge clk);
+      $display("STEP pos=%%0d tok=%%0d cycles=%%0d next=%%0d best=%%0d", p, t, cyc - t0, next_tok, best);
+      $fflush;
+    end
+  endtask
+  initial begin
+    fd = $fopen("weights.bin", "rb");
+    wlast = {%(WA1)d{1'b1}};
+    $readmemh("cparams.hex", cmem);
+    $readmemh("gains.hex", gmem);
+    for (i = 0; i <= %(kn)d; i = i + 1) km[i] = 0;
+    for (i = 0; i <= %(vn)d; i = i + 1) vm[i] = 0;
+    repeat (3) @(negedge clk); rst_n = 1; @(negedge clk);
+%(steps)s
+    $finish;
+  end
+endmodule
+"""
+
+
+def build(prompt, n_gen, work=WORK, log=print, layers=None):
+    cfg, W = qr.load()
+    tok = qr.Tokenizer()
+    cal = qc.calibration(cfg, W, tok)
+    if layers:
+        # A shortened stack, for a quick check of the same sequencer: the
+        # token it picks is meaningless, but it has to match the integer
+        # model run with the same layers.
+        cfg = dict(cfg, num_hidden_layers=layers)
+    im = qi.IntQwen(cfg, W, 16, True, cal, exact_io=True)
+    ids = tok.encode(prompt)
+    # The integer model's own run: what the RTL has to choose.
+    t0 = time.time()
+    want = qr.greedy(im, ids, n_gen)
+    log("integer model: %r (%.0f s)" % (tok.decode(want), time.time() - t0))
+    os.makedirs(work, exist_ok=True)
+    lay = Layout(im)
+    norms = write_images(im, lay, work, log)
+    lc, nf = layer_consts(im, norms)
+    rtl, w = render(im, lay, lc, nf)
+    with open(os.path.join(work, "qwen_full.v"), "w") as f:
+        f.write(rtl)
+    # The blocks, at Qwen's size.
+    ms = im.ms
+    rr = agent.RuleBasedAgent()
+    cf.write_attn_deps(ms, work)
+    cf.write_rmsnorm_deps(ms, work)
+    cf.write_silu_deps(ms, work)
+    cf.write_rope_deps(im.sp["rope"], work)
+    blocks = {
+        "b_projn.v": rr.render_projn(specgen.derive_projn_spec(ms, per_column=True),
+                                     {agent.FIX_LANE}),
+        "b_attnn.v": rr.render_attnn(specgen.derive_attnn_spec(ms), {agent.FIX_KLANE}),
+        "b_rmsnorm.v": rr.render_rmsnorm(im.sp["rmsnorm"], {agent.FIX_EPS}),
+        "b_rope.v": rr.render_rope(im.sp["rope"], {agent.FIX_ROTDIR}),
+        "b_silu.v": rr.render_silu(im.sp["silu"], {agent.FIX_SIGN}),
+        "b_resadd.v": rr.render_resadd(im.sp["resadd"], {agent.FIX_RRND}),
+    }
+    for fn, src in blocks.items():
+        with open(os.path.join(work, fn), "w") as f:
+            f.write(src)
+    deps = sorted(set(cf.ATTN_DEPS) | set(cf.RMSNORM_DEPS) | set(cf.SILU_DEPS)
+                  | {"rope_rom.v"})
+    steps = []
+    feed = list(ids)
+    for p in range(len(want) - 1):
+        # The prompt, then each generated token fed back; the head only
+        # where the next token is wanted.
+        he = 1 if p >= len(ids) - 1 else 0
+        steps.append("    step(%d, %d, %d);" % (want[p], p, he))
+    tb = TB % dict(tw=w["tw"] - 1, pw=w["pw"] - 1, WA=w["WA"] - 1,
+                   WA1=w["WA"], CA=w["CA"] - 1, CW=w["CW"] - 1,
+                   GA=w["GA"] - 1, KA=w["KA"] - 1, VA=w["VA"] - 1,
+                   cn=lay.cwords - 1, gn=(2 * im.NL + 1) * im.D - 1,
+                   kn=w["KWN"] - 1, vn=w["VWN"] - 1, steps="\n".join(steps))
+    with open(os.path.join(work, "tb_qfull.v"), "w") as f:
+        f.write(tb)
+    srcs = ["tb_qfull.v", "qwen_full.v"] + sorted(blocks) + deps
+    return tok, ids, want, srcs
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--prompt", default="The capital of France is")
+    ap.add_argument("--tokens", type=int, default=1)
+    ap.add_argument("--layers", type=int, default=None)
+    ap.add_argument("--work", default=WORK)
+    a = ap.parse_args()
+    tok, ids, want, srcs = build(a.prompt, a.tokens, a.work, layers=a.layers)
+    r = subprocess.run(["iverilog", "-g2005", "-o", "q.out"] + srcs, cwd=a.work,
+                       capture_output=True, text=True)
+    if r.returncode:
+        print(r.stdout[-3000:], r.stderr[-3000:])
+        sys.exit(1)
+    t0 = time.time()
+    p = subprocess.Popen(["vvp", "q.out"], cwd=a.work, stdout=subprocess.PIPE,
+                         text=True)
+    got = []
+    for line in p.stdout:
+        print(line.rstrip(), "(%.0f s)" % (time.time() - t0))
+        sys.stdout.flush()
+        if line.startswith("STEP") and "next=" in line:
+            pos_ = int(line.split("pos=")[1].split()[0])
+            if pos_ >= len(ids) - 1:
+                got.append(int(line.split("next=")[1].split()[0]))
+    p.wait()
+    gen = want[len(ids):]
+    print("RTL chose:     %r" % tok.decode(got))
+    print("integer model: %r" % tok.decode(gen))
+    print("MATCH" if got == gen else "MISMATCH")
+    sys.exit(0 if got == gen else 1)
+
+
+if __name__ == "__main__":
+    main()

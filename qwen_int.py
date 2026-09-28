@@ -74,8 +74,12 @@ def quantize_rows(Wf, rows, cols, per_channel):
 
 class IntQwen:
     def __init__(self, cfg, W, act_bits=8, per_channel=True, calib=None,
-                 log=print, probe=None):
+                 log=print, probe=None, exact_io=False):
         self.probe = probe or (lambda *a: None)
+        # exact_io: the embedding lookup and the head as the hardware does
+        # them, a per-token requantize in and a per-column requantize to
+        # one logit scale out, instead of float rescaling at the edges.
+        self.exact_io = exact_io
         self.c = cfg
         self.A = act_bits
         self.pc = per_channel
@@ -124,6 +128,10 @@ class IntQwen:
     def _constants(self):
         cal, A = self.cal, self.A
         s = {k: v / self.hi for k, v in cal.items()}
+        if "lg" in s:
+            # Headroom: a logit above every calibrated one must not
+            # saturate, or several would tie at the top code.
+            s["lg"] *= 1.5
         self.s = s
         at = self.sp["attn"]["parameters"]
         sm = self.sp["softmax"]["parameters"]
@@ -154,40 +162,50 @@ class IntQwen:
         self.Vc = [[] for _ in range(self.NL)]
 
     # -- blocks ----------------------------------------------------------
-    def proj(self, x, key, sx, dst_s, bias=None):
-        """requant(W x + b) at dst_s; per-channel weights give each output
-        its own requantizer scale."""
-        Qw, ws = self.Q[key], self.WS[key]
-        cols = len(x)
-        rows = len(Qw) // cols
-        mul = operator.mul
-        out = []
-        cache = {}
-        for r in range(rows):
-            acc = sum(map(mul, x, Qw[r * cols:(r + 1) * cols]))
-            w = ws[r]
-            if bias is not None:
-                acc += int(round(bias[r] / (sx * w)))
+    def proj_consts(self, key, sx, dst_s, bias=None):
+        """Each output column's (bias in accumulator units, scale, shift):
+        what the per-column projection reads from its constant memory."""
+        ws = self.WS[key]
+        out, cache = [], {}
+        for r, w in enumerate(ws):
+            b = int(round(bias[r] / (sx * w))) if bias is not None else 0
             ratio = sx * w / dst_s
             k = cache.get(ratio)
             if k is None:
                 k = cache[ratio] = pick(ratio, self.mw, self.sw)
-            out.append(specgen.requant_golden(acc, k[0], k[1], self.A)[0])
+            out.append((b, k[0], k[1]))
         return out
 
-    def norm(self, x, gname, dst):
-        p = self.sp["rmsnorm"]
-        pp = p["parameters"]
+    def proj(self, x, key, sx, dst_s, bias=None):
+        """requant(W x + b) at dst_s; per-channel weights give each output
+        its own requantizer scale."""
+        Qw = self.Q[key]
+        cols = len(x)
+        mul = operator.mul
+        out = []
+        for r, (b, sc, sh) in enumerate(self.proj_consts(key, sx, dst_s, bias)):
+            acc = sum(map(mul, x, Qw[r * cols:(r + 1) * cols])) + b
+            out.append(specgen.requant_golden(acc, sc, sh, self.A)[0])
+        return out
+
+    def norm_consts(self, gname, dst):
+        """The gains as int8 codes, and the output (scale, shift)."""
+        pp = self.sp["rmsnorm"]["parameters"]
         gf = self.Wf[gname][0]
         gs = max(abs(v) for v in gf) / 127.0
         gq = [int(round(v / gs)) for v in gf]
         ow, kk = pp["rsqrt_out_width"], pp["norm_shift"]
         sc, sh = pick(2.0 ** (kk - ow) * math.sqrt(self.D) * gs / dst,
                       pp["scale_width"], pp["shift_width"])
-        return specgen.rmsnorm_golden(x, gq, 1, sc, sh, pp,
+        return gq, sc, sh
+
+    def norm(self, x, gname, dst):
+        p = self.sp["rmsnorm"]
+        gq, sc, sh = self.norm_consts(gname, dst)
+        return specgen.rmsnorm_golden(x, gq, 1, sc, sh, p["parameters"],
                                       p["derivation"]["rsqrt"])[4]
 
-    def add(self, a, b, sa, sb, dst):
+    def add_consts(self, sa, sb, dst):
         rp = self.sp["resadd"]["parameters"]
         best = None
         for sh in range(1, 60):
@@ -195,8 +213,28 @@ class IntQwen:
             if max(ka, kb) >= 1 << rp["scale_width"]:
                 break
             best = (ka, kb, sh)
-        return [specgen.resadd_golden(u, v, best[0], best[1], best[2], self.A)
+        return best
+
+    def add(self, a, b, sa, sb, dst):
+        ka, kb, sh = self.add_consts(sa, sb, dst)
+        return [specgen.resadd_golden(u, v, ka, kb, sh, self.A)
                 for u, v in zip(a, b)]
+
+    def embed_consts(self, tok):
+        """The per-token (scale, shift) that requantizes an int8
+        embedding row, stored at its own per-channel scale, to x0's."""
+        return pick(self.WS["model.embed_tokens.weight"][tok] / self.s["x0"],
+                    self.mw, self.sw)
+
+    def embed(self, tok):
+        emb = "model.embed_tokens.weight"
+        row = self.Q[emb][tok * self.D:(tok + 1) * self.D]
+        if self.exact_io:
+            sc, sh = self.embed_consts(tok)
+            return [specgen.requant_golden(v, sc, sh, self.A)[0] for v in row]
+        es = self.WS[emb][tok]
+        return [max(-self.hi - 1, min(self.hi, int(round(v * es / self.s["x0"]))))
+                for v in row]
 
     def rope(self, v, heads, pos):
         rp = self.sp["rope"]
@@ -220,10 +258,7 @@ class IntQwen:
         sd = self.sp["silu"]["derivation"]
         emb = "model.embed_tokens.weight"
         # The embedding row, requantized from its int8 codes to x0's scale.
-        row = self.Q[emb][tok * D:(tok + 1) * D]
-        es = self.WS[emb][tok]
-        x = [max(-self.hi - 1, min(self.hi, int(round(v * es / s["x0"]))))
-             for v in row]
+        x = self.embed(tok)
         sx = s["x0"]
         pr = self.probe
         pr("x0", x, sx, None)
@@ -281,6 +316,11 @@ class IntQwen:
         if not logits:
             return None
         xf = self.norm(x, "model.norm.weight", s["xf"])
+        self.last_xf = xf
+        if self.exact_io:
+            # Every logit requantized to one calibrated scale, as the
+            # per-column projection does it; the argmax is over codes.
+            return self.proj(xf, emb, s["xf"], s["lg"])
         Qe, ws = self.Q[emb], self.WS[emb]
         mul = operator.mul
         # The head only needs the argmax, so its accumulators are compared
@@ -303,7 +343,8 @@ def calibrate(cfg, W, tok, text=CALIB, log=print):
     ids = tok.encode(text)
     t0 = time.time()
     for i, t in enumerate(ids):
-        fm.step(t, i, logits=False)
+        # Logits too, so the head's requantizer has a calibrated scale.
+        fm.step(t, i, logits=True)
     log("calibrated on %d tokens in %.0f s" % (len(ids), time.time() - t0))
     return mx
 

@@ -371,6 +371,36 @@ quantized, through the generated RTL, equals the arithmetic that
 decodes "Paris" from it. What it is not is one sequenced layer in RTL at
 this size; each block runs on its own inputs.
 
+## A real Qwen token through one generated sequencer
+
+```
+python3 qwen_full.py --layers 1 --prompt "Paris"     # 14 minutes
+python3 qwen_full.py                                  # all 24 layers, hours
+```
+
+The co-simulations above run one block at a time. `qwen_full.py`
+generates one sequencer for the whole decode step at Qwen2.5-0.5B's own
+size, over the same blocks at 8-bit weights and 16-bit activations: the
+per-column 16-lane projection, RMSNorm, the multi-lane attention head,
+RoPE, SiLU, the requantizer and the residual add. What would be DDR on a
+board is behind ports: a 256-bit weight word a cycle, which the
+testbench serves from a 1 GB image of the checkpoint with $fread, a
+memory of every projection column's bias, scale and shift, the norm
+gains, and the KV cache, written a lane at a time. The embedding lookup
+reads the tied head's own weight words and requantizes them with the
+token's constants, and the head runs as 32 projection chunks over
+151936 tokens with a streaming argmax, so no logit is stored. For this
+the integer model's two edges became hardware operations too: the
+embedding a per-token requantize, the head a per-column requantize to one
+calibrated logit scale. It still decodes "The capital of France is
+Paris."
+
+With the stack cut to its first layer, the same sequencer on the real
+weights, the real embedding and the real 151936-way head chooses the
+integer model's token: 9.5 million cycles, 14 minutes of simulation. The
+full 24-layer run takes about 32 minutes a position at the simulator's
+11,600 cycles a second.
+
 ## Qwen's structure decodes in RTL
 
 ```
