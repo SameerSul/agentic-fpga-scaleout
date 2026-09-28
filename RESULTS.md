@@ -439,9 +439,28 @@ eight line slots. The same run then takes 41.7 million bus cycles, 4.39
 per core cycle, against a floor of 4.0 set by one 64-bit port feeding a
 256-bit word a cycle; the token and the core's 9,510,162 cycles are
 unchanged. At 100 MHz a full Qwen2.5-0.5B token is then about 1.4
-seconds on one HP port. Striping the weights across the Zynq's four HP
-ports would bring it to about 0.35 seconds, near the 0.25 the 2 GB/s
-sizing assumes; that striping is not written. The first run of
+seconds on one HP port.
+
+The Zynq has four HP ports, so the weight lines are now striped across
+four masters, line L on port L mod 4, with 32 slots and each slot always
+filled through the same port so its responses stay in order. The first
+four-port run managed only 2.15, and counting stalled cycles by cause
+put almost all of it on weight misses in the head, where the address
+stream is perfectly sequential: the streamer took a full window as a
+jump, restarted at the core's line and re-walked 32 lines it already
+held. It now waits when the window is full and restarts only when the
+core's line jumps. The same run then takes 12.86 million bus cycles,
+1.35 per core cycle, token and core cycles again unchanged:
+
+| weight path | bus cycles per core cycle | full token at 100 MHz |
+|---|---|---|
+| one port, one read at a time | 13.3 | 4.2 s |
+| one port, 4 bursts outstanding | 4.39 | 1.4 s |
+| four ports, 32-line window | **1.35** | **0.42 s, 2.4 tokens/s** |
+
+What stands between that and the sizing model's 4 tokens/s is mostly
+the 64-bit width of each port at 100 MHz, 3.2 GB/s of peak for the four,
+and the constant port's line misses, which are not prefetched. The first run of
 this deadlocked, and the fault was the testbench's: before reset the
 master's valids are X, !X is false, and the DDR model ran a phantom
 write at cycle 2, then waited forever for its data beat.
