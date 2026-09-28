@@ -131,12 +131,13 @@ module qwen_zybo (
     if (!rst_n) begin
       fs <= F_IDLE; arvalid <= 1'b0; awvalid <= 1'b0; wvalid <= 1'b0;
       cv <= 1'b0; kv <= 1'b0; vv <= 1'b0; d0 <= 1'b0; d1 <= 1'b0;
-      d2 <= 1'b0; wq <= 0; cq <= 0; kq <= 0; vq <= 0; core_cycles <= 0;
+      d2 <= 1'b0; wq <= 0; curns <= NS; cq <= 0; kq <= 0; vq <= 0; core_cycles <= 0;
     end else begin
       // The core takes an edge now: capture its addresses as a registered
       // memory would, and clear the write flags for its new outputs.
       if (ce_l) begin
         wq <= w_addr; cq <= c_addr; kq <= k_raddr; vq <= v_raddr;
+        curns <= (w_addr >> 2) + NS;
         g_data <= gmem[g_addr];
         d0 <= 1'b0; d1 <= 1'b0; d2 <= 1'b0;
         core_cycles <= core_cycles + 1;
@@ -234,7 +235,11 @@ def render_streamer(np_, wam, ns=32, wbase=0):
     a("  wire hw = sval[cs] && stag[cs] == cur;")
     a("  reg [%d:0] nreq;" % wam)
     a("  wire [%d:0] ns = nreq[%d:0];" % (sb - 1, sb - 1))
-    a("  wire in_win = nreq >= cur && nreq < cur + NS;")
+    a("  // The window's end and the next line, registered with the values")
+    a("  // they come from, so the issue decision has no adder in it: with")
+    a("  // them the bridge clock's worst path was 11 LUTs through two adders.")
+    a("  reg [%d:0] curns, pcur1;" % (wam + 1))
+    a("  wire in_win = nreq >= cur && nreq < curns;")
     a("  // A full window is a reason to wait, not to restart. Treating it as")
     a("  // a jump restarted the stream at the core's line and re-walked 32")
     a("  // lines it already held before issuing a new one: 2.15 bus cycles a")
@@ -246,8 +251,8 @@ def render_streamer(np_, wam, ns=32, wbase=0):
     a("  // a deadlock the always-ready DDR model never showed. A stream past")
     a("  // the window can only follow a jump back, so it counts as one too.")
     a("  reg jl;")
-    a("  wire jumped = jl || (cur != pcur && cur != pcur + 1) || nreq < cur")
-    a("               || nreq > cur + NS;")
+    a("  wire jumped = jl || (cur != pcur && cur != pcur1) || nreq < cur")
+    a("               || nreq > curns;")
     a("  wire have = sval[ns] && stag[ns] == nreq;")
     anyv = " || ".join("w%d_arvalid" % p for p in range(np_))
     a("  wire anyv = %s;" % anyv)
@@ -262,7 +267,7 @@ def render_streamer(np_, wam, ns=32, wbase=0):
     a("  integer si;")
     a("  always @(posedge clk) begin")
     a("    if (!rst_n) begin")
-    a("      nreq <= 0; pcur <= 0; jl <= 1'b0;")
+    a("      nreq <= 0; pcur <= 0; pcur1 <= 1; jl <= 1'b0;")
     for p in range(np_):
         a("      w%d_arvalid <= 1'b0; out%d <= 0; ih%d <= 0; it%d <= 0; wb%d <= 0;"
           % (p, p, p, p, p))
@@ -272,7 +277,7 @@ def render_streamer(np_, wam, ns=32, wbase=0):
         a("      if (w%d_arvalid && w%d_arready) w%d_arvalid <= 1'b0;" % (p, p, p))
     a("      // A jump, to a new projection or back to the start of one:")
     a("      // restart the stream at the core's line.")
-    a("      pcur <= cur;")
+    a("      pcur <= cur; pcur1 <= cur + 1;")
     a("      jl <= jumped && anyv;")
     a("      if (jumped && !anyv) nreq <= cur;")
     a("      else if (in_win && have) nreq <= nreq + 1;")

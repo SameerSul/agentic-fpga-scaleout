@@ -195,6 +195,8 @@ python3 qwen_full.py               # one generated sequencer decoding a real Qwe
 python3 zybo.py                    # the same core on a 64-bit AXI3 DDR bus, clock held on misses
 python3 board_zybo.py              # the Zybo Z7-20 package in board_zybo/: PL top, Vivado block design, ARM code, SD files
 python3 board_zybo.py --work build_qfull1 --out build_bz1 --sim --jitter   # one layer through its registers
+board_zybo/open/build_open.sh      # the Zybo bitstream without Vivado (openXC7); routes at 50 MHz on the XC7Z020
+python3 fetch_qwen.py --model qwen3  # Qwen3-0.6B, the model Architect Labs hosted; FPGAI_QWEN=qwen3 selects it everywhere
 python3 bitstream.py --block mac   # place, route and pack a real iCE40 bitstream (needs nextpnr-ice40)
 python3 dv.py --rtl build/mac.v --tb tb_mac.v   # mutation-test a generated testbench
 python3 inference.py               # real quantized transformer dot products through the generated RTL

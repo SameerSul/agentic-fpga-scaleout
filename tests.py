@@ -1791,6 +1791,8 @@ def test_weight_streamer_survives_stalls():
   assign dummy = 1'b0;
 %s
 %s%s
+  // The bridge registers these with wq; here wq is an input.
+  always @(*) curns = (wq >> 2) + NS;
   assign hw_o = hw;
 endmodule
 """ % (wam, ports.split('\n', 1)[1],
@@ -1894,6 +1896,53 @@ endmodule
               'TB_RESULT: PASS' in out)
     finally:
         shutil.rmtree(work, ignore_errors=True)
+
+
+def test_full_sequencer_both_qwens():
+    """The full-size sequencer generator, run on small random checkpoints
+    with each real Qwen's structure: Qwen3-0.6B's (no biases, q twice the
+    hidden width, RMSNorm on every head of q and k) and Qwen2.5's (q, k,
+    v biases). Each head step's argmax and its logit have to be the
+    integer model's, and a sequencer that skips Qwen3's head norms has to
+    be caught, which the token alone would not do: a random tied-head
+    model keeps choosing its input token."""
+    import qwen_full, qwen_synth
+    ids = [3, 77, 12, 140]
+    for style, mut in (('qwen3', None), ('qwen2.5', None),
+                       ('qwen3', ('S_V: st <= S_QN;', 'S_V: st <= S_RQ;'))):
+        work = os.path.join(ROOT, 'build_qsynthtest')
+        shutil.rmtree(work, ignore_errors=True)
+        try:
+            im, _ = qwen_synth.model(style)
+            want, srcs = qwen_full.build_model(im, ids, 3, work, log=lambda *a: None)
+            im.reset()
+            best = []
+            for p in range(len(want) - 1):
+                lg = im.step(want[p], p, logits=p >= len(ids) - 1)
+                if lg is not None:
+                    best.append((max(range(len(lg)), key=lg.__getitem__), max(lg)))
+            if mut:
+                path = os.path.join(work, 'qwen_full.v')
+                src = open(path).read()
+                assert mut[0] in src
+                open(path, 'w').write(src.replace(mut[0], mut[1]))
+            r = subprocess.run(['iverilog', '-g2005', '-o', 'q.out'] + srcs, cwd=work,
+                               capture_output=True, text=True)
+            out = r.stdout + r.stderr
+            if not r.returncode:
+                out = subprocess.run(['vvp', 'q.out'], cwd=work, capture_output=True,
+                                     text=True, timeout=600).stdout
+            got = [(int(l.split('next=')[1].split()[0]), int(l.split('best=')[1].split()[0]))
+                   for l in out.splitlines() if l.startswith('STEP')
+                   and int(l.split('pos=')[1].split()[0]) >= len(ids) - 1]
+            if mut:
+                check('a Qwen3 sequencer skipping the head norms is caught',
+                      len(got) == len(best) and got != best)
+            else:
+                check('the %s-shaped sequencer matches every logit it picks' % style,
+                      got == best and len(best) == 3)
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
 
 
 def test_multi_lane_attention():
@@ -2738,6 +2787,7 @@ if __name__ == '__main__':
     test_basys3_top_level()
     test_zybo_register_block()
     test_weight_streamer_survives_stalls()
+    test_full_sequencer_both_qwens()
     test_composite_cell_count()
     test_requant_golden_is_shared()
     test_table_unit_specs_are_implementable()

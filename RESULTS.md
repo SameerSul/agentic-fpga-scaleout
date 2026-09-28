@@ -27,8 +27,10 @@ Architect Labs does, for one reason: nothing in this repo has been put on
 a board. The sequencer fits the Zybo's Zynq 7020, and `board_zybo/` is
 its whole board package, the PL top level on the Zynq's DDR ports, the
 Vivado block design, the ARM program and the SD card, simulated through
-the registers the ARM would use; running Vivado and the board are the
-steps not taken.
+the registers the ARM would use. Without Vivado, the open 7-series flow
+places and routes that design on the real XC7Z020 and closes 50 MHz,
+and the bitstream it writes round-trips frame for frame; loading it on a
+board is the step not taken.
 The remaining gap is listed at the bottom rather than glossed over.
 
 ## Verified
@@ -36,7 +38,7 @@ The remaining gap is listed at the bottom rather than glossed over.
 ### The full suite
 
 ```
-python3 tests.py            # 346 tests, or 344 without OpenSTA
+python3 tests.py            # 349 tests, or 347 without OpenSTA
 ```
 
 ### Spec to RTL, across the spec space
@@ -536,10 +538,50 @@ old streamer in half a second; `test_zybo_register_block` runs the
 registers around a stub core whose clock ticks one bus cycle in four,
 and fails if a start is a one-cycle pulse or done is not kept.
 
-Vivado has not run on any of this, so the block design, the
-interconnects, timing at 50 MHz and the software have not met real
-tools. The gated core clock, a BUFGCE, is the first path to read in the
-timing report.
+## A routed Zynq bitstream, without Vivado
+
+```
+board_zybo/open/build_open.sh     # Yosys, nextpnr-xilinx, Project X-Ray
+```
+
+Vivado needs an x86 host, but the open 7-series flow (openXC7:
+nextpnr-xilinx on Project X-Ray's database) supports the Zybo's
+XC7Z020, and it builds and runs on this ARM Mac. `board_zybo/open/` has
+what the flow needs in place of the IP integrator: `fpgai_ps7.v`
+instances the PS7 directly and wires GP0 to the register block (the
+CPU's register accesses are single beats; their IDs are kept and
+returned), the four weight masters to HP0 to HP3 and the fifth to ACP.
+The whole design, 24 layers, bridge, registers and PS7, then places and
+routes on the real part:
+
+| clock | post-route Fmax | at 50 MHz |
+|---|---|---|
+| core (gated, through a BUFGCTRL) | 53.4 MHz | passes |
+| bus and registers (FCLK0) | 50.9 MHz | passes |
+
+using 29% of the LUT sites (LUT RAM included), 14% of the flip-flops,
+132 of 220 DSPs and 49 block RAMs. The bitstream is 4,045,667 bytes, the
+XC7Z020's full size, and it round-trips: Project X-Ray decodes it back
+to features which, encoded again, give the routed design's frames
+exactly, all 7,802 of them.
+
+Two things stood in the way, and both are fixed. nextpnr-xilinx pins
+every DSP48E1 that starts no cascade to the lower DSP of its tile, which
+leaves 110 sites for this design's 132 lone multipliers, so placement
+failed on the same attention multiplier at every seed and with either
+placer; `nextpnr-xilinx-dsp.patch`, written by `board_zybo.py`, lets a
+lone DSP take either site. Then the bus clock missed 50 MHz by 0.25 ns,
+at 49.4 MHz: its worst path was the weight streamer's issue decision, 11
+LUTs through the window's two adders. `cur + NS` and `pcur + 1` are now
+registered at the same edges as `cur` and `pcur`, so every cycle sees
+the same values and no adder is left on the path; the same one-layer
+runs through the registers give the same token in the same bus cycles.
+
+What this does not settle: the PS7's own setup (DDR, clocks, the PL
+level shifters) is software's job on any Zynq, ps7_init from Vivado or
+Digilent's reference design, and nobody has loaded this bitstream on a
+board. Vivado's `build.tcl` route remains the one the handoff describes;
+this one says the design fits and closes timing on the real part.
 
 ## Qwen's structure decodes in RTL
 
@@ -1234,9 +1276,11 @@ These are the distance between this repo and a local LLM host.
    USB-UART, simulated end to end, and `build.tcl` is the part not run.
    For the Zybo it is the real model: `board_zybo/` builds the
    Qwen2.5-0.5B sequencer into the Zynq's PL with an ARM program that
-   loads the weights from SD and prints the text, simulated one layer
-   deep through its registers; its `build.tcl` and the Vitis build are
-   the part not run.
+   loads the weights from SD and prints the text, simulated through its
+   registers. Its PL now also has a routed bitstream from the open flow,
+   at 50 MHz on the XC7Z020, so what remains is the board itself,
+   `HANDOFF.md`'s steps: Vivado's build or that bitstream with a ps7_init,
+   the Vitis program, and a UART log.
 2. **The generated blocks are the arithmetic, not the whole engine.** The
    flow generates the multiply-accumulate unit, the requantizer between
    matmuls, the exponential and the reciprocal that softmax needs, the

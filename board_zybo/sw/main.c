@@ -93,13 +93,15 @@ int main(void)
         tok = step(prompt[pos + 1], pos, pos == n - 1);
         XTime_GetTime(&b);
     }
+    // N_GEN tokens: each one printed, then fed back for the next.
     for (int g = 0; g < N_GEN && pos < MAX_POS; g++, pos++) {
         print_tok(tok);
+        if (g + 1 == N_GEN)
+            break;
         XTime_GetTime(&a);
         tok = step(tok, pos, 1);
         XTime_GetTime(&b);
     }
-    print_tok(tok);
     // XTime counts at half the CPU clock.
     printf("\r\nlast step: %lu core cycles, %lu bus cycles, %.2f s\r\n",
            (unsigned long)Xil_In32(REG(FPGAI_CORE_CYCLES)),

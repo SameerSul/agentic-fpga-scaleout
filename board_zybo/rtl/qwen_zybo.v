@@ -88,7 +88,11 @@ module qwen_zybo (
   wire hw = sval[cs] && stag[cs] == cur;
   reg [24:0] nreq;
   wire [4:0] ns = nreq[4:0];
-  wire in_win = nreq >= cur && nreq < cur + NS;
+  // The window's end and the next line, registered with the values
+  // they come from, so the issue decision has no adder in it: with
+  // them the bridge clock's worst path was 11 LUTs through two adders.
+  reg [25:0] curns, pcur1;
+  wire in_win = nreq >= cur && nreq < curns;
   // A full window is a reason to wait, not to restart. Treating it as
   // a jump restarted the stream at the core's line and re-walked 32
   // lines it already held before issuing a new one: 2.15 bus cycles a
@@ -100,8 +104,8 @@ module qwen_zybo (
   // a deadlock the always-ready DDR model never showed. A stream past
   // the window can only follow a jump back, so it counts as one too.
   reg jl;
-  wire jumped = jl || (cur != pcur && cur != pcur + 1) || nreq < cur
-               || nreq > cur + NS;
+  wire jumped = jl || (cur != pcur && cur != pcur1) || nreq < cur
+               || nreq > curns;
   wire have = sval[ns] && stag[ns] == nreq;
   wire anyv = w0_arvalid || w1_arvalid || w2_arvalid || w3_arvalid;
   reg [3:0] out0;
@@ -124,7 +128,7 @@ module qwen_zybo (
   integer si;
   always @(posedge clk) begin
     if (!rst_n) begin
-      nreq <= 0; pcur <= 0; jl <= 1'b0;
+      nreq <= 0; pcur <= 0; pcur1 <= 1; jl <= 1'b0;
       w0_arvalid <= 1'b0; out0 <= 0; ih0 <= 0; it0 <= 0; wb0 <= 0;
       w1_arvalid <= 1'b0; out1 <= 0; ih1 <= 0; it1 <= 0; wb1 <= 0;
       w2_arvalid <= 1'b0; out2 <= 0; ih2 <= 0; it2 <= 0; wb2 <= 0;
@@ -137,7 +141,7 @@ module qwen_zybo (
       if (w3_arvalid && w3_arready) w3_arvalid <= 1'b0;
       // A jump, to a new projection or back to the start of one:
       // restart the stream at the core's line.
-      pcur <= cur;
+      pcur <= cur; pcur1 <= cur + 1;
       jl <= jumped && anyv;
       if (jumped && !anyv) nreq <= cur;
       else if (in_win && have) nreq <= nreq + 1;
@@ -250,12 +254,13 @@ module qwen_zybo (
     if (!rst_n) begin
       fs <= F_IDLE; arvalid <= 1'b0; awvalid <= 1'b0; wvalid <= 1'b0;
       cv <= 1'b0; kv <= 1'b0; vv <= 1'b0; d0 <= 1'b0; d1 <= 1'b0;
-      d2 <= 1'b0; wq <= 0; cq <= 0; kq <= 0; vq <= 0; core_cycles <= 0;
+      d2 <= 1'b0; wq <= 0; curns <= NS; cq <= 0; kq <= 0; vq <= 0; core_cycles <= 0;
     end else begin
       // The core takes an edge now: capture its addresses as a registered
       // memory would, and clear the write flags for its new outputs.
       if (ce_l) begin
         wq <= w_addr; cq <= c_addr; kq <= k_raddr; vq <= v_raddr;
+        curns <= (w_addr >> 2) + NS;
         g_data <= gmem[g_addr];
         d0 <= 1'b0; d1 <= 1'b0; d2 <= 1'b0;
         core_cycles <= core_cycles + 1;

@@ -1,0 +1,78 @@
+"""A small random checkpoint with a real Qwen's structure, for tests.
+
+The full-size sequencer takes hours to simulate on the real weights. This
+builds a checkpoint in the same format qwen_real.py loads, a few layers
+and a hidden size of 64, in either Qwen's style: "qwen3" (no biases, q
+wider than the hidden state, RMSNorm on every head of q and k) or
+"qwen2.5" (q, k and v biases, head_dim = hidden / heads). The integer
+model is calibrated on its own float run, so qwen_full.build_model can
+generate and simulate the same sequencer on it in seconds.
+"""
+import array
+import random
+
+import qwen_int as qi
+import qwen_real as qr
+
+
+def config(style="qwen3"):
+    c = {"hidden_size": 64, "intermediate_size": 256, "num_attention_heads": 4,
+         "num_key_value_heads": 2, "num_hidden_layers": 2, "vocab_size": 160,
+         "rms_norm_eps": 1e-6, "rope_theta": 1000000.0}
+    if style == "qwen3":
+        c["head_dim"] = 32
+    return c
+
+
+def weights(cfg, style="qwen3", seed=5):
+    rnd = random.Random(seed)
+    D, F, H, KV = (cfg["hidden_size"], cfg["intermediate_size"],
+                   cfg["num_attention_heads"], cfg["num_key_value_heads"])
+    hd = qr.head_dim(cfg)
+    W = {}
+
+    def put(name, shape, std, mean=0.0):
+        n = 1
+        for d in shape:
+            n *= d
+        W[name] = (array.array("f", [mean + rnd.gauss(0.0, std) for _ in range(n)]),
+                   list(shape))
+    put("model.embed_tokens.weight", (cfg["vocab_size"], D), 1.0)
+    put("model.norm.weight", (D,), 0.1, 1.0)
+    for li in range(cfg["num_hidden_layers"]):
+        P = "model.layers.%d." % li
+        put(P + "input_layernorm.weight", (D,), 0.1, 1.0)
+        put(P + "post_attention_layernorm.weight", (D,), 0.1, 1.0)
+        for m, (r, c) in (("q_proj", (H * hd, D)), ("k_proj", (KV * hd, D)),
+                          ("v_proj", (KV * hd, D)), ("o_proj", (D, H * hd))):
+            put(P + "self_attn.%s.weight" % m, (r, c), c ** -0.5)
+            if style == "qwen2.5" and m != "o_proj":
+                put(P + "self_attn.%s.bias" % m, (r,), 0.5)
+        if style == "qwen3":
+            put(P + "self_attn.q_norm.weight", (hd,), 0.3, 1.5)
+            put(P + "self_attn.k_norm.weight", (hd,), 0.3, 1.5)
+        for m, (r, c) in (("gate_proj", (F, D)), ("up_proj", (F, D)),
+                          ("down_proj", (D, F))):
+            put(P + "mlp.%s.weight" % m, (r, c), c ** -0.5)
+    return W
+
+
+class _Ids:
+    """calibrate() takes a tokenizer; this one hands back fixed ids."""
+
+    def __init__(self, ids):
+        self.ids = ids
+
+    def encode(self, text):
+        return self.ids
+
+
+def model(style="qwen3", seed=5):
+    """(integer model, float model) for a synthetic checkpoint."""
+    cfg = config(style)
+    W = weights(cfg, style, seed)
+    rnd = random.Random(seed + 1)
+    calib = [rnd.randrange(cfg["vocab_size"]) for _ in range(12)]
+    cal = qi.calibrate(cfg, W, _Ids(calib), log=lambda *a: None)
+    im = qi.IntQwen(cfg, W, 16, True, cal, log=lambda *a: None, exact_io=True)
+    return im, qr.FloatQwen(cfg, W)

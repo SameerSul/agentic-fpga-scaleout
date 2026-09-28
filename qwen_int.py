@@ -1,4 +1,4 @@
-"""The real Qwen2.5-0.5B on the generated blocks' arithmetic.
+"""The real Qwen2.5-0.5B, or Qwen3-0.6B, on the generated blocks' arithmetic.
 
 qwen_real.py runs the checkpoint in float. This runs it the way the
 hardware would: int8 weights, activations at a fixed width with scales
@@ -7,7 +7,9 @@ golden models, derived at Qwen's size (RMSNorm over 896, attention heads
 of 64 with the wide score path, RoPE with theta 1e6, SiLU, the residual
 add, the requantizer). The q, k and v projections carry biases, which are
 added to the accumulator before requantization, in the accumulator's
-own units.
+own units. Qwen3 (FPGAI_QWEN=qwen3) has no biases; instead each head of q
+and k goes through its own RMSNorm, the same block derived for a row of
+head_dim, before RoPE.
 
 Run: python3 qwen_int.py [--act-bits 16] [--per-channel] [--eval 24]
 """
@@ -34,11 +36,12 @@ EVAL = ("Paris is the capital and largest city of France. The city is "
 
 def model_spec(cfg, act_bits):
     base = specgen.load_model_spec()
-    return dict(base, name="qwen2_5_0p5b_a%d" % act_bits,
+    name = {"qwen2.5": "qwen2_5_0p5b", "qwen3": "qwen3_0p6b"}[qr.MODEL]
+    return dict(base, name="%s_a%d" % (name, act_bits),
                 d_model=cfg["hidden_size"], d_ff=cfg["intermediate_size"],
                 n_head=cfg["num_attention_heads"],
                 n_kv_head=cfg["num_key_value_heads"],
-                head_dim=cfg["hidden_size"] // cfg["num_attention_heads"],
+                head_dim=qr.head_dim(cfg),
                 n_layer=cfg["num_hidden_layers"], vocab=cfg["vocab_size"],
                 seq_len=256, rope_theta=cfg["rope_theta"], weight_bits=8,
                 activation_bits=act_bits)
@@ -74,12 +77,16 @@ def quantize_rows(Wf, rows, cols, per_channel):
 
 class IntQwen:
     def __init__(self, cfg, W, act_bits=8, per_channel=True, calib=None,
-                 log=print, probe=None, exact_io=False):
+                 log=print, probe=None, exact_io=False, wide=None):
         self.probe = probe or (lambda *a: None)
         # exact_io: the embedding lookup and the head as the hardware does
         # them, a per-token requantize in and a per-column requantize to
         # one logit scale out, instead of float rescaling at the edges.
         self.exact_io = exact_io
+        # wide: {tensor name: bits} for activations held wider than
+        # act_bits, e.g. {"m": 32} for Qwen3's MLP product, whose
+        # massive activations leave its ordinary values below one code.
+        self.wide = wide or {}
         self.c = cfg
         self.A = act_bits
         self.pc = per_channel
@@ -87,7 +94,8 @@ class IntQwen:
         self.F = cfg["intermediate_size"]
         self.H = cfg["num_attention_heads"]
         self.KV = cfg["num_key_value_heads"]
-        self.hd = self.D // self.H
+        self.hd = qr.head_dim(cfg)
+        self.qkn = "model.layers.0.self_attn.q_norm.weight" in W
         self.NL = cfg["num_hidden_layers"]
         self.V = cfg["vocab_size"]
         self.ms = model_spec(cfg, act_bits)
@@ -99,6 +107,15 @@ class IntQwen:
                    "silu": specgen.derive_silu_spec(ms),
                    "resadd": specgen.derive_resadd_spec(ms),
                    "requant": specgen.derive_requant_spec(ms)}
+        if self.qkn:
+            # The same norm over a row of head_dim: only the row length and
+            # its address change, so the rsqrt and requantizer inside are the
+            # hidden-size norm's, shared by both instances in the RTL.
+            hn = json.loads(json.dumps(self.sp["rmsnorm"]))
+            hn["top_module"] = "rmsnorm_hd"
+            hn["parameters"]["d_model"] = self.hd
+            hn["parameters"]["addr_width"] = max(1, (self.hd - 1).bit_length())
+            self.sp["headnorm"] = hn
         rq = self.sp["requant"]["parameters"]
         self.mw, self.sw = rq["scale_width"], rq["shift_width"]
         self.hi = (1 << (act_bits - 1)) - 1
@@ -127,7 +144,8 @@ class IntQwen:
     # -- scales ----------------------------------------------------------
     def _constants(self):
         cal, A = self.cal, self.A
-        s = {k: v / self.hi for k, v in cal.items()}
+        hi_of = lambda k: (1 << (self.wide.get(k[0] if isinstance(k, tuple) else k, A) - 1)) - 1
+        s = {k: v / hi_of(k) for k, v in cal.items()}
         if "lg" in s:
             # Headroom: a logit above every calibrated one must not
             # saturate, or several would tie at the top code.
@@ -188,22 +206,29 @@ class IntQwen:
             out.append(specgen.requant_golden(acc, sc, sh, self.A)[0])
         return out
 
-    def norm_consts(self, gname, dst):
-        """The gains as int8 codes, and the output (scale, shift)."""
-        pp = self.sp["rmsnorm"]["parameters"]
+    def norm_consts(self, gname, dst, block="rmsnorm"):
+        """The gains as int8 codes, and the output (scale, shift). The
+        row's 1/n is folded in, n the gains' length: the hidden size, or
+        head_dim for Qwen3's norms on q and k."""
+        pp = self.sp[block]["parameters"]
         gf = self.Wf[gname][0]
         gs = max(abs(v) for v in gf) / 127.0
         gq = [int(round(v / gs)) for v in gf]
         ow, kk = pp["rsqrt_out_width"], pp["norm_shift"]
-        sc, sh = pick(2.0 ** (kk - ow) * math.sqrt(self.D) * gs / dst,
+        sc, sh = pick(2.0 ** (kk - ow) * math.sqrt(len(gf)) * gs / dst,
                       pp["scale_width"], pp["shift_width"])
         return gq, sc, sh
 
-    def norm(self, x, gname, dst):
-        p = self.sp["rmsnorm"]
-        gq, sc, sh = self.norm_consts(gname, dst)
+    def norm(self, x, gname, dst, block="rmsnorm"):
+        p = self.sp[block]
+        gq, sc, sh = self.norm_consts(gname, dst, block)
         return specgen.rmsnorm_golden(x, gq, 1, sc, sh, p["parameters"],
                                       p["derivation"]["rsqrt"])[4]
+
+    def headnorm(self, v, heads, gname, dst):
+        hd = self.hd
+        return sum((self.norm(v[h * hd:(h + 1) * hd], gname, dst, "headnorm")
+                    for h in range(heads)), [])
 
     def add_consts(self, sa, sb, dst):
         rp = self.sp["resadd"]["parameters"]
@@ -266,9 +291,18 @@ class IntQwen:
             P = "model.layers.%d." % li
             xn = self.norm(x, P + "input_layernorm.weight", s[("xn", li)])
             sn = s[("xn", li)]
-            b = lambda n: self.Wf[P + "self_attn.%s.bias" % n][0]
-            q = self.proj(xn, P + "self_attn.q_proj.weight", sn, s[("q", li)], b("q_proj"))
-            k = self.proj(xn, P + "self_attn.k_proj.weight", sn, s[("k", li)], b("k_proj"))
+            b = lambda n: (self.Wf[P + "self_attn.%s.bias" % n][0]
+                           if P + "self_attn.%s.bias" % n in self.Wf else None)
+            if self.qkn:
+                # Qwen3: q and k at their own calibrated scales, then each
+                # head normalised to the scale the scores need.
+                q = self.proj(xn, P + "self_attn.q_proj.weight", sn, s[("qp", li)])
+                k = self.proj(xn, P + "self_attn.k_proj.weight", sn, s[("kp", li)])
+                q = self.headnorm(q, H, P + "self_attn.q_norm.weight", s[("q", li)])
+                k = self.headnorm(k, KV, P + "self_attn.k_norm.weight", s[("k", li)])
+            else:
+                q = self.proj(xn, P + "self_attn.q_proj.weight", sn, s[("q", li)], b("q_proj"))
+                k = self.proj(xn, P + "self_attn.k_proj.weight", sn, s[("k", li)], b("k_proj"))
             v = self.proj(xn, P + "self_attn.v_proj.weight", sn, s[("v", li)], b("v_proj"))
             q = self.rope(q, H, pos)
             k = self.rope(k, KV, pos)
@@ -303,7 +337,7 @@ class IntQwen:
                   for c in g]
             msc, msh = pick(2.0 ** -8 * s[("u", li)] / s[("m", li)],
                             self.mw, self.sw)
-            m = [specgen.requant_golden(p_ * u_, msc, msh, A)[0]
+            m = [specgen.requant_golden(p_ * u_, msc, msh, self.wide.get("m", A))[0]
                  for p_, u_ in zip(sg, u)]
             dn = self.proj(m, P + "mlp.down_proj.weight", s[("m", li)],
                            s[("dn", li)])

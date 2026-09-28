@@ -1,4 +1,4 @@
-"""The real Qwen2.5-0.5B, loaded and run in pure Python.
+"""The real Qwen2.5-0.5B or Qwen3-0.6B, loaded and run in pure Python.
 
 fetch_qwen.py downloads the weights; nothing here needs a numeric stack.
 This file has three parts: a safetensors reader, Qwen's byte-level BPE
@@ -6,7 +6,13 @@ tokenizer, and the model's forward pass in float, decoding one token at a
 time with a KV cache. The float pass is the reference the integer model
 built from the generated blocks is measured against.
 
+FPGAI_QWEN picks the checkpoint for this and every script built on it:
+qwen2.5 (the default) or qwen3, the model Architect Labs hosted. Qwen3
+has no q/k/v biases, a head dimension of its own (128, so q is wider than
+the hidden state), and an RMSNorm over each head of q and k before RoPE.
+
 Run: python3 qwen_real.py [--prompt "The capital of France is"] [--tokens 8]
+     FPGAI_QWEN=qwen3 python3 qwen_real.py
 """
 import argparse
 import array
@@ -20,7 +26,13 @@ import sys
 import time
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
-WDIR = os.path.join(ROOT, "qwen_weights")
+MODEL = os.environ.get("FPGAI_QWEN", "qwen2.5")
+WDIR = {"qwen2.5": os.path.join(ROOT, "qwen_weights"),
+        "qwen3": os.path.join(ROOT, "qwen_weights", "qwen3-0.6b")}[MODEL]
+
+
+def head_dim(cfg):
+    return cfg.get("head_dim") or cfg["hidden_size"] // cfg["num_attention_heads"]
 
 
 # ---------------------------------------------------------------- weights
@@ -171,7 +183,7 @@ class FloatQwen:
         self.F = cfg["intermediate_size"]
         self.H = cfg["num_attention_heads"]
         self.KV = cfg["num_key_value_heads"]
-        self.hd = self.D // self.H
+        self.hd = head_dim(cfg)
         self.NL = cfg["num_hidden_layers"]
         self.V = cfg["vocab_size"]
         self.eps = cfg["rms_norm_eps"]
@@ -186,6 +198,18 @@ class FloatQwen:
     def w(self, name):
         return self.W[name][0]
 
+    def b(self, name):
+        """A bias, or None where the checkpoint has none (Qwen3)."""
+        return self.W[name][0] if name in self.W else None
+
+    def headnorm(self, v, heads, name):
+        """Qwen3's RMSNorm over each head of q or k; Qwen2.5 has none."""
+        if name not in self.W:
+            return v
+        hd, g = self.hd, self.w(name)
+        return sum((rms(v[i * hd:(i + 1) * hd], g, self.eps)
+                    for i in range(heads)), [])
+
     def step(self, tok, pos, logits=True):
         D, F, H, KV, hd = self.D, self.F, self.H, self.KV, self.hd
         grp = H // KV
@@ -197,11 +221,15 @@ class FloatQwen:
             h = rms(x, self.w(P + "input_layernorm.weight"), self.eps)
             self.probe("xn", h, li)
             q = matvec(self.w(P + "self_attn.q_proj.weight"), h, H * hd, D,
-                       self.w(P + "self_attn.q_proj.bias"))
+                       self.b(P + "self_attn.q_proj.bias"))
             k = matvec(self.w(P + "self_attn.k_proj.weight"), h, KV * hd, D,
-                       self.w(P + "self_attn.k_proj.bias"))
+                       self.b(P + "self_attn.k_proj.bias"))
             v = matvec(self.w(P + "self_attn.v_proj.weight"), h, KV * hd, D,
-                       self.w(P + "self_attn.v_proj.bias"))
+                       self.b(P + "self_attn.v_proj.bias"))
+            self.probe("qp", q, li)
+            self.probe("kp", k, li)
+            q = self.headnorm(q, H, P + "self_attn.q_norm.weight")
+            k = self.headnorm(k, KV, P + "self_attn.k_norm.weight")
             q = sum((rope(q[i * hd:(i + 1) * hd], pos, hd, self.base)
                      for i in range(H)), [])
             k = sum((rope(k[i * hd:(i + 1) * hd], pos, hd, self.base)
