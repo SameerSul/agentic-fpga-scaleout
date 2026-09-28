@@ -22,15 +22,19 @@ never to overflow, for any input sequence, on the int8 targets. A trained
 language model decodes through the blocks' exact arithmetic and emits
 text, and a generated RTL sequencer decodes the real Qwen2.5-0.5B, all
 24 layers on its own weights, completing "The capital of France is" with
-" Paris" in simulation. It still does not host a local LLM the way
-Architect Labs does, for one reason: nothing in this repo has been put on
-a board. The sequencer fits the Zybo's Zynq 7020, and `board_zybo/` is
-its whole board package, the PL top level on the Zynq's DDR ports, the
-Vivado block design, the ARM program and the SD card, simulated through
-the registers the ARM would use. Without Vivado, the open 7-series flow
-places and routes that design on the real XC7Z020 and closes 50 MHz,
-and the bitstream it writes round-trips frame for frame; loading it on a
-board is the step not taken.
+" Paris" in simulation, through the board package's own registers
+against a DDR model that stalls at random. Qwen3-0.6B, the model
+Architect Labs hosted, is ported the same way: its integer model
+completes the prompt with " Paris", and its first layer on real weights
+is bit-exact in RTL. The package is generated for any Zynq board in
+`boards.py`, today the Zybo Z7-20 and the ZC706, and without Vivado the
+open 7-series flow places and routes the whole design on both parts at
+50 MHz, with bitstreams that round-trip frame for frame. Several boards
+can share one model as GALS stages on their own clocks, simulated exact
+to one board's tokens over fabric UARTs, with the Zynq's UDP protocol
+run on a host. It still does not host a local LLM the way Architect Labs
+does, for one reason: nothing has been loaded onto a board, and that is
+now the whole of the remaining step (`HANDOFF.md`).
 The remaining gap is listed at the bottom rather than glossed over.
 
 ## Verified
@@ -38,7 +42,7 @@ The remaining gap is listed at the bottom rather than glossed over.
 ### The full suite
 
 ```
-python3 tests.py            # 356 tests, or 354 without OpenSTA
+python3 tests.py            # 357 tests, or 355 without OpenSTA
 ```
 
 ### Spec to RTL, across the spec space
@@ -659,10 +663,18 @@ the head, both at the 50 MHz bus clock: 0.88 s a token for one stream,
 the same as one board, since a single stream's time is the sum of its
 stages, and 1.8 tokens/s with both stages busy on separate streams.
 `--package` wrote both boards' packages from the real weights, each
-elaborating whole. What is not run: the network code has only been
-compiled, against stand-ins for the Xilinx and lwIP headers, and a board
-without an ARM cannot yet hold a layer, having no DRAM this design
-reaches.
+elaborating whole. The network half of the ARM
+program has run too, on this host: `test_stage_network_on_host` compiles
+the generated program twice, a first and a last stage, links them over
+localhost UDP through a small shim for lwIP with a stand-in PL whose
+layers are a fixed integer map, and drops the first stage's first
+datagram on the wire. The first stage sends again after its timeout,
+the hidden state crosses in two parts, and the printed tokens are the
+reference's; a program that sends the hidden state's bytes swapped fails
+it. Resending is safe because running a position twice writes its KV
+cache entries again with the same values. What is not run: real lwIP on
+a Zynq, and a board without an ARM, which cannot yet hold a layer,
+having no DRAM this design reaches.
 
 ## Qwen3-0.6B, the model Architect Labs hosted
 
@@ -1389,25 +1401,16 @@ It found three things.
 
 These are the distance between this repo and a local LLM host.
 
-1. **Nothing has run on hardware.** The bitstreams are placed, routed,
-   packed and functionally verified, but for an iCE40 HX8K, and nobody
-   here owns that board. No device has been configured and clocked, so
-   every timing number is from a vendor model rather than from silicon in
-   operation. The Xilinx parts the team owns are still unreachable: Vivado
-   does not run on an ARM Mac and nextpnr has no mainline Xilinx target.
-   This is the only remaining item that work on this machine cannot close;
-   it needs a board (a ~50 CAD iCE40 runs these bitstreams unmodified) or
-   an x86 machine with Vivado for the Zynq and Artix parts. For the
-   team's Basys 3 that step is now one command: `board_basys3/` is a
-   complete Vivado build of the Qwen-shaped decoder behind the board's
-   USB-UART, simulated end to end, and `build.tcl` is the part not run.
-   For the Zybo it is the real model: `board_zybo/` builds the
-   Qwen2.5-0.5B sequencer into the Zynq's PL with an ARM program that
-   loads the weights from SD and prints the text, simulated through its
-   registers. Its PL now also has a routed bitstream from the open flow,
-   at 50 MHz on the XC7Z020, so what remains is the board itself,
-   `HANDOFF.md`'s steps: Vivado's build or that bitstream with a ps7_init,
-   the Vitis program, and a UART log.
+1. **Nothing has run on hardware.** No device has been configured and
+   clocked, so every timing number is from a timing model rather than
+   from silicon in operation. The Zynq parts are no longer out of reach:
+   the open 7-series flow (nextpnr-xilinx on Project X-Ray, with one
+   patch in `open/`) places and routes the whole design on the XC7Z020
+   and the XC7Z045 at 50 MHz and writes bitstreams that round-trip. The
+   team has a ZC706, so what remains is the board itself, `HANDOFF.md`'s
+   steps: Vivado's build or the open-flow bitstream with a ps7_init, the
+   Vitis program, the SD card, and a UART log. `board_basys3/` is the
+   same for the Basys 3, with the small Qwen-shaped decoder.
 2. **The generated blocks are the arithmetic, not the whole engine.** The
    flow generates the multiply-accumulate unit, the requantizer between
    matmuls, the exponential and the reciprocal that softmax needs, the
@@ -1423,8 +1426,8 @@ These are the distance between this repo and a local LLM host.
    checkpoint here uses learned positions, so the decoder has no use for
    the rotary unit, but Qwen does. The generated decoder runs a
    whole decode step of the 16-dimensional checkpoint in RTL. At Qwen's
-   size nothing yet sequences a layer: many heads over shared KV heads,
-   24 layers and DDR-streamed weights are still on the host. Qwen's MLP is the gated block,
+   size `qwen_full.py` sequences the blocks through a whole decode step,
+   every layer and the head, with weights streamed from DDR. Qwen's MLP is the gated block,
    down(SiLU(gate(x)) * up(x)); the older MLP block, two matmuls with a
    ReLU, is not Qwen's and remains as the simpler case. The composite
    layer blocks still hold 64-entry activation banks; only the
@@ -1435,17 +1438,21 @@ These are the distance between this repo and a local LLM host.
    sequencer decodes Qwen2.5-0.5B's own weights in iverilog, all 24
    layers and the full head, and chooses " Paris" as the integer model
    does; that integer model agrees with float on 14 of 16 positions at
-   int16 activations. The weights reach it through AXI masters shaped
+   int16 activations, and Qwen3-0.6B's on 13 of 16. The weights reach it through AXI masters shaped
    like the Zynq's HP ports, against a DDR model that stalls and gaps at
    random; the Zynq's own DDR controller and interconnect have not
    carried them.
-4. **Throughput is predicted, not measured.** tokens/s comes from a sizing
-   model checked against a fabric simulation, agreeing within 15% and at
-   ratio 1.00 on the current configuration. Both are models. Neither is a
-   board. The one RTL-grounded number is the compute side: measured
-   cycles of the multi-lane blocks, summed for a Qwen2.5-0.5B token at
-   256 positions, give 6.8 tokens/s at 112 MHz, above the DDR bound, so
-   the sizing model's premise that one board is bandwidth bound holds.
+4. **Throughput is simulated, not measured on a board.** The decode's
+   own cycles are exact: through the Zybo package's registers against
+   the stalling DDR model, a Qwen2.5-0.5B position takes 26.9 million bus
+   cycles and a step with the head 37.5 million, 0.54 s and 0.75 s at
+   the 50 MHz the design closes: a generated token every 0.75 s, about
+   1.3 tokens/s for one stream, and
+   `cluster.py` puts Qwen3-0.6B at 0.88 s a token on one board. The real
+   DDR controller, the interconnect and the ARM have not run it, and
+   the 16-lane core is sized for the Zybo: the ZC706 uses 14% of its
+   DSPs for it. The fabric-level tokens/s of the sizing model remains a
+   model checked against a fabric simulation.
 
 5. **Formal coverage is one property of one block.** The accumulator
    proof holds for the int8 targets; with 16-bit operands the MAC splits
@@ -1454,5 +1461,6 @@ These are the distance between this repo and a local LLM host.
    testbenches and mutation testing. No other block has a formal proof.
 
 Item 1 is the one that would let this claim what Architect Labs
-demonstrated, and it is blocked on tooling rather than on design. Items 2
-and 3 are ordinary remaining work.
+demonstrated, and it is no longer blocked on tooling: the board is on
+hand and the package for it is written. Items 2 to 4 are ordinary
+remaining work.

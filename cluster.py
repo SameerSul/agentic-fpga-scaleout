@@ -175,6 +175,17 @@ def package(p, out_root, prompt="The capital of France is", tokens=16,
     n = len(p["stages"])
     ips = [subnet + (10 + i,) for i in range(n)]
     outs = []
+    if n == 1:
+        # One board is not a pipeline: its package is the ordinary one,
+        # every layer, the embedding and the head, no network.
+        st = p["stages"][0]
+        work = os.path.join(out_root, "build_single")
+        qwen_full.build_model(im, ids, 0, work, log=log, want=list(ids) + [0])
+        out = os.path.join(out_root, "single_%s" % st["board"])
+        board_zybo.package(work, st["board"], out, prompt, tokens)
+        with open(os.path.join(out_root, "plan.json"), "w") as f:
+            json.dump(dict(p, packages=[out]), f, indent=1)
+        return [out]
     for i, st in enumerate(p["stages"]):
         pk = boards.PACKAGES[st["board"]]
         if not pk.get("ps7"):

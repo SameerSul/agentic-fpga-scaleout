@@ -28,6 +28,7 @@ Below, `board_<name>/` is whichever package matches the board.
 | fits the XC7Z020 (Yosys) | 33169 LUTs + 7380 LUT RAM, 148 DSPs, 36 BRAMs |
 | places and routes in the open flow (nextpnr-xilinx), XC7Z020 and XC7Z045 | both close 50 MHz; the Zybo bitstream round-trips frame for frame |
 | several boards on their own clocks, each a stage of layers (`gals.py`, simulated) | two and three stages over fabric UARTs give one board's tokens and logits exactly |
+| the stage ARM program's UDP protocol, run on a host (two processes, lwIP shimmed, one datagram dropped) | resends, reassembles, prints the reference tokens |
 | Vivado block design, Vivado timing, the ARM program | **not run** |
 | the board | **not run** |
 

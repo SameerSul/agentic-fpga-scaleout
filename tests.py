@@ -9,6 +9,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 import zlib
 
 import chiplet_flow
@@ -2146,6 +2147,230 @@ endmodule
         shutil.rmtree(work, ignore_errors=True)
 
 
+STAGE_SHIM = {
+    "xil_io.h": """#pragma once
+#include <stdint.h>
+typedef uint32_t u32; typedef uint16_t u16; typedef uint8_t u8; typedef int16_t s16;
+typedef uint16_t u16_t; typedef uintptr_t UINTPTR;
+void Xil_Out32(UINTPTR a, u32 v); u32 Xil_In32(UINTPTR a);
+""",
+    "xil_cache.h": "static inline void Xil_DCacheFlush(void) {}\n",
+    "xtime_l.h": """#pragma once
+#include <time.h>
+typedef unsigned long long XTime;
+#define COUNTS_PER_SECOND 1000000000ULL
+static inline void XTime_GetTime(XTime *t) { struct timespec s; clock_gettime(CLOCK_MONOTONIC, &s);
+  *t = (XTime)s.tv_sec * 1000000000ULL + s.tv_nsec; }
+""",
+    "ff.h": """#pragma once
+#include <stdio.h>
+typedef unsigned int UINT; typedef struct { int x; } FATFS; typedef struct { FILE *f; long size; } FIL;
+typedef enum { FR_OK = 0, FR_NO_FILE = 4 } FRESULT;
+#define FA_READ 1
+FRESULT f_mount(FATFS *fs, const char *p, int o); FRESULT f_open(FIL *f, const char *n, int m);
+FRESULT f_read(FIL *f, void *b, UINT n, UINT *br); FRESULT f_close(FIL *f);
+#define f_size(fp) ((fp)->size)
+""",
+    "platform.h": "void init_platform(void); void platform_enable_interrupts(void);\n",
+    "platform_config.h": "#define PLATFORM_EMAC_BASEADDR 0\n",
+    "lwip/ip_addr.h": """#pragma once
+#include <stdint.h>
+typedef struct { uint32_t addr; } ip_addr_t;
+#define IP4_ADDR(ip, a, b, c, d) ((ip)->addr = (uint32_t)(a) | (uint32_t)(b) << 8 | (uint32_t)(c) << 16 | (uint32_t)(d) << 24)
+extern const ip_addr_t ip_addr_any;
+#define IP_ADDR_ANY (&ip_addr_any)
+""",
+    "lwip/init.h": "void lwip_init(void);\n",
+    "lwip/udp.h": """#pragma once
+#include "lwip/ip_addr.h"
+#include <stdint.h>
+typedef uint16_t u16_t;
+struct pbuf { void *payload; uint16_t tot_len; };
+typedef enum { PBUF_TRANSPORT } pbuf_layer; typedef enum { PBUF_RAM } pbuf_type;
+struct pbuf *pbuf_alloc(pbuf_layer l, uint16_t n, pbuf_type t); void pbuf_free(struct pbuf *p);
+uint16_t pbuf_copy_partial(const struct pbuf *p, void *d, uint16_t n, uint16_t off);
+struct udp_pcb;
+typedef void (*udp_recv_fn)(void *, struct udp_pcb *, struct pbuf *, const ip_addr_t *, u16_t);
+struct udp_pcb *udp_new(void); int udp_bind(struct udp_pcb *, const ip_addr_t *, u16_t);
+void udp_recv(struct udp_pcb *, udp_recv_fn, void *);
+int udp_sendto(struct udp_pcb *, struct pbuf *, const ip_addr_t *, u16_t);
+""",
+    "netif/xadapter.h": """#pragma once
+#include "lwip/ip_addr.h"
+#include <stdint.h>
+struct netif { int x; };
+struct netif *xemac_add(struct netif *, ip_addr_t *, ip_addr_t *, ip_addr_t *, unsigned char *, uint32_t);
+int xemacif_input(struct netif *); void netif_set_default(struct netif *); void netif_set_up(struct netif *);
+""",
+    # The shim: lwIP over a localhost UDP socket (IP a.b.c.d is port
+    # PORT0 + d), FatFs over a directory, and a stand-in PL whose layers
+    # are a fixed integer map, so a Python reference knows every token.
+    "shim.c": """#include <arpa/inet.h>
+#include <fcntl.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#include "xil_io.h"
+#include "ff.h"
+#include "lwip/udp.h"
+#include "netif/xadapter.h"
+#include "fpgai_layout.h"
+unsigned char host_ddr[1 << 20];
+const ip_addr_t ip_addr_any = {0};
+static int sock = -1, sent = 0;
+static udp_recv_fn cb; static struct udp_pcb *cbpcb;
+void init_platform(void) {} void platform_enable_interrupts(void) {} void lwip_init(void) {}
+void netif_set_default(struct netif *n) { (void)n; } void netif_set_up(struct netif *n) { (void)n; }
+static int port_of(uint32_t a) { return PORT0 + (int)(a >> 24); }
+struct netif *xemac_add(struct netif *n, ip_addr_t *ip, ip_addr_t *m, ip_addr_t *g, unsigned char *mac, uint32_t b) {
+  (void)m; (void)g; (void)mac; (void)b;
+  sock = socket(AF_INET, SOCK_DGRAM, 0);
+  struct sockaddr_in sa = {0}; sa.sin_family = AF_INET; sa.sin_port = htons(port_of(ip->addr));
+  sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  if (bind(sock, (struct sockaddr *)&sa, sizeof sa)) return 0;
+  fcntl(sock, F_SETFL, O_NONBLOCK); return n; }
+struct pbuf *pbuf_alloc(pbuf_layer l, uint16_t n, pbuf_type t) { (void)l; (void)t;
+  struct pbuf *p = malloc(sizeof *p); p->payload = malloc(n); p->tot_len = n; return p; }
+void pbuf_free(struct pbuf *p) { free(p->payload); free(p); }
+uint16_t pbuf_copy_partial(const struct pbuf *p, void *d, uint16_t n, uint16_t off) {
+  memcpy(d, (char *)p->payload + off, n); return n; }
+struct udp_pcb *udp_new(void) { return (struct udp_pcb *)&sock; }
+int udp_bind(struct udp_pcb *u, const ip_addr_t *a, u16_t p) { (void)u; (void)a; (void)p; return 0; }
+void udp_recv(struct udp_pcb *u, udp_recv_fn f, void *arg) { (void)arg; cb = f; cbpcb = u; }
+int udp_sendto(struct udp_pcb *u, struct pbuf *p, const ip_addr_t *dst, u16_t port) { (void)u; (void)port;
+  sent++;
+  if (getenv("DROP") && atoi(getenv("DROP")) == sent) return 0;     /* a lost datagram */
+  struct sockaddr_in sa = {0}; sa.sin_family = AF_INET; sa.sin_port = htons(port_of(dst->addr));
+  sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  sendto(sock, p->payload, p->tot_len, 0, (struct sockaddr *)&sa, sizeof sa); return 0; }
+int xemacif_input(struct netif *n) { (void)n; unsigned char b[2048];
+  ssize_t k = recv(sock, b, sizeof b, 0);
+  if (k <= 0) { usleep(200); return 0; }
+  struct pbuf *p = pbuf_alloc(PBUF_TRANSPORT, (uint16_t)k, PBUF_RAM); memcpy(p->payload, b, k);
+  ip_addr_t a = {0}; cb(0, cbpcb, p, &a, 0); return 1; }
+FRESULT f_mount(FATFS *fs, const char *p, int o) { (void)fs; (void)p; (void)o; return FR_OK; }
+FRESULT f_open(FIL *f, const char *n, int m) { (void)m; char path[512];
+  snprintf(path, sizeof path, "%s/%s", getenv("SD"), n); f->f = fopen(path, "rb");
+  if (!f->f) return FR_NO_FILE; fseek(f->f, 0, SEEK_END); f->size = ftell(f->f); fseek(f->f, 0, SEEK_SET); return FR_OK; }
+FRESULT f_read(FIL *f, void *b, UINT n, UINT *br) { *br = (UINT)fread(b, 1, n, f->f); return FR_OK; }
+FRESULT f_close(FIL *f) { fclose(f->f); return FR_OK; }
+/* the stand-in PL */
+static u32 r_tok, r_pos, r_ctrl, done, nxt, xaddr; static s16 bst, hid[FPGAI_D];
+static s16 wrap(long v) { return (s16)(((v % 20011) + 20011) % 20011 - 10005); }
+void Xil_Out32(UINTPTR a, u32 v) {
+  u32 o = (u32)(a - FPGAI_REGS);
+  if (o == FPGAI_TOK) r_tok = v; else if (o == FPGAI_POS) r_pos = v;
+  else if (o == FPGAI_XADDR) xaddr = v; else if (o == FPGAI_XDATA) hid[xaddr++] = (s16)v;
+  else if (o == FPGAI_CTRL && (v & 1)) {
+    r_ctrl = v;
+    if (v & 4) for (int i = 0; i < FPGAI_D; i++) hid[i] = wrap((long)r_tok * 31 + i);
+    for (int l = STAGE_L0; l < STAGE_L1; l++)
+      for (int i = 0; i < FPGAI_D; i++) hid[i] = wrap((long)hid[i] * 3 + l + i + (long)r_pos * 7);
+    if (v & 2) { long s = 0; for (int i = 0; i < FPGAI_D; i++) s += hid[i] < 0 ? -hid[i] : hid[i];
+                 nxt = (u32)(s % 97); bst = (s16)(nxt * 3); }
+    done = 1; } }
+u32 Xil_In32(UINTPTR a) {
+  u32 o = (u32)(a - FPGAI_REGS);
+  if (o == FPGAI_ID) return FPGAI_ID_VALUE; if (o == FPGAI_STAGE) return STAGE_VALUE;
+  if (o == FPGAI_KVEND) return (u32)KVEND; if (o == FPGAI_STATUS) return done ? 2 : 0;
+  if (o == FPGAI_NEXT_TOK) return nxt; if (o == FPGAI_BEST) return (u32)(u16)bst;
+  if (o == FPGAI_XDATA) return (u32)(u16)hid[xaddr++];
+  return 0; }
+""",
+}
+
+
+def test_stage_network_on_host():
+    """The Zynq stage program's network half, run for real on this host:
+    the generated main.c compiled twice, a first stage (layers 0-2, the
+    prompt) and a last one (layers 2-4, the head), talking UDP over
+    localhost through a shim for lwIP, with a stand-in PL whose layers
+    are a fixed integer map. The first stage's first datagram is dropped
+    on the wire. It has to be sent again, the hidden state has to cross
+    in two parts, and the printed tokens have to be the reference's."""
+    import board_zybo as bz
+    cc = shutil.which('cc') or shutil.which('clang') or shutil.which('gcc')
+    if not cc:
+        check('the stage network program runs on the host (no C compiler: skipped)', True)
+        return
+    work = os.path.join(ROOT, 'build_stagenettest')
+    shutil.rmtree(work, ignore_errors=True)
+    D, V, prompt, n_gen, port0 = 700, 97, [5, 11, 2], 4, 47000 + os.getpid() % 1000
+    procs = []
+    try:
+        for i, (l0, l1) in enumerate(((0, 2), (2, 4))):
+            d = os.path.join(work, 's%d' % i)
+            os.makedirs(os.path.join(d, 'lwip'))
+            os.makedirs(os.path.join(d, 'netif'))
+            os.makedirs(os.path.join(d, 'sd'))
+            for name, src in STAGE_SHIM.items():
+                open(os.path.join(d, name), 'w').write(src)
+            L = dict(W=dict(tok=18, pos=8, x_addr=10), wb=0, cb=0, cn=64, kb=0, vb=0,
+                     end=0, words=64)
+            st = dict(D=D, index=i, count=2, l0=l0, l1=l1, emb=i == 0, head=i == 1,
+                      ip=(127, 0, 0, 10 + i), next_ip=(127, 0, 0, 10 + (i + 1) % 2),
+                      first_ip=(127, 0, 0, 10))
+            h = bz.render_header(L, n_gen, 'host', st)
+            # The DDR regions point into the shim's array.
+            for k, v in (('WBASE', '((UINTPTR)host_ddr)'), ('CBASE', '((UINTPTR)host_ddr + 4096)'),
+                         ('KBASE', '((UINTPTR)host_ddr + 8192)'), ('KVEND', '((UINTPTR)host_ddr + 16384)'),
+                         ('VOCAB_BASE', '((UINTPTR)host_ddr + 65536)'), ('WBYTES', '1024U'),
+                         ('CBYTES', '512U'), ('FPGAI_REGS', '0x43C00000U')):
+                h = re.sub(r'#define %s\s+\S+' % k, '#define %s %s' % (k, v), h)
+            h = h.replace('#ifndef FPGAI_LAYOUT_H\n#define FPGAI_LAYOUT_H\n',
+                          '#ifndef FPGAI_LAYOUT_H\n#define FPGAI_LAYOUT_H\n'
+                          'extern unsigned char host_ddr[];\n#define PORT0 %d\n' % port0)
+            open(os.path.join(d, 'fpgai_layout.h'), 'w').write(h)
+            open(os.path.join(d, 'main.c'), 'w').write(bz.STAGE_C)
+            open(os.path.join(d, 'sd', 'weights8.bin'), 'wb').write(bytes(1024))
+            open(os.path.join(d, 'sd', 'cparams.bin'), 'wb').write(bytes(512))
+            if i == 0:
+                import struct
+                words = ['<%d>' % t for t in range(V)]
+                blob, offs = b'', [0]
+                for w_ in words:
+                    blob += w_.encode(); offs.append(len(blob))
+                open(os.path.join(d, 'sd', 'vocab.bin'), 'wb').write(
+                    struct.pack('<%dI' % (V + 2), V, *offs) + blob)
+                open(os.path.join(d, 'sd', 'prompt.bin'), 'wb').write(
+                    struct.pack('<%dI' % (len(prompt) + 1), len(prompt), *prompt))
+            r = subprocess.run([cc, '-O1', '-w', '-I.', '-o', 'stage', 'main.c', 'shim.c'],
+                               cwd=d, capture_output=True, text=True)
+            assert r.returncode == 0, r.stderr[-2000:]
+        env1 = dict(os.environ, SD=os.path.join(work, 's1', 'sd'))
+        procs.append(subprocess.Popen([os.path.join(work, 's1', 'stage')], env=env1,
+                                      stdout=subprocess.PIPE, stderr=subprocess.STDOUT))
+        time.sleep(0.5)
+        env0 = dict(os.environ, SD=os.path.join(work, 's0', 'sd'), DROP='1')
+        out = subprocess.run([os.path.join(work, 's0', 'stage')], env=env0,
+                             capture_output=True, text=True, timeout=120).stdout
+
+        def wrap(v):
+            return ((v % 20011) + 20011) % 20011 - 10005
+        # The reference: the same map, all four layers in one place.
+        seq, pos, tok, want = list(prompt), 0, prompt[0], []
+        while pos < len(prompt) + n_gen - 1:
+            if pos < len(prompt):
+                tok = prompt[pos]
+            hid = [wrap(tok * 31 + i) for i in range(D)]
+            for l in range(4):
+                hid = [wrap(hid[i] * 3 + l + i + pos * 7) for i in range(D)]
+            if pos >= len(prompt) - 1:
+                tok = sum(abs(v) for v in hid) % 97
+                want.append(tok)
+            pos += 1
+        text = ''.join('<%d>' % t for t in prompt) + ''.join('<%d>' % t for t in want)
+        if text not in out:
+            print(out[-1500:])
+        check('two stages pass the hidden state over UDP and resend a lost part',
+              text in out)
+    finally:
+        for p in procs:
+            p.kill()
+        shutil.rmtree(work, ignore_errors=True)
+
+
 def test_multi_lane_attention():
     """Lanes over cached positions for the scores and over dimensions for
     the weighted sum. On a full 256-position row it has to match the
@@ -2992,6 +3217,7 @@ if __name__ == '__main__':
     test_gals_two_boards()
     test_cluster_plan()
     test_zybo_stage_registers()
+    test_stage_network_on_host()
     test_composite_cell_count()
     test_requant_golden_is_shared()
     test_table_unit_specs_are_implementable()

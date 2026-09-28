@@ -58,8 +58,9 @@ Simulated here: the register block, and a full one-layer build of this
 same design run only through AXI-Lite, against a DDR model with 30
 cycles of latency on every port, matching the direct testbench's token
 and core cycles, both with every port always ready and with every port
-stalling and gapping its beats at random (`--jitter`). Not run: Vivado, so the block design, the AXI
-interconnects, timing at 50 MHz and the software have not met real
-hardware. The core clock is gated with a BUFGCE while a port's line is
-still on the bus; that path is the first thing to read in the timing
-report.
+stalling and gapping its beats at random (`--jitter`), and with all
+24 layers and the head, choosing " Paris". The open flow in `open/` places and routes it on this part: 68.0 MHz core, 52.8 MHz bus, both past 50 MHz. Not run: Vivado,
+so its block design, its interconnects and its timing, and the software
+on real hardware. The core clock is gated with a BUFGCE while a port's
+line is still on the bus; that path is the first thing to read in the
+timing report.
