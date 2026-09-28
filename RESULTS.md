@@ -428,13 +428,20 @@ held, a BUFGCE on the FPGA, so none of the generated blocks needed a
 stall input. Against a DDR model with 30 cycles of latency, the
 one-layer run chooses the same token, 70526, in exactly the same
 9,510,162 core cycles as the direct run: holding the clock changes
-nothing the core computes. It costs 126 million bus cycles, 13.3 per
-core cycle. That is the bus's number, not the core's: one 64-bit port
-with no prefetch against a core that wants a 256-bit word every cycle.
-At 100 MHz a full token would take about 4 seconds this way, against
-0.25 at the 2 GB/s the sizing model assumes; prefetching the next line
-while the current one drains and using all four HP ports are the
-changes that close that gap, and neither is written. The first run of
+nothing the core computes.
+
+The first version took 126 million bus cycles for it, 13.3 per core
+cycle, because it had one read in flight at a time and every weight
+line paid the full DDR latency. The weights now have their own read
+master, as they would have their own HP port, with a streamer that keeps
+up to four bursts outstanding ahead of the line the core is on, into
+eight line slots. The same run then takes 41.7 million bus cycles, 4.39
+per core cycle, against a floor of 4.0 set by one 64-bit port feeding a
+256-bit word a cycle; the token and the core's 9,510,162 cycles are
+unchanged. At 100 MHz a full Qwen2.5-0.5B token is then about 1.4
+seconds on one HP port. Striping the weights across the Zynq's four HP
+ports would bring it to about 0.35 seconds, near the 0.25 the 2 GB/s
+sizing assumes; that striping is not written. The first run of
 this deadlocked, and the fault was the testbench's: before reset the
 master's valids are X, !X is false, and the DDR model ran a phantom
 write at cycle 2, then waited forever for its data beat.

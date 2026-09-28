@@ -48,6 +48,11 @@ module qwen_zybo (
   input [{twm}:0] tok, input [{pwm}:0] pos,
   output [{twm}:0] next_tok, output signed [15:0] best,
   output done, output busy,
+  // Weights: their own read master, streaming ahead of the core.
+  output reg [31:0] w_araddr, output [3:0] w_arlen, output reg w_arvalid,
+  input w_arready, input [63:0] w_rdata, input w_rvalid, input w_rlast,
+  output w_rready,
+  // Constants and the KV cache.
   output reg [31:0] araddr, output [3:0] arlen, output reg arvalid,
   input arready, input [63:0] rdata, input rvalid, input rlast,
   output rready,
@@ -58,6 +63,7 @@ module qwen_zybo (
   output reg [31:0] core_cycles
 );
   assign arlen = 4'd15; assign awlen = 4'd0; assign wlast = 1'b1;
+  assign w_arlen = 4'd15; assign w_rready = 1'b1;
   assign rready = 1'b1; assign bready = 1'b1;
 
   // ---- the core, on a clock held while memory catches up
@@ -93,15 +99,68 @@ module qwen_zybo (
   // ---- line buffers: the address each port was given at the core's
   // last edge, and the line that holds it.
   reg [{wam}:0] wq; reg [{cam}:0] cq; reg [{kam}:0] kq; reg [{vam}:0] vq;
-  reg [255:0] wl [0:3], kl [0:3], vl [0:3];
+  reg [255:0] kl [0:3], vl [0:3];
   reg [63:0] cl [0:15];
-  reg [{wam}:0] wb; reg [{cam}:0] cbase; reg [{kam}:0] kbl; reg [{vam}:0] vbl;
-  reg wv, cv, kv, vv;
-  wire hw = wv && (wq >> 2) == (wb >> 2);
+  reg [{cam}:0] cbase; reg [{kam}:0] kbl; reg [{vam}:0] vbl;
+  reg cv, kv, vv;
+
+  // ---- the weight streamer: 8 line slots, direct mapped, filled up to 4
+  // bursts ahead of the line the core is on. Responses come back in
+  // request order, so a line requested later always lands later.
+  localparam NS = 8, MAXO = 4;
+  reg [255:0] sw [0:NS * 4 - 1];
+  reg [{wam}:0] stag [0:NS - 1];
+  reg sval [0:NS - 1];
+  wire [{wam}:0] cur = wq >> 2;
+  wire [2:0] cs = cur[2:0];
+  wire hw = sval[cs] && stag[cs] == cur;
+  reg [{wam}:0] nreq;
+  reg [2:0] outst;
+  reg [{wam}:0] inflight [0:MAXO - 1];
+  reg [1:0] ihead, itail;
+  reg [3:0] wbeat;
+  wire [2:0] ns = nreq[2:0];
+  wire in_win = nreq >= cur && nreq < cur + NS;
+  wire have = sval[ns] && stag[ns] == nreq;
+  integer si;
+  always @(posedge clk) begin
+    if (!rst_n) begin
+      w_arvalid <= 1'b0; nreq <= 0; outst <= 0; ihead <= 0; itail <= 0;
+      wbeat <= 0;
+      for (si = 0; si < NS; si = si + 1) begin sval[si] <= 1'b0; stag[si] <= 0; end
+    end else begin
+      // A jump, to a new projection or back to the start of one: restart
+      // the stream at the core's line.
+      if (!in_win && !w_arvalid) nreq <= cur;
+      else if (w_arvalid) begin
+        if (w_arready) begin w_arvalid <= 1'b0; nreq <= nreq + 1; end
+      end else if (have) nreq <= nreq + 1;
+      else if (outst < MAXO) begin
+        w_araddr <= nreq * 128; w_arvalid <= 1'b1;
+        sval[ns] <= 1'b0; stag[ns] <= nreq;
+        inflight[itail] <= nreq; itail <= itail + 1;
+      end
+      if (w_rvalid) begin
+        sw[inflight[ihead][2:0] * 4 + wbeat[3:2]][wbeat[1:0] * 64 +: 64] <= w_rdata;
+        wbeat <= wbeat + 1;
+        if (w_rlast) begin
+          // Only if no later request has claimed the slot since.
+          if (stag[inflight[ihead][2:0]] == inflight[ihead])
+            sval[inflight[ihead][2:0]] <= 1'b1;
+          ihead <= ihead + 1;
+        end
+      end
+      case ({{w_arvalid && w_arready, w_rvalid && w_rlast}})
+        2'b10: outst <= outst + 1;
+        2'b01: outst <= outst - 1;
+        default: ;
+      endcase
+    end
+  end
   wire hc = cv && (cq >> 4) == (cbase >> 4);
   wire hk = kv && (kq >> 2) == (kbl >> 2);
   wire hv = vv && (vq >> 2) == (vbl >> 2);
-  assign w_data = wl[wq[1:0]];
+  assign w_data = sw[cs * 4 + wq[1:0]];
   assign c_data = cl[cq[3:0]][61:0];
   assign k_rdata = kl[kq[1:0]];
   assign v_rdata = vl[vq[1:0]];
@@ -126,7 +185,7 @@ module qwen_zybo (
   always @(posedge clk) begin
     if (!rst_n) begin
       fs <= F_IDLE; arvalid <= 1'b0; awvalid <= 1'b0; wvalid <= 1'b0;
-      wv <= 1'b0; cv <= 1'b0; kv <= 1'b0; vv <= 1'b0; d0 <= 1'b0; d1 <= 1'b0;
+      cv <= 1'b0; kv <= 1'b0; vv <= 1'b0; d0 <= 1'b0; d1 <= 1'b0;
       d2 <= 1'b0; wq <= 0; cq <= 0; kq <= 0; vq <= 0; core_cycles <= 0;
     end else begin
       // The core takes an edge now: capture its addresses as a registered
@@ -150,9 +209,6 @@ module qwen_zybo (
                       + (p0 ? kw0_addr : p1 ? kw1_addr : vw_addr) * 32
                       + ((p0 ? kw0_lane : p1 ? kw1_lane : vw_lane) >> 2) * 8;
             awvalid <= 1'b1; fs <= F_AW;
-          end else if (!hw) begin
-            port <= 2'd0; araddr <= (wq >> 2) * 128; wb <= wq; wv <= 1'b0;
-            arvalid <= 1'b1; beat <= 0; fs <= F_AR;
           end else if (!hc) begin
             port <= 2'd1; araddr <= 32'd{cb} + (cq >> 4) * 128; cbase <= cq; cv <= 1'b0;
             arvalid <= 1'b1; beat <= 0; fs <= F_AR;
@@ -167,7 +223,6 @@ module qwen_zybo (
         F_AR: if (arready) begin arvalid <= 1'b0; fs <= F_R; end
         F_R: if (rvalid) begin
           case (port)
-            2'd0: wl[beat[3:2]][beat[1:0] * 64 +: 64] <= rdata;
             2'd1: cl[beat] <= rdata;
             2'd2: kl[beat[3:2]][beat[1:0] * 64 +: 64] <= rdata;
             2'd3: vl[beat[3:2]][beat[1:0] * 64 +: 64] <= rdata;
@@ -175,7 +230,7 @@ module qwen_zybo (
           beat <= beat + 1;
           if (rlast) begin
             fs <= F_IDLE;
-            case (port) 2'd0: wv <= 1'b1; 2'd1: cv <= 1'b1; 2'd2: kv <= 1'b1;
+            case (port) 2'd1: cv <= 1'b1; 2'd2: kv <= 1'b1;
                         2'd3: vv <= 1'b1; endcase
           end
         end
@@ -220,12 +275,20 @@ module tb_zybo;
   wire arvalid, rready, awvalid, wvalid, wlast, bready;
   reg arready = 0, rvalid = 0, rlast = 0, awready = 0, wready = 0, bvalid = 0;
   reg [63:0] rdata = 0;
+  wire [31:0] w_araddr;
+  wire [3:0] w_arlen;
+  wire w_arvalid, w_rready;
+  reg w_arready = 1, w_rvalid = 0, w_rlast = 0;
+  reg [63:0] w_rdata = 0;
   wire [63:0] wdata;
   wire [7:0] wstrb;
   always #5 clk = ~clk;
   qwen_zybo dut (.clk(clk), .rst_n(rst_n), .start(start), .head_en(head_en),
     .tok(tok), .pos(pos), .next_tok(next_tok), .best(best), .done(done),
-    .busy(busy), .araddr(araddr), .arlen(arlen), .arvalid(arvalid),
+    .busy(busy), .w_araddr(w_araddr), .w_arlen(w_arlen),
+    .w_arvalid(w_arvalid), .w_arready(w_arready), .w_rdata(w_rdata),
+    .w_rvalid(w_rvalid), .w_rlast(w_rlast), .w_rready(w_rready),
+    .araddr(araddr), .arlen(arlen), .arvalid(arvalid),
     .arready(arready), .rdata(rdata), .rvalid(rvalid), .rlast(rlast),
     .rready(rready), .awaddr(awaddr), .awlen(awlen), .awvalid(awvalid),
     .awready(awready), .wdata(wdata), .wstrb(wstrb), .wlast(wlast),
@@ -279,6 +342,27 @@ module tb_zybo;
         @(posedge clk);
       end
       rvalid <= 0; rlast <= 0;
+    end
+  end
+  // The weight port takes reads as fast as they come, as a DDR controller
+  // queues them, and answers each after its latency, bursts back to back.
+  reg [31:0] qa [0:15];
+  integer qt [0:15];
+  integer qh = 0, qtl = 0, j;
+  always @(posedge clk) if (rst_n && w_arvalid && w_arready) begin
+    qa[qtl %% 16] = w_araddr; qt[qtl %% 16] = cyc; qtl = qtl + 1;
+  end
+  initial begin
+    @(posedge rst_n);
+    forever begin
+      @(posedge clk);
+      if (qh < qtl && cyc >= qt[qh %% 16] + %(lat)d) begin
+        for (j = 0; j < 16; j = j + 1) begin
+          w_rdata <= beat_at(qa[qh %% 16] + j * 8); w_rvalid <= 1; w_rlast <= (j == 15);
+          @(posedge clk);
+        end
+        w_rvalid <= 0; w_rlast <= 0; qh = qh + 1;
+      end
     end
   end
   // Writes: one beat, strobed, into the KV arrays.
