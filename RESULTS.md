@@ -20,10 +20,13 @@ the same way, bit-exact on every logit. An LLM has written
 and signed off ten of the nineteen blocks through the same gates, the rotary embedding the newest of them, and the multiply-accumulate unit's accumulator is formally proved
 never to overflow, for any input sequence, on the int8 targets. A trained
 language model decodes through the blocks' exact arithmetic and emits
-text. It still does not host a local LLM the way Architect Labs does:
-nothing in this repo has been put on a board, and the decoders run
-models of 16 and 32 dimensions trained here, not Qwen's 896-dimensional
-weights.
+text, and a generated RTL sequencer decodes the real Qwen2.5-0.5B, all
+24 layers on its own weights, completing "The capital of France is" with
+" Paris" in simulation. It still does not host a local LLM the way
+Architect Labs does, for one reason: nothing in this repo has been put on
+a board. The sequencer fits the Zybo's Zynq 7020, but the connection
+from its weight port to the board's DDR, and a Vivado run, are the steps
+not taken.
 The remaining gap is listed at the bottom rather than glossed over.
 
 ## Verified
@@ -395,11 +398,24 @@ embedding a per-token requantize, the head a per-column requantize to one
 calibrated logit scale. It still decodes "The capital of France is
 Paris."
 
-With the stack cut to its first layer, the same sequencer on the real
-weights, the real embedding and the real 151936-way head chooses the
-integer model's token: 9.5 million cycles, 14 minutes of simulation. The
-full 24-layer run takes about 32 minutes a position at the simulator's
-11,600 cycles a second.
+All 24 layers, on the prompt "The capital of France is":
+
+```
+STEP pos=0 tok=785  cycles=22809961
+STEP pos=1 tok=6722 cycles=22811641
+STEP pos=2 tok=315  cycles=22813321
+STEP pos=3 tok=9625 cycles=22815001
+STEP pos=4 tok=374  cycles=31375553 next=12095
+```
+
+Token 12095 is " Paris", the integer model's choice: the generated RTL,
+sequencing real Qwen2.5-0.5B weights through every layer and the full
+vocabulary head, completes the sentence. A prompt position is 22.8
+million cycles, and the head adds 8.6 million; at 16 lanes and 100 MHz
+that is 0.23 s a position, compute bound, where the 32-lane projection
+and a DDR-fed weight port would bring it to the bandwidth bound. The run
+took about three and a half hours of simulation. With the stack cut to
+its first layer the same sequencer also matches, in 9.5 million cycles.
 
 It is also a design, not only a simulation. Yosys maps the whole
 sequencer with every block under it to 25650 LUTs, 3240 more as LUT RAM,
@@ -1123,13 +1139,13 @@ These are the distance between this repo and a local LLM host.
    projection block streams activations from memory at full size, and
    the attention and MLP blocks have not been moved onto it. In `generate.py` those run on the host, and the
    output says so each run.
-3. **The RTL has run small models; the real one runs as arithmetic.**
-   Qwen2.5-0.5B's own weights run through the blocks' golden models in
-   Python, 14 of 16 positions against float at int16 activations, but
-   the RTL decoders run the checkpoints trained here, one 16 dimensional
-   and one with Qwen's structure at 32 dimensions and 2 layers. Real
-   Qwen matrices run bit-exact through the projection RTL one at a time
-   (`qwen_cosim.py`), not as a sequenced layer.
+3. **The real model has run in simulation, not on silicon.** A generated
+   sequencer decodes Qwen2.5-0.5B's own weights in iverilog, all 24
+   layers and the full head, and chooses " Paris" as the integer model
+   does; that integer model agrees with float on 14 of 16 positions at
+   int16 activations. The weights reach it from a file through the
+   testbench, standing in for DDR, and the AXI link to a real DDR
+   controller is not written.
 4. **Throughput is predicted, not measured.** tokens/s comes from a sizing
    model checked against a fabric simulation, agreeing within 15% and at
    ratio 1.00 on the current configuration. Both are models. Neither is a
