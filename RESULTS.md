@@ -592,6 +592,41 @@ Digilent's reference design, and nobody has loaded this bitstream on a
 board. Vivado's `build.tcl` route remains the one the handoff describes;
 this one says the design fits and closes timing on the real part.
 
+## Qwen3-0.6B, the model Architect Labs hosted
+
+```
+python3 fetch_qwen.py --model qwen3           # ~1.5 GB, git-ignored
+FPGAI_QWEN=qwen3 python3 qwen_real.py         # float
+FPGAI_QWEN=qwen3 python3 qwen_int.py --act-bits 16 --per-channel
+```
+
+Everything built for Qwen2.5 takes the other checkpoint through one
+variable. Qwen3's structure differs in three places the generator now
+handles: no q, k or v biases; a head dimension of its own, 128, so q is
+2048 wide over a 1024 hidden state; and an RMSNorm over every head of q
+and k before RoPE, which the integer model runs through the same norm
+block sized for a head and the sequencer through a second instance of
+it, normalising each head in place. `test_full_sequencer_both_qwens`
+generates and simulates the sequencer on small random checkpoints with
+each structure and requires every chosen token and its logit to be the
+integer model's; a Qwen3 sequencer that skips the head norms fails it
+even though its tokens do not change. Qwen2.5's generated RTL and images
+are byte-identical to before.
+
+| model | float | integer (w8 per-channel, a16) | teacher-forced |
+|---|---|---|---|
+| Qwen2.5-0.5B | "Paris. It is the" | "Paris. Paris is" | 14/16 |
+| Qwen3-0.6B | "Paris. The capital of Italy" | "Paris. The capital of the" | 13/16 |
+
+Qwen3 is harder on static integer scales than Qwen2.5 because of its
+massive activations. Over the prompt, the residual stream reaches 6,500
+against a median of 1.7, and in layer 2 the MLP product reaches 3,658
+against a median of 0.065, a ratio past what 16 bits hold. Holding that
+product in 32 bits did not help, 5/8 against 6/8 on the first eight
+positions, so it is not the limit; of the three misses in sixteen, one
+is a near tie in float (0.12), one is the first position, where float's
+own top two are 0.07 apart, and one, position 7, is a real miss.
+
 ## Qwen's structure decodes in RTL
 
 ```

@@ -196,7 +196,7 @@ python3 zybo.py                    # the same core on a 64-bit AXI3 DDR bus, clo
 python3 board_zybo.py              # the Zybo Z7-20 package in board_zybo/: PL top, Vivado block design, ARM code, SD files
 python3 board_zybo.py --work build_qfull1 --out build_bz1 --sim --jitter   # one layer through its registers
 board_zybo/open/build_open.sh      # the Zybo bitstream without Vivado (openXC7); routes at 50 MHz on the XC7Z020
-python3 fetch_qwen.py --model qwen3  # Qwen3-0.6B, the model Architect Labs hosted; FPGAI_QWEN=qwen3 selects it everywhere
+python3 fetch_qwen.py --model qwen3  # Qwen3-0.6B, ~1.5 GB; FPGAI_QWEN=qwen3 selects it everywhere
 python3 bitstream.py --block mac   # place, route and pack a real iCE40 bitstream (needs nextpnr-ice40)
 python3 dv.py --rtl build/mac.v --tb tb_mac.v   # mutation-test a generated testbench
 python3 inference.py               # real quantized transformer dot products through the generated RTL
@@ -456,8 +456,8 @@ checked against another model. Read that list before quoting any number here.
 - fmax still comes from OpenSTA against the toy generic liberty, so it is an ASIC-flavored number used as an FPGA clock estimate. A real FPGA fmax needs Vivado timing; the endpoint datapath search is therefore honest about *relative* timing pressure rather than absolute megahertz.
 - Feeding 8601 MAC instances would need on-chip operand bandwidth the model does not check. DSP count is the right first-order capacity ceiling, not a claim that the array is routable at that size.
 - A 25 Gbps endpoint does not close timing in this flow at either standard datapath. Reaching it needs a pipelined or matrix-form CRC that the rule-based agent does not write, so the default target is 10 Gbps, which is also what the mid board class actually exposes.
-- There is no place-and-route anywhere; timing is real OpenSTA static timing but against a toy illustrative liberty, so fmax is an estimate of an estimate.
-- The derivation now covers twenty-one blocks, not just the matmul datapath: the exponential, reciprocal and inverse square root are generated and signed off, softmax and an MLP layer sequence them, an attention head composes matvec, the MAC, softmax and the requantizer, RMSNorm drives the inverse square root, SiLU is built from the exponential and the reciprocal, the gated MLP runs Qwen's three projections through it, the residual add closes each half of a layer, the rotary unit turns q and k by position, and the projection block runs a matrix at the model's full size over external memories. A generated decoder sequences them into a whole decode step, and the trained 16-dimensional checkpoint runs on it in RTL, every output token the hardware's argmax; a second decoder does the same for a checkpoint with Qwen's structure, RoPE, grouped-query attention, SwiGLU and two layers. What is still missing is that sequencing at Qwen's size: 896 dimensions, 14 heads over 2 KV heads, 24 layers, and weights streamed from DDR. The composite layer blocks still hold 64-entry activation banks; the projection shows the way past that, streaming activations from memory the way the weights already are, but the attention and MLP blocks have not been moved onto it, and the blocks are the arithmetic of an inference engine rather than the whole of one.
+- Per-block fmax is OpenSTA against a toy illustrative liberty, an estimate of an estimate. The one post-route number is the whole Zybo design through the open 7-series flow (nextpnr-xilinx): 50 MHz met on the XC7Z020.
+- The derivation now covers twenty-one blocks, not just the matmul datapath: the exponential, reciprocal and inverse square root are generated and signed off, softmax and an MLP layer sequence them, an attention head composes matvec, the MAC, softmax and the requantizer, RMSNorm drives the inverse square root, SiLU is built from the exponential and the reciprocal, the gated MLP runs Qwen's three projections through it, the residual add closes each half of a layer, the rotary unit turns q and k by position, and the projection block runs a matrix at the model's full size over external memories. A generated decoder sequences them into a whole decode step, and the trained 16-dimensional checkpoint runs on it in RTL, every output token the hardware's argmax; a second decoder does the same for a checkpoint with Qwen's structure, RoPE, grouped-query attention, SwiGLU and two layers. At Qwen's size the sequencing is `qwen_full.py`: one generated sequencer runs the whole decode step, all 24 layers and the head, with weights streamed from DDR through `zybo.py`'s bridge. The older composite layer blocks still hold 64-entry activation banks; the full-size sequencer does not use them.
 - Boards are simulated, not real: link rates, propagation delays, clock caps, and capacities are representative class parameters, not measured silicon.
 - The 30% fabric reservation for NIC and routing logic is a stated guess, not a floorplan; the endpoint reservation per link is real, from the synthesized cell count.
 - Decode compute time is charged from the measured chiplet profile at full model dimensions; the weights are not materialized. The sharded numerics (real arithmetic, bit-exactness across cluster shapes) are validated at reduced dimensions in stage 8 and in the test suite.
@@ -467,3 +467,60 @@ checked against another model. Read that list before quoting any number here.
 - ACK/credit control packets share link bandwidth but are assumed error-free (in RTL they are short, heavily protected control words); topology is a full mesh of point-to-point links; payloads are fixed 1024 B with a 20 B header.
 - The compute cycle model charges cycles per unit from the profile; it ignores on-board operand distribution to the chiplet array and memory bandwidth limits.
 - The committed RTL and profiles come from the rule-based agent, so they are reproducible offline. The LLM agent is measured separately in `RESULTS.md`: it has signed off nine of the ten layer blocks, eight with Haiku and the requantizer with Sonnet, once the specs stated their arithmetic and timing exactly and the tool feedback named what an engineer would look at.
+
+## End to end: what goes in, what happens, what comes out
+
+### Inputs
+
+| input | what it holds | where it is used |
+|---|---|---|
+| `model_spec.json` | the model's shape and number formats: layers, hidden size, MLP size, heads and KV heads, head dimension, vocabulary, weight and activation bits, context length, RoPE base, target tokens/s | every derived spec, the sizing model |
+| `boards.py` | each board's resources (LUTs, flip-flops, DSPs, on-chip RAM), DDR bandwidth and size, clock cap, link rates | lane counts, fit checks, the sizing model |
+| a checkpoint, optional | real weights, tokenizer and `config.json` from `fetch_qwen.py` (Qwen2.5-0.5B, or Qwen3-0.6B with `FPGAI_QWEN=qwen3`) | the integer model, the full-size sequencer, the SD image |
+| a prompt | text, tokenized with the checkpoint's own BPE | the decode, in simulation and on the board |
+
+### Inner processes
+
+1. **Spec derivation** (`specgen.py`). Nineteen `derive_*_spec` functions
+   turn the model spec into one spec per block (MAC, requantizer, exp,
+   reciprocal, rsqrt, matvec, softmax, attention, RMSNorm, SiLU, RoPE,
+   residual add, the projections, the MLPs, the fabric endpoint). Each
+   spec gives exact parameters, the rule each one was derived by, the
+   ports with widths and signedness, and the required behavior; each
+   comes with a bit-exact Python golden model and a generated testbench
+   that includes chosen edge cases.
+2. **RTL generation** (`agent.py`, `llm_agent.py`, `chiplet_flow.py`). An
+   agent, rule-based or an LLM, writes Verilog from the spec. The loop
+   seeds realistic first-draft bugs and has to find and fix them from
+   tool output alone.
+3. **Signoff gates**, per block: Icarus simulation bit-exact against the
+   golden model, Yosys lint, OpenSTA timing at the target clock, and
+   `synth_xilinx` for resources. `dv.py` then mutation-tests the
+   testbench itself, and `formal.py` proves the MAC's accumulator never
+   overflows. What passes is written out as a measured profile.
+4. **The integer model** (`qwen_int.py`). The checkpoint quantized the
+   way the hardware runs it: int8 weights per channel, 16-bit
+   activations with static scales calibrated on a float run
+   (`qwen_real.py`), every stage computed by the blocks' own golden
+   models. It is checked against float before any RTL runs.
+5. **The sequencer** (`qwen_full.py`). One generated RTL module sequences
+   the signed-off blocks through a whole decode step, embedding to
+   argmax over the full vocabulary, and writes the weight, constant and
+   gain images it reads. Simulated on the real weights, it has to choose
+   the integer model's tokens.
+6. **The board** (`zybo.py`, `board_zybo.py`). A DDR bridge puts the
+   sequencer on the Zynq's memory ports (four weight streams, one port
+   for constants and the KV cache, the core clock held while a line is
+   in flight), an AXI-Lite register block lets the ARM run it, and the
+   package adds the Vivado block design, an open-flow build
+   (`board_zybo/open/`), the bare-metal ARM program and the SD card
+   files. `HANDOFF.md` is the bring-up.
+
+### Outputs
+
+| output | what it is |
+|---|---|
+| `build*/`, `chiplet_profile.json`, `fabric_profile.json` | per-block RTL that passed every gate, with measured cycles, timing and resources |
+| `build_qfull/qwen_full.v` and its images | the full decode step as one RTL design, with `weights.bin`, `cparams.hex` and `gains.hex` |
+| `board_zybo/` | the board package: RTL, `build.tcl`, `open/build_open.sh` (a bitstream without Vivado), `sw/main.c`, and `sd/` (the model, 494 MB) |
+| on the board | generated text over the USB-UART: `The capital of France is Paris. Paris is the capital of France. ...`, the integer model's tokens; RTL simulation has checked the first one, " Paris", through all 24 layers and the head |
