@@ -1726,6 +1726,42 @@ def test_mutants_edit_code_not_comments():
           and '// + here too' in m)
 
 
+def test_per_column_projection():
+    """Real checkpoints have a weight scale per output channel and biases.
+    The multi-lane projection's per-column mode reads {bias, shift, scale}
+    for each column from a memory; the testbench gives every column its
+    own, and a design that drops the bias has to fail."""
+    import chiplet_flow as cf
+    ms = load_model_spec()
+    spec = specgen_mod.derive_projn_spec(ms, per_column=True)
+    work = os.path.join(ROOT, 'build_projctest')
+    shutil.rmtree(work, ignore_errors=True)
+    try:
+        cf.write_projn_deps(ms, work)
+        with open(os.path.join(work, 'tb.v'), 'w') as f:
+            f.write(specgen_mod.render_projn_testbench(spec))
+        good = RuleBasedAgent().render_projn(spec, {agent_mod.FIX_LANE})
+        nobias = good.replace('shadow[dselb] + $signed(', 'shadow[dselb] + 0 * $signed(')
+        assert nobias != good
+        out = {}
+        for label, src in (('good', good), ('nobias', nobias)):
+            with open(os.path.join(work, 'p.v'), 'w') as f:
+                f.write(src)
+            r = subprocess.run(['iverilog', '-g2005', '-o', 's.out', 'tb.v',
+                                'p.v'] + list(cf.PROJN_DEPS), cwd=work,
+                               capture_output=True, text=True)
+            assert r.returncode == 0, r.stdout + r.stderr
+            out[label] = subprocess.run(['vvp', 's.out'], cwd=work,
+                                        capture_output=True, text=True,
+                                        timeout=600).stdout
+        check('every column requantized with its own bias, scale and shift',
+              'TB_RESULT: PASS' in out['good'])
+        check('a projection that drops the bias is caught',
+              'TB_RESULT: PASS' not in out['nobias'])
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
 def test_requant_golden_is_shared():
     """One model of requantization, used by the requantizer's own
     testbench and by the layer that sequences it, so the two cannot
@@ -2461,6 +2497,7 @@ if __name__ == '__main__':
     test_full_size_projection()
     test_multi_lane_projection()
     test_multi_lane_attention()
+    test_per_column_projection()
     test_mutants_edit_code_not_comments()
     test_decoder_runs_the_model()
     test_small_model_derivation()

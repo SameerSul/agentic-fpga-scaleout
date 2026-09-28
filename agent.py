@@ -575,6 +575,44 @@ endmodule
                 else "w_data[%d*(%d-j) +: %d]" % (dw, N - 1, dw))
         # Rows issued, then data a cycle later, then the MAC's stages.
         flush = 1 + ms_
+        pc = p.get("per_column")
+        cw = p.get("col_word_width", 0)
+        if pc:
+            cports = ("  output reg [%d:0] c_addr,\n  input      [%d:0] c_data,\n"
+                      % (col_w - 1, cw - 1))
+            # Each column's {bias, shift, scale}. c_addr is a register and
+            # the read is registered, so the word is there two edges after
+            # the address is issued; the sum waits in dselb until then. The
+            # bias is added in the accumulator's own units.
+            drain = """      if (dj != dn) begin
+        c_addr <= cap0 + dj; dsel <= dj[{lwm}:0]; dva <= 1'b1;
+        didx <= cap0 + dj; dj <= dj + 1;
+      end else dva <= 1'b0;
+      dvb <= dva; dselb <= dsel; didxb <= didx;
+      if (dvb) begin
+        rq_acc <= shadow[dselb] + $signed(c_data[{cwm}:{bot}]);
+        rq_shift_r <= c_data[{shtop}:{mw}]; rq_scale_r <= c_data[{mwm}:0];
+        rq_idx <= didxb; rq_vin <= 1'b1;
+      end""".format(lwm=lw - 1, cwm=cw - 1, bot=shw + mw,
+                    shtop=shw + mw - 1, mw=mw, mwm=mw - 1)
+            cregs = """  reg [{lwm}:0] dsel, dselb;
+  reg dva, dvb;
+  reg [{colwm}:0] didx, didxb;
+  reg [{mwm}:0] rq_scale_r;
+  reg [{swm}:0] rq_shift_r;
+""".format(lwm=lw - 1, colwm=col_w - 1, mwm=mw - 1, swm=shw - 1)
+            rqsc, rqsh = "rq_scale_r", "rq_shift_r"
+            crst = ("      c_addr <= 0; dsel <= 0; dva <= 1'b0; didx <= 0;\n"
+                    "      dselb <= 0; dvb <= 1'b0; didxb <= 0;\n"
+                    "      rq_scale_r <= 0; rq_shift_r <= 0;\n")
+            idle = " && !dva && !dvb"
+        else:
+            cports = cregs = crst = idle = ""
+            drain = """      if (dj != dn) begin
+        rq_acc <= shadow[dj[{lwm}:0]]; rq_idx <= cap0 + dj;
+        rq_vin <= 1'b1; dj <= dj + 1;
+      end""".format(lwm=lw - 1)
+            rqsc, rqsh = "scale", "shift"
         return """module projn (
   input                    clk,
   input                    rst_n,
@@ -587,7 +625,7 @@ endmodule
   input      signed [{dwm}:0] a_data,
   output     [{wawm}:0] w_addr,
   input      [{wdm}:0] w_data,
-  output reg               o_valid,
+{cports}  output reg               o_valid,
   output reg [{colwm}:0] o_index,
   output reg signed [{dwm}:0] o_data,
   output reg               busy
@@ -624,8 +662,8 @@ endmodule
   reg  [{colwm}:0] rq_idx;
   wire signed [{dwm}:0] rq_q;
   wire rq_sat, rq_vout;
-  requant rq (.clk(clk), .rst_n(rst_n), .acc_in(rq_acc), .scale(scale),
-              .shift(shift), .valid_in(rq_vin), .q_out(rq_q),
+{cregs}  requant rq (.clk(clk), .rst_n(rst_n), .acc_in(rq_acc), .scale({rqsc}),
+              .shift({rqsh}), .valid_in(rq_vin), .q_out(rq_q),
               .sat(rq_sat), .valid_out(rq_vout));
   reg [{colwm}:0] idx_pipe [0:{rqsm}];
   reg [7:0] outst;
@@ -640,7 +678,7 @@ endmodule
       lastp <= 0; mclr <= 1'b0; cap0 <= 0; dj <= 0; dn <= 0;
       rq_vin <= 1'b0; rq_acc <= 0; rq_idx <= 0; outst <= 0; pend <= 1'b0;
       busy <= 1'b0; o_valid <= 1'b0; o_index <= 0; o_data <= 0;
-      for (k = 0; k <= {rqsm}; k = k + 1) idx_pipe[k] <= 0;
+{crst}      for (k = 0; k <= {rqsm}; k = k + 1) idx_pipe[k] <= 0;
       for (k = 0; k <= {fl}; k = k + 1) gp[k] <= 0;
       for (k = 0; k < {N}; k = k + 1) shadow[k] <= 0;
     end else begin
@@ -675,7 +713,9 @@ endmodule
       // A group's sums are complete: take them once the drain is free,
       // clear the lanes, and start the next group in the same cycle.
       if (lastp[{fl}] || pend) begin
-        if (dj == dn) begin
+        // The shadow bank is only free once its last column has left the
+        // drain, parameter read included.
+        if (dj == dn{idle}) begin
           pend <= 1'b0;
           for (k = 0; k < {N}; k = k + 1) shadow[k] <= acc[k];
           cap0 <= gp[{fl}];
@@ -690,16 +730,13 @@ endmodule
         end
       end
 
-      if (dj != dn) begin
-        rq_acc <= shadow[dj[{lwm}:0]]; rq_idx <= cap0 + dj;
-        rq_vin <= 1'b1; dj <= dj + 1;
-      end
+{drain}
 
       if (!busy && start) begin
         busy <= 1'b1; issuing <= 1'b1; r <= 0; g0 <= 0; wbase <= 0;
         dj <= 0; dn <= 0; pend <= 1'b0;
       end else if (busy && !issuing && !v1 && lastp == 0 && !pend
-                   && dj == dn && outst == 0 && !rq_vin && !mclr
+                   && dj == dn && outst == 0 && !rq_vin && !mclr{idle}
                    && g0 + {N} >= cols) begin
         busy <= 1'b0;
       end
@@ -709,7 +746,8 @@ endmodule
 """.format(depwm=dep_w - 1, colwm=col_w - 1, mwm=mw - 1, swm=shw - 1,
            dwm=dw - 1, wawm=waw - 1, wdm=N * dw - 1, awm=aw - 1,
            nm=N - 1, N=N, byte=byte, fl=flush, flm=flush - 1,
-           lwp=lw, lwm=lw - 1, rqsm=rqs - 1)
+           lwp=lw, lwm=lw - 1, rqsm=rqs - 1, cports=cports, cregs=cregs,
+           rqsc=rqsc, rqsh=rqsh, crst=crst, drain=drain, idle=idle)
 
     def render_rope(self, spec, fixes):
         """Four stages: the phase, the table, the four products, then

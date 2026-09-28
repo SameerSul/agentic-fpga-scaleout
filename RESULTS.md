@@ -31,7 +31,7 @@ The remaining gap is listed at the bottom rather than glossed over.
 ### The full suite
 
 ```
-python3 tests.py            # 342 tests, or 340 without OpenSTA
+python3 tests.py            # 344 tests, or 342 without OpenSTA
 ```
 
 ### Spec to RTL, across the spec space
@@ -336,11 +336,40 @@ was already 10 to 20% off. At 16 bits the stages are within about 2%, and
 the model decodes. The w8/a16 datapath is not new: it is the sweep's
 asym_w8_a16 variant, which every block derives and signs off.
 
-Two things that run uses are not yet in the RTL: a requantizer scale per
-output channel, where the projection has one per call, and the biases.
 The one stage still well off at 16 bits is SiLU times up, 9% in layer 1,
-from SiLU's fixed Q4.8 output. This is the arithmetic, run in Python; no
-RTL simulation runs a 494-million-weight token.
+from SiLU's fixed Q4.8 output.
+
+That run is the arithmetic in Python; no RTL simulation runs a
+494-million-weight token. What does run in RTL is the real matrices. The
+multi-lane projection gained a per-column mode, in which each output
+column's bias, scale and shift come from a small memory read two edges
+ahead of its sum, the bias added in the accumulator's own units, since a
+per-channel weight scale gives every column its own requantizer
+constants. `qwen_cosim.py` feeds it Qwen's own layer-0 matrices at full
+size, with the int16 activation the integer model computes for a real
+token:
+
+```
+python3 qwen_cosim.py
+projection: 16 lanes of 16-bit, 37-bit accumulator
+q_proj, 896 to 896, with bias    bit-exact  50494 cycles
+down_proj, 4864 to 896           bit-exact  272702 cycles
+rmsnorm, 896 wide, real gains    bit-exact
+rope, 14 heads at position 4     bit-exact
+attention head 0 over 5 cached positions bit-exact
+silu on the 4864-wide gate       bit-exact
+residual add after attention     bit-exact
+```
+
+Every block type in a Qwen layer, fed real layer-0 data for the prompt
+"The capital of France is", matches the integer model on every output:
+the projections with per-channel constants and bias, RMSNorm with the
+checkpoint's own gains, the rotation of all 14 query heads, attention
+over the real five-position cache, SiLU on the full gate, and the
+residual add. So the chain holds block by block: the real checkpoint,
+quantized, through the generated RTL, equals the arithmetic that
+decodes "Paris" from it. What it is not is one sequenced layer in RTL at
+this size; each block runs on its own inputs.
 
 ## Qwen's structure decodes in RTL
 
@@ -1060,9 +1089,9 @@ These are the distance between this repo and a local LLM host.
    Qwen2.5-0.5B's own weights run through the blocks' golden models in
    Python, 14 of 16 positions against float at int16 activations, but
    the RTL decoders run the checkpoints trained here, one 16 dimensional
-   and one with Qwen's structure at 32 dimensions and 2 layers. Per
-   channel requantizer scales and biases, which the real model needs,
-   are not in the projection RTL yet.
+   and one with Qwen's structure at 32 dimensions and 2 layers. Real
+   Qwen matrices run bit-exact through the projection RTL one at a time
+   (`qwen_cosim.py`), not as a sequenced layer.
 4. **Throughput is predicted, not measured.** tokens/s comes from a sizing
    model checked against a fabric simulation, agreeing within 15% and at
    ratio 1.00 on the current configuration. Both are models. Neither is a

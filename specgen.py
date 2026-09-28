@@ -3937,7 +3937,7 @@ def proj_golden(depth, cols, seed, dw, scale, shift):
     return acc, [requant_golden(a, scale, shift, dw)[0] for a in acc]
 
 
-def render_proj_testbench(spec, cases=None):
+def render_proj_testbench(spec, cases=None, colfn=None):
     """Cases are (depth, cols, seed). The default is small, for the flow;
     tests.py renders one at the model's full size.
 
@@ -3964,6 +3964,16 @@ def render_proj_testbench(spec, cases=None):
         sc, sh = _mlp_scale(acc, dw, mw, sw_o)
         _, y = proj_golden(depth, cols, seed, dw, sc, sh)
         body.append("    // depth %d, cols %d" % (depth, cols))
+        if colfn:
+            # Each column its own bias, scale and shift, from a small
+            # memory, as a model with per-channel weight scales needs.
+            y = []
+            for c, (b, csc, csh) in enumerate(colfn(acc, seed)):
+                y.append(requant_golden(acc[c] + b, csc, csh, dw)[0])
+                word = (((b & ((1 << p["acc_width"]) - 1)) << (sw_o + mw))
+                        | (csh << mw) | csc)
+                body.append("    cmem[%d] = %d'h%x;"
+                            % (c, p["acc_width"] + sw_o + mw, word))
         for c, v in enumerate(y):
             body.append("    expect_y[%d] = %s;" % (c, _slit(v, dw)))
         body.append("    run_proj(%d, %d, %d, %d, %d);"
@@ -4088,7 +4098,7 @@ endmodule
 """
 
 
-def derive_projn_spec(ms, board=None):
+def derive_projn_spec(ms, board=None, per_column=False):
     """model spec -> multi-lane projection spec.
 
     Batch-1 decode reads every weight once per token, so throughput is
@@ -4112,13 +4122,17 @@ def derive_projn_spec(ms, board=None):
         lanes *= 2
     top = p["max_dim"]
     words = -(-top // lanes) * top
+    p.update(per_column=bool(per_column),
+             col_word_width=p["acc_width"] + p["shift_width"]
+             + p["scale_width"])
     p.update(lanes=lanes, word_width=lanes * p["data_width"],
              word_addr_width=max(1, (words - 1).bit_length()),
              mac_stages=derive_chiplet_spec(ms)["parameters"]
              ["pipeline_stages"])
     spec = dict(base)
     spec.update(
-        name="projn%d_%s" % (lanes, ms["name"]),
+        name="projn%d%s_%s" % (lanes, "c" if per_column else "",
+                                ms["name"]),
         description="Multi-lane projection y = requant(W x): %d columns at "
                     "once, each lane taking its own byte of a %d-bit weight "
                     "word, sized to consume %s's sustained DDR bandwidth"
@@ -4143,6 +4157,14 @@ def derive_projn_spec(ms, board=None):
                                                p["data_width"] - 1,
                                                p["data_width"]))
         ports.append(q)
+    if per_column:
+        ports.insert(-4, {"name": "c_addr", "dir": "output",
+                          "width": p["col_width"],
+                          "desc": "column parameter address"})
+        ports.insert(-4, {"name": "c_data", "dir": "input",
+                          "width": p["col_word_width"],
+                          "desc": "{bias, shift, scale} for column c_addr, "
+                                  "registered read"})
     spec["ports"] = ports
     spec["behavior"] = [
         "Columns are processed in groups of %d. Group g covers columns "
@@ -4164,6 +4186,25 @@ def derive_projn_spec(ms, board=None):
     return spec
 
 
+def _colparams(p):
+    """Per-column bias, scale and shift for the testbench: every column
+    different, most outputs in range, a few saturated."""
+    dw, mw, sw_o = p["data_width"], p["scale_width"], p["shift_width"]
+
+    def fn(acc, seed):
+        rnd = random.Random(1000 + seed)
+        m = max(1, max(abs(a) for a in acc))
+        sc, sh = _mlp_scale(acc, dw, mw, sw_o)
+        out = []
+        for _ in acc:
+            b = rnd.randrange(-m // 6, m // 6 + 1)
+            csh = min((1 << sw_o) - 1, sh + rnd.randrange(0, 2))
+            csc = max(1, rnd.randrange(sc // 2, max(sc // 2 + 1, sc * 5 // 6)))
+            out.append((b, csc, csh))
+        return out
+    return fn
+
+
 def render_projn_testbench(spec, cases=None):
     """The projection's cases and golden, with a wide weight word: lane j
     of word g*depth + r is column g*lanes + j's weight at row r."""
@@ -4173,7 +4214,8 @@ def render_projn_testbench(spec, cases=None):
         cwide = min(p["max_dim"], (1 << (p["addr_width"] // 2 + 1)) // dwide + 1)
         cases = ((16, 8, 1), (100, 40, 2), (7, 130, 3), (3, 60, 4),
                  (dwide, cwide, 5))
-    tb = render_proj_testbench(spec, cases)
+    pc = p.get("per_column")
+    tb = render_proj_testbench(spec, cases, _colparams(p) if pc else None)
     N, dw = p["lanes"], p["data_width"]
     rep = [
         ("module tb_proj;", "module tb_projn;"),
@@ -4192,6 +4234,18 @@ def render_projn_testbench(spec, cases=None):
         ("expected_proj", "expected_lane"),
         ("got_proj", "got_lane"),
     ]
+    if pc:
+        cw = p["col_word_width"]
+        rep += [
+            ("  integer wj, wc, wr;",
+             "  integer wj, wc, wr;\n  wire [%d:0] c_addr;\n"
+             "  reg [%d:0] cmem [0:%d];\n  reg [%d:0] c_data;\n"
+             "  always @(posedge clk) c_data <= cmem[c_addr];"
+             % (p["col_width"] - 1, cw - 1,
+                max(c for _, c, _ in (cases or ((1, 260, 0),))) - 1
+                if cases else (1 << p["col_width"]) - 1, cw - 1)),
+            (".w_data(w_data),", ".w_data(w_data), .c_addr(c_addr), .c_data(c_data),"),
+        ]
     for a_, b_ in rep:
         assert a_ in tb, a_
         tb = tb.replace(a_, b_)

@@ -190,6 +190,7 @@ python3 qwen_decoder.py            # its integer-only decode, against float
 python3 board.py                   # the Basys 3 package in board_basys3/, simulated over its UART
 python3 fetch_qwen.py              # optional, ~1 GB: Qwen2.5-0.5B's real weights, git-ignored
 python3 qwen_int.py --act-bits 16 --per-channel   # the real model on the blocks' integer arithmetic
+python3 qwen_cosim.py              # real Qwen layer-0 matrices through the projection RTL, bit-exact
 python3 bitstream.py --block mac   # place, route and pack a real iCE40 bitstream (needs nextpnr-ice40)
 python3 dv.py --rtl build/mac.v --tb tb_mac.v   # mutation-test a generated testbench
 python3 inference.py               # real quantized transformer dot products through the generated RTL
