@@ -1666,6 +1666,236 @@ def test_basys3_top_level():
         shutil.rmtree(work, ignore_errors=True)
 
 
+def test_zybo_register_block():
+    """The Zybo top level's AXI-Lite registers, around a stub core whose
+    clock only ticks every fourth bus cycle, as the real one's does while
+    lines fill. A start written once has to reach it, done has to stay
+    set until the next start clears it, and the layout registers have to
+    read back what the software's header was generated with."""
+    import board_zybo as bz
+    L = dict(W=dict(tok=18, pos=8), wb=0x08000000, cb=0x25714000,
+             kb=0x25BB8000, vb=0x25D38000, end=0x25EB8000)
+    work = os.path.join(ROOT, 'build_zregtest')
+    shutil.rmtree(work, ignore_errors=True)
+    os.makedirs(work)
+    wp = ''.join('  output [31:0] w%d_araddr, output [3:0] w%d_arlen, output w%d_arvalid,\n'
+                 '  input w%d_arready, input [63:0] w%d_rdata, input w%d_rvalid,\n'
+                 '  input w%d_rlast, output w%d_rready,\n' % ((p,) * 8) for p in range(4))
+    wt = ''.join('  assign w%d_araddr = 0; assign w%d_arlen = 0; assign w%d_arvalid = 0;'
+                 ' assign w%d_rready = 1;\n' % ((p,) * 4) for p in range(4))
+    stub = """module qwen_zybo (input clk, input rst_n, input start, input head_en,
+  input [17:0] tok, input [7:0] pos, output reg [17:0] next_tok,
+  output reg signed [15:0] best, output reg done, output reg busy,
+%s  output [31:0] araddr, output [3:0] arlen, output arvalid, input arready,
+  input [63:0] rdata, input rvalid, input rlast, output rready,
+  output [31:0] awaddr, output [3:0] awlen, output awvalid, input awready,
+  output [63:0] wdata, output [7:0] wstrb, output wlast, output wvalid,
+  input wready, input bvalid, output bready, output reg [31:0] core_cycles);
+%s  assign araddr = 0; assign arlen = 0; assign arvalid = 0; assign rready = 1;
+  assign awaddr = 0; assign awlen = 0; assign awvalid = 0; assign wdata = 0;
+  assign wstrb = 0; assign wlast = 0; assign wvalid = 0; assign bready = 1;
+  reg [1:0] ph; reg [7:0] left;
+  always @(posedge clk) begin
+    if (!rst_n) begin ph <= 0; busy <= 0; done <= 0; core_cycles <= 0; end
+    else begin
+      ph <= ph + 1;
+      if (ph == 0) begin   // one core edge in four bus cycles
+        core_cycles <= core_cycles + 1; done <= 1'b0;
+        if (!busy && start) begin busy <= 1'b1; left <= 20; end
+        else if (busy && left == 0) begin
+          busy <= 1'b0; done <= 1'b1;
+          next_tok <= tok ^ 18'h155; best <= head_en ? -$signed({8'd0, pos}) : 16'sd0;
+        end else if (busy) left <= left - 1;
+      end
+    end
+  end
+endmodule
+""" % (wp, wt)
+    tasks = bz.STEP[:bz.STEP.index('  task expect_reg')].replace('%%', '%')
+    tb = """`timescale 1ns/1ps
+module tb;
+  reg clk = 0, rst_n = 0;
+  always #5 clk = ~clk;
+  reg [5:0] s_awaddr = 0, s_araddr = 0; reg [31:0] s_wdata = 0;
+  reg s_awvalid = 0, s_wvalid = 0, s_arvalid = 0, s_bready = 0, s_rready = 0;
+  wire s_awready, s_wready, s_bvalid, s_arready, s_rvalid;
+  wire [1:0] s_bresp, s_rresp; wire [31:0] s_rdata;
+  fpgai_zybo dut (.aclk(clk), .aresetn(rst_n),
+    .s_axi_awaddr(s_awaddr), .s_axi_awvalid(s_awvalid), .s_axi_awready(s_awready),
+    .s_axi_wdata(s_wdata), .s_axi_wstrb(4'hf), .s_axi_wvalid(s_wvalid),
+    .s_axi_wready(s_wready), .s_axi_bresp(s_bresp), .s_axi_bvalid(s_bvalid),
+    .s_axi_bready(s_bready), .s_axi_araddr(s_araddr), .s_axi_arvalid(s_arvalid),
+    .s_axi_arready(s_arready), .s_axi_rdata(s_rdata), .s_axi_rresp(s_rresp),
+    .s_axi_rvalid(s_rvalid), .s_axi_rready(s_rready));
+%s  integer bad = 0;
+  task want(input [5:0] a, input [31:0] v);
+    begin rd(a); if (rv !== v) begin bad = bad + 1;
+      $display("reg %%h = %%h, want %%h", a, rv, v); end end
+  endtask
+  // A lost start leaves the poll loop waiting for good.
+  initial begin #100000; $display("TB_RESULT: FAIL, timed out"); $finish; end
+  initial begin
+    repeat (4) @(negedge clk); rst_n = 1;
+    want(6'h20, 32'h%08x); want(6'h24, 32'h%08x); want(6'h28, 32'h%08x);
+    want(6'h2c, 32'h%08x); want(6'h30, 32'h%08x); want(6'h34, 32'h%08x);
+    want(6'h0c, 0);
+    wr(6'h04, 32'hfffff); want(6'h04, 32'h3ffff);
+    wr(6'h04, 1234); wr(6'h08, 7); wr(6'h00, 3);
+    rd(6'h0c); if (rv[1]) bad = bad + 1;
+    rv = 0; while (!rv[1]) rd(6'h0c);
+    want(6'h10, 1234 ^ 18'h155); want(6'h14, -7); want(6'h00, 2);
+    rd(6'h1c); if (rv < 60) begin bad = bad + 1; $display("bus %%0d", rv); end
+    repeat (40) @(negedge clk); want(6'h0c, 2);
+    wr(6'h04, 99); wr(6'h08, 8); wr(6'h00, 1);
+    rd(6'h0c); if (rv[1]) bad = bad + 1;
+    rv = 0; while (!rv[1]) rd(6'h0c);
+    want(6'h10, 99 ^ 18'h155); want(6'h14, 0);
+    if (bad) $display("TB_RESULT: FAIL"); else $display("TB_RESULT: PASS");
+    $finish;
+  end
+endmodule
+""" % (tasks, bz.FPGAI_ID, L['wb'], L['cb'], L['kb'], L['vb'], L['end'])
+    try:
+        open(os.path.join(work, 'fpgai_zybo.v'), 'w').write(bz.render_wrapper(L))
+        open(os.path.join(work, 'stub.v'), 'w').write(stub)
+        open(os.path.join(work, 'tb.v'), 'w').write(tb)
+        r = subprocess.run(['iverilog', '-g2005', '-o', 'z.out', 'tb.v',
+                            'fpgai_zybo.v', 'stub.v'], cwd=work,
+                           capture_output=True, text=True)
+        out = r.stdout + r.stderr
+        if not r.returncode:
+            out = subprocess.run(['vvp', 'z.out'], cwd=work, capture_output=True,
+                                 text=True, timeout=120).stdout
+        check('the Zybo registers start a held core and read its token',
+              'TB_RESULT: PASS' in out)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def test_weight_streamer_survives_stalls():
+    """The Zybo bridge's weight streamer alone, on four read ports that
+    stall arready and gap their beats at random, fed an address stream
+    that runs ahead, jumps back and jumps forward the way projections do.
+    Every word the core is shown has to be the right one and the stream
+    must never stop: a jump back while a request waited for arready used
+    to be forgotten, and the core then waited forever."""
+    import zybo
+    wam, base = 15, 0x08000000
+    work = os.path.join(ROOT, 'build_strmtest')
+    shutil.rmtree(work, ignore_errors=True)
+    os.makedirs(work)
+    ports, _, wdata = zybo.render_wports(4)
+    top = """module strm (input clk, input rst_n, input [%d:0] wq, output hw_o,
+  output [255:0] w_data,
+%s  output dummy);
+  assign dummy = 1'b0;
+%s
+%s%s
+  assign hw_o = hw;
+endmodule
+""" % (wam, ports.split('\n', 1)[1],
+       '  ' + ' '.join('assign w%d_arlen = 4\'d7; assign w%d_rready = 1\'b1;' % (p, p)
+                       for p in range(4)),
+       zybo.render_streamer(4, wam, wbase=base), wdata)
+    conn = ''.join('    .w%(p)d_araddr(a%(p)d), .w%(p)d_arlen(), .w%(p)d_arvalid(av%(p)d),'
+                   ' .w%(p)d_arready(ar%(p)d), .w%(p)d_rdata(rd%(p)d),'
+                   ' .w%(p)d_rvalid(rv%(p)d), .w%(p)d_rlast(rl%(p)d), .w%(p)d_rready(),\n'
+                   % {'p': p} for p in range(4))
+    mem = ''.join("""  wire [31:0] a%(p)d; wire av%(p)d; reg ar%(p)d = 1, rv%(p)d = 0, rl%(p)d = 0;
+  reg [63:0] rd%(p)d = 0;
+  reg [31:0] qa%(p)d [0:15]; integer qh%(p)d = 0, qn%(p)d = 0, j%(p)d;
+  always @(posedge clk) ar%(p)d <= {$random} %% 3 != 0;
+  always @(posedge clk) if (rst_n && av%(p)d && ar%(p)d) begin
+    qa%(p)d[qn%(p)d %% 16] = a%(p)d; qn%(p)d = qn%(p)d + 1; end
+  initial begin
+    @(posedge rst_n);
+    forever begin
+      @(posedge clk);
+      if (qh%(p)d < qn%(p)d) begin
+        repeat ({$random} %% 20) @(posedge clk);
+        for (j%(p)d = 0; j%(p)d < 8; j%(p)d = j%(p)d + 1) begin
+          while ({$random} %% 3 == 0) begin rv%(p)d <= 0; rl%(p)d <= 0; @(posedge clk); end
+          rd%(p)d <= beat(qa%(p)d[qh%(p)d %% 16] + j%(p)d * 8);
+          rv%(p)d <= 1; rl%(p)d <= (j%(p)d == 7); @(posedge clk);
+        end
+        rv%(p)d <= 0; rl%(p)d <= 0; qh%(p)d = qh%(p)d + 1;
+      end
+    end
+  end
+""" % {'p': p} for p in range(4))
+    tb = """`timescale 1ns/1ps
+module tb;
+  reg clk = 0, rst_n = 0;
+  always #5 clk = ~clk;
+  // word w of the image: sixteen int8 weights, byte k = w * 7 + k * 13
+  function [63:0] beat(input [31:0] a);
+    integer k; reg [31:0] w;
+    begin
+      w = (a - %d) / 16;
+      for (k = 0; k < 8; k = k + 1)
+        beat[k * 8 +: 8] = w * 7 + (k + ((a / 8) %% 2) * 8) * 13;
+    end
+  endfunction
+  function [255:0] want(input [31:0] w);
+    integer k; reg [7:0] b;
+    begin
+      for (k = 0; k < 16; k = k + 1) begin
+        b = w * 7 + k * 13; want[k * 16 +: 16] = {{8{b[7]}}, b};
+      end
+    end
+  endfunction
+%s  reg [%d:0] wq = 0;
+  wire hw; wire [255:0] w_data;
+  strm dut (.clk(clk), .rst_n(rst_n), .wq(wq), .hw_o(hw), .w_data(w_data),
+%s    .dummy());
+  // The core: a word a cycle whenever it is there, with the address
+  // pattern of projections: runs, jumps back, jumps ahead, many of them
+  // short so that jumps land while requests still wait on arready.
+  integer seg, i, bad = 0, n = 0;
+  integer from [0:@NS@], len [0:@NS@];
+  initial begin
+@SEGS@
+    repeat (4) @(negedge clk); rst_n = 1;
+    for (seg = 0; seg <= @NS@; seg = seg + 1)
+      for (i = 0; i < len[seg]; i = i + 1) begin
+        wq = from[seg] + i;
+        @(negedge clk); while (!hw) @(negedge clk);
+        n = n + 1;
+        if (w_data !== want(wq)) begin
+          bad = bad + 1;
+          if (bad < 5) $display("word %%0d wrong", wq);
+        end
+      end
+    if (bad) $display("TB_RESULT: FAIL, %%0d of %%0d words", bad, n);
+    else $display("TB_RESULT: PASS, %%0d words", n);
+    $finish;
+  end
+  initial begin #20000000; $display("TB_RESULT: FAIL, stalled"); $finish; end
+endmodule
+""" % (base, mem, wam, conn)
+    rng = random.Random(7)
+    segs = [(0, 900), (8, 300)]
+    for _ in range(120):
+        start = rng.choice([rng.randrange(0, 4000), rng.randrange(0, 64)])
+        segs.append((start, rng.choice([rng.randrange(1, 12), rng.randrange(20, 200)])))
+    tb = tb.replace('@NS@', str(len(segs) - 1)).replace('@SEGS@', '\n'.join(
+        '    from[%d] = %d; len[%d] = %d;' % (k, f, k, l)
+        for k, (f, l) in enumerate(segs)))
+    try:
+        open(os.path.join(work, 'strm.v'), 'w').write(top)
+        open(os.path.join(work, 'tb.v'), 'w').write(tb)
+        r = subprocess.run(['iverilog', '-g2005', '-o', 'z.out', 'tb.v', 'strm.v'],
+                           cwd=work, capture_output=True, text=True)
+        out = r.stdout + r.stderr
+        if not r.returncode:
+            out = subprocess.run(['vvp', 'z.out'], cwd=work, capture_output=True,
+                                 text=True, timeout=300).stdout
+        check('the weight streamer never stalls under a stalling bus',
+              'TB_RESULT: PASS' in out)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
 def test_multi_lane_attention():
     """Lanes over cached positions for the scores and over dimensions for
     the weighted sum. On a full 256-position row it has to match the
@@ -2506,6 +2736,8 @@ if __name__ == '__main__':
     test_scores_wider_than_the_exponential()
     test_qwen_shaped_decoder()
     test_basys3_top_level()
+    test_zybo_register_block()
+    test_weight_streamer_survives_stalls()
     test_composite_cell_count()
     test_requant_golden_is_shared()
     test_table_unit_specs_are_implementable()

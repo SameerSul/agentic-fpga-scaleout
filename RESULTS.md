@@ -1,6 +1,6 @@
 # What is verified, and what is not
 
-Last run 2026-09-27. Every number here came from a command in this repo, and
+Last run 2026-09-28. Every number here came from a command in this repo, and
 every command is named so it can be re-run.
 
 ## Short answer
@@ -24,9 +24,11 @@ text, and a generated RTL sequencer decodes the real Qwen2.5-0.5B, all
 24 layers on its own weights, completing "The capital of France is" with
 " Paris" in simulation. It still does not host a local LLM the way
 Architect Labs does, for one reason: nothing in this repo has been put on
-a board. The sequencer fits the Zybo's Zynq 7020, but the connection
-from its weight port to the board's DDR, and a Vivado run, are the steps
-not taken.
+a board. The sequencer fits the Zybo's Zynq 7020, and `board_zybo/` is
+its whole board package, the PL top level on the Zynq's DDR ports, the
+Vivado block design, the ARM program and the SD card, simulated through
+the registers the ARM would use; running Vivado and the board are the
+steps not taken.
 The remaining gap is listed at the bottom rather than glossed over.
 
 ## Verified
@@ -34,7 +36,7 @@ The remaining gap is listed at the bottom rather than glossed over.
 ### The full suite
 
 ```
-python3 tests.py            # 344 tests, or 342 without OpenSTA
+python3 tests.py            # 346 tests, or 344 without OpenSTA
 ```
 
 ### Spec to RTL, across the spec space
@@ -477,8 +479,67 @@ sequencer with every block under it to 25650 LUTs, 3240 more as LUT RAM,
 13600 flip-flops, 148 DSPs and 16 block RAMs on 7-series: 54% of a Zynq
 7020's LUTs and 67% of its DSPs. The weights, column constants and KV
 cache are the ports' side, which on the team's Zybo is its 1 GB of DDR,
-reached through the HP ports; that AXI connection is the part not
-written.
+reached through the HP ports; `board_zybo.py`, below, writes that
+connection.
+
+## A Zybo package
+
+```
+python3 board_zybo.py                                  # board_zybo/, from the 24-layer build
+python3 board_zybo.py --work build_qfull1 --out build_bz1 --sim --jitter
+```
+
+`board_zybo/` is what the team's Zybo Z7-20 needs to run the sequencer
+above, generated rather than written by hand. `rtl/` has the core and
+its blocks, the DDR bridge with every region at its real DDR address
+(weights from 0x08000000, below them the ARM's program), and
+`fpgai_zybo`, a top level with an AXI-Lite register block and five AXI4
+masters: the four weight streams on HP0 to HP3, the constants and the KV
+cache on ACP. `build.tcl` is the Vivado block design: the PS7 with
+Digilent's preset, the ports and their interconnects, FCLK0 at 50 MHz,
+then the bitstream and the `.xsa`. `sw/main.c` is the bare-metal ARM
+side: it reads the SD card's four files into DDR, zeroes the KV cache,
+flushes its caches, runs the prompt a position at a time through the
+registers and prints each generated token's text over the USB-UART. The
+software reads the layout registers first, so SD files and a bitstream
+from different builds are refused before anything runs. `sd/` holds the
+494 MB int8 weights, the column constants, the vocabulary and the
+prompt, and is not committed.
+
+Yosys maps the whole top level, 24 layers, bridge and registers, to
+33169 LUTs, 7380 more as LUT RAM, 15922 flip-flops, 148 DSPs and 36
+block RAMs on 7-series: 76% of a Zynq 7020's LUTs counting the LUT RAM,
+67% of its DSPs.
+
+The testbench drives the design only through AXI-Lite, as the ARM would,
+against the DDR model, and the one-layer build chooses token 70526, the direct testbench's, in
+11,140,965 bus cycles, 1.17 a core cycle as before.
+The DDR model used to accept every read the cycle it came and send every
+burst without a gap, which no interconnect shared with a processor does.
+With `--jitter` every port drops its ready and gaps its beats at random,
+and the first such run deadlocked at core cycle 6339: the weight
+streamer saw a jump back in the core's address for one cycle only, and
+when a request was still waiting for arready that cycle, the restart was
+skipped and forgotten, leaving the stream 255 lines ahead of a core that
+waited for good. The always-ready model could never show it; the board
+would have. The jump is now held until the stream can restart, and a
+stream past its window counts as one. With that fix the jittered run
+chooses 70526 too, in 11,452,288 bus cycles, 1.20 a core cycle. Both
+run the core's 9,510,162 cycles; the core counter they print is a few
+higher because it is read before the AXI-Lite write that starts the
+step, and the idle core ticks through that write.
+
+Two tests keep it: `test_weight_streamer_survives_stalls` runs the
+streamer alone on four stalling ports under an address stream of 122
+runs and jumps, checks every word it hands the core, and fails on the
+old streamer in half a second; `test_zybo_register_block` runs the
+registers around a stub core whose clock ticks one bus cycle in four,
+and fails if a start is a one-cycle pulse or done is not kept.
+
+Vivado has not run on any of this, so the block design, the
+interconnects, timing at 50 MHz and the software have not met real
+tools. The gated core clock, a BUFGCE, is the first path to read in the
+timing report.
 
 ## Qwen's structure decodes in RTL
 
@@ -1171,6 +1232,11 @@ These are the distance between this repo and a local LLM host.
    team's Basys 3 that step is now one command: `board_basys3/` is a
    complete Vivado build of the Qwen-shaped decoder behind the board's
    USB-UART, simulated end to end, and `build.tcl` is the part not run.
+   For the Zybo it is the real model: `board_zybo/` builds the
+   Qwen2.5-0.5B sequencer into the Zynq's PL with an ARM program that
+   loads the weights from SD and prints the text, simulated one layer
+   deep through its registers; its `build.tcl` and the Vitis build are
+   the part not run.
 2. **The generated blocks are the arithmetic, not the whole engine.** The
    flow generates the multiply-accumulate unit, the requantizer between
    matmuls, the exponential and the reciprocal that softmax needs, the
@@ -1198,9 +1264,10 @@ These are the distance between this repo and a local LLM host.
    sequencer decodes Qwen2.5-0.5B's own weights in iverilog, all 24
    layers and the full head, and chooses " Paris" as the integer model
    does; that integer model agrees with float on 14 of 16 positions at
-   int16 activations. The weights reach it from a file through the
-   testbench, standing in for DDR, and the AXI link to a real DDR
-   controller is not written.
+   int16 activations. The weights reach it through AXI masters shaped
+   like the Zynq's HP ports, against a DDR model that stalls and gaps at
+   random; the Zynq's own DDR controller and interconnect have not
+   carried them.
 4. **Throughput is predicted, not measured.** tokens/s comes from a sizing
    model checked against a fabric simulation, agreeing within 15% and at
    ratio 1.00 on the current configuration. Both are models. Neither is a
