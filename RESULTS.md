@@ -456,11 +456,18 @@ core's line jumps. The same run then takes 12.86 million bus cycles,
 |---|---|---|
 | one port, one read at a time | 13.3 | 4.2 s |
 | one port, 4 bursts outstanding | 4.39 | 1.4 s |
-| four ports, 32-line window | **1.35** | **0.42 s, 2.4 tokens/s** |
+| four ports, 32-line window | 1.35 | 0.42 s, 2.4 tokens/s |
+| four ports, weights int8 in DDR | **1.17** | **0.37 s, 2.7 tokens/s** |
 
-What stands between that and the sizing model's 4 tokens/s is mostly
-the 64-bit width of each port at 100 MHz, 3.2 GB/s of peak for the four,
-and the constant port's line misses, which are not prefetched. The first run of
+The last row fixes a waste that also mattered for fitting the board.
+The core's word carries each weight in a 16-bit lane, since the
+datapath is 16 bits, and the DDR image had stored them that way: 988 MB
+of the Zybo's 1 GB, leaving the processor almost nothing. DDR now holds
+the weights as int8, 16 to a 128-bit word, 494 MB, and the bridge
+sign-extends each byte on the way into the core, which halves the bus
+traffic too. Same token, same core cycles. What remains between this and
+the sizing model's 4 tokens/s is the constant port's line misses, which
+are not prefetched, and projection restarts. The first run of
 this deadlocked, and the fault was the testbench's: before reset the
 master's valids are X, !X is false, and the DDR model ran a phantom
 write at cycle 2, then waited forever for its data beat.

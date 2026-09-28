@@ -224,7 +224,7 @@ def render_streamer(np_, wam, ns=32):
     a("  // master only, so a line requested later always lands later.")
     a("  localparam NS = %d, MAXO = 8;" % ns)
     for p in range(np_):
-        a("  reg [255:0] swb%d [0:%d];" % (p, per * 4 - 1))
+        a("  reg [127:0] swb%d [0:%d];" % (p, per * 4 - 1))
     a("  reg [%d:0] stag [0:NS - 1];" % wam)
     a("  reg sval [0:NS - 1];")
     a("  wire [%d:0] cur = wq >> 2;" % wam)
@@ -270,7 +270,7 @@ def render_streamer(np_, wam, ns=32):
     a("        case (np_sel)")
     for p in range(np_):
         a("          %d: if (!w%d_arvalid && out%d < MAXO) begin" % (p, p, p))
-        a("            w%d_araddr <= nreq * 128; w%d_arvalid <= 1'b1;" % (p, p))
+        a("            w%d_araddr <= nreq * 64; w%d_arvalid <= 1'b1;" % (p, p))
         a("            sval[ns] <= 1'b0; stag[ns] <= nreq;")
         a("            inf%d[it%d] <= nreq; it%d <= it%d + 1; nreq <= nreq + 1;" % (p, p, p, p))
         a("          end")
@@ -279,7 +279,7 @@ def render_streamer(np_, wam, ns=32):
     a("      end")
     for p in range(np_):
         a("      if (w%d_rvalid) begin" % p)
-        a("        swb%d[(inf%d[ih%d][%d:0] / %d) * 4 + wb%d[3:2]][wb%d[1:0] * 64 +: 64] <= w%d_rdata;"
+        a("        swb%d[(inf%d[ih%d][%d:0] / %d) * 4 + wb%d[2:1]][wb%d[0] * 64 +: 64] <= w%d_rdata;"
           % (p, p, p, sb - 1, np_, p, p, p))
         a("        wb%d <= wb%d + 1;" % (p, p))
         a("        if (w%d_rlast) begin" % p)
@@ -304,13 +304,19 @@ def render_wports(np_):
         "  output reg [31:0] w%d_araddr, output [3:0] w%d_arlen, output reg w%d_arvalid,\n"
         "  input w%d_arready, input [63:0] w%d_rdata, input w%d_rvalid, input w%d_rlast,\n"
         "  output w%d_rready,\n" % ((p,) * 8) for p in range(np_))
-    assign = " ".join("assign w%d_arlen = 4'd15; assign w%d_rready = 1'b1;" % (p, p)
+    assign = " ".join("assign w%d_arlen = 4'd7; assign w%d_rready = 1'b1;" % (p, p)
                       for p in range(np_))
     sel = "cs %% %d" % np_
     arms = " : ".join("(%s == %d) ? swb%d[(cs / %d) * 4 + wq[1:0]]" % (sel, p, p, np_)
                       for p in range(np_ - 1))
     last = "swb%d[(cs / %d) * 4 + wq[1:0]]" % (np_ - 1, np_)
-    wdata = "  assign w_data = %s;" % ((arms + " : " + last) if np_ > 1 else last)
+    # DDR holds the weights as int8, 16 to a 128-bit word; the core's
+    # word has them in 16-bit lanes, so each byte is sign-extended here.
+    # Half the memory, and half the bus traffic, of storing the lanes.
+    ext = ", ".join("{{8{wpk[%d]}}, wpk[%d:%d]}" % (8 * j + 7, 8 * j + 7, 8 * j)
+                    for j in range(15, -1, -1))
+    wdata = ("  wire [127:0] wpk = %s;\n  assign w_data = {%s};"
+             % ((arms + " : " + last) if np_ > 1 else last, ext))
     return ("  // Weights: their own read masters, streaming ahead of the core.\n"
             + ports), "  " + assign, wdata
 
@@ -346,7 +352,7 @@ module tb_zybo;
   reg [61:0] c62 [0:%(cn)d];
   reg [255:0] km [0:%(kn)d];
   reg [255:0] vm [0:%(vn)d];
-  integer fd, r, i, cyc = 0, t0 = 0, c0 = 0, lat;
+  integer fd, fd8, r, i, cyc = 0, t0 = 0, c0 = 0, lat;
   reg [255:0] wword, t;
   integer wlast_ = -1;
   reg [31:0] ra;
@@ -422,6 +428,7 @@ module tb_zybo;
   endtask
   initial begin
     fd = $fopen("weights.bin", "rb");
+    fd8 = $fopen("weights8.bin", "rb");
     $readmemh("cparams.hex", c62);
     for (i = 0; i <= %(cn)d; i = i + 1) cmem[i] = {2'b00, c62[i]};
     for (i = 0; i <= %(kn)d; i = i + 1) km[i] = 0;
@@ -451,7 +458,7 @@ def render_tb_weights(np_, lat):
         resp.append("""  reg [31:0] qa%(p)d [0:15];
   integer qt%(p)d [0:15];
   integer qh%(p)d = 0, qn%(p)d = 0, j%(p)d;
-  reg [255:0] ww%(p)d;
+  reg [127:0] ww%(p)d;
   integer wl%(p)d = -1;
   always @(posedge clk) if (rst_n && w%(p)d_arvalid && w%(p)d_arready) begin
     qa%(p)d[qn%(p)d %% 16] = w%(p)d_araddr; qt%(p)d[qn%(p)d %% 16] = cyc; qn%(p)d = qn%(p)d + 1;
@@ -461,13 +468,13 @@ def render_tb_weights(np_, lat):
     forever begin
       @(posedge clk);
       if (qh%(p)d < qn%(p)d && cyc >= qt%(p)d[qh%(p)d %% 16] + %(lat)d) begin
-        for (j%(p)d = 0; j%(p)d < 16; j%(p)d = j%(p)d + 1) begin
-          if ((qa%(p)d[qh%(p)d %% 16] + j%(p)d * 8) / 32 != wl%(p)d) begin
-            wl%(p)d = (qa%(p)d[qh%(p)d %% 16] + j%(p)d * 8) / 32;
-            r = $fseek(fd, wl%(p)d * 32, 0); r = $fread(ww%(p)d, fd);
+        for (j%(p)d = 0; j%(p)d < 8; j%(p)d = j%(p)d + 1) begin
+          if ((qa%(p)d[qh%(p)d %% 16] + j%(p)d * 8) / 16 != wl%(p)d) begin
+            wl%(p)d = (qa%(p)d[qh%(p)d %% 16] + j%(p)d * 8) / 16;
+            r = $fseek(fd8, wl%(p)d * 16, 0); r = $fread(ww%(p)d, fd8);
           end
-          w%(p)d_rdata <= ww%(p)d[(((qa%(p)d[qh%(p)d %% 16] + j%(p)d * 8) %% 32) / 8) * 64 +: 64];
-          w%(p)d_rvalid <= 1; w%(p)d_rlast <= (j%(p)d == 15);
+          w%(p)d_rdata <= ww%(p)d[(((qa%(p)d[qh%(p)d %% 16] + j%(p)d * 8) %% 16) / 8) * 64 +: 64];
+          w%(p)d_rvalid <= 1; w%(p)d_rlast <= (j%(p)d == 7);
           @(posedge clk);
         end
         w%(p)d_rvalid <= 0; w%(p)d_rlast <= 0; qh%(p)d = qh%(p)d + 1;
@@ -492,8 +499,20 @@ def main():
     size = lambda name: int(re.search(r"%s \[0:(\d+)\]" % name, old).group(1)) + 1
     cn, gn, kn, vn = size("cmem"), size("gmem"), size("km"), size("vm")
     words = os.path.getsize(os.path.join(work, "weights.bin")) // 32
+    # The DDR image: each 16-bit lane's low byte, int8, 16 to a word. In
+    # weights.bin lane j's low byte is every other byte, so this is a
+    # slice, and the byte order $fread reads is kept.
+    w8 = os.path.join(work, "weights8.bin")
+    if not os.path.exists(w8) or os.path.getsize(w8) != words * 16:
+        with open(os.path.join(work, "weights.bin"), "rb") as f, \
+                open(w8, "wb") as g:
+            while True:
+                blk = f.read(32 << 20)
+                if not blk:
+                    break
+                g.write(blk[1::2])
     align = lambda x: (x + 4095) // 4096 * 4096
-    cb = align(words * 32)
+    cb = align(words * 16)
     kb = align(cb + cn * 8)
     vb = align(kb + kn * 32)
     steps = "\n".join(l for l in old.splitlines() if l.strip().startswith("step("))
