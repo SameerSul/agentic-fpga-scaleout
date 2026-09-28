@@ -1,0 +1,134 @@
+{
+  "name": "projn32_qwen2_5_0p5b",
+  "description": "Multi-lane projection y = requant(W x): 32 columns at once, each lane taking its own byte of a 256-bit weight word, sized to consume zybo_z7_20's sustained DDR bandwidth",
+  "top_module": "projn",
+  "unit": "projection",
+  "parameters": {
+    "data_width": 8,
+    "acc_width": 29,
+    "depth_width": 13,
+    "col_width": 13,
+    "addr_width": 26,
+    "scale_width": 18,
+    "shift_width": 7,
+    "requant_stages": 9,
+    "max_dim": 4864,
+    "signed": true,
+    "pipeline_stages": 1,
+    "target_clock_mhz": 100,
+    "lanes": 32,
+    "word_width": 256,
+    "word_addr_width": 20,
+    "mac_stages": 2
+  },
+  "derivation": {
+    "model": "qwen2_5_0p5b",
+    "rule": "depth, column and address widths from the matmul sequencer, which is sized from the model's largest dimension; the requantizer from that block",
+    "board": "zybo_z7_20",
+    "mem_gbytes_per_s": 2.0,
+    "lanes_rule": "smallest power of two with lanes * clock * data bytes >= sustained DDR bandwidth"
+  },
+  "ports": [
+    {
+      "name": "clk",
+      "dir": "input",
+      "width": 1,
+      "desc": "clock, rising edge"
+    },
+    {
+      "name": "rst_n",
+      "dir": "input",
+      "width": 1,
+      "desc": "active-low synchronous reset"
+    },
+    {
+      "name": "start",
+      "dir": "input",
+      "width": 1,
+      "desc": "run one projection"
+    },
+    {
+      "name": "depth",
+      "dir": "input",
+      "width": 13,
+      "desc": "input length, the reduction depth"
+    },
+    {
+      "name": "cols",
+      "dir": "input",
+      "width": 13,
+      "desc": "outputs"
+    },
+    {
+      "name": "scale",
+      "dir": "input",
+      "width": 18,
+      "desc": "requantizer scale"
+    },
+    {
+      "name": "shift",
+      "dir": "input",
+      "width": 7,
+      "desc": "requantizer shift"
+    },
+    {
+      "name": "a_addr",
+      "dir": "output",
+      "width": 13,
+      "desc": "activation address"
+    },
+    {
+      "name": "a_data",
+      "dir": "input",
+      "width": 8,
+      "signed": true,
+      "desc": "activation, registered read"
+    },
+    {
+      "name": "w_addr",
+      "dir": "output",
+      "width": 20,
+      "desc": "weight word address: group g, row r at g * depth + r"
+    },
+    {
+      "name": "w_data",
+      "dir": "input",
+      "width": 256,
+      "signed": false,
+      "desc": "lane j's weight in bits [8*j+7:8*j], registered read"
+    },
+    {
+      "name": "o_valid",
+      "dir": "output",
+      "width": 1,
+      "desc": "an output is on o_data"
+    },
+    {
+      "name": "o_index",
+      "dir": "output",
+      "width": 13,
+      "desc": "which output"
+    },
+    {
+      "name": "o_data",
+      "dir": "output",
+      "width": 8,
+      "signed": true,
+      "desc": "output activation"
+    },
+    {
+      "name": "busy",
+      "dir": "output",
+      "width": 1,
+      "desc": "a projection is in progress"
+    }
+  ],
+  "behavior": [
+    "Columns are processed in groups of 32. Group g covers columns g*32 .. g*32+31; in the last group, lanes past cols produce nothing.",
+    "For each group, rows r = 0..depth-1 are read: a_addr = r and w_addr = g*depth + r, both registered reads whose data arrives the cycle after the address. Lane j of the word is the weight of column g*32 + j at row r.",
+    "Each lane accumulates a[r] * w_j over the rows in its own MAC, the supplied mac module, one instance per lane, cleared between groups.",
+    "Each column's sum is requantized by the supplied requant module with scale and shift, and emitted with o_valid high for one cycle and o_index its column. Each column exactly once, in order.",
+    "busy is high from start until the last output has been emitted.",
+    "All state resets to zero."
+  ]
+}

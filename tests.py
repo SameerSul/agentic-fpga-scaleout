@@ -1598,6 +1598,74 @@ def test_scores_wider_than_the_exponential():
               for t in (-99999, -3, 0, 7, 12345) for s in range(0, 12)))
 
 
+def test_multi_lane_projection():
+    """Enough lanes to consume the board's DDR bandwidth, each taking its
+    own byte of a wide weight word. At Qwen's full 896 by 4864 size it has
+    to be bit-exact and within one percent of one cycle per row per group
+    of lanes, and the first cut that wires lanes to mirrored bytes has to
+    be caught."""
+    import chiplet_flow as cf
+    ms = load_model_spec()
+    spec = specgen_mod.derive_projn_spec(ms)
+    N = spec['parameters']['lanes']
+    check('32 lanes consume 2 GB/s of int8 weights at 100 MHz', N == 32)
+    D, F = ms['d_model'], ms['d_ff']
+    work = os.path.join(ROOT, 'build_projntest')
+    shutil.rmtree(work, ignore_errors=True)
+    try:
+        cf.write_projn_deps(ms, work)
+        with open(os.path.join(work, 'small.v'), 'w') as f:
+            f.write(specgen_mod.render_projn_testbench(spec))
+        with open(os.path.join(work, 'full.v'), 'w') as f:
+            f.write(specgen_mod.render_projn_testbench(spec, cases=((D, F, 9),)))
+        rr = RuleBasedAgent()
+        out = {}
+        for label, tb, fx in (('first', 'small.v', set()),
+                              ('full', 'full.v', {agent_mod.FIX_LANE})):
+            with open(os.path.join(work, 'p.v'), 'w') as f:
+                f.write(rr.render_projn(spec, fx))
+            r = subprocess.run(['iverilog', '-g2005', '-o', 's.out', tb, 'p.v']
+                               + list(cf.PROJN_DEPS), cwd=work,
+                               capture_output=True, text=True)
+            assert r.returncode == 0, r.stdout + r.stderr
+            out[label] = subprocess.run(['vvp', 's.out'], cwd=work,
+                                        capture_output=True, text=True,
+                                        timeout=1200).stdout
+        check('mirrored lane bytes are caught',
+              'TB_RESULT: PASS' not in out['first']
+              and 'expected_lane' in out['first'])
+        m = re.search(r'span_cycles=(\d+)', out['full'])
+        span = int(m.group(1)) if m else 0
+        ideal = -(-F // N) * D
+        check('the %d by %d projection is bit-exact in %d cycles, within 1%% '
+              'of %d' % (D, F, span, ideal),
+              'TB_RESULT: PASS' in out['full'] and ('checks=%d' % (F + 1))
+              in out['full'] and ideal <= span <= ideal * 1.01)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def test_basys3_top_level():
+    """The board package: the Qwen-shaped decoder behind a UART, weights
+    in a ROM image, simulated whole. A prompt typed into the UART has to
+    come back as the integer reference's continuation, character for
+    character, and the committed package has to be what board.py writes."""
+    import board
+    work = os.path.join(ROOT, 'build_boardtest')
+    try:
+        out = board.build(work)
+        check('the Basys 3 top level answers a prompt over its UART',
+              'TB_RESULT: PASS' in out and 'writes the rtl' in out)
+        same = all(open(os.path.join(work, f)).read()
+                   == open(os.path.join(ROOT, 'board_basys3', f)).read()
+                   for f in ('qwen_params.hex', 'basys3.xdc', 'build.tcl',
+                             os.path.join('rtl', 'fpgai_top.v'),
+                             os.path.join('rtl', 'qwen_decoder.v')))
+        check('the committed board package is what board.py generates', same)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
 def test_requant_golden_is_shared():
     """One model of requantization, used by the requantizer's own
     testbench and by the layer that sequences it, so the two cannot
@@ -2331,12 +2399,14 @@ if __name__ == '__main__':
     test_gated_mlp()
     test_residual_add()
     test_full_size_projection()
+    test_multi_lane_projection()
     test_decoder_runs_the_model()
     test_small_model_derivation()
     test_fpga_counts_the_hierarchy_once()
     test_rotary_embedding()
     test_scores_wider_than_the_exponential()
     test_qwen_shaped_decoder()
+    test_basys3_top_level()
     test_composite_cell_count()
     test_requant_golden_is_shared()
     test_table_unit_specs_are_implementable()

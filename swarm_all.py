@@ -34,6 +34,7 @@ BLOCKS = [
     ("resadd",   cf.RESADD_JOB),
     ("proj",     cf.PROJ_JOB),
     ("rope",     cf.ROPE_JOB),
+    ("projn",    cf.PROJN_JOB),
 ]
 
 

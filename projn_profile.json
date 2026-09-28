@@ -1,0 +1,35 @@
+{
+  "block": "projn32_qwen2_5_0p5b",
+  "top_module": "projn",
+  "unit": "projection",
+  "cycles_per_projection": 235.6,
+  "latency_cycles": 144,
+  "cell_count": 67136,
+  "area": 138313.0,
+  "fmax_estimate_mhz": 115.20737327188941,
+  "fmax_method": "opensta_slack",
+  "target_clock_mhz": 100,
+  "sim_checks_passed": 372,
+  "fpga": {
+    "family": "xcup",
+    "luts": 4516,
+    "lutram": 0,
+    "ffs": 3643,
+    "dsps": 40,
+    "brams": 0,
+    "urams": 0,
+    "carry": 360,
+    "muxf": 122
+  },
+  "derivation": {
+    "model": "qwen2_5_0p5b",
+    "rule": "depth, column and address widths from the matmul sequencer, which is sized from the model's largest dimension; the requantizer from that block",
+    "board": "zybo_z7_20",
+    "mem_gbytes_per_s": 2.0,
+    "lanes_rule": "smallest power of two with lanes * clock * data bytes >= sustained DDR bandwidth"
+  },
+  "projection": "projn32_qwen2_5_0p5b",
+  "max_dim": 4864,
+  "lanes": 32,
+  "agent": "RuleBasedAgent"
+}

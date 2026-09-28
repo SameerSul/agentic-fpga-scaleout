@@ -4,12 +4,33 @@ For Yax. This is what the repo produces, how to build it, and what you
 should see. Everything here has been run; if your machine disagrees, that
 is worth knowing and worth reporting.
 
+## Fastest path: a model talking over the Basys 3's USB port
+
+`board_basys3/` is a complete Vivado build for the Basys 3: the
+Qwen-shaped decoder and every block under it, a top level on the board's
+USB-UART, the weights as a block RAM image, the pin constraints and a
+build script. On an x86 machine with Vivado:
+
+```
+cd board_basys3
+vivado -mode batch -source build.tcl
+```
+
+Program the bitstream it prints, open a serial terminal on the board's
+COM port at 115200 8N1, type `the agent` and press enter. It should send
+back ` writes the rtl ` and a newline, which is what the simulation of
+this exact top level sends (`python3 board.py` regenerates the directory
+and reruns it). LED 0 is on while it decodes and LED 15 blinks. Yosys puts
+it at 8632 LUTs, 34 DSPs and 12 block RAMs of the XC7A35T, and the core
+runs at 50 MHz from the MMCM; `timing.rpt` is the number to send back,
+since Vivado's is the first real one.
+
 ## What this is in one paragraph
 
 You give it a model spec, a small JSON file naming a transformer's
 dimensions and its quantization. It derives the hardware that model
 needs, writes the Verilog, and checks it with real tools until it passes.
-Nineteen blocks come out, each one sized from the model rather than written
+Twenty blocks come out, each one sized from the model rather than written
 for it. Point it at a different model and every block re-derives.
 
 ## The picture
@@ -44,7 +65,7 @@ for it. Point it at a different model and every block re-derives.
                            re-simulated against the same testbench
 ```
 
-## The nineteen blocks
+## The twenty blocks
 
 Arithmetic, bottom to top:
 
@@ -73,6 +94,8 @@ Sequencing, which is what makes the above into a layer:
    gmlp       Qwen's gated MLP: gate through SiLU, times up, then down
    resadd     residual add of two scaled int8 tensors, streaming
    rope       rotary position embedding on q and k, one pair a cycle
+   projn      32-lane projection over a 256-bit weight word, sized to
+              the board's DDR bandwidth
    proj       a full-size projection, 896 by 4864 here, over external
               activation and weight memories
 ```
@@ -148,6 +171,7 @@ Four blocks instantiate others, so bring their dependencies along:
                      exp_rom.v recip_rom.v
    proj.v     needs  matvec.v mac.v requant.v
    rope.v     needs  rope_rom.v, its frequency and sine tables
+   projn.v    needs  mac.v requant.v
    decoder.v  needs  proj.v rmsnorm.v attn.v resadd.v and everything
                      they need, all derived at the checkpoint's size
 ```
@@ -178,6 +202,7 @@ Measured here with yosys against a generic library, for Qwen2.5-0.5B:
                                   table; on your part that is a BRAM
    proj       115 MHz   13989     1831 LUTs and 9 DSPs; its memories
                                   are outside it, on your part BRAM or DDR
+   projn      115 MHz   67136     4516 LUTs and 40 DSPs, 32 lanes
    attn       115 MHz  132047     the score and weight buffers and the
                                   softmax's become flops here; on the
                                   FPGA they map to 3 BRAMs, 3265 LUTs
@@ -196,9 +221,9 @@ The Qwen-shaped decoder, two layers with RoPE and SwiGLU, is 8376 LUTs
 plus 164 as LUT RAM, 34 DSPs and 3 block RAMs on 7-series: it fits the
 Basys 3 too, at about 41% of its LUTs and 38% of its DSPs.
 
-A Zynq 7020 has 53200 LUTs and 220 DSPs. The seventeen Qwen-sized blocks map to
-20554 LUTs and 81 DSPs on yosys's UltraScale+ mapping, about 39% and
-37% of the part, and that counts the composite blocks' sub-blocks twice.
+A Zynq 7020 has 53200 LUTs and 220 DSPs. The eighteen Qwen-sized blocks map to
+25150 LUTs, LUT RAM included, and 121 DSPs on yosys's UltraScale+
+mapping, about 47% and 55% of the part, and that counts the composite blocks' sub-blocks twice.
 These are about half what this file reported before: the resource count
 read every submodule table yosys printed after the top module's, then the
 hierarchy totals on top, so every composite block was counted about

@@ -214,6 +214,30 @@ def write_proj_deps(ms, build):
             f.write(srcs[fn])
 
 
+PROJN_DEPS = ("mac_dep.v", "rq_dep.v")
+PROJN_JOB = {
+    "spec_file": "spec_projn.json", "tb_file": "tb_projn.v",
+    "rtl_file": "projn.v", "profile_file": "projn_profile.json",
+    "report_file": "report_projn.json",
+    "derive_from_model": "projn",
+    "extra_sources": PROJN_DEPS,
+}
+
+
+def write_projn_deps(ms, build):
+    """The MAC every lane instantiates, and the requantizer."""
+    from agent import RuleBasedAgent, FIX_WIDTH, FIX_CLEAR, FIX_SATURATE
+    r = RuleBasedAgent()
+    srcs = {"mac_dep.v": r.render_mac(specgen.derive_chiplet_spec(ms),
+                                      {FIX_WIDTH, FIX_CLEAR}),
+            "rq_dep.v": r.render_requant(specgen.derive_requant_spec(ms),
+                                         {FIX_SATURATE})}
+    os.makedirs(build, exist_ok=True)
+    for fn in PROJN_DEPS:
+        with open(os.path.join(build, fn), "w") as f:
+            f.write(srcs[fn])
+
+
 ROPE_JOB = {
     "spec_file": "spec_rope.json", "tb_file": "tb_rope.v",
     "rtl_file": "rope.v", "profile_file": "rope_profile.json",
@@ -672,6 +696,7 @@ def derive_profile(spec, final):
     elif unit == "projection":
         prof["projection"] = spec["name"]
         prof["max_dim"] = spec["parameters"]["max_dim"]
+        prof["lanes"] = spec["parameters"].get("lanes", 1)
     elif unit == "element":
         prof["pointwise"] = spec["name"]
     elif unit == "norm":
@@ -770,6 +795,10 @@ def run_flow(job=None, verbose=True, agent=None, max_iters=None):
                     specgen.derive_requant_spec(_ms), {FIX_SATURATE}))):
             with open(os.path.join(BUILD, _fn), "w") as f:
                 f.write(_src)
+    elif job.get("derive_from_model") == "projn":
+        specgen.generate_projn(spec_file=job["spec_file"],
+                               tb_file=job["tb_file"])
+        write_projn_deps(specgen.load_model_spec(), BUILD)
     elif job.get("derive_from_model") == "rope":
         sp = specgen.generate_rope(spec_file=job["spec_file"],
                                    tb_file=job["tb_file"])

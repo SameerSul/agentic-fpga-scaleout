@@ -196,7 +196,7 @@ def main():
     ap.add_argument("--only", default="all",
                     choices=["all", "both", "chiplet", "requant", "exp",
                              "recip", "rsqrt", "matvec",
-                             "wmem", "softmax", "mlp", "attn", "rmsnorm", "silu", "gmlp", "resadd", "proj", "rope",
+                             "wmem", "softmax", "mlp", "attn", "rmsnorm", "silu", "gmlp", "resadd", "proj", "rope", "projn",
                              "endpoint"])
     ap.add_argument("--skip-dv", action="store_true")
     a = ap.parse_args()
@@ -405,6 +405,25 @@ def main():
             label = "proj %s max%d" % (ms["name"], spec["parameters"]["max_dim"])
             r, d = one_case(label, spec, "projection", a.agent, do_dv,
                             extra=chiplet_flow.PROJ_DEPS)
+            rows.append(r)
+            details.append((label, d))
+            if any(r[c] not in ("ok", "skip", "-") for c in COLS):
+                failures.append(label)
+
+    if a.only in ("all", "projn"):
+        base = specgen.load_model_spec()
+        for ms in _models(base):
+            spec = specgen.derive_projn_spec(ms)
+            with open(os.path.join(chiplet_flow.ROOT, JOB["spec_file"]),
+                      "w") as f:
+                json.dump(spec, f, indent=2)
+            with open(os.path.join(chiplet_flow.ROOT, JOB["tb_file"]),
+                      "w") as f:
+                f.write(specgen.render_projn_testbench(spec))
+            chiplet_flow.write_projn_deps(ms, BUILD)
+            label = "projn %s x%d" % (ms["name"], spec["parameters"]["lanes"])
+            r, d = one_case(label, spec, "projection", a.agent, do_dv,
+                            extra=chiplet_flow.PROJN_DEPS)
             rows.append(r)
             details.append((label, d))
             if any(r[c] not in ("ok", "skip", "-") for c in COLS):

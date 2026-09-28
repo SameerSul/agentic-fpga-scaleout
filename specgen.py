@@ -3993,6 +3993,127 @@ endmodule
 """
 
 
+def derive_projn_spec(ms, board=None):
+    """model spec -> multi-lane projection spec.
+
+    Batch-1 decode reads every weight once per token, so throughput is
+    set by how many weight bytes arrive per cycle, not by the arithmetic.
+    The single-lane projection does one multiply-accumulate a cycle: at
+    Qwen2.5-0.5B's 494 million per token that is under a quarter of a
+    token a second, far below what the board's DDR could feed. This block
+    has as many lanes as it takes to consume the board's sustained DDR
+    bandwidth at the fabric clock, rounded up to a power of two, and each
+    lane takes its own byte of one wide weight word: N columns computed
+    at once against a shared activation.
+    """
+    import boards
+    b = boards.BOARDS[board or ms.get("board", "zybo_z7_20")]
+    base = derive_proj_spec(ms)
+    p = dict(base["parameters"])
+    clock = p["target_clock_mhz"]
+    need = b["mem_gbytes_per_s"] * 1e3 / clock / (p["data_width"] / 8.0)
+    lanes = 1
+    while lanes < need:
+        lanes *= 2
+    top = p["max_dim"]
+    words = -(-top // lanes) * top
+    p.update(lanes=lanes, word_width=lanes * p["data_width"],
+             word_addr_width=max(1, (words - 1).bit_length()),
+             mac_stages=derive_chiplet_spec(ms)["parameters"]
+             ["pipeline_stages"])
+    spec = dict(base)
+    spec.update(
+        name="projn%d_%s" % (lanes, ms["name"]),
+        description="Multi-lane projection y = requant(W x): %d columns at "
+                    "once, each lane taking its own byte of a %d-bit weight "
+                    "word, sized to consume %s's sustained DDR bandwidth"
+                    % (lanes, lanes * p["data_width"], b["name"]),
+        top_module="projn", parameters=p)
+    spec["derivation"] = dict(base["derivation"], board=b["name"],
+                              mem_gbytes_per_s=b["mem_gbytes_per_s"],
+                              lanes_rule="smallest power of two with lanes "
+                              "* clock * data bytes >= sustained DDR "
+                              "bandwidth")
+    ports = []
+    for q in base["ports"]:
+        q = dict(q)
+        if q["name"] == "w_addr":
+            q.update(width=p["word_addr_width"],
+                     desc="weight word address: group g, row r at "
+                          "g * depth + r")
+        elif q["name"] == "w_data":
+            q.update(width=p["word_width"], signed=False,
+                     desc="lane j's weight in bits [%d*j+%d:%d*j], "
+                          "registered read" % (p["data_width"],
+                                               p["data_width"] - 1,
+                                               p["data_width"]))
+        ports.append(q)
+    spec["ports"] = ports
+    spec["behavior"] = [
+        "Columns are processed in groups of %d. Group g covers columns "
+        "g*%d .. g*%d+%d; in the last group, lanes past cols produce "
+        "nothing." % (lanes, lanes, lanes, lanes - 1),
+        "For each group, rows r = 0..depth-1 are read: a_addr = r and "
+        "w_addr = g*depth + r, both registered reads whose data arrives "
+        "the cycle after the address. Lane j of the word is the weight of "
+        "column g*%d + j at row r." % lanes,
+        "Each lane accumulates a[r] * w_j over the rows in its own MAC, "
+        "the supplied mac module, one instance per lane, cleared between "
+        "groups.",
+        "Each column's sum is requantized by the supplied requant module "
+        "with scale and shift, and emitted with o_valid high for one cycle "
+        "and o_index its column. Each column exactly once, in order.",
+        "busy is high from start until the last output has been emitted.",
+        "All state resets to zero.",
+    ]
+    return spec
+
+
+def render_projn_testbench(spec, cases=None):
+    """The projection's cases and golden, with a wide weight word: lane j
+    of word g*depth + r is column g*lanes + j's weight at row r."""
+    p = spec["parameters"]
+    if cases is None:
+        dwide = min(p["max_dim"], 128)
+        cwide = min(p["max_dim"], (1 << (p["addr_width"] // 2 + 1)) // dwide + 1)
+        cases = ((16, 8, 1), (100, 40, 2), (7, 130, 3), (3, 60, 4),
+                 (dwide, cwide, 5))
+    tb = render_proj_testbench(spec, cases)
+    N, dw = p["lanes"], p["data_width"]
+    rep = [
+        ("module tb_proj;", "module tb_projn;"),
+        ("  wire [%d:0] w_addr;" % (p["addr_width"] - 1),
+         "  wire [%d:0] w_addr;" % (p["word_addr_width"] - 1)),
+        ("  reg signed [%d:0] a_data, w_data;" % (dw - 1),
+         "  reg signed [%d:0] a_data;\n  reg [%d:0] w_data;\n"
+         "  integer wj, wc, wr;" % (dw - 1, N * dw - 1)),
+        ("    w_data <= hw(w_addr, seed);",
+         "    for (wj = 0; wj < %d; wj = wj + 1) begin\n"
+         "      wc = (w_addr / depth) * %d + wj;\n"
+         "      wr = w_addr %% depth;\n"
+         "      w_data[wj * %d +: %d] <= (wc < cols) ? hw(wc * depth + wr, seed)"
+         " : 0;\n    end" % (N, N, dw, dw)),
+        ("  proj dut (", "  projn dut ("),
+        ("expected_proj", "expected_lane"),
+        ("got_proj", "got_lane"),
+    ]
+    for a_, b_ in rep:
+        assert a_ in tb, a_
+        tb = tb.replace(a_, b_)
+    return tb
+
+
+def generate_projn(ms=None, spec_file="spec_projn.json",
+                   tb_file="tb_projn.v"):
+    ms = ms or load_model_spec()
+    spec = derive_projn_spec(ms)
+    with open(os.path.join(ROOT, spec_file), "w") as f:
+        json.dump(spec, f, indent=2)
+    with open(os.path.join(ROOT, tb_file), "w") as f:
+        f.write(render_projn_testbench(spec))
+    return spec
+
+
 def generate_proj(ms=None, spec_file="spec_proj.json", tb_file="tb_proj.v"):
     """Write the derived projection spec and its small testbench."""
     ms = ms or load_model_spec()

@@ -31,36 +31,50 @@ The remaining gap is listed at the bottom rather than glossed over.
 ### The full suite
 
 ```
-python3 tests.py            # 334 tests, or 332 without OpenSTA
+python3 tests.py            # 339 tests, or 337 without OpenSTA
 ```
 
 ### Spec to RTL, across the spec space
 
-`python3 sweep.py` drives sixty three cases through every stage: derivation,
+`python3 sweep.py` drives 105 cases through every stage: derivation,
 RTL, simulation, synthesis, timing closure, FPGA mapping, the profile
 fields the sizing model consumes, and a mutation sweep of the testbench
-generated at that width. All sixty three clean.
+generated at that width. All 105 are clean: sixteen block kinds over six
+model variants, 96 cases, and nine endpoint datapath options across four
+link rates, including the options the endpoint's search tries and
+rejects on timing before it settles. The multi-lane
+projection was added after that run and passed the same gates on all six
+variants separately; the two decoders are sized for their checkpoints and
+are gated by the flow and `tests.py` instead. Cycles are measured by each
+testbench. The rows below are Qwen2.5-0.5B, the base variant.
 
-| case | cyc/unit | fmax | cells | DV |
+| case | cycles | fmax | cells | DV killed |
 |---|---|---|---|---|
-| mac gpt2_124m, int8, acc28 | 1.00 | 177 MHz | 1408 | 8/8 |
-| exp Q4.8 to Q0.15 | 4.00 | 172 MHz | 2347 | 4/4 |
-| recip 26b to 17b | 4.00 | 223 MHz | 1562 | 4/4 |
-| rsqrt 28b to 17b | 4.00 | 174 MHz | 1351 | 4/4 |
-| matvec sequencer | 68.0 | 169 MHz | 1397 | 4/4 |
-| wmem tile + loader | 1024 | 333 MHz | 61712 | 5/5 |
-| softmax sequencer | 64.0 | 106 MHz | 1546 | 6/6 |
-| mlp layer | 78.0 | 102 MHz | 9275 | 3/3 |
-| requant acc28 to 8 | 7.00 | 102 MHz | 9274 | 5/5 |
-| mac int4 weights, acc24 | 1.00 | 187 MHz | 1383 | 8/8 |
-| mac int16, acc46 | 1.00 | 104 MHz | 4570 | 6/6 |
-| mac tiny model, acc24 | 1.00 | 187 MHz | 1383 | 8/8 |
-| mac qwen3_0p6b, acc28 | 1.00 | 177 MHz | 1408 | 8/8 |
-| mac w8/a16, acc37 | 1.00 | 115 MHz | 4400 | 6/6 |
-| crc 1G, 1 B/cyc | 1.00 | 476 MHz | 774 | 6/6 |
-| crc 10G, 16 B/cyc ripple | 0.06 | 85 MHz | 7333 | 6/6 |
-| crc 25G, 16 B/cyc flat | 0.06 | 385 MHz | 10527 | 5/5 |
-| crc 100G, 64 B/cyc flat | 0.02 | 325 MHz | 34682 | 5/5 |
+| mac, int8, acc29 | 1.00 /MAC | 169 MHz | 1473 | 8/8 |
+| requant acc29 to 8 | 10.0 /activation | 115 MHz | 10445 | 5/5 |
+| exp Q4.8 to Q0.15 | 4.00 /score | 164 MHz | 2370 | 4/4 |
+| recip 26b to 17b | 4.00 /row | 206 MHz | 1636 | 4/4 |
+| rsqrt 30b to 17b | 4.00 /row | 170 MHz | 1340 | 4/4 |
+| matvec sequencer | 73.0 /column | 187 MHz | 1294 | 4/4 |
+| wmem tile + loader | 2132 /tile | 333 MHz | 61712 | 5/5, 1 unproven |
+| softmax, 21-bit scores | 49.0 /row | 120 MHz | 40262 | 6/6 |
+| mlp layer | 158 /layer | 119 MHz | 23124 | 4/4 |
+| proj, full size | 4726 /projection | 115 MHz | 13989 | 3/3 |
+| rope | 1.03 /pair | 129 MHz | 21224 | 7/7 |
+| resadd | 1.05 /element | 136 MHz | 4894 | 5/5 |
+| gmlp, Qwen's MLP | 269 /layer | 110 MHz | 48418 | 5/5 |
+| silu | 1.06 /element | 120 MHz | 11935 | 4/4 |
+| rmsnorm, d896 | 1818 /norm | 115 MHz | 19904 | 3/3 |
+| attn, hd64 | 1803 /head | 115 MHz | 132047 | 4/4 |
+| crc 1G, 1 B/cyc | 1.00 /byte | 476 MHz | 774 | 6/6 |
+| crc 10G, 16 B/cyc | 0.06 /byte | 85 MHz | 7333 | 6/6 |
+| crc 25G, 16 B/cyc | 0.06 /byte | 385 MHz | 10527 | 5/5 |
+| crc 100G, 64 B/cyc | 0.02 /byte | 325 MHz | 34682 | 5/5 |
+
+At every link rate but 1G the endpoint's first datapath misses timing and
+the flow advances to the next standard width and clock, which is the
+architecture search, not a failure. The one DV case marked unproven is a
+survivor the equivalence prover could not decide in its time budget.
 
 Timing is OpenSTA, and the sweep rejects any case whose number came from
 the gate-depth proxy instead, because a proxy is an estimate and not
@@ -338,6 +352,26 @@ every applicable operator.
 What is still not Qwen: 32 dimensions rather than 896, 2 layers rather
 than 24, and a checkpoint trained here rather than Qwen's weights.
 
+## Ready for the Basys 3
+
+```
+python3 board.py           # writes board_basys3/ and simulates it
+```
+
+`board_basys3/` holds everything Vivado needs to put the Qwen-shaped
+model on the team's Basys 3: the decoder and its blocks, a top level on
+the board's USB-UART, the weights as a block RAM image, the XC7A35T's pin
+constraints and a batch build script. The top level takes a prompt as
+UART characters, maps them to tokens through the checkpoint's vocabulary,
+runs a decode step per position, and sends back each generated character
+until the context is full. Simulated whole, UART frames in and out, it
+answers `the agent` with ` writes the rtl `, every character checked
+against the integer reference. Yosys maps it to 8632 LUTs and 172 more as
+LUT RAM, 34 DSPs, 12 block RAMs and one MMCM on 7-series, about 42% of
+the part; the MMCM runs the core at 50 MHz, half what the generic library
+closes, since a real Artix-7 route is slower than that library. The one
+step not taken here is running Vivado, which needs an x86 host.
+
 ## Attention scores wider than the exponential
 
 The Qwen-shaped checkpoint first agreed with float on 48 of 93 positions,
@@ -524,6 +558,7 @@ Qwen2.5-0.5B:
 | gated MLP | not yet attempted | | |
 | residual add | not yet attempted | | |
 | full-size projection | not yet attempted | | |
+| multi-lane projection | not yet attempted | | |
 | decoder | not yet attempted | | |
 | rotary embedding | converged | 5 | Haiku |
 | Qwen-shaped decoder | not yet attempted | | |
@@ -807,6 +842,32 @@ the MAC instead, because synth_xilinx prints a hierarchy section of its
 own before the script's last pass; `tests.py` now checks both shapes.
 Single-module blocks were always counted correctly.
 
+## Enough lanes to use the DDR
+
+The projection above does one multiply-accumulate a cycle, and batch-1
+decode reads every weight once per token, so at Qwen2.5-0.5B's 494
+million weights that is under a quarter of a token a second at 115 MHz.
+The sizing model's 4 tokens/s on one board assumes the board is bound by
+DDR bandwidth instead, and nothing in the RTL could get there.
+
+The multi-lane projection derives its width from the board: the smallest
+power of two of lanes whose bytes per cycle, at the fabric clock, cover
+the Zybo's 2 GB/s of sustained DDR bandwidth, which is 32. Each lane is
+an instance of the generated MAC and takes its own byte of a 256-bit
+weight word; a group of 32 columns reads each activation once, then the
+32 sums move to a shadow bank and drain through one requantizer while
+the next group accumulates. At the full 896 by 4864 up projection it is
+bit-exact on every output in 136,844 cycles, 0.5% over one cycle per row
+per group and 32 times fewer than the single lane. 115 MHz, 4516 LUTs
+and 40 DSPs. The rules agent's first cut wires each lane to the mirrored
+byte of the word and is caught.
+
+Carried to a whole Qwen2.5-0.5B token, the weight matmuls take about
+15.5 million cycles, 7.4 tokens/s at 115 MHz, so compute is no longer
+what binds: the DDR's 4 tokens/s is. The attention head is still one
+lane, and over a full 1024-token context it would take about 44 million
+cycles a token, so it is now the block to widen.
+
 ## Cycle counts are measured, not assumed
 
 The sequencing blocks' profiles used to report cycle counts the
@@ -896,7 +957,10 @@ These are the distance between this repo and a local LLM host.
    does not run on an ARM Mac and nextpnr has no mainline Xilinx target.
    This is the only remaining item that work on this machine cannot close;
    it needs a board (a ~50 CAD iCE40 runs these bitstreams unmodified) or
-   an x86 machine with Vivado for the Zynq and Artix parts.
+   an x86 machine with Vivado for the Zynq and Artix parts. For the
+   team's Basys 3 that step is now one command: `board_basys3/` is a
+   complete Vivado build of the Qwen-shaped decoder behind the board's
+   USB-UART, simulated end to end, and `build.tcl` is the part not run.
 2. **The generated blocks are the arithmetic, not the whole engine.** The
    flow generates the multiply-accumulate unit, the requantizer between
    matmuls, the exponential and the reciprocal that softmax needs, the

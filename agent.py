@@ -30,6 +30,7 @@ FIX_UPBASE = "offset_the_up_weights_past_the_gate_weights"
 FIX_RRND = "round_the_residual_sum_before_the_shift"
 FIX_PIDX = "carry_the_column_index_through_the_requantizer"
 FIX_ROTDIR = "rotate_by_plus_the_angle"
+FIX_LANE = "take_each_lanes_weight_from_its_own_byte"
 # One definition, in specgen, so the declared depth and the generated
 # depth cannot disagree.
 WIDE_ADD_BITS = specgen.WIDE_ADD_BITS
@@ -72,6 +73,8 @@ class RuleBasedAgent:
             return self.render_resadd(spec, fixes), sorted(fixes)
         if spec["top_module"] == "proj":
             return self.render_proj(spec, fixes), sorted(fixes)
+        if spec["top_module"] == "projn":
+            return self.render_projn(spec, fixes), sorted(fixes)
         if spec["top_module"] == "rope":
             return self.render_rope(spec, fixes), sorted(fixes)
         if spec["top_module"] == "decoder":
@@ -111,6 +114,10 @@ class RuleBasedAgent:
                     fixes.add(decoder.FIX_RELU)
                 elif "clear" in m.get("test", "").lower():
                     fixes.add(FIX_CLEAR)
+                elif "expected_lane" in m:
+                    # The multi-lane projection's only seeded bug: each
+                    # lane read the mirrored byte of the weight word.
+                    fixes.add(FIX_LANE)
                 elif "expected_rope" in m:
                     # The rotation's only seeded bug: it turned each pair
                     # by minus the angle, the transpose of the rotation.
@@ -278,6 +285,162 @@ class RuleBasedAgent:
 endmodule
 """.format(dwm=dw - 1, depwm=dep_w - 1, colwm=col_w - 1, mvam=mva - 1,
            mwm=mw - 1, swm=shw - 1, awm=aw - 1, rqsm=rqs - 1, oidx=oidx)
+
+    def render_projn(self, spec, fixes):
+        """N lanes of the generated MAC under one sequencer. A group of N
+        columns reads each activation once and each lane its own byte of
+        the weight word; at the end of the group the sums move to a
+        shadow bank and drain through one requantizer while the next
+        group accumulates.
+
+        The seeded first cut wires lane j to byte N-1-j of the word.
+        """
+        p = spec["parameters"]
+        dw, aw, N = p["data_width"], p["acc_width"], p["lanes"]
+        dep_w, col_w = p["depth_width"], p["col_width"]
+        waw = p["word_addr_width"]
+        mw, shw, rqs = p["scale_width"], p["shift_width"], p["requant_stages"]
+        ms_ = p["mac_stages"]
+        lw = max(1, (N - 1).bit_length())
+        byte = ("w_data[%d*j +: %d]" % (dw, dw) if FIX_LANE in fixes
+                else "w_data[%d*(%d-j) +: %d]" % (dw, N - 1, dw))
+        # Rows issued, then data a cycle later, then the MAC's stages.
+        flush = 1 + ms_
+        return """module projn (
+  input                    clk,
+  input                    rst_n,
+  input                    start,
+  input      [{depwm}:0] depth,
+  input      [{colwm}:0] cols,
+  input      [{mwm}:0] scale,
+  input      [{swm}:0] shift,
+  output     [{depwm}:0] a_addr,
+  input      signed [{dwm}:0] a_data,
+  output     [{wawm}:0] w_addr,
+  input      [{wdm}:0] w_data,
+  output reg               o_valid,
+  output reg [{colwm}:0] o_index,
+  output reg signed [{dwm}:0] o_data,
+  output reg               busy
+);
+  reg issuing;
+  reg [{depwm}:0] r;
+  reg [{colwm}:0] g0;          // first column of the group being issued
+  reg [{wawm}:0] wbase;        // g * depth
+  assign a_addr = r;
+  assign w_addr = wbase + r;
+
+  // The valid for each row trails its address by the read, and the last
+  // row's flag trails the MACs by their stages, when every lane's sum is
+  // complete.
+  reg v1;
+  reg [{fl}:0] lastp;
+  reg [{colwm}:0] gp [0:{fl}];
+  reg mclr;
+  wire signed [{awm}:0] acc [0:{nm}];
+  genvar j;
+  generate
+    for (j = 0; j < {N}; j = j + 1) begin : lane
+      mac mc (.clk(clk), .rst_n(rst_n), .clear(mclr), .a(a_data),
+              .b({byte}), .valid_in(v1), .acc(acc[j]), .valid_out());
+    end
+  endgenerate
+
+  // Shadow bank and the drain through one requantizer.
+  reg signed [{awm}:0] shadow [0:{nm}];
+  reg [{colwm}:0] cap0;
+  reg [{lwp}:0] dj, dn;
+  reg  rq_vin;
+  reg  signed [{awm}:0] rq_acc;
+  reg  [{colwm}:0] rq_idx;
+  wire signed [{dwm}:0] rq_q;
+  wire rq_sat, rq_vout;
+  requant rq (.clk(clk), .rst_n(rst_n), .acc_in(rq_acc), .scale(scale),
+              .shift(shift), .valid_in(rq_vin), .q_out(rq_q),
+              .sat(rq_sat), .valid_out(rq_vout));
+  reg [{colwm}:0] idx_pipe [0:{rqsm}];
+  reg [7:0] outst;
+  reg pend;                    // a finished group waits for the drain
+  integer k;
+  wire [{colwm}:0] left = cols - cap0;
+  wire [{colwm}:0] next0 = g0 + {N};
+
+  always @(posedge clk) begin
+    if (!rst_n) begin
+      issuing <= 1'b0; r <= 0; g0 <= 0; wbase <= 0; v1 <= 1'b0;
+      lastp <= 0; mclr <= 1'b0; cap0 <= 0; dj <= 0; dn <= 0;
+      rq_vin <= 1'b0; rq_acc <= 0; rq_idx <= 0; outst <= 0; pend <= 1'b0;
+      busy <= 1'b0; o_valid <= 1'b0; o_index <= 0; o_data <= 0;
+      for (k = 0; k <= {rqsm}; k = k + 1) idx_pipe[k] <= 0;
+      for (k = 0; k <= {fl}; k = k + 1) gp[k] <= 0;
+      for (k = 0; k < {N}; k = k + 1) shadow[k] <= 0;
+    end else begin
+      mclr <= 1'b0;
+      rq_vin <= 1'b0;
+      o_valid <= 1'b0;
+      v1 <= issuing;
+      lastp <= {{lastp[{flm}:0], issuing && r == depth - 1}};
+      gp[0] <= g0;
+      for (k = 1; k <= {fl}; k = k + 1) gp[k] <= gp[k-1];
+      idx_pipe[0] <= rq_idx;
+      for (k = 1; k <= {rqsm}; k = k + 1) idx_pipe[k] <= idx_pipe[k-1];
+      case ({{rq_vin, rq_vout}})
+        2'b10: outst <= outst + 1;
+        2'b01: outst <= outst - 1;
+        default: ;
+      endcase
+      if (rq_vout) begin
+        o_valid <= 1'b1; o_index <= idx_pipe[{rqsm}]; o_data <= rq_q;
+      end
+
+      // Issue rows for the current group; at its last row, stop and wait
+      // for the sums.
+      if (issuing) begin
+        if (r == depth - 1) begin
+          issuing <= 1'b0; r <= 0;
+        end else begin
+          r <= r + 1;
+        end
+      end
+
+      // A group's sums are complete: take them once the drain is free,
+      // clear the lanes, and start the next group in the same cycle.
+      if (lastp[{fl}] || pend) begin
+        if (dj == dn) begin
+          pend <= 1'b0;
+          for (k = 0; k < {N}; k = k + 1) shadow[k] <= acc[k];
+          cap0 <= gp[{fl}];
+          dj <= 0;
+          dn <= (cols - gp[{fl}] < {N}) ? cols - gp[{fl}] : {N};
+          mclr <= 1'b1;
+          if (next0 < cols) begin
+            g0 <= next0; wbase <= wbase + depth; issuing <= 1'b1;
+          end
+        end else begin
+          pend <= 1'b1;
+        end
+      end
+
+      if (dj != dn) begin
+        rq_acc <= shadow[dj[{lwm}:0]]; rq_idx <= cap0 + dj;
+        rq_vin <= 1'b1; dj <= dj + 1;
+      end
+
+      if (!busy && start) begin
+        busy <= 1'b1; issuing <= 1'b1; r <= 0; g0 <= 0; wbase <= 0;
+        dj <= 0; dn <= 0; pend <= 1'b0;
+      end else if (busy && !issuing && !v1 && lastp == 0 && !pend
+                   && dj == dn && outst == 0 && !rq_vin && !mclr
+                   && g0 + {N} >= cols) begin
+        busy <= 1'b0;
+      end
+    end
+  end
+endmodule
+""".format(depwm=dep_w - 1, colwm=col_w - 1, mwm=mw - 1, swm=shw - 1,
+           dwm=dw - 1, wawm=waw - 1, wdm=N * dw - 1, awm=aw - 1,
+           nm=N - 1, N=N, byte=byte, fl=flush, flm=flush - 1,
+           lwp=lw, lwm=lw - 1, rqsm=rqs - 1)
 
     def render_rope(self, spec, fixes):
         """Four stages: the phase, the table, the four products, then
