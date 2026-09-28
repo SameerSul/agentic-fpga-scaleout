@@ -401,6 +401,14 @@ integer model's token: 9.5 million cycles, 14 minutes of simulation. The
 full 24-layer run takes about 32 minutes a position at the simulator's
 11,600 cycles a second.
 
+It is also a design, not only a simulation. Yosys maps the whole
+sequencer with every block under it to 25650 LUTs, 3240 more as LUT RAM,
+13600 flip-flops, 148 DSPs and 16 block RAMs on 7-series: 54% of a Zynq
+7020's LUTs and 67% of its DSPs. The weights, column constants and KV
+cache are the ports' side, which on the team's Zybo is its 1 GB of DDR,
+reached through the HP ports; that AXI connection is the part not
+written.
+
 ## Qwen's structure decodes in RTL
 
 ```

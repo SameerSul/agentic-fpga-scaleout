@@ -219,6 +219,12 @@ The decoder is sized for the checkpoint rather than Qwen: 111 MHz,
 14117 LUTs, 22 DSPs and 2 BRAMs on the UltraScale+ mapping. On the
 7-series mapping, the family of Vaibhav's Basys 3, it is 13247 LUTs and
 22 DSPs, 64% and 24% of an XC7A35T, so the whole decoder fits that board.
+The full-size sequencer for the real Qwen2.5-0.5B (`qwen_full.py`),
+every block at 8-bit weights and 16-bit activations with the weights and
+KV cache on external ports, is 25650 LUTs plus 3240 as LUT RAM, 148 DSPs
+and 16 block RAMs on 7-series: it fits your Zynq 7020 at 54% of LUTs and
+67% of DSPs, with the model's weights in the Zybo's DDR.
+
 The Qwen-shaped decoder, two layers with RoPE and SwiGLU, is 8376 LUTs
 plus 164 as LUT RAM, 34 DSPs and 3 block RAMs on 7-series: it fits the
 Basys 3 too, at about 41% of its LUTs and 38% of its DSPs.
