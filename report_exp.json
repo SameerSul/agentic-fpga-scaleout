@@ -139,6 +139,7 @@
         "urams": 0,
         "carry": 10,
         "muxf": 44,
+        "lutram": 0,
         "status": "pass",
         "family": "xcup",
         "top": "expu",

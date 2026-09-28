@@ -160,6 +160,7 @@
         "urams": 0,
         "carry": 0,
         "muxf": 422,
+        "lutram": 0,
         "status": "pass",
         "family": "xcup",
         "top": "crc32",

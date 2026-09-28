@@ -221,6 +221,7 @@
         "urams": 0,
         "carry": 101,
         "muxf": 60,
+        "lutram": 0,
         "status": "pass",
         "family": "xcup",
         "top": "proj",

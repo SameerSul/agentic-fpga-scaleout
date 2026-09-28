@@ -164,6 +164,7 @@
         "urams": 0,
         "carry": 68,
         "muxf": 43,
+        "lutram": 0,
         "status": "pass",
         "family": "xcup",
         "top": "requant",

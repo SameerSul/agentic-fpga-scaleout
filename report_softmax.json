@@ -8,6 +8,7 @@
       "capacity": 256,
       "index_width": 8,
       "score_width": 13,
+      "score_in_width": 21,
       "score_frac": 8,
       "weight_width": 16,
       "weight_frac": 15,
@@ -58,7 +59,7 @@
       {
         "name": "s_data",
         "dir": "input",
-        "width": 13,
+        "width": 21,
         "signed": true,
         "desc": "score, registered read, one cycle after s_addr"
       },
@@ -91,7 +92,7 @@
       "start is a one-cycle pulse that begins a row of n scores, 1 <= n <= 256, held stable for the whole row. busy must be high on the clock edge that samples start, so it already reads 1 one cycle later, and it stays high until the last weight has been emitted.",
       "Scores are read through s_addr and s_data, and the read is registered: s_data carries score[a] on the cycle after s_addr = a. If s_addr is itself a register, that is two clock edges after the edge that loads a into it: one edge updates s_addr and the next one reads the memory. Count those two edges when pairing each score with its index.",
       "Pass 1 reads every score and keeps the maximum mx. The exponential is only defined for non-positive arguments, and subtracting the row maximum is what guarantees that.",
-      "Pass 2 feeds e_i = expu(score_i - mx) for every i. score_i - mx always fits the 13-bit signed input of expu. Buffer every e_i, a 16-bit unsigned value, and accumulate their sum S. S is at most 256 * 2**15, so it fits the 26-bit input of recip without saturating.",
+      "Pass 2 feeds e_i = expu(d_i) for every i, where d_i = max(score_i - mx, -2**12): score_i - mx is never positive but can be far below the 13-bit signed input of expu, and below -2**12 the exponential is zero in its output format anyway, so the clamp is exact. Buffer every e_i, a 16-bit unsigned value, and accumulate their sum S. S is at most 256 * 2**15, so it fits the 26-bit input of recip without saturating.",
       "S then goes through recip once, giving a mantissa m and a shift k. A divide per weight would be absurd.",
       "Pass 3 emits, for every i, w_i = min(2**15, ((e_i << 15) * m) >> (42 - k)), with w_index = i and w_valid high for exactly that one cycle. The product is unsigned and needs about 48 bits; the min clamps any weight that would round above 1.0.",
       "Weights may be emitted in any order, but each index exactly once per row, and w_valid must be low at every other time.",
@@ -137,37 +138,38 @@
       "sim": {
         "stage": "sim",
         "status": "pass",
-        "checks": 121,
+        "checks": 132,
         "mismatches": [],
         "throughput": {
-          "rows": 9,
-          "span_cycles": 471,
-          "latency_cycles": 143,
-          "units": 9,
-          "cycles_per_unit": 52.333333333333336
+          "rows": 11,
+          "span_cycles": 539,
+          "latency_cycles": 145,
+          "units": 11,
+          "cycles_per_unit": 49.0
         }
       },
       "synth": {
         "stage": "synth",
         "status": "pass",
-        "cell_count": 40017,
-        "area": 95173.0
+        "cell_count": 40262,
+        "area": 95702.0
       },
       "timing": {
         "stage": "timing",
         "status": "pass",
         "method": "opensta",
         "clock_period_ns": 10.0,
-        "worst_slack_ns": 0.3
+        "worst_slack_ns": 1.7
       },
       "fpga": {
-        "luts": 861,
-        "ffs": 279,
+        "luts": 930,
+        "ffs": 300,
         "dsps": 2,
         "brams": 1,
         "urams": 0,
-        "carry": 35,
-        "muxf": 222,
+        "carry": 38,
+        "muxf": 246,
+        "lutram": 0,
         "status": "pass",
         "family": "xcup",
         "top": "softmax",
@@ -178,15 +180,15 @@
   ],
   "final_metrics": {
     "sim_pass": true,
-    "sim_checks": 121,
-    "cell_count": 40017,
-    "area": 95173.0,
+    "sim_checks": 132,
+    "cell_count": 40262,
+    "area": 95702.0,
     "timing": {
       "stage": "timing",
       "status": "pass",
       "method": "opensta",
       "clock_period_ns": 10.0,
-      "worst_slack_ns": 0.3
+      "worst_slack_ns": 1.7
     }
   }
 }

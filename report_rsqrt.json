@@ -144,6 +144,7 @@
         "urams": 0,
         "carry": 1,
         "muxf": 79,
+        "lutram": 0,
         "status": "pass",
         "family": "xcup",
         "top": "rsqrt",

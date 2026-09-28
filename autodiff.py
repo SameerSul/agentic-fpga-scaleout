@@ -105,3 +105,20 @@ class V:
         for n in reversed(order):
             if n._back:
                 n._back()
+
+
+def dot(xs, ws):
+    """sum(x * w) as one node. A dot product built from + and * makes two
+    nodes per term, and the Qwen-shaped checkpoint's matrices made that
+    the whole cost of a training step. The gradient is the same one the
+    chain of nodes would give: d/dx_i = w_i, d/dw_i = x_i."""
+    out = V(sum(x.d * w.d for x, w in zip(xs, ws)), tuple(xs) + tuple(ws))
+
+    def back():
+        g = out.g
+        for x, w in zip(xs, ws):
+            x.g += w.d * g
+            w.g += x.d * g
+    out._back = back
+    return out
+

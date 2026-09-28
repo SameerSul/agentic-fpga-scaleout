@@ -77,6 +77,10 @@ class RuleBasedAgent:
         if spec["top_module"] == "decoder":
             import decoder
             return decoder.render_decoder(spec, fixes), sorted(fixes)
+        if spec["top_module"] == "qwen_decoder":
+            import qwen_decoder
+            return (qwen_decoder.render_qwen_decoder(spec, fixes),
+                    sorted(fixes))
         return self.render_mac(spec, fixes), sorted(fixes)
 
     def diagnose(self, spec, history):
@@ -92,6 +96,13 @@ class RuleBasedAgent:
             for m in fb.get("mismatches", []):
                 if "expected_crc" in m:
                     fixes.add(FIX_XOR)
+                elif "expected_lg" in m and \
+                        spec["top_module"] == "qwen_decoder":
+                    # The Qwen-shaped decoder's only seeded bug: keys went
+                    # into the cache unrotated. Rotation is the identity at
+                    # position 0, so it is the second step that fails.
+                    import qwen_decoder
+                    fixes.add(qwen_decoder.FIX_ROPEK)
                 elif "expected_lg" in m:
                     # The decoder's only seeded bug: the up projection's
                     # output went into the MLP without its ReLU, so the
@@ -932,6 +943,11 @@ endmodule
                          p["mv_addr_width"])
         siw = p["sm_index_width"]
         wsw = p["wsum_width"]
+        # Scores are formed from t << guard, so shift_s can scale them up
+        # as well as down: calibrated q and k scales need not multiply to
+        # a power of two at or below one score count.
+        g = p.get("score_guard", 0)
+        tsc = ("{{acc[{awm}], acc, %d'd0}}" % g) if g else "{{acc[{awm}], acc}}"
         late = FIX_VLAT in fixes
         # Stage that forms the weight-by-value product. Fixed: after both
         # the weight and the value have been through their registered
@@ -991,17 +1007,17 @@ endmodule
 
   // Score quantizer: round, shift, clamp. Two stages, so the rounding
   // add and the variable shift are not in the same cycle.
-  wire signed [{aw}:0] rnd_s = (shift_s == 5'd0) ? {aw1}'sd0
-                                : ({aw1}'sd1 <<< (shift_s - 5'd1));
+  wire signed [{awg}:0] rnd_s = (shift_s == 5'd0) ? {awg1}'sd0
+                                : ({awg1}'sd1 <<< (shift_s - 5'd1));
   // shift_s is held for the whole run, so its rounding constant is
   // registered once at start. Built from the port every cycle, the
   // shifter sat in front of the rounding add and missed timing by 0.64 ns
   // at 16-bit operands, where the add is 47 bits.
-  reg  signed [{aw}:0] rnd_r;
+  reg  signed [{awg}:0] rnd_r;
   reg  sv1;
-  reg  signed [{aw}:0] st1;
+  reg  signed [{awg}:0] st1;
   reg  [{siwm}:0] si1;
-  wire signed [{aw}:0] shv = st1 >>> shift_s;
+  wire signed [{awg}:0] shv = st1 >>> shift_s;
   reg  [{nwm}:0] scnt;
 
   // Weights: the softmax block reads the score buffer.
@@ -1074,13 +1090,13 @@ endmodule
       // Score quantizer.
       sv1 <= mv_colv;
       if (mv_colv) begin
-        st1 <= {{acc[{awm}], acc}} + rnd_r;
+        st1 <= {tsc} + rnd_r;
         si1 <= mv_coli[{siwm}:0];
       end
       if (sv1) begin
-        if (shv > {aw1}'sd{smax})
+        if (shv > {awg1}'sd{smax})
           sbuf[si1] <= {sw}'sd{smax};
-        else if (shv < -{aw1}'sd{smax1})
+        else if (shv < -{awg1}'sd{smax1})
           sbuf[si1] <= -{sw}'sd{smax1};
         else
           sbuf[si1] <= shv[{swm}:0];
@@ -1152,6 +1168,7 @@ endmodule
             mvdm=mvd - 1, mvd=mvd, mvam=mva - 1, mvcm=mvc - 1,
             mvcpad=mvc - nw, awm=aw - 1, aw=aw, aw1=aw + 1,
             siwm=siw - 1, smax=smax, smax1=smax + 1, pwm=ww + dw,
+            awg=aw + g, awg1=aw + g + 1, tsc=tsc.format(awm=aw - 1),
             rqsm=rqs - 1, prod=prod, wswm=wsw - 1, wsw=wsw,
             # A zero-width replication is not legal Verilog-2005, and the
             # tiny model's sum is exactly the requantizer's width.
@@ -1359,19 +1376,24 @@ endmodule
         """
         p = spec["parameters"]
         nw, sw = p["index_width"], p["score_width"]
+        # Scores arrive wider than the exponential's input: a row can span
+        # far more than it covers, and only the difference from the
+        # maximum has to fit, after a clamp.
+        swi = p.get("score_in_width", sw)
         ww, wf = p["weight_width"], p["weight_frac"]
         rw, riw = p["recip_out_width"], p["recip_in_width"]
         bias = p["shift_bias"]
         kw = max(4, riw.bit_length())
         pw = ww + wf + rw
-        sub = "sub_max" if FIX_SUBMAX in fixes else "s_data"
+        sub = ("sub_max" if FIX_SUBMAX in fixes
+               else "s_data[%d:0]" % (sw - 1))
         return """module softmax (
   input                    clk,
   input                    rst_n,
   input                    start,
   input      [{nw}:0] n,
   output reg [{nwm}:0] s_addr,
-  input      signed [{swm}:0] s_data,
+  input      signed [{swim}:0] s_data,
   output reg               w_valid,
   output reg [{nwm}:0] w_index,
   output reg [{wwm}:0] w_data,
@@ -1384,7 +1406,7 @@ endmodule
              P_RCP  = 3'd3, P_OUT = 3'd4;
   reg [2:0] ph;
   reg [{nw}:0] iss, col;
-  reg signed [{swm}:0] mx;
+  reg signed [{swim}:0] mx;
   reg [{riwm}:0] sum;
   reg [{rwm}:0] rm;
   reg [{kwm}:0] rk;
@@ -1396,11 +1418,20 @@ endmodule
   // pass, which is the kind of thing that passes a one-element row.
   reg v1, v2;
 
-  wire signed [{swm}:0] sub_max = s_data - mx;
+  // score - max is never positive, but it can be far below the
+  // exponential's range. Anything below -2**{swm} has an exponential of
+  // zero in the output format anyway, so clamping there is exact.
+  wire signed [{swi}:0] dfull = s_data - mx;
+  wire signed [{swm}:0] sub_max = (dfull < -{swi1}'sd{elo}) ? -{sw}'sd{elo}
+                                  : dfull[{swm}:0];
+  // Registered before the exponential: the wide subtract, the clamp and
+  // the exponential's first stage missed 100 MHz by 0.42 ns together.
+  reg  signed [{swm}:0] sub_r;
+  always @(posedge clk) sub_r <= {sub};
   reg  e_vin;
   wire [{wwm}:0] e_y;
   wire e_vout;
-  expu eu (.clk(clk), .rst_n(rst_n), .x({sub}), .valid_in(e_vin),
+  expu eu (.clk(clk), .rst_n(rst_n), .x(sub_r), .valid_in(e_vin),
            .y(e_y), .valid_out(e_vout));
 
   reg  r_vin;
@@ -1438,7 +1469,7 @@ endmodule
         P_IDLE: if (start && n != 0) begin
           ph <= P_MAX; iss <= 1; col <= 0; s_addr <= 0;
           busy <= 1'b1; v1 <= 1'b1;
-          mx <= {sw}'sh{minv};
+          mx <= {swi}'sh{minv};
         end
         P_MAX: begin
           // Reads are registered, so the datum for an address arrives
@@ -1463,11 +1494,12 @@ endmodule
           if (iss != n) begin
             s_addr <= iss[{nwm}:0]; iss <= iss + 1; v1 <= 1'b1;
           end
-          // e_vin is registered, so driving it from v1 makes it high
-          // in the same cycle v2 is, which is the cycle s_data holds
-          // the value. Gating it on v2 asserts it a cycle late and the
-          // exponential consumes the next element instead.
-          e_vin <= v1;
+          // s_data holds an element in the cycle v2 is high, and sub_r
+          // holds its clamped difference one cycle later. e_vin is
+          // registered from v2, so it is high in exactly that cycle.
+          // Driving it from v1, as before sub_r existed, feeds the
+          // exponential the previous element's difference.
+          e_vin <= v2;
           if (e_vout) begin
             buf_mem[col[{nwm}:0]] <= e_y;
             sum <= sum + e_y;
@@ -1507,7 +1539,8 @@ endmodule
 """.format(nw=nw, nwm=nw - 1, swm=sw - 1, wwm=ww - 1, ww=ww, wf=wf,
            rwm=rw - 1, riwm=riw - 1, kwm=kw - 1, pwm=pw - 1,
            capm=p["capacity"] - 1, bias=bias, sub=sub,
-           sw=sw, one=(1 << wf), minv="%x" % (1 << (sw - 1)))
+           sw=sw, one=(1 << wf), minv="%x" % (1 << (swi - 1)),
+           swim=swi - 1, swi=swi, swi1=swi + 1, elo=1 << (sw - 1))
 
     def render_wmem(self, spec, fixes):
         """Weight tile memory with a streaming loader.

@@ -243,6 +243,7 @@
         "urams": 0,
         "carry": 111,
         "muxf": 398,
+        "lutram": 0,
         "status": "pass",
         "family": "xcup",
         "top": "mlp",

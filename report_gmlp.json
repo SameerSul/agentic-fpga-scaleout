@@ -356,13 +356,11 @@
         "urams": 0,
         "carry": 160,
         "muxf": 619,
+        "lutram": 64,
         "status": "pass",
         "family": "xcup",
         "top": "gmlp",
         "lint": [],
-        "unmapped_cells": {
-          "RAM64M8": 8
-        },
         "stage": "fpga"
       }
     }

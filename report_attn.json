@@ -12,12 +12,13 @@
       "capacity": 256,
       "n_width": 9,
       "addr_width": 14,
-      "score_width": 13,
-      "score_max": 2047,
+      "score_width": 21,
+      "score_max": 1048575,
       "weight_width": 16,
       "weight_frac": 15,
       "wsum_width": 24,
       "shift_s_width": 5,
+      "score_guard": 4,
       "scale_width": 18,
       "shift_width": 7,
       "requant_stages": 9,
@@ -35,6 +36,7 @@
         "capacity": 256,
         "index_width": 8,
         "score_width": 13,
+        "score_in_width": 21,
         "score_frac": 8,
         "weight_width": 16,
         "weight_frac": 15,
@@ -161,12 +163,12 @@
       "Each cycle with load_valid high writes load_data into the query buffer at the next index, starting from 0 after reset and after every run, so q[0..63] are loaded in order before start.",
       "start is a one-cycle pulse, with n, shift_s, scale_o and shift_o held stable for the whole run. busy must be high on the clock edge that samples start, so it already reads 1 one cycle later, and it stays high until the last output has been emitted.",
       "The key and value caches are row-major: element d of position j is at address j*64 + d in both. k_data and v_data are registered reads: each carries the element at address a on the cycle after k_addr or v_addr = a. If the address is itself a register, that is two clock edges after the edge that loads a into it.",
-      "Scores: for j in 0..n-1, t_j = sum over d of q[d] * K[j][d], a signed 29-bit dot product. s_j = (t_j + 2**(shift_s-1)) >>> shift_s when shift_s > 0, else t_j, then clamped to [-2048, 2047]. The clamp is half the 13-bit score range so that a score minus the row maximum always fits the exponential's input.",
+      "Scores: for j in 0..n-1, t_j = sum over d of q[d] * K[j][d], a signed 29-bit dot product. With u_j = t_j << 4, s_j = (u_j + 2**(shift_s-1)) >>> shift_s when shift_s > 0, else u_j, then clamped to [-1048576, 1048575], the 21-bit signed score the softmax reads. The softmax clamps each score minus the row maximum to its exponential's range itself.",
       "Weights: w = softmax(s) over the n scores, exactly as the supplied softmax block computes it: 16-bit unsigned Q0.15, where 32768 is 1.0.",
       "Output: for d in 0..63, a_d = sum over j of w_j * V[j][d], with w_j unsigned and V signed, then o_d = requant(a_d, scale_o, shift_o): multiply by scale_o, add 2**(shift_o-1) when shift_o > 0, arithmetic shift right by shift_o, saturate to [-128, 127]. The weights sum to under 2.0, so |a_d| stays under 2**23: a 24-bit signed sum, sign-extended into the requantizer's 29-bit input.",
       "Emit each o_d with o_index = d and o_valid high for exactly that one cycle. Outputs may come in any order, but each index exactly once, and o_valid must be low at every other time.",
-      "The scores and weights are held in memories named sbuf and pbuf, declared reg signed [12:0] sbuf [0:255] and reg [15:0] pbuf [0:255], with position j at index j. The testbench reads them directly to check the scores and the softmax, so these names and layouts are part of the interface.",
-      "matvec, mac, softmax and requant are separate modules supplied as source files, not something to write. Instantiate them with exactly these ports, connected by name: matvec (input clk, input rst_n, input start, input [12:0] depth, input [12:0] cols, output [12:0] a_addr, output [25:0] w_addr, output mac_valid, output mac_clear, output col_valid, output [12:0] col_index, output busy); mac (input clk, input rst_n, input clear, input signed [7:0] a, input signed [7:0] b, input valid_in, output signed [28:0] acc, output valid_out); softmax (input clk, input rst_n, input start, input [8:0] n, output [7:0] s_addr, input signed [12:0] s_data, output w_valid, output [7:0] w_index, output [15:0] w_data, output busy); requant (input clk, input rst_n, input signed [28:0] acc_in, input [17:0] scale, input [6:0] shift, input valid_in, output signed [7:0] q_out, output sat, output valid_out).",
+      "The scores and weights are held in memories named sbuf and pbuf, declared reg signed [20:0] sbuf [0:255] and reg [15:0] pbuf [0:255], with position j at index j. The testbench reads them directly to check the scores and the softmax, so these names and layouts are part of the interface.",
+      "matvec, mac, softmax and requant are separate modules supplied as source files, not something to write. Instantiate them with exactly these ports, connected by name: matvec (input clk, input rst_n, input start, input [12:0] depth, input [12:0] cols, output [12:0] a_addr, output [25:0] w_addr, output mac_valid, output mac_clear, output col_valid, output [12:0] col_index, output busy); mac (input clk, input rst_n, input clear, input signed [7:0] a, input signed [7:0] b, input valid_in, output signed [28:0] acc, output valid_out); softmax (input clk, input rst_n, input start, input [8:0] n, output [7:0] s_addr, input signed [20:0] s_data, output w_valid, output [7:0] w_index, output [15:0] w_data, output busy); requant (input clk, input rst_n, input signed [28:0] acc_in, input [17:0] scale, input [6:0] shift, input valid_in, output signed [7:0] q_out, output sat, output valid_out).",
       "matvec walks a_addr 0..depth-1 and w_addr col*depth onward for each of cols columns, drives mac_valid one cycle behind the address, pulses mac_clear between columns, and pulses col_valid with col_index when a column's sum is on the MAC's acc. Wire mac_valid to the MAC's valid_in and mac_clear to its clear. With depth = 64 and cols = n, matvec's w_addr is exactly the key address. softmax reads scores through s_addr and a registered s_data and emits w_valid, w_index and w_data. requant has a latency of exactly 9 cycles.",
       "The weighted sum multiplies a 16-bit unsigned weight by an 8-bit signed value, which the 8-bit MAC cannot do, so it is its own multiply-accumulate.",
       "All state resets to zero: busy and o_valid are 0 during reset."
@@ -256,40 +258,38 @@
         "mismatches": [],
         "throughput": {
           "heads": 4,
-          "span_cycles": 7208,
-          "latency_cycles": 2954,
+          "span_cycles": 7212,
+          "latency_cycles": 2955,
           "units": 4,
-          "cycles_per_unit": 1802.0
+          "cycles_per_unit": 1803.0
         }
       },
       "synth": {
         "stage": "synth",
         "status": "pass",
-        "cell_count": 115091,
-        "area": 276670.0
+        "cell_count": 132047,
+        "area": 319239.0
       },
       "timing": {
         "stage": "timing",
         "status": "pass",
         "method": "opensta",
         "clock_period_ns": 10.0,
-        "worst_slack_ns": 1.08
+        "worst_slack_ns": 1.28
       },
       "fpga": {
-        "luts": 3182,
-        "ffs": 1697,
+        "luts": 3265,
+        "ffs": 1724,
         "dsps": 12,
         "brams": 3,
         "urams": 0,
-        "carry": 178,
-        "muxf": 456,
+        "carry": 181,
+        "muxf": 481,
+        "lutram": 16,
         "status": "pass",
         "family": "xcup",
         "top": "attn",
         "lint": [],
-        "unmapped_cells": {
-          "RAM64M8": 2
-        },
         "stage": "fpga"
       }
     }
@@ -297,14 +297,14 @@
   "final_metrics": {
     "sim_pass": true,
     "sim_checks": 364,
-    "cell_count": 115091,
-    "area": 276670.0,
+    "cell_count": 132047,
+    "area": 319239.0,
     "timing": {
       "stage": "timing",
       "status": "pass",
       "method": "opensta",
       "clock_period_ns": 10.0,
-      "worst_slack_ns": 1.08
+      "worst_slack_ns": 1.28
     }
   }
 }

@@ -34,6 +34,13 @@ BUCKETS = (
     ("muxf", re.compile(r"^MUXF\d+$")),
 )
 IGNORE = re.compile(r"^(BUFG|IBUF|OBUF|BUFGCE)")
+# Distributed RAM is built from LUTs, so it is counted as the LUTs it
+# occupies rather than left as an unmapped cell: a design whose small
+# memories map to LUT RAM still spends LUTs on them.
+LUTRAM_LUTS = {"RAM32X1S": 1, "RAM64X1S": 1, "RAM128X1S": 2,
+               "RAM256X1S": 4, "RAM32X1D": 2, "RAM64X1D": 2,
+               "RAM128X1D": 4, "RAM256X1D": 8, "RAM32M": 4, "RAM64M": 4,
+               "RAM32M16": 8, "RAM64M8": 8}
 CELL_LINE = re.compile(r"^\s+(\d+)\s+([A-Z][A-Z0-9_]*)\s*$")
 LATCH = re.compile(r"Latch inferred for signal\s+`([^']+)'")
 MULTIDRIVE = re.compile(r"multiple conflicting drivers.*?`([^']+)'", re.I)
@@ -98,6 +105,7 @@ def parse_stat(out, top):
     else:
         tail = last.rsplit("=== " + top + " ===", 1)[-1]
     res = {k: 0 for k, _ in BUCKETS}
+    res["lutram"] = 0
     unknown = {}
     for line in tail.splitlines():
         m = CELL_LINE.match(line)
@@ -105,6 +113,9 @@ def parse_stat(out, top):
             continue
         n, cell = int(m.group(1)), m.group(2)
         if IGNORE.match(cell):
+            continue
+        if cell in LUTRAM_LUTS:
+            res["lutram"] += n * LUTRAM_LUTS[cell]
             continue
         for key, pat in BUCKETS:
             if pat.match(cell):

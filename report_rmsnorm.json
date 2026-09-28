@@ -202,6 +202,7 @@
         "urams": 0,
         "carry": 100,
         "muxf": 122,
+        "lutram": 0,
         "status": "pass",
         "family": "xcup",
         "top": "rmsnorm",

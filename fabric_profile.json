@@ -13,6 +13,7 @@
   "fpga": {
     "family": "xcup",
     "luts": 1004,
+    "lutram": 0,
     "ffs": 65,
     "dsps": 0,
     "brams": 0,

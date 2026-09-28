@@ -1,0 +1,32 @@
+{
+  "block": "qwen_decoder_tiny_qwen",
+  "top_module": "qwen_decoder",
+  "unit": "token",
+  "cycles_per_token": 24773.0,
+  "latency_cycles": 26533,
+  "cell_count": 229892,
+  "area": 526581.0,
+  "fmax_estimate_mhz": 109.64912280701755,
+  "fmax_method": "opensta_slack",
+  "target_clock_mhz": 100,
+  "sim_checks_passed": 847,
+  "fpga": {
+    "family": "xcup",
+    "luts": 9654,
+    "lutram": 184,
+    "ffs": 4334,
+    "dsps": 34,
+    "brams": 3,
+    "urams": 0,
+    "carry": 353,
+    "muxf": 2510
+  },
+  "derivation": {
+    "model": "tiny_qwen",
+    "rule": "block specs derived at the checkpoint's own size; static scales by calibration; the gate's scale a power of two so its code shifts straight into SiLU"
+  },
+  "decoder": "qwen_decoder_tiny_qwen",
+  "d_model": 32,
+  "context": 24,
+  "agent": "RuleBasedAgent"
+}

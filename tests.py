@@ -1075,9 +1075,12 @@ def test_attention_head():
     q = [rnd.randrange(-60, 60) for _ in range(hd)]
     K = [[rnd.randrange(-60, 60) for _ in range(hd)] for _ in range(n)]
     V = [[rnd.randrange(-60, 60) for _ in range(hd)] for _ in range(n)]
-    sh = 6
+    # Scores are (t << guard) >> shift_s, so this is an effective right
+    # shift of six.
+    g = p.get('score_guard', 0)
+    sh = 6 + g
     t, s_, w, a, o = specgen_mod.attn_golden(q, K, V, n, sh, 1, 0, p, sm_p)
-    fs = [x / (1 << sh) / (1 << sm_p['score_frac']) for x in t]
+    fs = [x / (1 << (sh - g)) / (1 << sm_p['score_frac']) for x in t]
     mx = max(fs)
     e = [math.exp(x - mx) for x in fs]
     z = sum(e)
@@ -1477,6 +1480,10 @@ def test_fpga_counts_the_hierarchy_once():
         "4. Printing statistics.\n=== mac ===\n        2   LUT6\n", "mac")
     check('a single-module block reads only the final statistics pass',
           res['luts'] == 2)
+    res, unk = fpga.parse_stat("4. Printing statistics.\n=== m ===\n"
+                               "        3   RAM32M\n        5   LUT6\n", "m")
+    check('LUT RAM is counted as the LUTs it occupies, not left unmapped',
+          res['lutram'] == 12 and res['luts'] == 5 and not unk)
 
 
 def test_rotary_embedding():
@@ -1536,6 +1543,59 @@ def test_rotary_embedding():
               'TB_RESULT: PASS' not in out['phase'])
     finally:
         shutil.rmtree(work, ignore_errors=True)
+
+
+def test_qwen_shaped_decoder():
+    """The Qwen-shaped checkpoint decodes in RTL: two layers, two query
+    heads over one KV head, RoPE, the gated SiLU MLP and a final norm,
+    every stage a generated block, every logit checked."""
+    import qwen_decoder as qd
+    dec = qd.load()
+    same, total = qd.agreement(dec.ck, dec)
+    check('Qwen-shaped integer decode agrees with float on every corpus '
+          'position (%d/%d)' % (same, total), same == total)
+    stoi = {c: i for i, c in enumerate(dec.ck['chars'])}
+    runs = [([stoi[c] for c in s], n) for s, n in qd.RUNS]
+    work = os.path.join(ROOT, 'build_qdectest')
+    shutil.rmtree(work, ignore_errors=True)
+    os.makedirs(work)
+    try:
+        rc, out = qd.run_rtl(dec, runs, work)
+        check('the Qwen-shaped decoder RTL passes every logit of every step',
+              rc == 0 and 'TB_RESULT: PASS' in out)
+        check('and the text it prints is its own argmax fed back',
+              'the agent writes the rtl' in out)
+        rc, out = qd.run_rtl(dec, runs, work, fixes=set())
+        check('a decoder that caches unrotated keys fails on a logit',
+              'TB_RESULT: PASS' not in out and 'expected_lg' in out)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def test_scores_wider_than_the_exponential():
+    """A trained head's scores can span far more than the exponential's
+    +-16. The softmax takes them at full width and clamps only the
+    difference from the row maximum, which is exact, and the head's
+    guard lets shift_s scale scores up as well as down."""
+    ms = load_model_spec()
+    sm = specgen_mod.derive_softmax_spec(ms)['parameters']
+    e_lo = 1 << (sm['score_width'] - 1)
+    w, _, _ = specgen_mod.softmax_golden([200000, 190000, -150000], sm)
+    check('scores 39 and 1367 below a 781 maximum get weight zero, the '
+          'maximum all of it',
+          # one count under 1.0 is the reciprocal's rounding, the same
+          # weight a single-score row gets
+          w[0] >= (1 << sm['weight_frac']) - 1 and w[1] == 0 and w[2] == 0)
+    w1, _, _ = specgen_mod.softmax_golden([5000, 5000 - e_lo], sm)
+    w2, _, _ = specgen_mod.softmax_golden([5000, 5000 - e_lo - 999], sm)
+    check('clamping score minus maximum at the exponential\'s floor is exact',
+          w1 == w2)
+    at = specgen_mod.derive_attn_spec(ms)['parameters']
+    g = at['score_guard']
+    rs = specgen_mod._round_shift
+    check('the score guard leaves every right shift unchanged',
+          all(rs(t << g, s + g) == rs(t, s)
+              for t in (-99999, -3, 0, 7, 12345) for s in range(0, 12)))
 
 
 def test_requant_golden_is_shared():
@@ -2275,6 +2335,8 @@ if __name__ == '__main__':
     test_small_model_derivation()
     test_fpga_counts_the_hierarchy_once()
     test_rotary_embedding()
+    test_scores_wider_than_the_exponential()
+    test_qwen_shaped_decoder()
     test_composite_cell_count()
     test_requant_golden_is_shared()
     test_table_unit_specs_are_implementable()

@@ -235,6 +235,19 @@ DECODER_JOB = {
 }
 
 
+QWEN_DECODER_JOB = {
+    "spec_file": "spec_qwen_decoder.json", "tb_file": "tb_qwen_decoder.v",
+    "rtl_file": "qwen_decoder.v", "profile_file": "qwen_decoder_profile.json",
+    "report_file": "report_qwen_decoder.json",
+    "derive_from_model": "qwen_decoder",
+    "extra_sources": ("mac_dep.v", "mv_dep.v", "rq_dep.v", "sm_dep.v",
+                      "expu_dep.v", "recip_dep.v", "exp_rom.v",
+                      "recip_rom.v", "rs_dep.v", "rsqrt_rom.v", "rn_dep.v",
+                      "at_dep.v", "pj_dep.v", "ra_dep.v", "ro_dep.v",
+                      "rope_rom.v", "si_dep.v"),
+}
+
+
 SOFTMAX_JOB = {
     "spec_file": "spec_softmax.json", "tb_file": "tb_softmax.v",
     "rtl_file": "softmax.v", "profile_file": "softmax_profile.json",
@@ -629,8 +642,8 @@ def derive_profile(spec, final):
         # infers a DSP slice, the endpoint is pure LUT logic, and those are
         # different resources, so a single capacity number cannot fit both.
         prof["fpga"] = {k: fpg[k] for k in
-                        ("family", "luts", "ffs", "dsps", "brams", "urams",
-                         "carry", "muxf") if k in fpg}
+                        ("family", "luts", "lutram", "ffs", "dsps", "brams",
+                         "urams", "carry", "muxf") if k in fpg}
     # Block-specific fields, keyed on the unit the spec declares rather
     # than on there being exactly two kinds of block.
     if "derivation" in spec:
@@ -761,6 +774,10 @@ def run_flow(job=None, verbose=True, agent=None, max_iters=None):
         sp = specgen.generate_rope(spec_file=job["spec_file"],
                                    tb_file=job["tb_file"])
         write_rope_deps(sp, BUILD)
+    elif job.get("derive_from_model") == "qwen_decoder":
+        import qwen_decoder
+        qwen_decoder.generate(spec_file=job["spec_file"],
+                              tb_file=job["tb_file"], build=BUILD)
     elif job.get("derive_from_model") == "decoder":
         import decoder
         decoder.generate(spec_file=job["spec_file"], tb_file=job["tb_file"],

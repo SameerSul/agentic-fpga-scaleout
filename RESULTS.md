@@ -13,13 +13,17 @@ rotary embedding existed. One
 projection runs at the model's full size, 896 by 4864, bit-exact on every
 output. A generated decoder sequences those blocks into a whole decode
 step, and the trained checkpoint runs on it in RTL, embedding to argmax,
-with every token of its output chosen by the hardware. An LLM has written
-and signed off every block but the eight newest through the same gates, and the multiply-accumulate unit's accumulator is formally proved
+with every token of its output chosen by the hardware. A second
+checkpoint trained with Qwen's structure, RoPE, two query heads over one
+KV head, the gated SiLU MLP, two layers and a final norm, decodes in RTL
+the same way, bit-exact on every logit. An LLM has written
+and signed off ten of the nineteen blocks through the same gates, the rotary embedding the newest of them, and the multiply-accumulate unit's accumulator is formally proved
 never to overflow, for any input sequence, on the int8 targets. A trained
 language model decodes through the blocks' exact arithmetic and emits
 text. It still does not host a local LLM the way Architect Labs does:
-nothing in this repo has been put on a board, and the generated blocks
-are the arithmetic of an inference engine rather than the whole of one.
+nothing in this repo has been put on a board, and the decoders run
+models of 16 and 32 dimensions trained here, not Qwen's 896-dimensional
+weights.
 The remaining gap is listed at the bottom rather than glossed over.
 
 ## Verified
@@ -27,7 +31,7 @@ The remaining gap is listed at the bottom rather than glossed over.
 ### The full suite
 
 ```
-python3 tests.py            # 326 tests, or 324 without OpenSTA
+python3 tests.py            # 334 tests, or 332 without OpenSTA
 ```
 
 ### Spec to RTL, across the spec space
@@ -264,9 +268,9 @@ Every character after each prompt is the hardware's argmax, fed back as
 its next input, and all 736 logits are bit-exact. It closes the flow's
 gates like every other block: the rules agent's first cut, which leaves
 out the MLP's ReLU, fails on the first logit, and the second converges.
-110 MHz from OpenSTA, 3789 cycles per token, so about 29,000 tokens/s for
-this model, and 13905 LUTs, 22 DSPs and 2 BRAMs on yosys's UltraScale+
-mapping. On the 7-series mapping it is 12802 LUTs and 22 DSPs, 62% and
+111 MHz from OpenSTA, 3790 cycles per token, so about 29,000 tokens/s for
+this model, and 14117 LUTs, 22 DSPs and 2 BRAMs on yosys's UltraScale+
+mapping. On the 7-series mapping it is 13247 LUTs and 22 DSPs, 64% and
 24% of the XC7A35T on the team's Basys 3, so the decoder fits that
 board. Mutation testing kills every applicable operator. The one that
 first survived took the last maximum on a tie instead of the first: the
@@ -281,9 +285,81 @@ softmax's capacity was fixed at 256 whatever the context, past what the
 head's matvec could count at this size; it is now bounded by the context.
 
 What this is not: the model is the 16-dimensional checkpoint, one layer
-and one head, in one 24-position window. Qwen's size needs the same
-sequencing over 14 heads sharing 2 KV heads, 24 layers, and weights
-streamed from DDR, and none of that exists yet.
+and one head, in one 24-position window, with learned positions and a
+ReLU MLP. The next section runs Qwen's structure.
+
+## Qwen's structure decodes in RTL
+
+```
+python3 train_qwen.py      # one off: trains and writes tiny_qwen.json
+python3 qwen_decoder.py    # the integer reference, against float
+```
+
+`tiny_qwen.json` is trained in this repo with Qwen's structure rather
+than the simpler one above: no position vectors but RoPE on q and k, two
+query heads sharing one key/value head, the gated SiLU MLP, two layers,
+a final RMSNorm before the head. 19,616 parameters on the same two
+sentences; a fused dot-product node in the autodiff, checked against
+finite differences, made training it take minutes rather than hours.
+
+The integer reference fixes every scale by calibration, as before, and
+agrees with the float checkpoint on all 93 teacher-forced positions.
+`qwen_decoder.v` runs a decode step over one instance each of the
+projection, RMSNorm, attention head, residual add, rotary unit, SiLU unit
+and a requantizer, looping over both layers and both query heads, with
+the KV cache laid out per layer and per KV head so the two query heads
+read the same keys. The gate is requantized to a power-of-two scale so
+its int8 code shifts straight into SiLU's input, and SiLU(gate) * up is
+requantized in one stream. Fed its own tokens back:
+
+```
+  the agent writes the rtl
+  the tools decide. the ag
+TB_PROFILE tokens=46 span_cycles=1139558 latency_cycles=26533
+TB_PASS checks=847
+```
+
+All 736 logits are bit-exact. It closes every gate: 110 MHz and 24773
+cycles per token. On the 7-series mapping it is 8376 LUTs, 164 more as
+LUT RAM, 34 DSPs and 3 block RAMs, about 41% and 38% of the XC7A35T on
+the team's Basys 3, so it fits that board. The first version did not: one
+shared activation array with two writes a cycle, from the rotary unit,
+and a key cache written two elements at a time could not be inferred as
+memory, so all of it became flip-flops and multiplexers, 36289 LUTs.
+Each activation now has its own small memory with one write port, and
+q, k and the key cache are split into the two halves of the rotary pairs,
+so every memory takes one write a cycle and maps to LUT RAM or block
+RAM. `fpga.py` now counts LUT RAM as the LUTs it occupies; it had been
+listing those cells as unmapped. The rules
+agent's first cut stores the keys without rotating them, which is the
+identity at position 0 and fails two steps later. Mutation testing kills
+every applicable operator.
+
+What is still not Qwen: 32 dimensions rather than 896, 2 layers rather
+than 24, and a checkpoint trained here rather than Qwen's weights.
+
+## Attention scores wider than the exponential
+
+The Qwen-shaped checkpoint first agreed with float on 48 of 93 positions,
+and the reason was a limit in the attention head, not the model. Its
+scores reached 149 and 205 in real units. The head clamped every score to
++-8 before the softmax subtracted the row maximum, because the
+exponential's input spans +-16 and a score minus the maximum had to fit
+it; once scores pass 8 they all clamp to the same value and the weights
+flatten. Real models' heads routinely produce scores past 8, so this was
+a bug for Qwen, not for this checkpoint.
+
+The softmax now reads scores eight bits wider than the exponential and
+clamps only each score minus the maximum, at the exponential's floor.
+That clamp is exact: below -16 the exponential is zero in its 15-bit
+output anyway. The head also forms scores from q.k shifted left by four
+before its right shift, so shift_s can scale scores up as well as down;
+the Qwen-shaped model needed about three times more than a pure right
+shift allowed without saturating q. Registering the clamped difference
+before the exponential kept timing; the softmax closes at 121 MHz and
+the head at 115 MHz. The 16-dimensional checkpoint's scores are
+bit-identical, since a left shift by four followed by a right shift by
+four more is the same right shift.
 
 ## A real bitstream exists
 
@@ -449,7 +525,11 @@ Qwen2.5-0.5B:
 | residual add | not yet attempted | | |
 | full-size projection | not yet attempted | | |
 | decoder | not yet attempted | | |
-| rotary embedding | not yet attempted | | |
+| rotary embedding | converged | 5 | Haiku |
+| Qwen-shaped decoder | not yet attempted | | |
+
+The softmax row predates the wider score input added for the Qwen-shaped
+checkpoint; the block Haiku signed off read 13-bit scores, not 21-bit.
 
 Every block the flow generated before the attention head has been
 written and signed off by an LLM through all four gates. The attention
@@ -572,7 +652,7 @@ the weighted sum, which the 8-bit MAC cannot do.
 
 Against real attention on the same integers the fixed-point head is
 within 0.08 on values up to 60. The rules agent converges in two
-iterations on every model variant, 112 MHz on Qwen2.5-0.5B, 3182 LUTs
+iterations on every model variant, 115 MHz on Qwen2.5-0.5B, 3265 LUTs
 and 12 DSPs on yosys's UltraScale+ mapping with its sub-blocks, and
 mutation testing kills every mutant on all six. Its weighted-sum
 accumulator is sized from its own bound, the weights summing to under
@@ -842,9 +922,10 @@ These are the distance between this repo and a local LLM host.
    output says so each run.
 3. **The model is small and its weights are its own.** Qwen3-0.6B is not
    loaded; there is no numeric stack here to load it with and no network
-   dependency wanted in a capstone repo. The committed checkpoint is a
-   real trained transformer with a real tokenizer, but it is 16
-   dimensional and trained on two sentences.
+   dependency wanted in a capstone repo. The committed checkpoints are
+   real trained transformers with a real tokenizer, one 16 dimensional
+   and one with Qwen's structure at 32 dimensions and 2 layers, both
+   trained on two sentences.
 4. **Throughput is predicted, not measured.** tokens/s comes from a sizing
    model checked against a fabric simulation, agreeing within 15% and at
    ratio 1.00 on the current configuration. Both are models. Neither is a

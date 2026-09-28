@@ -145,6 +145,7 @@
         "urams": 0,
         "carry": 3,
         "muxf": 0,
+        "lutram": 0,
         "status": "pass",
         "family": "xcup",
         "top": "wmem",

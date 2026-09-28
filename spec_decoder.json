@@ -80,7 +80,7 @@
         18
       ]
     },
-    "shift_s": 4,
+    "shift_s": 8,
     "eps": 1,
     "ports": {
       "rn_addr": 4,

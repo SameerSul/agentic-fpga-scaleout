@@ -1,0 +1,273 @@
+{
+  "name": "qwen_decoder_tiny_qwen",
+  "description": "One decode step of the Qwen-shaped checkpoint: 2 layers, 2 query heads over 1 key/value head, RoPE, the gated SiLU MLP, a final norm, embedding lookup to argmax",
+  "top_module": "qwen_decoder",
+  "unit": "token",
+  "parameters": {
+    "d_model": 32,
+    "d_ff": 64,
+    "vocab": 16,
+    "context": 24,
+    "n_head": 2,
+    "n_kv_head": 1,
+    "head_dim": 16,
+    "n_layer": 2,
+    "region": 64,
+    "param_offsets": {
+      "tok": 0,
+      "l0_g1": 512,
+      "l0_g2": 544,
+      "l0_wq": 576,
+      "l0_wk": 1600,
+      "l0_wv": 2112,
+      "l0_wo": 2624,
+      "l0_wg": 3648,
+      "l0_wu": 5696,
+      "l0_wd": 7744,
+      "l1_g1": 9792,
+      "l1_g2": 9824,
+      "l1_wq": 9856,
+      "l1_wk": 10880,
+      "l1_wv": 11392,
+      "l1_wo": 11904,
+      "l1_wg": 12928,
+      "l1_wu": 14976,
+      "l1_wd": 17024,
+      "gf": 19072,
+      "head": 19104
+    },
+    "param_words": 19616,
+    "constants": {
+      "l0_q": [
+        226506,
+        27
+      ],
+      "l0_k": [
+        143112,
+        26
+      ],
+      "l0_v": [
+        213354,
+        26
+      ],
+      "l0_ctx": [
+        131072,
+        32
+      ],
+      "l0_a": [
+        204104,
+        26
+      ],
+      "l0_g": [
+        222745,
+        26
+      ],
+      "l0_u": [
+        241784,
+        26
+      ],
+      "l0_m": [
+        232128,
+        29
+      ],
+      "l0_dn": [
+        186240,
+        25
+      ],
+      "l0_n1": [
+        141958,
+        31
+      ],
+      "l0_n2": [
+        246031,
+        32
+      ],
+      "l0_r1": [
+        11177,
+        259755,
+        18
+      ],
+      "l0_r2": [
+        36175,
+        248429,
+        18
+      ],
+      "l1_q": [
+        145345,
+        26
+      ],
+      "l1_k": [
+        167594,
+        26
+      ],
+      "l1_v": [
+        250390,
+        26
+      ],
+      "l1_ctx": [
+        131072,
+        32
+      ],
+      "l1_a": [
+        136492,
+        27
+      ],
+      "l1_g": [
+        143325,
+        26
+      ],
+      "l1_u": [
+        221495,
+        26
+      ],
+      "l1_m": [
+        239908,
+        29
+      ],
+      "l1_dn": [
+        256048,
+        25
+      ],
+      "l1_n1": [
+        138799,
+        31
+      ],
+      "l1_n2": [
+        144351,
+        31
+      ],
+      "l1_r1": [
+        224254,
+        102693,
+        18
+      ],
+      "l1_r2": [
+        237805,
+        84368,
+        18
+      ],
+      "nf": [
+        136362,
+        31
+      ],
+      "lg": [
+        183379,
+        26
+      ]
+    },
+    "shift_s": [
+      3,
+      2
+    ],
+    "gate_shift": [
+      5,
+      5
+    ],
+    "eps": 1,
+    "ports": {
+      "rn_addr": 5,
+      "rn_eps": 22,
+      "at_addr": 9,
+      "at_hd": 4,
+      "at_n": 6,
+      "at_shs": 5,
+      "pj_depth": 7,
+      "pj_col": 7,
+      "pj_addr": 14,
+      "sc": 18,
+      "sh": 7,
+      "ro_idx": 3,
+      "ro_pos": 5,
+      "si_w": 13,
+      "rq_acc": 24
+    },
+    "data_width": 8,
+    "signed": true,
+    "pipeline_stages": 1,
+    "target_clock_mhz": 100
+  },
+  "ports": [
+    {
+      "name": "clk",
+      "dir": "input",
+      "width": 1,
+      "desc": "clock, rising edge"
+    },
+    {
+      "name": "rst_n",
+      "dir": "input",
+      "width": 1,
+      "desc": "synchronous active-low reset"
+    },
+    {
+      "name": "start",
+      "dir": "input",
+      "width": 1,
+      "desc": "one-cycle pulse: decode tok at pos"
+    },
+    {
+      "name": "tok",
+      "dir": "input",
+      "width": 4,
+      "desc": "the token at this position"
+    },
+    {
+      "name": "pos",
+      "dir": "input",
+      "width": 5,
+      "desc": "its position; the KV cache slot"
+    },
+    {
+      "name": "p_addr",
+      "dir": "output",
+      "width": 15,
+      "desc": "parameter memory address"
+    },
+    {
+      "name": "p_data",
+      "dir": "input",
+      "width": 8,
+      "desc": "parameter word, one cycle after its address"
+    },
+    {
+      "name": "lg_valid",
+      "dir": "output",
+      "width": 1,
+      "desc": "a logit is on lg_index/lg_data"
+    },
+    {
+      "name": "lg_index",
+      "dir": "output",
+      "width": 4,
+      "desc": "which logit"
+    },
+    {
+      "name": "lg_data",
+      "dir": "output",
+      "width": 8,
+      "desc": "its int8 value"
+    },
+    {
+      "name": "next_tok",
+      "dir": "output",
+      "width": 4,
+      "desc": "argmax, lowest index on a tie"
+    },
+    {
+      "name": "done",
+      "dir": "output",
+      "width": 1,
+      "desc": "one-cycle pulse: next_tok is valid"
+    },
+    {
+      "name": "busy",
+      "dir": "output",
+      "width": 1,
+      "desc": "high from start to done"
+    }
+  ],
+  "derivation": {
+    "model": "tiny_qwen",
+    "rule": "block specs derived at the checkpoint's own size; static scales by calibration; the gate's scale a power of two so its code shifts straight into SiLU"
+  }
+}

@@ -9,7 +9,7 @@ is worth knowing and worth reporting.
 You give it a model spec, a small JSON file naming a transformer's
 dimensions and its quantization. It derives the hardware that model
 needs, writes the Verilog, and checks it with real tools until it passes.
-Eighteen blocks come out, each one sized from the model rather than written
+Nineteen blocks come out, each one sized from the model rather than written
 for it. Point it at a different model and every block re-derives.
 
 ## The picture
@@ -44,7 +44,7 @@ for it. Point it at a different model and every block re-derives.
                            re-simulated against the same testbench
 ```
 
-## The eighteen blocks
+## The nineteen blocks
 
 Arithmetic, bottom to top:
 
@@ -83,6 +83,8 @@ And the one that runs the model:
    decoder    one decode step of the trained 16-dimensional checkpoint,
               embedding to argmax, over one instance each of proj,
               rmsnorm, attn and resadd. The text it emits is its own.
+   qwen_decoder  the same for a Qwen-shaped checkpoint: RoPE, two query
+              heads over one KV head, SwiGLU, two layers, final norm
 ```
 
 ## Build it
@@ -176,10 +178,10 @@ Measured here with yosys against a generic library, for Qwen2.5-0.5B:
                                   table; on your part that is a BRAM
    proj       115 MHz   13989     1831 LUTs and 9 DSPs; its memories
                                   are outside it, on your part BRAM or DDR
-   attn       112 MHz  115091     the score and weight buffers and the
+   attn       115 MHz  132047     the score and weight buffers and the
                                   softmax's become flops here; on the
-                                  FPGA they map to 3 BRAMs, 3182 LUTs
-   softmax    103 MHz   40017     its exponential buffer, the same way
+                                  FPGA they map to 3 BRAMs, 3265 LUTs
+   softmax    121 MHz   40262     its exponential buffer, the same way
 
    Counts include each block's submodules. Before this, a composite
    block reported whichever submodule yosys listed first: the MLP and
@@ -187,12 +189,15 @@ Measured here with yosys against a generic library, for Qwen2.5-0.5B:
 ```
 
 The decoder is sized for the checkpoint rather than Qwen: 111 MHz,
-13905 LUTs, 22 DSPs and 2 BRAMs on the UltraScale+ mapping. On the
-7-series mapping, the family of Vaibhav's Basys 3, it is 12802 LUTs and
-22 DSPs, 62% and 24% of an XC7A35T, so the whole decoder fits that board.
+14117 LUTs, 22 DSPs and 2 BRAMs on the UltraScale+ mapping. On the
+7-series mapping, the family of Vaibhav's Basys 3, it is 13247 LUTs and
+22 DSPs, 64% and 24% of an XC7A35T, so the whole decoder fits that board.
+The Qwen-shaped decoder, two layers with RoPE and SwiGLU, is 8376 LUTs
+plus 164 as LUT RAM, 34 DSPs and 3 block RAMs on 7-series: it fits the
+Basys 3 too, at about 41% of its LUTs and 38% of its DSPs.
 
 A Zynq 7020 has 53200 LUTs and 220 DSPs. The seventeen Qwen-sized blocks map to
-20402 LUTs and 81 DSPs on yosys's UltraScale+ mapping, about 38% and
+20554 LUTs and 81 DSPs on yosys's UltraScale+ mapping, about 39% and
 37% of the part, and that counts the composite blocks' sub-blocks twice.
 These are about half what this file reported before: the resource count
 read every submodule table yosys printed after the top module's, then the

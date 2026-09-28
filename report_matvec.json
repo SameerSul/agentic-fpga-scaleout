@@ -199,6 +199,7 @@
         "urams": 0,
         "carry": 23,
         "muxf": 17,
+        "lutram": 0,
         "status": "pass",
         "family": "xcup",
         "top": "matvec",

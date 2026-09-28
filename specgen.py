@@ -1494,6 +1494,12 @@ def derive_softmax_spec(ms):
         "parameters": {
             "capacity": cap, "index_width": nw,
             "score_width": e["parameters"]["in_width"],
+            # Scores themselves are wider than the exponential's input. A
+            # row can span far more than the exponential covers, and at
+            # 13 bits a trained head's scores, 149 and 205 on the
+            # Qwen-shaped checkpoint, had to be clamped to +-8 before the
+            # maximum was even known, which flattened the weights.
+            "score_in_width": e["parameters"]["in_width"] + 8,
             "score_frac": e["parameters"]["in_frac"],
             "weight_width": e["parameters"]["out_width"],
             "weight_frac": e["parameters"]["out_frac"],
@@ -1524,7 +1530,7 @@ def derive_softmax_spec(ms):
             {"name": "s_addr", "dir": "output", "width": nw,
              "desc": "score index being read"},
             {"name": "s_data", "dir": "input",
-             "width": e["parameters"]["in_width"], "signed": True,
+             "width": e["parameters"]["in_width"] + 8, "signed": True,
              "desc": "score, registered read, one cycle after s_addr"},
             {"name": "w_valid", "dir": "output", "width": 1,
              "desc": "a normalised weight is on w_data"},
@@ -1551,12 +1557,15 @@ def derive_softmax_spec(ms):
             "Pass 1 reads every score and keeps the maximum mx. The "
             "exponential is only defined for non-positive arguments, and "
             "subtracting the row maximum is what guarantees that.",
-            "Pass 2 feeds e_i = expu(score_i - mx) for every i. score_i - "
-            "mx always fits the %d-bit signed input of expu. Buffer every "
-            "e_i, a %d-bit unsigned value, and accumulate their sum S. S "
-            "is at most %d * 2**%d, so it fits the %d-bit input of recip "
-            "without saturating."
-            % (e["parameters"]["in_width"], e["parameters"]["out_width"],
+            "Pass 2 feeds e_i = expu(d_i) for every i, where d_i = "
+            "max(score_i - mx, -2**%d): score_i - mx is never positive but "
+            "can be far below the %d-bit signed input of expu, and below "
+            "-2**%d the exponential is zero in its output format anyway, "
+            "so the clamp is exact. Buffer every e_i, a %d-bit unsigned "
+            "value, and accumulate their sum S. S is at most %d * 2**%d, "
+            "so it fits the %d-bit input of recip without saturating."
+            % (e["parameters"]["in_width"] - 1, e["parameters"]["in_width"],
+               e["parameters"]["in_width"] - 1, e["parameters"]["out_width"],
                cap, e["parameters"]["out_frac"], r["parameters"]["in_width"]),
             "S then goes through recip once, giving a mantissa m and a "
             "shift k. A divide per weight would be absurd.",
@@ -1601,7 +1610,8 @@ def softmax_golden(scores, p):
            "out_width": p["recip_out_width"],
            "lut_bits": 8, "shift_bias": p["shift_bias"]}
     mx = max(scores)
-    ex = [exp_golden(s - mx, e_p) for s in scores]
+    lo = -(1 << (p["score_width"] - 1))
+    ex = [exp_golden(max(s - mx, lo), e_p) for s in scores]
     tot = min(sum(ex), (1 << r_p["in_width"]) - 1)
     m, k = recip_golden(max(1, tot), r_p)
     # recip_apply already divides, so shifting again here would scale
@@ -1638,6 +1648,7 @@ def _softmax_discriminating_row(p, rnd, tries=200000):
 def render_softmax_testbench(spec):
     p = spec["parameters"]
     sw, ww, nw = p["score_width"], p["weight_width"], p["index_width"]
+    swi = p.get("score_in_width", sw)
     rnd = random.Random(53)
     rows = []
     lo = -(1 << (sw - 1))
@@ -1650,6 +1661,11 @@ def render_softmax_testbench(spec):
     rows.append([1234] * 8)                    # all equal, all positive
     rows.append([hi // 2] + [hi // 8] * 7)     # one dominant score
     rows.append([lo // 4, 0, hi // 4, 7])      # mixed signs
+    # Rows wider than the exponential covers: scores far apart, and
+    # exactly at and one past the clamp on the difference from the max.
+    top = (1 << (swi - 2)) + 12345
+    rows.append([top, top - (1 << 20), -(1 << (swi - 2)), top - 3000])
+    rows.append([top, top + lo, top + lo - 1, top + lo + 1, top - 5])
     disc = _softmax_discriminating_row(p, rnd)
     if disc:
         # A row whose product sits one count below a shift boundary, so
@@ -1665,12 +1681,12 @@ def render_softmax_testbench(spec):
         w, _, _ = softmax_golden(sc, p)
         body.append("    // row %d, n=%d" % (ri, len(sc)))
         for i, v in enumerate(sc):
-            body.append("    smem[%d] = %s;" % (i, _slit(v, sw)))
+            body.append("    smem[%d] = %s;" % (i, _slit(v, swi)))
         for i, v in enumerate(w):
             body.append("    expect_w[%d] = %d'd%d;" % (i, ww, v))
         body.append("    run_row(%d'd%d);" % (nw + 1, len(sc)))
     return SOFTMAX_TB.format(
-        swm=sw - 1, wwm=ww - 1, nwm=nw - 1, nw=nw + 1, cap=p["capacity"],
+        swm=swi - 1, wwm=ww - 1, nwm=nw - 1, nw=nw + 1, cap=p["capacity"],
         rows="\n".join(body), nrows=len(rows))
 
 
@@ -1844,12 +1860,14 @@ def derive_attn_spec(ms):
     dw, aw = c["parameters"]["data_width"], c["parameters"]["acc_width"]
     hd = ms.get("head_dim") or ms["d_model"] // ms["n_head"]
     cap = sm["parameters"]["capacity"]
-    sw = sm["parameters"]["score_width"]
+    sw = sm["parameters"]["score_in_width"]
     ww = sm["parameters"]["weight_width"]
     hdw = max(1, (hd - 1).bit_length())
     addr_w = (cap * hd - 1).bit_length()
     nw = sm["parameters"]["index_width"] + 1
-    smax = (1 << (sw - 2)) - 1              # scores clamp to +-(2**(sw-2))
+    # Scores saturate only at the edge of the softmax's wide input; the
+    # softmax clamps each score minus the row maximum itself.
+    smax = (1 << (sw - 1)) - 1
     wsum = dw + sm["parameters"]["weight_frac"] + 1
     assert wsum <= aw, "the requantizer input is narrower than the weighted sum"
     assert nw <= mv["parameters"]["col_width"], \
@@ -1874,6 +1892,11 @@ def derive_attn_spec(ms):
             # at 16-bit operands that could not close timing.
             "wsum_width": wsum,
             "shift_s_width": 5,
+            # Scores are (t << 4) >> shift_s, so shift_s covers x16 down to
+            # /2**27. Right shifts alone forced q's scale times k's below
+            # sqrt(head_dim) score counts, and a trained head needed three
+            # times that: q saturated at int8 instead.
+            "score_guard": 4,
             "scale_width": rq["parameters"]["scale_width"],
             "shift_width": rq["parameters"]["shift_width"],
             "requant_stages": rq["parameters"]["pipeline_stages"],
@@ -1947,11 +1970,12 @@ def derive_attn_spec(ms):
             "itself a register, that is two clock edges after the edge "
             "that loads a into it." % hd,
             "Scores: for j in 0..n-1, t_j = sum over d of q[d] * K[j][d], "
-            "a signed %d-bit dot product. s_j = (t_j + 2**(shift_s-1)) >>> "
-            "shift_s when shift_s > 0, else t_j, then clamped to "
-            "[%d, %d]. The clamp is half the %d-bit score range so that a "
-            "score minus the row maximum always fits the exponential's "
-            "input." % (aw, -(smax + 1), smax, sw),
+            "a signed %d-bit dot product. With u_j = t_j << 4, s_j = (u_j + "
+            "2**(shift_s-1)) >>> shift_s when shift_s > 0, else u_j, then "
+            "clamped to [%d, %d], the %d-bit signed score the softmax "
+            "reads. The softmax clamps each score minus the row maximum "
+            "to its exponential's range itself." % (aw, -(smax + 1), smax,
+                                                    sw),
             "Weights: w = softmax(s) over the n scores, exactly as the "
             "supplied softmax block computes it: %d-bit unsigned Q0.%d, "
             "where %d is 1.0." % (ww, sm["parameters"]["weight_frac"],
@@ -2003,9 +2027,8 @@ def attn_golden(q, K, V, n, shift_s, scale_o, shift_o, p, sm_p):
     models so the testbench checks the composition."""
     smax = p["score_max"]
     t = [sum(q[d] * K[j][d] for d in range(p["head_dim"])) for j in range(n)]
-    s = [max(-smax - 1, min(smax, _round_shift(v, shift_s))) for v in t]
-    mx = max(s)
-    assert all(-(1 << (p["score_width"] - 1)) <= v - mx <= 0 for v in s)
+    g = p.get("score_guard", 0)
+    s = [max(-smax - 1, min(smax, _round_shift(v << g, shift_s))) for v in t]
     w = softmax_golden(s, sm_p)[0]
     a = [sum(w[j] * V[j][d] for j in range(n)) for d in range(p["head_dim"])]
     assert all(abs(v) < 1 << (p["wsum_width"] - 1) for v in a), \
@@ -2038,17 +2061,20 @@ def render_attn_testbench(spec):
             # its accumulator is sized for.
             V[0] = [-(1 << (dw - 1))] * hd
         t = [sum(q[d] * K[j][d] for d in range(hd)) for j in range(n)]
-        big = max(abs(v) for v in t)
+        big = max(abs(v) for v in t) << p.get("score_guard", 0)
         sh = 0
         while (big >> sh) > 1800:
             sh += 1
         if clamp:
-            sh = max(0, sh - 2)             # push the top scores to the clamp
+            # Spread the row past the exponential's range, so the
+            # softmax's clamp on score minus maximum has work to do.
+            sh = max(0, sh - 4)
         _, s, w, a, _ = attn_golden(q, K, V, n, sh, 1, 0, p, sm_p)
         sc, so = _mlp_scale(a, dw, mw, sw_o)
         t, s, w, a, o = attn_golden(q, K, V, n, sh, sc, so, p, sm_p)
         if clamp:
-            assert any(v == p["score_max"] for v in s), "clamp case did not clamp"
+            e_lo = 1 << (sm_p["score_width"] - 1)
+            assert max(s) - min(s) > e_lo, "spread case did not spread"
         cases.append((n, q, K, V, sh, sc, so, s, w, o))
     body = []
     for ci, (n, q, K, V, sh, sc, so, s, w, o) in enumerate(cases):
