@@ -417,6 +417,28 @@ and a DDR-fed weight port would bring it to the bandwidth bound. The run
 took about three and a half hours of simulation. With the stack cut to
 its first layer the same sequencer also matches, in 9.5 million cycles.
 
+The testbench above answers every port the next cycle, which no DRAM
+does, so `zybo.py` puts the same core, unchanged, on a memory system
+shaped like the Zybo's: the weights, the column constants and the KV
+cache in DDR behind one 64-bit AXI3 master, the width of a Zynq-7000 HP
+port, and the norm gains in block RAM. Each DDR-backed port has a line
+buffer filled by 16-beat bursts, KV writes go out as strobed single
+beats, and while any port's word is still on the bus the core's clock is
+held, a BUFGCE on the FPGA, so none of the generated blocks needed a
+stall input. Against a DDR model with 30 cycles of latency, the
+one-layer run chooses the same token, 70526, in exactly the same
+9,510,162 core cycles as the direct run: holding the clock changes
+nothing the core computes. It costs 126 million bus cycles, 13.3 per
+core cycle. That is the bus's number, not the core's: one 64-bit port
+with no prefetch against a core that wants a 256-bit word every cycle.
+At 100 MHz a full token would take about 4 seconds this way, against
+0.25 at the 2 GB/s the sizing model assumes; prefetching the next line
+while the current one drains and using all four HP ports are the
+changes that close that gap, and neither is written. The first run of
+this deadlocked, and the fault was the testbench's: before reset the
+master's valids are X, !X is false, and the DDR model ran a phantom
+write at cycle 2, then waited forever for its data beat.
+
 It is also a design, not only a simulation. Yosys maps the whole
 sequencer with every block under it to 25650 LUTs, 3240 more as LUT RAM,
 13600 flip-flops, 148 DSPs and 16 block RAMs on 7-series: 54% of a Zynq
