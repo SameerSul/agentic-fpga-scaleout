@@ -1666,6 +1666,66 @@ def test_basys3_top_level():
         shutil.rmtree(work, ignore_errors=True)
 
 
+def test_multi_lane_attention():
+    """Lanes over cached positions for the scores and over dimensions for
+    the weighted sum. On a full 256-position row it has to match the
+    one-lane head bit for bit, including its score and weight buffers, in
+    a fraction of the cycles, and a first cut that reads mirrored key
+    lanes has to be caught."""
+    import chiplet_flow as cf
+    ms = load_model_spec()
+    one, wide = (specgen_mod.derive_attn_spec(ms),
+                 specgen_mod.derive_attnn_spec(ms))
+    work = os.path.join(ROOT, 'build_attnntest')
+    shutil.rmtree(work, ignore_errors=True)
+    try:
+        cf.write_attn_deps(ms, work)
+        rr = RuleBasedAgent()
+        out = {}
+        for label, spec, tbf, src in (
+                ('one', one, specgen_mod.render_attn_testbench,
+                 rr.render_attn(one, {agent_mod.FIX_VLAT})),
+                ('wide', wide, specgen_mod.render_attnn_testbench,
+                 rr.render_attnn(wide, {agent_mod.FIX_KLANE})),
+                ('first', wide, specgen_mod.render_attnn_testbench,
+                 rr.render_attnn(wide, set()))):
+            with open(os.path.join(work, 'tb.v'), 'w') as f:
+                f.write(tbf(spec, rows=((256, False),)))
+            with open(os.path.join(work, 'h.v'), 'w') as f:
+                f.write(src)
+            r = subprocess.run(['iverilog', '-g2005', '-o', 's.out', 'tb.v',
+                                'h.v'] + list(cf.ATTN_DEPS), cwd=work,
+                               capture_output=True, text=True)
+            assert r.returncode == 0, r.stdout + r.stderr
+            out[label] = subprocess.run(['vvp', 's.out'], cwd=work,
+                                        capture_output=True, text=True,
+                                        timeout=1200).stdout
+        span = lambda o: int(re.search(r'span_cycles=(\d+)', o).group(1))
+        ok = all('TB_RESULT: PASS' in out[k] for k in ('one', 'wide'))
+        check('%d lanes compute a 256-position head bit-exact in %d cycles, '
+              'against %d on one lane' % (wide['parameters']['lanes'],
+                                          span(out['wide']) if ok else 0,
+                                          span(out['one']) if ok else 0),
+              ok and span(out['wide']) * 10 < span(out['one']))
+        check('mirrored key lanes are caught at the scores',
+              'TB_RESULT: PASS' not in out['first']
+              and 'expected_s' in out['first'])
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def test_mutants_edit_code_not_comments():
+    """The adder mutant flips the first real addition. A '+' in a comment
+    ahead of it made the mutant a comment edit on SiLU and the multi-lane
+    head: nothing could kill it, and it was reported as an unproven hole
+    instead of a test that was never run."""
+    src = "  // a + b is the idea\n  assign y = a + b;  // + here too\n"
+    m = dv._sub_first_real_add(src)
+    check('the adder mutant changes the code, not a comment',
+          'assign y = a - b;' in m and '// a + b is the idea' in m
+          and '// + here too' in m)
+
+
 def test_requant_golden_is_shared():
     """One model of requantization, used by the requantizer's own
     testbench and by the layer that sequences it, so the two cannot
@@ -2400,6 +2460,8 @@ if __name__ == '__main__':
     test_residual_add()
     test_full_size_projection()
     test_multi_lane_projection()
+    test_multi_lane_attention()
+    test_mutants_edit_code_not_comments()
     test_decoder_runs_the_model()
     test_small_model_derivation()
     test_fpga_counts_the_hierarchy_once()

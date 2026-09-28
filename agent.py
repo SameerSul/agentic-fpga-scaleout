@@ -31,6 +31,7 @@ FIX_RRND = "round_the_residual_sum_before_the_shift"
 FIX_PIDX = "carry_the_column_index_through_the_requantizer"
 FIX_ROTDIR = "rotate_by_plus_the_angle"
 FIX_LANE = "take_each_lanes_weight_from_its_own_byte"
+FIX_KLANE = "score_each_position_from_its_own_key_lane"
 # One definition, in specgen, so the declared depth and the generated
 # depth cannot disagree.
 WIDE_ADD_BITS = specgen.WIDE_ADD_BITS
@@ -73,6 +74,8 @@ class RuleBasedAgent:
             return self.render_resadd(spec, fixes), sorted(fixes)
         if spec["top_module"] == "proj":
             return self.render_proj(spec, fixes), sorted(fixes)
+        if spec["top_module"] == "attnn":
+            return self.render_attnn(spec, fixes), sorted(fixes)
         if spec["top_module"] == "projn":
             return self.render_projn(spec, fixes), sorted(fixes)
         if spec["top_module"] == "rope":
@@ -114,6 +117,10 @@ class RuleBasedAgent:
                     fixes.add(decoder.FIX_RELU)
                 elif "clear" in m.get("test", "").lower():
                     fixes.add(FIX_CLEAR)
+                elif "expected_s" in m and spec["top_module"] == "attnn":
+                    # The multi-lane head's only seeded bug: each score
+                    # lane read the mirrored lane of the key word.
+                    fixes.add(FIX_KLANE)
                 elif "expected_lane" in m:
                     # The multi-lane projection's only seeded bug: each
                     # lane read the mirrored byte of the weight word.
@@ -285,6 +292,268 @@ class RuleBasedAgent:
 endmodule
 """.format(dwm=dw - 1, depwm=dep_w - 1, colwm=col_w - 1, mvam=mva - 1,
            mwm=mw - 1, swm=shw - 1, awm=aw - 1, rqsm=rqs - 1, oidx=oidx)
+
+    def render_attnn(self, spec, fixes):
+        """L lanes for the scores, one cached position each, L lanes for
+        the weighted sum, one output dimension each, and the single-lane
+        softmax between them. Score lanes are instances of the generated
+        MAC; their sums drain through the score quantizer into sbuf, as
+        the one-lane head's do, and the weighted sums drain through the
+        requantizer.
+
+        The seeded first cut wires score lane l to lane L-1-l of the key
+        word, so every group's scores come out mirrored.
+        """
+        p = spec["parameters"]
+        dw, aw, hd = p["data_width"], p["acc_width"], p["head_dim"]
+        La, cap = p["lanes"], p["capacity"]
+        hdw, nw = p["head_dim_width"], p["n_width"]
+        kaw, vaw = p["k_addr_width"], p["v_addr_width"]
+        sw, smax, ww = p["score_width"], p["score_max"], p["weight_width"]
+        mw, shw, rqs = p["scale_width"], p["shift_width"], p["requant_stages"]
+        siw, wsw = p["sm_index_width"], p["wsum_width"]
+        g = p.get("score_guard", 0)
+        ms_ = p["mac_stages"]
+        lw = max(1, (La - 1).bit_length())
+        ndg = hd // La
+        dgw = max(1, (ndg - 1).bit_length())
+        fl = 1 + ms_
+        kbyte = ("k_data[%d*l +: %d]" % (dw, dw) if FIX_KLANE in fixes
+                 else "k_data[%d*(%d-l) +: %d]" % (dw, La - 1, dw))
+        awg = aw + g
+        widen = ("x" if aw == wsw else
+                 "{{%d{x[%d]}}, x}" % (aw - wsw, wsw - 1))
+        tsc = ("{shadow[dj[%d:0]][%d], shadow[dj[%d:0]], %d'd0}"
+               % (lw - 1, aw - 1, lw - 1, g) if g else
+               "{shadow[dj[%d:0]][%d], shadow[dj[%d:0]]}"
+               % (lw - 1, aw - 1, lw - 1))
+        return """module attnn (
+  input                    clk,
+  input                    rst_n,
+  input                    load_valid,
+  input      signed [{dwm}:0] load_data,
+  input                    start,
+  input      [{nwm}:0] n,
+  input      [4:0]  shift_s,
+  input      [{mwm}:0] scale_o,
+  input      [{shwm}:0] shift_o,
+  output     [{kawm}:0] k_addr,
+  input      [{wdm}:0] k_data,
+  output     [{vawm}:0] v_addr,
+  input      [{wdm}:0] v_data,
+  output reg               o_valid,
+  output reg [{hdwm}:0] o_index,
+  output reg signed [{dwm}:0] o_data,
+  output reg               busy
+);
+  reg signed [{dwm}:0] qbuf [0:{hdm}];
+  reg signed [{swm}:0] sbuf [0:{capm}];
+  reg        [{wwm}:0] pbuf [0:{capm}];
+  reg [{hdwm1}:0] lptr;
+  reg [{nwm}:0] n_r;
+  reg [1:0] st;
+  localparam S_IDLE = 2'd0, S_SCORE = 2'd1, S_SOFT = 2'd2, S_WSUM = 2'd3;
+
+  // ---- scores: lane l is position g0 + l
+  reg issuing;
+  reg [{hdwm1}:0] r;
+  reg [{nwm}:0] g0;
+  reg [{kawm}:0] kbase;
+  assign k_addr = kbase + r;
+  reg signed [{dwm}:0] a_data;
+  always @(posedge clk) a_data <= qbuf[r[{hdwm}:0]];
+  reg v1;
+  reg [{fl}:0] lastp;
+  reg [{nwm}:0] gp [0:{fl}];
+  reg mclr;
+  wire signed [{awm}:0] acc [0:{lam}];
+  genvar l;
+  generate
+    for (l = 0; l < {La}; l = l + 1) begin : slane
+      mac mc (.clk(clk), .rst_n(rst_n), .clear(mclr), .a(a_data),
+              .b({kbyte}), .valid_in(v1), .acc(acc[l]), .valid_out());
+    end
+  endgenerate
+  reg signed [{awm}:0] shadow [0:{lam}];
+  reg [{nwm}:0] cap0;
+  reg [{lw}:0] dj, dn;
+  reg pend;
+  wire [{nwm}:0] next0 = g0 + {La};
+
+  // Score quantizer, as the one-lane head's: round, shift, clamp.
+  wire signed [{awg}:0] rnd_s = (shift_s == 5'd0) ? {awg1}'sd0
+                                : ({awg1}'sd1 <<< (shift_s - 5'd1));
+  reg  signed [{awg}:0] rnd_r;
+  reg  sv1;
+  reg  signed [{awg}:0] st1;
+  reg  [{siwm}:0] si1;
+  wire signed [{awg}:0] shv = st1 >>> shift_s;
+  reg  [{nwm}:0] scnt;
+
+  // ---- the softmax, one lane
+  reg  sm_start, sm_ran;
+  wire [{siwm}:0] sm_saddr, sm_wi;
+  reg  signed [{swm}:0] sm_sdata;
+  wire sm_wv, sm_busy;
+  wire [{wwm}:0] sm_wd;
+  always @(posedge clk) sm_sdata <= sbuf[sm_saddr];
+  softmax sm (.clk(clk), .rst_n(rst_n), .start(sm_start), .n(n_r),
+              .s_addr(sm_saddr), .s_data(sm_sdata), .w_valid(sm_wv),
+              .w_index(sm_wi), .w_data(sm_wd), .busy(sm_busy));
+  reg  [{nwm}:0] pcnt;
+
+  // ---- weighted sum: lane l is dimension dg * {La} + l
+  reg wiss;
+  reg [{nwm}:0] jj;
+  reg [{dgwm}:0] dg;
+  reg [{vawm}:0] vaddr;
+  assign v_addr = vaddr;
+  reg [{wwm}:0] p_r;
+  always @(posedge clk) p_r <= pbuf[jj[{siwm}:0]];
+  reg u1, f1, uA, fA;
+  reg [3:0] lastw;
+  reg [{dgwm}:0] dgp [0:3];
+  reg signed [{pwm}:0] prod [0:{lam}];
+  reg signed [{wswm}:0] accw [0:{lam}];
+  reg signed [{wswm}:0] shadow2 [0:{lam}];
+  reg [{dgwm}:0] capd;
+  reg [{lw}:0] dj2, dn2;
+  reg pend2;
+  wire signed [{wswm}:0] x = shadow2[dj2[{lwm}:0]];
+
+  reg  rq_vin;
+  reg  signed [{awm}:0] rq_acc;
+  reg  [{hdwm}:0] rq_idx;
+  wire signed [{dwm}:0] rq_q;
+  wire rq_sat, rq_vout;
+  requant rq (.clk(clk), .rst_n(rst_n), .acc_in(rq_acc),
+              .scale(scale_o), .shift(shift_o), .valid_in(rq_vin),
+              .q_out(rq_q), .sat(rq_sat), .valid_out(rq_vout));
+  reg [{hdwm}:0] idx_pipe [0:{rqsm}];
+  reg [{hdwm1}:0] ocnt;
+  integer k;
+
+  always @(posedge clk) begin
+    if (!rst_n) begin
+      lptr <= 0; n_r <= 0; st <= S_IDLE; busy <= 1'b0; issuing <= 1'b0;
+      r <= 0; g0 <= 0; kbase <= 0; v1 <= 1'b0; lastp <= 0; mclr <= 1'b0;
+      cap0 <= 0; dj <= 0; dn <= 0; pend <= 1'b0; rnd_r <= 0; sv1 <= 1'b0;
+      st1 <= 0; si1 <= 0; scnt <= 0; sm_start <= 1'b0; sm_ran <= 1'b0;
+      pcnt <= 0; wiss <= 1'b0; jj <= 0; dg <= 0; vaddr <= 0; u1 <= 1'b0;
+      f1 <= 1'b0; uA <= 1'b0; fA <= 1'b0; lastw <= 0; capd <= 0; dj2 <= 0;
+      dn2 <= 0; pend2 <= 1'b0; rq_vin <= 1'b0; rq_acc <= 0; rq_idx <= 0;
+      ocnt <= 0; o_valid <= 1'b0; o_index <= 0; o_data <= 0;
+      for (k = 0; k <= {fl}; k = k + 1) gp[k] <= 0;
+      for (k = 0; k < 4; k = k + 1) dgp[k] <= 0;
+      for (k = 0; k <= {rqsm}; k = k + 1) idx_pipe[k] <= 0;
+    end else begin
+      mclr <= 1'b0; sm_start <= 1'b0; rq_vin <= 1'b0; o_valid <= 1'b0;
+      sv1 <= 1'b0;
+      if (load_valid) begin
+        qbuf[lptr[{hdwm}:0]] <= load_data; lptr <= lptr + 1;
+      end
+
+      // Scores.
+      v1 <= issuing;
+      lastp <= {{lastp[{flm}:0], issuing && r == {hdm}}};
+      gp[0] <= g0;
+      for (k = 1; k <= {fl}; k = k + 1) gp[k] <= gp[k-1];
+      if (issuing) begin
+        if (r == {hdm}) begin issuing <= 1'b0; r <= 0; end
+        else r <= r + 1;
+      end
+      if (lastp[{fl}] || pend) begin
+        if (dj == dn) begin
+          pend <= 1'b0;
+          for (k = 0; k < {La}; k = k + 1) shadow[k] <= acc[k];
+          cap0 <= gp[{fl}]; dj <= 0;
+          dn <= (n_r - gp[{fl}] < {La}) ? n_r - gp[{fl}] : {La};
+          mclr <= 1'b1;
+          if (next0 < n_r) begin
+            g0 <= next0; kbase <= kbase + {hd}; issuing <= 1'b1;
+          end
+        end else pend <= 1'b1;
+      end
+      if (dj != dn) begin
+        st1 <= {tsc} + rnd_r; si1 <= cap0 + dj; sv1 <= 1'b1; dj <= dj + 1;
+      end
+      if (sv1) begin
+        if (shv > {awg1}'sd{smax}) sbuf[si1] <= {sw}'sd{smax};
+        else if (shv < -{awg1}'sd{smax1}) sbuf[si1] <= -{sw}'sd{smax1};
+        else sbuf[si1] <= shv[{swm}:0];
+        scnt <= scnt + 1;
+      end
+
+      // Weights.
+      if (sm_wv) begin pbuf[sm_wi] <= sm_wd; pcnt <= pcnt + 1; end
+
+      // Weighted sum.
+      u1 <= wiss; f1 <= wiss && jj == 0;
+      uA <= u1; fA <= f1;
+      lastw <= {{lastw[2:0], wiss && jj == n_r - 1}};
+      dgp[0] <= dg;
+      for (k = 1; k < 4; k = k + 1) dgp[k] <= dgp[k-1];
+      for (k = 0; k < {La}; k = k + 1) begin
+        if (u1) prod[k] <= $signed({{1'b0, p_r}}) * $signed(v_data[k*{dw} +: {dw}]);
+        if (uA) accw[k] <= fA ? prod[k] : accw[k] + prod[k];
+      end
+      if (wiss) begin
+        if (jj == n_r - 1) wiss <= 1'b0;
+        else begin jj <= jj + 1; vaddr <= vaddr + {ndg}; end
+      end
+      if (lastw[3] || pend2) begin
+        if (dj2 == dn2) begin
+          pend2 <= 1'b0;
+          for (k = 0; k < {La}; k = k + 1) shadow2[k] <= accw[k];
+          capd <= dgp[3]; dj2 <= 0; dn2 <= {La};
+          if (dg + 1 < {ndg}) begin
+            dg <= dg + 1; jj <= 0; vaddr <= dg + 1; wiss <= 1'b1;
+          end
+        end else pend2 <= 1'b1;
+      end
+      if (dj2 != dn2) begin
+        rq_acc <= {widen}; rq_idx <= capd * {La} + dj2; rq_vin <= 1'b1;
+        dj2 <= dj2 + 1;
+      end
+      idx_pipe[0] <= rq_idx;
+      for (k = 1; k <= {rqsm}; k = k + 1) idx_pipe[k] <= idx_pipe[k-1];
+      if (rq_vout) begin
+        o_valid <= 1'b1; o_index <= idx_pipe[{rqsm}]; o_data <= rq_q;
+        ocnt <= ocnt + 1;
+      end
+
+      case (st)
+        S_IDLE: if (start) begin
+          busy <= 1'b1; n_r <= n; st <= S_SCORE; rnd_r <= rnd_s;
+          issuing <= 1'b1; r <= 0; g0 <= 0; kbase <= 0; mclr <= 1'b1;
+          dj <= 0; dn <= 0; pend <= 1'b0; scnt <= 0; pcnt <= 0; ocnt <= 0;
+        end
+        S_SCORE: if (scnt == n_r && !sv1 && dj == dn) begin
+          sm_start <= 1'b1; sm_ran <= 1'b0; st <= S_SOFT;
+        end
+        S_SOFT: begin
+          if (sm_busy) sm_ran <= 1'b1;
+          if (sm_ran && !sm_busy && pcnt == n_r) begin
+            st <= S_WSUM; wiss <= 1'b1; jj <= 0; dg <= 0; vaddr <= 0;
+            dj2 <= 0; dn2 <= 0; pend2 <= 1'b0;
+          end
+        end
+        S_WSUM: if (ocnt == {hd}) begin
+          st <= S_IDLE; busy <= 1'b0; lptr <= 0;
+        end
+        default: st <= S_IDLE;
+      endcase
+    end
+  end
+endmodule
+""".format(dwm=dw - 1, nwm=nw - 1, mwm=mw - 1, shwm=shw - 1,
+           kawm=kaw - 1, vawm=vaw - 1, wdm=La * dw - 1, hdwm=hdw - 1,
+           hdwm1=hdw, hdm=hd - 1, hd=hd, swm=sw - 1, sw=sw, wwm=ww - 1,
+           capm=cap - 1, fl=fl, flm=fl - 1, awm=aw - 1, lam=La - 1, La=La,
+           kbyte=kbyte, lw=lw, lwm=lw - 1, awg=awg, awg1=awg + 1,
+           siwm=siw - 1, dgwm=dgw - 1, pwm=ww + dw, wswm=wsw - 1,
+           rqsm=rqs - 1, smax=smax, smax1=smax + 1, tsc=tsc, widen=widen,
+           ndg=ndg, dw=dw)
 
     def render_projn(self, spec, fixes):
         """N lanes of the generated MAC under one sequencer. A group of N

@@ -214,6 +214,14 @@ def write_proj_deps(ms, build):
             f.write(srcs[fn])
 
 
+ATTNN_JOB = {
+    "spec_file": "spec_attnn.json", "tb_file": "tb_attnn.v",
+    "rtl_file": "attnn.v", "profile_file": "attnn_profile.json",
+    "report_file": "report_attnn.json",
+    "derive_from_model": "attnn",
+    "extra_sources": ATTN_DEPS,
+}
+
 PROJN_DEPS = ("mac_dep.v", "rq_dep.v")
 PROJN_JOB = {
     "spec_file": "spec_projn.json", "tb_file": "tb_projn.v",
@@ -704,6 +712,7 @@ def derive_profile(spec, final):
         prof["d_model"] = spec["parameters"]["d_model"]
     elif unit == "head":
         prof["head"] = spec["name"]
+        prof["lanes"] = spec["parameters"].get("lanes", 1)
         prof["head_dim"] = spec["parameters"]["head_dim"]
         prof["capacity"] = spec["parameters"]["capacity"]
     elif unit == "row":
@@ -795,6 +804,10 @@ def run_flow(job=None, verbose=True, agent=None, max_iters=None):
                     specgen.derive_requant_spec(_ms), {FIX_SATURATE}))):
             with open(os.path.join(BUILD, _fn), "w") as f:
                 f.write(_src)
+    elif job.get("derive_from_model") == "attnn":
+        specgen.generate_attnn(spec_file=job["spec_file"],
+                               tb_file=job["tb_file"])
+        write_attn_deps(specgen.load_model_spec(), BUILD)
     elif job.get("derive_from_model") == "projn":
         specgen.generate_projn(spec_file=job["spec_file"],
                                tb_file=job["tb_file"])

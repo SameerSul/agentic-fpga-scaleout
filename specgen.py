@@ -2037,7 +2037,8 @@ def attn_golden(q, K, V, n, shift_s, scale_o, shift_o, p, sm_p):
     return t, s, w, a, o
 
 
-def render_attn_testbench(spec):
+def render_attn_testbench(spec, rows=((1, False), (3, False), (8, True),
+                                      (40, False))):
     """Rows chosen to exercise each part: one position (a weight of 1.0),
     a few, a clamped score, and enough to stress the weight sum."""
     sm_p = spec["derivation"]["softmax"]
@@ -2047,7 +2048,7 @@ def render_attn_testbench(spec):
     half = ((1 << dw) - 5) // 2
     rnd = random.Random(71)
     cases = []
-    for n, clamp in ((1, False), (3, False), (8, True), (40, False)):
+    for n, clamp in rows:
         q = [rnd.randrange(-half, half) for _ in range(hd)]
         K = [[rnd.randrange(-half, half) for _ in range(hd)] for _ in range(n)]
         V = [[rnd.randrange(-half, half) for _ in range(hd)] for _ in range(n)]
@@ -2233,6 +2234,100 @@ module tb_attn;
   end
 endmodule
 """
+
+
+def derive_attnn_spec(ms, board=None):
+    """model spec -> multi-lane attention head spec.
+
+    With the projection widened to the DDR, the single-lane head was the
+    slowest thing in a Qwen token: 14 heads by 24 layers, each reading
+    1024 cached positions twice, one multiply a cycle, about 44 million
+    cycles against the projections' 15. This head runs L lanes: for the
+    scores each lane takes one cached position, from a key word holding
+    element d of L consecutive positions; for the weighted sum each lane
+    takes one output dimension, from a value word holding L elements of
+    one position's row. The softmax between them stays one lane: it is
+    3n cycles against the 2*n*hd it used to wait behind.
+    """
+    base = derive_attn_spec(ms)
+    p = dict(base["parameters"])
+    hd, cap, dw = p["head_dim"], p["capacity"], p["data_width"]
+    La = min(derive_projn_spec(ms, board)["parameters"]["lanes"], hd)
+    kwords = -(-cap // La) * hd
+    vwords = cap * (hd // La)
+    p.update(lanes=La, word_width=La * dw,
+             k_addr_width=max(1, (kwords - 1).bit_length()),
+             v_addr_width=max(1, (vwords - 1).bit_length()),
+             mac_stages=derive_chiplet_spec(ms)["parameters"]
+             ["pipeline_stages"])
+    spec = dict(base)
+    spec.update(name="attnn%d_%s" % (La, ms["name"]), top_module="attnn",
+                description="Multi-lane attention head, %d lanes: scores "
+                            "for %d cached positions at once, the weighted "
+                            "sum for %d dimensions at once" % (La, La, La),
+                parameters=p)
+    ports = []
+    for q in base["ports"]:
+        q = dict(q)
+        if q["name"] == "k_addr":
+            q.update(width=p["k_addr_width"],
+                     desc="key word: element d of positions g*%d.. at "
+                          "g*%d + d" % (La, hd))
+        elif q["name"] == "v_addr":
+            q.update(width=p["v_addr_width"],
+                     desc="value word: row j, elements dg*%d.. at "
+                          "j*%d + dg" % (La, hd // La))
+        elif q["name"] in ("k_data", "v_data"):
+            q.update(width=La * dw, signed=False,
+                     desc="lane l in bits [%d*l+%d:%d*l], registered read"
+                          % (dw, dw - 1, dw))
+        ports.append(q)
+    spec["ports"] = ports
+    spec["behavior"] = list(base["behavior"]) + [
+        "Key words: word g*%d + d holds element d of positions g*%d + l "
+        "in lane l. Value words: word j*%d + dg holds V[j][dg*%d + l] in "
+        "lane l." % (hd, La, hd // La, La)]
+    return spec
+
+
+def render_attnn_testbench(spec, rows=None):
+    """The head's cases, its golden and its direct score and weight
+    checks, with wide key and value words built from the same memories."""
+    p = spec["parameters"]
+    La, dw, hd = p["lanes"], p["data_width"], p["head_dim"]
+    tb = (render_attn_testbench(spec, rows) if rows
+          else render_attn_testbench(spec))
+    rep = [
+        ("module tb_attn;", "module tb_attnn;"),
+        ("  wire [%d:0] k_addr, v_addr;" % (p["addr_width"] - 1),
+         "  wire [%d:0] k_addr;\n  wire [%d:0] v_addr;"
+         % (p["k_addr_width"] - 1, p["v_addr_width"] - 1)),
+        ("  reg signed [%d:0] k_data, v_data;" % (dw - 1),
+         "  reg [%d:0] k_data, v_data;\n  integer wl, ki;" % (La * dw - 1)),
+        ("    k_data <= kmem[k_addr];\n    v_data <= vmem[v_addr];",
+         "    for (wl = 0; wl < %d; wl = wl + 1) begin\n"
+         "      ki = ((k_addr / %d) * %d + wl) * %d + k_addr %% %d;\n"
+         "      k_data[wl * %d +: %d] <= (ki < %d) ? kmem[ki] : 0;\n"
+         "      v_data[wl * %d +: %d] <= vmem[v_addr * %d + wl];\n"
+         "    end" % (La, hd, La, hd, hd, dw, dw, p["capacity"] * hd,
+                      dw, dw, La)),
+        ("  attn dut (", "  attnn dut ("),
+    ]
+    for a_, b_ in rep:
+        assert a_ in tb, a_
+        tb = tb.replace(a_, b_)
+    return tb
+
+
+def generate_attnn(ms=None, spec_file="spec_attnn.json",
+                   tb_file="tb_attnn.v"):
+    ms = ms or load_model_spec()
+    spec = derive_attnn_spec(ms)
+    with open(os.path.join(ROOT, spec_file), "w") as f:
+        json.dump(spec, f, indent=2)
+    with open(os.path.join(ROOT, tb_file), "w") as f:
+        f.write(render_attnn_testbench(spec))
+    return spec
 
 
 def generate_attn(ms=None, spec_file="spec_attn.json", tb_file="tb_attn.v"):

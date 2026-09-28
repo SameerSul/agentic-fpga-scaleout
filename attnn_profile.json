@@ -1,0 +1,50 @@
+{
+  "block": "attnn32_qwen2_5_0p5b",
+  "top_module": "attnn",
+  "unit": "head",
+  "cycles_per_head": 244.75,
+  "latency_cycles": 340,
+  "cell_count": 246432,
+  "area": 548918.0,
+  "fmax_estimate_mhz": 112.35955056179775,
+  "fmax_method": "opensta_slack",
+  "target_clock_mhz": 100,
+  "sim_checks_passed": 364,
+  "fpga": {
+    "family": "xcup",
+    "luts": 6953,
+    "lutram": 16,
+    "ffs": 6291,
+    "dsps": 74,
+    "brams": 3,
+    "urams": 0,
+    "carry": 605,
+    "muxf": 1061
+  },
+  "derivation": {
+    "model": "qwen2_5_0p5b",
+    "softmax": {
+      "capacity": 256,
+      "index_width": 8,
+      "score_width": 13,
+      "score_in_width": 21,
+      "score_frac": 8,
+      "weight_width": 16,
+      "weight_frac": 15,
+      "exp_stages": 3,
+      "recip_stages": 3,
+      "recip_in_width": 26,
+      "recip_out_width": 17,
+      "shift_bias": 42,
+      "signed": true,
+      "pipeline_stages": 1,
+      "target_clock_mhz": 100
+    },
+    "rule": "head_dim from the model; capacity and the score and weight formats from the softmax block; the output requantizer and accumulator widths from the MAC and requantizer blocks"
+  },
+  "head": "attnn32_qwen2_5_0p5b",
+  "lanes": 32,
+  "head_dim": 64,
+  "capacity": 256,
+  "agent": "RuleBasedAgent"
+}

@@ -30,7 +30,7 @@ since Vivado's is the first real one.
 You give it a model spec, a small JSON file naming a transformer's
 dimensions and its quantization. It derives the hardware that model
 needs, writes the Verilog, and checks it with real tools until it passes.
-Twenty blocks come out, each one sized from the model rather than written
+Twenty-one blocks come out, each one sized from the model rather than written
 for it. Point it at a different model and every block re-derives.
 
 ## The picture
@@ -65,7 +65,7 @@ for it. Point it at a different model and every block re-derives.
                            re-simulated against the same testbench
 ```
 
-## The twenty blocks
+## The twenty-one blocks
 
 Arithmetic, bottom to top:
 
@@ -96,6 +96,7 @@ Sequencing, which is what makes the above into a layer:
    rope       rotary position embedding on q and k, one pair a cycle
    projn      32-lane projection over a 256-bit weight word, sized to
               the board's DDR bandwidth
+   attnn      32-lane attention head: positions, then dimensions
    proj       a full-size projection, 896 by 4864 here, over external
               activation and weight memories
 ```
@@ -203,6 +204,7 @@ Measured here with yosys against a generic library, for Qwen2.5-0.5B:
    proj       115 MHz   13989     1831 LUTs and 9 DSPs; its memories
                                   are outside it, on your part BRAM or DDR
    projn      115 MHz   67136     4516 LUTs and 40 DSPs, 32 lanes
+   attnn      112 MHz  246432     6953 LUTs and 74 DSPs, 32 lanes
    attn       115 MHz  132047     the score and weight buffers and the
                                   softmax's become flops here; on the
                                   FPGA they map to 3 BRAMs, 3265 LUTs
@@ -221,9 +223,9 @@ The Qwen-shaped decoder, two layers with RoPE and SwiGLU, is 8376 LUTs
 plus 164 as LUT RAM, 34 DSPs and 3 block RAMs on 7-series: it fits the
 Basys 3 too, at about 41% of its LUTs and 38% of its DSPs.
 
-A Zynq 7020 has 53200 LUTs and 220 DSPs. The eighteen Qwen-sized blocks map to
-25150 LUTs, LUT RAM included, and 121 DSPs on yosys's UltraScale+
-mapping, about 47% and 55% of the part, and that counts the composite blocks' sub-blocks twice.
+A Zynq 7020 has 53200 LUTs and 220 DSPs. The nineteen Qwen-sized blocks map to
+32119 LUTs, LUT RAM included, and 195 DSPs on yosys's UltraScale+
+mapping, about 60% and 89% of the part, and that counts the composite blocks' sub-blocks twice.
 These are about half what this file reported before: the resource count
 read every submodule table yosys printed after the top module's, then the
 hierarchy totals on top, so every composite block was counted about

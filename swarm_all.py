@@ -35,6 +35,7 @@ BLOCKS = [
     ("proj",     cf.PROJ_JOB),
     ("rope",     cf.ROPE_JOB),
     ("projn",    cf.PROJN_JOB),
+    ("attnn",    cf.ATTNN_JOB),
 ]
 
 

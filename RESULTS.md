@@ -31,7 +31,7 @@ The remaining gap is listed at the bottom rather than glossed over.
 ### The full suite
 
 ```
-python3 tests.py            # 339 tests, or 337 without OpenSTA
+python3 tests.py            # 342 tests, or 340 without OpenSTA
 ```
 
 ### Spec to RTL, across the spec space
@@ -559,6 +559,7 @@ Qwen2.5-0.5B:
 | residual add | not yet attempted | | |
 | full-size projection | not yet attempted | | |
 | multi-lane projection | not yet attempted | | |
+| multi-lane attention | not yet attempted | | |
 | decoder | not yet attempted | | |
 | rotary embedding | converged | 5 | Haiku |
 | Qwen-shaped decoder | not yet attempted | | |
@@ -863,10 +864,41 @@ and 40 DSPs. The rules agent's first cut wires each lane to the mirrored
 byte of the word and is caught.
 
 Carried to a whole Qwen2.5-0.5B token, the weight matmuls take about
-15.5 million cycles, 7.4 tokens/s at 115 MHz, so compute is no longer
-what binds: the DDR's 4 tokens/s is. The attention head is still one
-lane, and over a full 1024-token context it would take about 44 million
-cycles a token, so it is now the block to widen.
+15.5 million cycles, 7.4 tokens/s at 115 MHz, so the weight matmuls no
+longer bind: the DDR's 4 tokens/s does. The one-lane attention head was
+then the slowest block, and it is widened next.
+
+## Attention on lanes
+
+The multi-lane head runs 32 lanes on both of its matrix halves. For the
+scores, each lane is one cached position, an instance of the generated
+MAC reading its own lane of a key word that holds element d of 32
+consecutive positions; the sums drain through the one-lane head's score
+quantizer into the same score buffer. The softmax between the halves
+stays one lane. For the weighted sum each lane is one output dimension,
+reading its lane of a value word that holds 32 elements of one
+position's row, and the sums drain through the requantizer. On a full
+256-position row it matches the one-lane head bit for bit, its score and
+weight buffers checked directly as well as its outputs, in 1927 cycles
+against 34,851: 18 times fewer. 112 MHz, 6953 LUTs and 74 DSPs. The rules
+agent's first cut reads each position's key from the mirrored lane and
+fails at the score buffer. All six model variants converge and kill every
+applicable mutant. The first sweep of it reported one mutant as unproven
+on every variant, and the hole was in the tooling: the adder mutant
+flipped the first ' + ' in the file, which here was in a comment, so it
+changed nothing and the prover timed out on a design that large. It now
+edits code only; SiLU had the same comment ahead of its first addition,
+and both blocks now kill a mutant on a real add.
+
+With both halves widened, a Qwen2.5-0.5B token at 256 positions adds up,
+from measured block cycles, to about 16.5 million cycles: 15.5 million in
+the projections, 0.65 million in 336 heads and about 0.3 million in the
+norms, adds and activations. That is 6.8 tokens/s of compute at 112 MHz,
+above the 4 the Zybo's DDR can feed, so one board is bandwidth bound, as
+the sizing model assumes. Two limits stand: the head holds 256 positions,
+the softmax's row tile, so Qwen's 1024-token context needs row tiling
+that does not exist, and those cycles are summed per block rather than
+run as one sequence at that size.
 
 ## Cycle counts are measured, not assumed
 
@@ -993,7 +1025,10 @@ These are the distance between this repo and a local LLM host.
 4. **Throughput is predicted, not measured.** tokens/s comes from a sizing
    model checked against a fabric simulation, agreeing within 15% and at
    ratio 1.00 on the current configuration. Both are models. Neither is a
-   board.
+   board. The one RTL-grounded number is the compute side: measured
+   cycles of the multi-lane blocks, summed for a Qwen2.5-0.5B token at
+   256 positions, give 6.8 tokens/s at 112 MHz, above the DDR bound, so
+   the sizing model's premise that one board is bandwidth bound holds.
 
 5. **Formal coverage is one property of one block.** The accumulator
    proof holds for the int8 targets; with 16-bit operands the MAC splits

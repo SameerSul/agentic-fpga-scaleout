@@ -61,10 +61,14 @@ def _sub_first_real_add(src):
     out = []
     done = False
     for line in src.splitlines(True):
-        if (not done and " + " in line
-                and "for (" not in line.replace("for(", "for (")
-                and not re.search(r"\b(\w+)\s*=\s*\1\s*\+\s*1\b", line)):
-            line = line.replace(" + ", " - ", 1)
+        # Only code counts: a '+' in a comment made the attention head's
+        # mutant a comment edit, which no testbench can kill and which the
+        # prover then timed out on, reported as an unproven hole.
+        code = line.split("//", 1)[0]
+        if (not done and " + " in code
+                and "for (" not in code.replace("for(", "for (")
+                and not re.search(r"\b(\w+)\s*=\s*\1\s*\+\s*1\b", code)):
+            line = code.replace(" + ", " - ", 1) + line[len(code):]
             done = True
         out.append(line)
     return "".join(out)
