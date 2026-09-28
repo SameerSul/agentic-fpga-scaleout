@@ -1,8 +1,22 @@
-# Board handoff: fpgAI on the Zybo Z7-20
+# Board handoff: fpgAI on a Zynq board
 
-For whoever has the team's Zybo Z7-20 and an x86 machine. Everything up
-to the board has been generated and simulated in this repo; this is the
-part that needs the hardware. Nothing below needs this repo's author.
+For whoever has one of the boards and an x86 machine: the Zybo Z7-20 or
+the ZC706, the two with a generated package. Everything up to the board
+has been generated and simulated in this repo; this is the part that
+needs the hardware. Nothing below needs this repo's author.
+
+| | Zybo Z7-20 | ZC706 |
+|---|---|---|
+| package | `board_zybo/` | `board_zc706/` (`python3 board_zybo.py --board zc706`) |
+| part | XC7Z020-1CLG400 | XC7Z045-2FFG900 |
+| Vivado board preset | Digilent's board files | ships with Vivado |
+| Vivado license | free edition | the ZC706 kit's device-locked license (the XC7Z045 is not in the free edition), or the open flow below |
+| open flow, post-route | core 53.4, bus 50.9 MHz | core 68.0, bus 52.8 MHz |
+| boot from JTAG | JP5 to JTAG | SW11 boot mode to JTAG (UG954) |
+| USB-UART | the PROG/UART micro-USB | J21 |
+| busy LED | LD0 | none driven (STATUS register instead) |
+
+Below, `board_<name>/` is whichever package matches the board.
 
 ## What is already verified, and what is not
 
@@ -12,19 +26,21 @@ part that needs the hardware. Nothing below needs this repo's author.
 | the generated sequencer, 24 layers + head, in iverilog | chooses " Paris", the integer model's token |
 | the Zybo top level (`board_zybo/rtl/fpgai_zybo.v`) driven only through its AXI-Lite registers, DDR model with random stalls | all 24 layers + head: " Paris", same core cycles, 1.18 bus cycles per core cycle |
 | fits the XC7Z020 (Yosys) | 33169 LUTs + 7380 LUT RAM, 148 DSPs, 36 BRAMs |
-| places and routes on the XC7Z020 in the open flow (nextpnr-xilinx) | closes 50 MHz: core 53.4, bus 50.9 MHz; bitstream round-trips |
+| places and routes in the open flow (nextpnr-xilinx), XC7Z020 and XC7Z045 | both close 50 MHz; the Zybo bitstream round-trips frame for frame |
+| several boards on their own clocks, each a stage of layers (`gals.py`, simulated) | two and three stages over fabric UARTs give one board's tokens and logits exactly |
 | Vivado block design, Vivado timing, the ARM program | **not run** |
 | the board | **not run** |
 
 ## What you need
 
-- x86 Linux or Windows with Vivado and Vitis 2020.2 or later. The free
-  edition covers the XC7Z020.
-- Digilent's board files, so Vivado knows the Zybo's DDR and MIO:
+- x86 Linux or Windows with Vivado and Vitis 2020.2 or later, licensed
+  for the board's part (table above).
+- For the Zybo, Digilent's board files, so Vivado knows its DDR and MIO:
   <https://github.com/Digilent/vivado-boards>, copied into
-  `<Vivado>/data/boards/board_files/`.
-- The Zybo Z7-20, a micro-USB cable, a microSD card of 1 GB or more
-  formatted FAT32.
+  `<Vivado>/data/boards/board_files/`. The ZC706's preset ships with
+  Vivado.
+- The board, its USB cable, a microSD card of 1 GB or more formatted
+  FAT32.
 - Python 3 (standard library only), `iverilog` only if you want to rerun
   the simulations.
 
@@ -38,6 +54,7 @@ that the bitstream's layout registers match its header before it runs.
 python3 fetch_qwen.py                      # Qwen2.5-0.5B, ~1 GB, into qwen_weights/
 python3 qwen_full.py --no-sim --work build_qfull   # quantize, write weights.bin, cparams.hex, gains.hex
 python3 board_zybo.py                      # board_zybo/, including board_zybo/sd/
+python3 board_zybo.py --board zc706        # or board_zc706/, for the ZC706
 ```
 
 `board_zybo/sd/` then holds `weights8.bin` (494 MB), `cparams.bin`,
@@ -48,7 +65,7 @@ disagree, and the committed one is what was simulated.
 ## 2. Build the bitstream and the platform
 
 ```bash
-cd board_zybo
+cd board_zybo          # or board_zc706
 vivado -mode batch -source build.tcl
 ```
 
@@ -124,3 +141,32 @@ last line prints the core and bus cycles of the last step.
 | hangs after loading, LD0 lit | the core is waiting on memory: an AXI connection in the block design is wrong (check the address map: every master must see DDR at 0x00000000) |
 | hangs, LD0 dark | the start never reached the core: check the GP0 connection and the register base 0x43C00000 |
 | different tokens | send the log: the position where it first differs says which block |
+
+## Several boards
+
+Any set of the boards can share one model, each running its own clock
+and a contiguous range of layers, passing the hidden state on as
+messages. Plan the split, then write one package per board:
+
+```bash
+python3 cluster.py zc706 zybo_z7_20                   # which layers where, and each link
+FPGAI_QWEN=qwen3 python3 cluster.py zc706 zybo_z7_20 --package build_cluster
+```
+
+`build_cluster/stage<i>_<board>/` is each board's package, built and
+run exactly as above, with two differences:
+
+- its ARM program talks UDP, so create the Vitis application from the
+  **lwIP Echo Server** template (it brings the lwIP BSP and
+  `platform_zynq.c`), then replace the template's `main.c` with the
+  package's `sw/main.c` and add `sw/fpgai_layout.h`; keep `xilffs`
+  enabled;
+- the boards need to be on one Ethernet segment: a switch, or a direct
+  cable for two. Stage i is 192.168.1.(10+i), UDP port 5000, set in each
+  package's `fpgai_layout.h`.
+
+Start the later stages first; stage 0 holds the prompt, prints the text
+on its UART and waits for each token to come back from the last stage.
+A board with no ARM would take the fabric UART link instead
+(`gals.py`'s `stage_ctrl`), but none of those boards can hold a layer
+yet: they have no DRAM this design reaches.

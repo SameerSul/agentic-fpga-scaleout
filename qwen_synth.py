@@ -6,7 +6,9 @@ and a hidden size of 64, in either Qwen's style: "qwen3" (no biases, q
 wider than the hidden state, RMSNorm on every head of q and k) or
 "qwen2.5" (q, k and v biases, head_dim = hidden / heads). The integer
 model is calibrated on its own float run, so qwen_full.build_model can
-generate and simulate the same sequencer on it in seconds.
+generate and simulate the same sequencer on it in seconds. The
+vocabulary is more than twice the MLP width, so the head runs in several
+chunks with a short last one, as the real vocabularies do.
 """
 import array
 import random
@@ -15,9 +17,9 @@ import qwen_int as qi
 import qwen_real as qr
 
 
-def config(style="qwen3"):
+def config(style="qwen3", nl=2):
     c = {"hidden_size": 64, "intermediate_size": 256, "num_attention_heads": 4,
-         "num_key_value_heads": 2, "num_hidden_layers": 2, "vocab_size": 160,
+         "num_key_value_heads": 2, "num_hidden_layers": nl, "vocab_size": 600,
          "rms_norm_eps": 1e-6, "rope_theta": 1000000.0}
     if style == "qwen3":
         c["head_dim"] = 32
@@ -67,9 +69,9 @@ class _Ids:
         return self.ids
 
 
-def model(style="qwen3", seed=5):
+def model(style="qwen3", seed=5, nl=2):
     """(integer model, float model) for a synthetic checkpoint."""
-    cfg = config(style)
+    cfg = config(style, nl)
     W = weights(cfg, style, seed)
     rnd = random.Random(seed + 1)
     calib = [rnd.randrange(cfg["vocab_size"]) for _ in range(12)]

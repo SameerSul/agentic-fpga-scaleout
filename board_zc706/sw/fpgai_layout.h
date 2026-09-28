@@ -28,5 +28,5 @@
 #define MAX_POS         256
 #define N_GEN           16
 #define CORE_MHZ        50
-#define FPGAI_BOARD     "Zybo Z7-20"
+#define FPGAI_BOARD     "ZC706"
 #endif

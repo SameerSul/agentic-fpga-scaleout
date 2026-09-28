@@ -53,6 +53,26 @@ BOARDS = {
         "link_ports": 1,
         "num_links": 1,
     },
+    # ZC706 (AMD evaluation kit), Zynq XC7Z045-2: Kintex-class fabric
+    # beside the same dual Cortex-A9. The PL reaches the PS's 1 GB of
+    # DDR3 through the same four HP ports as the Zybo, so the figure worth
+    # sizing against is the same; its second 1 GB, a SODIMM on the PL,
+    # needs a memory controller in the fabric that is not written here.
+    "zc706": {
+        "name": "zc706",
+        "class": "ZC706 (Zynq XC7Z045)",
+        "family": "xc7",
+        "price_usd": 2500,
+        "luts": 218600, "ffs": 437200, "dsps": 900,
+        "sram_bytes": 2452500,         # 545 BRAM36
+        "max_chiplet_clock_mhz": 250.0,
+        "mem_gbytes_per_s": 2.0,
+        "dram_gbytes": 1.0,
+        "serdes_line_gbps": 10.3125,   # GTX, one SFP+ cage
+        "eth_line_gbps": 1.0,          # the PS's Gigabit Ethernet
+        "link_ports": 1,
+        "num_links": 1,
+    },
     "arty_a7_100t": {
         "name": "arty_a7_100t",
         "class": "Arty A7-100T (Artix-7 XC7A100T)",
@@ -229,3 +249,51 @@ def fit(board, chiplet_profile, fabric_profile=None,
         "mem_bytes_per_ns": board["mem_gbytes_per_s"],
         "sram_bytes": board["sram_bytes"],
     }
+
+
+# What a board package needs beyond the sizing figures above. A board
+# with a PS7 (every Zynq) is driven by its ARM, and boards talk over its
+# Gigabit Ethernet; a board without one has no processor to run a network
+# stack, so it takes the portable default instead, a UART in the fabric
+# on two spare pins, which any FPGA can do. "ddr" is how the design
+# reaches DRAM: "ps7" through the HP ports; None where only a controller
+# in the fabric (MIG or LiteDRAM) could, which is not written yet, so the
+# board cannot hold a layer's weights.
+PACKAGES = {
+    "zybo_z7_20": {
+        "title": "Zybo Z7-20", "part": "xc7z020clg400-1", "chip": "xc7z020",
+        "vivado_board": "*zybo-z7-20*",
+        "board_files": "Digilent's board files (github.com/Digilent/vivado-boards)",
+        "led": ("M14", "LVCMOS33", "LD0"), "ps7": True, "ddr": "ps7",
+        "ddr_bytes": 1 << 30, "link": "ethernet", "out": "board_zybo",
+        "license": "the free edition covers the XC7Z020",
+        "boot": "set the boot jumper (JP5) to JTAG",
+        "uart": "the micro-USB port (PROG/UART)",
+    },
+    "zc706": {
+        "title": "ZC706", "part": "xc7z045ffg900-2", "chip": "xc7z045",
+        "vivado_board": "*zc706*",
+        "board_files": "Vivado's own board files (the ZC706 preset ships with it)",
+        # Its user LEDs sit in banks of more than one voltage; rather than
+        # guess an IOSTANDARD, the package drives none, and STATUS says
+        # the same thing over the registers.
+        "led": None, "ps7": True, "ddr": "ps7",
+        "ddr_bytes": 1 << 30, "link": "ethernet", "out": "board_zc706",
+        "license": "the XC7Z045 is not in the free edition: use the ZC706 "
+                   "kit's device-locked license, or the open flow in open/",
+        "boot": "set the boot-mode switch (SW11) to JTAG, per UG954",
+        "uart": "the USB-UART port (J21)",
+    },
+    "arty_a7_100t": {
+        "title": "Arty A7-100T", "part": "xc7a100tcsg324-1", "chip": "xc7a100t",
+        "led": None, "ps7": False, "ddr": None, "ddr_bytes": 256 << 20,
+        "link": "uart", "out": "board_arty",
+    },
+}
+
+
+def link_between(a, b):
+    """How two boards talk: Ethernet when both have an ARM to run it,
+    otherwise the fabric UART, which both ends can always build."""
+    pa, pb = PACKAGES[a], PACKAGES[b]
+    return "ethernet" if pa["link"] == pb["link"] == "ethernet" else "uart"

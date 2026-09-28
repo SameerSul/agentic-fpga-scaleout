@@ -196,6 +196,9 @@ python3 zybo.py                    # the same core on a 64-bit AXI3 DDR bus, clo
 python3 board_zybo.py              # the Zybo Z7-20 package in board_zybo/: PL top, Vivado block design, ARM code, SD files
 python3 board_zybo.py --work build_qfull1 --out build_bz1 --sim --jitter   # one layer through its registers
 board_zybo/open/build_open.sh      # the Zybo bitstream without Vivado (openXC7); routes at 50 MHz on the XC7Z020
+python3 board_zybo.py --board zc706 # the same package for the ZC706 (XC7Z045); its open/ build routes at 50 MHz too
+python3 cluster.py zc706 zybo_z7_20 # split the model over any set of boards: layers per board, and each link
+python3 gals.py                    # boards on their own clocks over fabric UARTs, simulated: one board's tokens
 python3 fetch_qwen.py --model qwen3  # Qwen3-0.6B, ~1.5 GB; FPGAI_QWEN=qwen3 selects it everywhere
 python3 bitstream.py --block mac   # place, route and pack a real iCE40 bitstream (needs nextpnr-ice40)
 python3 dv.py --rtl build/mac.v --tb tb_mac.v   # mutation-test a generated testbench
@@ -475,7 +478,8 @@ checked against another model. Read that list before quoting any number here.
 | input | what it holds | where it is used |
 |---|---|---|
 | `model_spec.json` | the model's shape and number formats: layers, hidden size, MLP size, heads and KV heads, head dimension, vocabulary, weight and activation bits, context length, RoPE base, target tokens/s | every derived spec, the sizing model |
-| `boards.py` | each board's resources (LUTs, flip-flops, DSPs, on-chip RAM), DDR bandwidth and size, clock cap, link rates | lane counts, fit checks, the sizing model |
+| `boards.py` | each board's resources (LUTs, flip-flops, DSPs, on-chip RAM), DDR bandwidth and size, clock cap, link rates; and for the boards a package can be built for (Zybo Z7-20, ZC706), the part, Vivado preset, pins, and whether it has an ARM | lane counts, fit checks, the sizing model, the board packages, the multi-board split |
+| a board list, optional | the boards on hand, in chain order, e.g. `zc706 zybo_z7_20` | the multi-board split (`cluster.py`) |
 | a checkpoint, optional | real weights, tokenizer and `config.json` from `fetch_qwen.py` (Qwen2.5-0.5B, or Qwen3-0.6B with `FPGAI_QWEN=qwen3`) | the integer model, the full-size sequencer, the SD image |
 | a prompt | text, tokenized with the checkpoint's own BPE | the decode, in simulation and on the board |
 
@@ -508,13 +512,23 @@ checked against another model. Read that list before quoting any number here.
    argmax over the full vocabulary, and writes the weight, constant and
    gain images it reads. Simulated on the real weights, it has to choose
    the integer model's tokens.
-6. **The board** (`zybo.py`, `board_zybo.py`). A DDR bridge puts the
-   sequencer on the Zynq's memory ports (four weight streams, one port
-   for constants and the KV cache, the core clock held while a line is
-   in flight), an AXI-Lite register block lets the ARM run it, and the
-   package adds the Vivado block design, an open-flow build
-   (`board_zybo/open/`), the bare-metal ARM program and the SD card
-   files. `HANDOFF.md` is the bring-up.
+6. **The board** (`zybo.py`, `board_zybo.py --board zybo_z7_20|zc706`).
+   A DDR bridge puts the sequencer on the Zynq's memory ports (four
+   weight streams, one port for constants and the KV cache, the core
+   clock held while a line is in flight), an AXI-Lite register block
+   lets the ARM run it, and the package adds the Vivado block design, an
+   open-flow build (`open/`: Yosys, nextpnr-xilinx and Project X-Ray, no
+   Vivado), the bare-metal ARM program and the SD card files.
+   `HANDOFF.md` is the bring-up.
+7. **Several boards** (`cluster.py`, `gals.py`). The boards run as GALS
+   stages: each on its own clock, a contiguous range of layers each,
+   sharing nothing but CRC-checked messages, the hidden state down the
+   chain and the chosen token back. `cluster.py` splits the layers by
+   each board's speed and memory and picks each link: UDP over the ARM's
+   Ethernet between Zynq boards, and otherwise a UART in the fabric on
+   two pins, which any FPGA can build. `cluster.py --package` writes
+   every stage's board package; each stage's sequencer gains a port to
+   load and read the hidden state, and its ARM program the network.
 
 ### Outputs
 
@@ -522,5 +536,6 @@ checked against another model. Read that list before quoting any number here.
 |---|---|
 | `build*/`, `chiplet_profile.json`, `fabric_profile.json` | per-block RTL that passed every gate, with measured cycles, timing and resources |
 | `build_qfull/qwen_full.v` and its images | the full decode step as one RTL design, with `weights.bin`, `cparams.hex` and `gains.hex` |
-| `board_zybo/` | the board package: RTL, `build.tcl`, `open/build_open.sh` (a bitstream without Vivado), `sw/main.c`, and `sd/` (the model, 494 MB) |
+| `board_zybo/`, `board_zc706/` | one board's package: RTL, `build.tcl`, `open/build_open.sh` (a bitstream without Vivado), `sw/main.c`, and `sd/` (the model, 494 MB) |
+| `cluster.py --package DIR` | one package a stage, `DIR/stage<i>_<board>/`, each with its layers, its images, and an ARM program that knows its neighbours' addresses; `plan.json` records the split |
 | on the board | generated text over the USB-UART: `The capital of France is Paris. Paris is the capital of France. ...`, the integer model's tokens; RTL simulation has checked the first one, " Paris", through all 24 layers and the head |

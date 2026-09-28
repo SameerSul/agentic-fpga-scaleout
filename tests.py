@@ -26,6 +26,7 @@ import specgen as specgen_mod
 from specgen import (derive_chiplet_spec, derive_endpoint_spec,
                      endpoint_options, generate, crc_matrix)
 from boards import BOARDS, fit, TRANSPORTS
+import boards as boards_mod
 from fpga import synth_fpga
 from fabric import make_cluster, fabric_stats, mm, relu, RX_CAP
 from collectives import ring_allreduce, run_workers
@@ -1945,6 +1946,206 @@ def test_full_sequencer_both_qwens():
             shutil.rmtree(work, ignore_errors=True)
 
 
+def test_gals_two_boards():
+    """Boards on their own clocks, 10, 7.9 and 12.3 ns, whose UART bit
+    times differ by up to 1.25%, each running a stage of the model: layer
+    0 with the embedding, a middle layer with no vocabulary table at all,
+    then the last layer and the head. They share nothing but CRC-checked
+    messages, the hidden state down the chain and the token back to a
+    host at its own rate. With two boards and with three, every token and
+    logit has to be the one-board integer model's, the links must see no
+    CRC error, and a link that sends the hidden state's bytes swapped is
+    caught."""
+    import gals, qwen_synth
+    ids = [3, 77, 12, 140]
+    work = os.path.join(ROOT, 'build_galstest')
+    for nl, split, mut in (
+            (2, [[0], [1]], None),
+            (3, [[0], [1], [2]], None),
+            (2, [[0], [1]], ("tbyte = tx_hid ? (ti[0] ? x_rdata[7:0] : x_rdata[15:8])",
+                             "tbyte = tx_hid ? (ti[0] ? x_rdata[15:8] : x_rdata[7:0])"))):
+        shutil.rmtree(work, ignore_errors=True)
+        try:
+            im, _ = qwen_synth.model('qwen3', nl=nl)
+            want, srcs = gals.build(im, ids, 3, work, split)
+            im.reset()
+            best = []
+            for p in range(len(want) - 1):
+                lg = im.step(want[p], p, logits=p >= len(ids) - 1)
+                if lg is not None:
+                    best.append((max(range(len(lg)), key=lg.__getitem__), max(lg)))
+            if mut:
+                path = os.path.join(work, 'stage_ctrl.v')
+                src = open(path).read()
+                assert mut[0] in src
+                open(path, 'w').write(src.replace(mut[0], mut[1]))
+            out = gals.run(work, srcs, timeout=900)
+            got = [(int(l.split('tok=')[1].split()[0]), int(l.split('best=')[1].split()[0]))
+                   for l in out.splitlines() if l.startswith('TOKEN')]
+            if mut:
+                check('a link that swaps the hidden state bytes is caught',
+                      len(got) == len(best) and got != best)
+            else:
+                check('%d boards on their own clocks give one board\'s tokens' % len(split),
+                      got == best and len(best) == 3 and 'LINK crc_errors=0 host_bad=0' in out)
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+
+
+def test_cluster_plan():
+    """The partitioner, on mixes of the boards it knows: every layer on
+    exactly one board, in order; no board past its DDR; the tied table on
+    the first and last stage; Ethernet only where both ends have an ARM;
+    a board with no reachable DRAM left out; and a split that cannot fit
+    refused rather than overfilled."""
+    import cluster
+    ok = True
+    for names, model in ((['zc706'], 'qwen3'), (['zc706', 'zybo_z7_20'], 'qwen3'),
+                         (['zybo_z7_20', 'zc706', 'arty_a7_100t'], 'qwen2.5')):
+        for mode in ('balanced', 'fast'):
+            p = cluster.plan(names, model, mode)
+            m = cluster.MODELS[model]
+            sb = cluster.shape_bytes(m)
+            got = []
+            for i, st in enumerate(p['stages']):
+                got += list(range(*st['layers']))
+                n = st['layers'][1] - st['layers'][0]
+                table = sb['table'] if (st['emb'] or st['head']) else 0
+                ok &= n * sb['layer'] + table <= cluster.capacity(st['board'])
+                ok &= st['emb'] == (i == 0) and st['head'] == (i == len(p['stages']) - 1)
+            ok &= got == list(range(m['NL']))
+            ok &= 'arty_a7_100t' not in [s['board'] for s in p['stages']]
+            for l in p['links']:
+                ok &= l['kind'] == ('ethernet' if boards_mod.PACKAGES[l['src']]['ps7']
+                                    and boards_mod.PACKAGES[l['dst']]['ps7'] else 'uart')
+    check('the partitioner places every layer once, within every DDR', ok)
+    two = cluster.plan(['zc706', 'zybo_z7_20'], 'qwen3', 'balanced')
+    check('a balanced split over two boards uses both, over Ethernet',
+          len(two['stages']) == 2 and all(l['kind'] == 'ethernet' for l in two['links']))
+    try:
+        cluster.plan(['arty_a7_100t'], 'qwen3')
+        refused = False
+    except ValueError:
+        refused = True
+    check('a board set that cannot hold the model is refused', refused)
+
+
+def test_zybo_stage_registers():
+    """A pipeline stage's register block around a stub core whose clock
+    ticks one bus cycle in four: eight hidden-state words written through
+    XADDR and XDATA have to read back through them, land in the core, and
+    be what a start with CTRL bit 2 clear computes from; STAGE has to say
+    which layers the bitstream holds."""
+    import board_zybo as bz
+    L = dict(W=dict(tok=18, pos=8, x_addr=4), wb=0x08000000, cb=0x25714000,
+             kb=0x25BB8000, vb=0x25D38000, end=0x25EB8000,
+             stage=dict(l0=14, l1=28, emb=0, head=1))
+    work = os.path.join(ROOT, 'build_zstagetest')
+    shutil.rmtree(work, ignore_errors=True)
+    os.makedirs(work)
+    wp = ''.join('  output [31:0] w%d_araddr, output [3:0] w%d_arlen, output w%d_arvalid,\n'
+                 '  input w%d_arready, input [63:0] w%d_rdata, input w%d_rvalid,\n'
+                 '  input w%d_rlast, output w%d_rready,\n' % ((p,) * 8) for p in range(4))
+    wt = ''.join('  assign w%d_araddr = 0; assign w%d_arlen = 0; assign w%d_arvalid = 0;'
+                 ' assign w%d_rready = 1;\n' % ((p,) * 4) for p in range(4))
+    stub = """module qwen_zybo (input clk, input rst_n, input start, input head_en,
+  input [17:0] tok, input [7:0] pos, output reg [17:0] next_tok,
+  output reg signed [15:0] best, output reg done, output reg busy,
+  input emb_en, input x_we, input [3:0] x_addr, input signed [15:0] x_wdata,
+  output reg signed [15:0] x_rdata,
+%s  output [31:0] araddr, output [3:0] arlen, output arvalid, input arready,
+  input [63:0] rdata, input rvalid, input rlast, output rready,
+  output [31:0] awaddr, output [3:0] awlen, output awvalid, input awready,
+  output [63:0] wdata, output [7:0] wstrb, output wlast, output wvalid,
+  input wready, input bvalid, output bready, output reg [31:0] core_cycles);
+%s  assign araddr = 0; assign arlen = 0; assign arvalid = 0; assign rready = 1;
+  assign awaddr = 0; assign awlen = 0; assign awvalid = 0; assign wdata = 0;
+  assign wstrb = 0; assign wlast = 0; assign wvalid = 0; assign bready = 1;
+  reg signed [15:0] xm [0:15];
+  reg [1:0] ph; reg [7:0] left; reg emb_seen; integer i; reg signed [17:0] sum;
+  always @(posedge clk) begin
+    if (!rst_n) begin ph <= 0; busy <= 0; done <= 0; core_cycles <= 0; end
+    else begin
+      ph <= ph + 1;
+      if (ph == 0) begin   // one core edge in four bus cycles
+        core_cycles <= core_cycles + 1; done <= 1'b0;
+        if (!busy && x_we) xm[x_addr] <= x_wdata;
+        x_rdata <= xm[x_addr];
+        if (!busy && start) begin busy <= 1'b1; left <= 12; emb_seen <= emb_en; end
+        else if (busy && left == 0) begin
+          sum = 0; for (i = 0; i < 8; i = i + 1) sum = sum + xm[i];
+          busy <= 1'b0; done <= 1'b1; next_tok <= sum; best <= {15'd0, emb_seen};
+        end else if (busy) left <= left - 1;
+      end
+    end
+  end
+endmodule
+""" % (wp, wt)
+    tasks = bz.STEP[:bz.STEP.index('  task expect_reg')].replace('%%', '%').replace(
+        'input [5:0] a', 'input [6:0] a')
+    vals = [37 * i - 100 for i in range(8)]
+    tb = """`timescale 1ns/1ps
+module tb;
+  reg clk = 0, rst_n = 0;
+  always #5 clk = ~clk;
+  reg [6:0] s_awaddr = 0, s_araddr = 0; reg [31:0] s_wdata = 0;
+  reg s_awvalid = 0, s_wvalid = 0, s_arvalid = 0, s_bready = 0, s_rready = 0;
+  wire s_awready, s_wready, s_bvalid, s_arready, s_rvalid;
+  wire [1:0] s_bresp, s_rresp; wire [31:0] s_rdata;
+  fpgai_zybo dut (.aclk(clk), .aresetn(rst_n),
+    .s_axi_awaddr(s_awaddr), .s_axi_awvalid(s_awvalid), .s_axi_awready(s_awready),
+    .s_axi_wdata(s_wdata), .s_axi_wstrb(4'hf), .s_axi_wvalid(s_wvalid),
+    .s_axi_wready(s_wready), .s_axi_bresp(s_bresp), .s_axi_bvalid(s_bvalid),
+    .s_axi_bready(s_bready), .s_axi_araddr(s_araddr), .s_axi_arvalid(s_arvalid),
+    .s_axi_arready(s_arready), .s_axi_rdata(s_rdata), .s_axi_rresp(s_rresp),
+    .s_axi_rvalid(s_rvalid), .s_axi_rready(s_rready));
+%s  integer bad = 0, j;
+  task want(input [6:0] a, input [31:0] v);
+    begin rd(a); if (rv !== v) begin bad = bad + 1;
+      $display("reg %%h = %%h, want %%h", a, rv, v); end end
+  endtask
+  initial begin #200000; $display("TB_RESULT: FAIL, timed out"); $finish; end
+  initial begin
+    repeat (4) @(negedge clk); rst_n = 1;
+    want(7'h40, 32'h%08x);
+    wr(7'h38, 0);
+%s
+    want(7'h38, 8);
+    wr(7'h38, 0);
+%s
+    wr(7'h00, 1);            // start, embedding off: from the loaded state
+    rv = 0; while (!rv[1]) rd(7'h0c);
+    want(7'h10, %d); want(7'h14, 0);
+    wr(7'h00, 5);            // start with the embedding
+    rv = 0; while (!rv[1]) rd(7'h0c);
+    want(7'h14, 1); want(7'h00, 4);
+    if (bad) $display("TB_RESULT: FAIL"); else $display("TB_RESULT: PASS");
+    $finish;
+  end
+endmodule
+""" % (tasks, 14 | 28 << 8 | 1 << 17,
+       "\n".join("    wr(7'h3c, 32'h%08x);" % (v & 0xffffffff) for v in vals),
+       "\n".join("    want(7'h3c, 32'h%08x);" % (v & 0xffffffff) for v in vals),
+       sum(vals) & 0x3ffff)
+    try:
+        open(os.path.join(work, 'fpgai_zybo.v'), 'w').write(bz.render_wrapper(L))
+        open(os.path.join(work, 'stub.v'), 'w').write(stub)
+        open(os.path.join(work, 'tb.v'), 'w').write(tb)
+        r = subprocess.run(['iverilog', '-g2005', '-o', 'z.out', 'tb.v',
+                            'fpgai_zybo.v', 'stub.v'], cwd=work,
+                           capture_output=True, text=True)
+        out = r.stdout + r.stderr
+        if not r.returncode:
+            out = subprocess.run(['vvp', 'z.out'], cwd=work, capture_output=True,
+                                 text=True, timeout=120).stdout
+        if 'TB_RESULT: PASS' not in out:
+            print(out[-1500:])
+        check('a stage loads and reads its hidden state through the registers',
+              'TB_RESULT: PASS' in out)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
 def test_multi_lane_attention():
     """Lanes over cached positions for the scores and over dimensions for
     the weighted sum. On a full 256-position row it has to match the
@@ -2788,6 +2989,9 @@ if __name__ == '__main__':
     test_zybo_register_block()
     test_weight_streamer_survives_stalls()
     test_full_sequencer_both_qwens()
+    test_gals_two_boards()
+    test_cluster_plan()
+    test_zybo_stage_registers()
     test_composite_cell_count()
     test_requant_golden_is_shared()
     test_table_unit_specs_are_implementable()

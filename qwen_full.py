@@ -41,7 +41,16 @@ import specgen
 ROOT = os.path.dirname(os.path.abspath(__file__))
 WORK = os.path.join(ROOT, "build_qfull")
 N = 16                       # projection lanes at 16-bit data
-CHUNK = 4864                 # head columns per projection call
+
+
+def head_chunk(im):
+    """Head columns per projection call: the widest matrix the model's
+    projection block is sized for. A fixed 4864, Qwen2.5's MLP width,
+    overflowed Qwen3's 12-bit column port (it sizes for 3072): the block
+    ran 768 columns and the sequencer waited for 4864, for good."""
+    c = max(im.D, im.F)
+    assert im.H * im.hd <= c and c % N == 0
+    return c
 
 
 def _clog2(n):
@@ -56,8 +65,10 @@ class Layout:
             ("g", "mlp.gate_proj"), ("u", "mlp.up_proj"),
             ("d", "mlp.down_proj"))
 
-    def __init__(self, im):
+    def __init__(self, im, nl=None, table=True):
         D, F, H, KV, hd = im.D, im.F, im.H, im.KV, im.hd
+        nl = im.NL if nl is None else nl
+        self.table = table
         self.shape = {"q": (H * hd, D), "k": (KV * hd, D), "v": (KV * hd, D),
                       "o": (D, H * hd), "g": (F, D), "u": (F, D), "d": (D, F)}
         self.woff, self.coff = {}, {}
@@ -68,17 +79,20 @@ class Layout:
             w += (rows // N) * depth
             c += rows
         self.lw, self.lc = w, c
-        self.headw = im.NL * self.lw
-        self.headc = im.NL * self.lc
+        self.headw = nl * self.lw
+        self.headc = nl * self.lc
         self.embc = self.headc + im.V
-        self.words = self.headw + (im.V // N) * D
-        self.cwords = self.embc + im.V
+        # A middle pipeline stage neither embeds nor runs the head, so
+        # its images stop before the tied table.
+        self.words = self.headw + ((im.V // N) * D if table else 0)
+        self.cwords = self.embc + im.V if table else self.headc
 
 
-def write_images(im, lay, work, log=print):
+def write_images(im, lay, work, log=print, layers=None):
     """weights.bin, cparams.hex, gains.hex. Weight words are what $fread
     reads, most significant byte first: lane 15's high byte leads."""
     s = im.s
+    layers = list(range(im.NL)) if layers is None else list(layers)
     t0 = time.time()
     sign = bytes((0xff if b >= 128 else 0) for b in range(256))
     with open(os.path.join(work, "weights.bin"), "wb") as f:
@@ -92,11 +106,12 @@ def write_images(im, lay, work, log=print):
                     buf[(15 - j) * 2::32] = lo.translate(sign)
                     buf[(15 - j) * 2 + 1::32] = lo
                 f.write(buf)
-        for li in range(im.NL):
+        for li in layers:
             for m, name in lay.MATS:
                 rows, depth = lay.shape[m]
                 put("model.layers.%d.%s.weight" % (li, name), rows, depth)
-        put("model.embed_tokens.weight", im.V, im.D)
+        if lay.table:
+            put("model.embed_tokens.weight", im.V, im.D)
     log("weights.bin: %.0f MB in %.0f s"
         % (os.path.getsize(os.path.join(work, "weights.bin")) / 1e6,
            time.time() - t0))
@@ -107,7 +122,7 @@ def write_images(im, lay, work, log=print):
     def word(b, sc, sh):
         return ((b & ((1 << aw) - 1)) << (sw + mw)) | (sh << mw) | sc
     with open(os.path.join(work, "cparams.hex"), "w") as f:
-        for li in range(im.NL):
+        for li in layers:
             P = "model.layers.%d." % li
             src = {"q": ("xn", "q"), "k": ("xn", "k"), "v": ("xn", "v"),
                    "o": ("ctx", "a"), "g": ("xn2", "g"), "u": ("xn2", "u"),
@@ -124,15 +139,16 @@ def write_images(im, lay, work, log=print):
                                                 s[(sx, li)], s[(dst, li)],
                                                 bias):
                     f.write("%x\n" % word(b, sc, sh))
-        for b, sc, sh in im.proj_consts("model.embed_tokens.weight",
-                                        s["xf"], s["lg"]):
-            f.write("%x\n" % word(b, sc, sh))
-        for t in range(im.V):
-            sc, sh = im.embed_consts(t)
-            f.write("%x\n" % word(0, sc, sh))
+        if lay.table:
+            for b, sc, sh in im.proj_consts("model.embed_tokens.weight",
+                                            s["xf"], s["lg"]):
+                f.write("%x\n" % word(b, sc, sh))
+            for t in range(im.V):
+                sc, sh = im.embed_consts(t)
+                f.write("%x\n" % word(0, sc, sh))
     consts = []
     with open(os.path.join(work, "gains.hex"), "w") as f:
-        for li in range(im.NL):
+        for li in layers:
             P = "model.layers.%d." % li
             for gname, dst in (("input_layernorm", "xn"),
                                ("post_attention_layernorm", "xn2")):
@@ -145,7 +161,7 @@ def write_images(im, lay, work, log=print):
         consts.append((sc, sh))
         if im.qkn:
             # Then each layer's q and k head-norm gains, head_dim each.
-            for li in range(im.NL):
+            for li in layers:
                 P = "model.layers.%d." % li
                 for gname, dst in (("q_norm", "q"), ("k_norm", "k")):
                     gq = im.norm_consts(P + "self_attn.%s.weight" % gname,
@@ -154,23 +170,25 @@ def write_images(im, lay, work, log=print):
     return consts
 
 
-def gain_words(im):
-    return (2 * im.NL + 1) * im.D + (2 * im.NL * im.hd if im.qkn else 0)
+def gain_words(im, nl=None):
+    nl = im.NL if nl is None else nl
+    return (2 * nl + 1) * im.D + (2 * nl * im.hd if im.qkn else 0)
 
 
-def layer_consts(im, norms):
+def layer_consts(im, norms, layers=None):
     """Per layer: the norms' and adds' constants, the attention's shift and
     output requantizer, the gate's shift into SiLU, the product's
     requantizer."""
     s = im.s
     at = im.sp["attn"]["parameters"]
     out = []
-    for li in range(im.NL):
+    layers = list(range(im.NL)) if layers is None else list(layers)
+    for k, li in enumerate(layers):
         sx = s["x0"] if li == 0 else s[("x2", li - 1)]
         ctx = qi.pick(2.0 ** -at["weight_frac"] * s[("v", li)] / s[("ctx", li)],
                       at["scale_width"], at["shift_width"])
         out.append(dict(
-            n1=norms[2 * li], n2=norms[2 * li + 1],
+            n1=norms[2 * k], n2=norms[2 * k + 1],
             r1=im.add_consts(sx, s[("a", li)], s[("x1", li)]),
             r2=im.add_consts(s[("x1", li)], s[("dn", li)], s[("x2", li)]),
             shs=im.shs[li], ctx=ctx, gsh=im.gsh[li],
@@ -183,9 +201,13 @@ def layer_consts(im, norms):
     return out, norms[-1]
 
 
-def render(im, lay, lc, nf):
-    """The sequencer."""
-    D, F, H, KV, hd, NL, V = im.D, im.F, im.H, im.KV, im.hd, im.NL, im.V
+def render(im, lay, lc, nf, stage=False):
+    """The sequencer. stage: a pipeline stage of a multi-board run, with
+    a port to load the hidden state it starts from and read back the one
+    it ends with while idle, and emb_en to choose between that and the
+    embedding lookup."""
+    D, F, H, KV, hd, V = im.D, im.F, im.H, im.KV, im.hd, im.V
+    NL = len(lc)
     L = im.ms["seq_len"]
     grp, h2 = H // KV, hd // 2
     ps = specgen.derive_projn_spec(im.ms, per_column=True)["parameters"]
@@ -199,7 +221,7 @@ def render(im, lay, lc, nf):
     tw, pw = _clog2(V), ro["pos_width"]
     WA, CA = _clog2(lay.words), _clog2(lay.cwords)
     qkn = im.qkn
-    GA = _clog2(gain_words(im))
+    GA = _clog2(gain_words(im, NL))
     GQ = (2 * NL + 1) * D
     KWN = NL * KV * (L // N) * hd
     VWN = NL * KV * L * (hd // N)
@@ -233,6 +255,10 @@ def render(im, lay, lc, nf):
     a("  output reg vw_en, output reg [%d:0] vw_addr, output reg [3:0] vw_lane," % (VA - 1))
     a("  output reg signed [15:0] vw_data,")
     a("  output reg [%d:0] next_tok, output reg signed [15:0] best," % (tw - 1))
+    if stage:
+        a("  // The hidden state in and out, while idle: a pipeline stage.")
+        a("  input emb_en, input x_we, input [%d:0] x_addr, input signed [15:0] x_wdata," % (_clog2(D) - 1))
+        a("  output reg signed [15:0] x_rdata,")
     a("  output reg done, output reg busy")
     a(");")
     a("  localparam " + ", ".join("%s = %d'd%d" % (x, stw, i)
@@ -241,7 +267,9 @@ def render(im, lay, lc, nf):
     a("  reg ph, hen;")
     a("  reg [4:0] lyr;")
     a("  reg [3:0] hh;")
-    a("  reg [5:0] hk;")
+    chunk = head_chunk(im)
+    nlast = -(-V // chunk) - 1          # the last chunk, never empty
+    a("  reg [%d:0] hk;" % (max(6, _clog2(nlast + 1)) - 1))
     a("  reg [%d:0] tok_r;" % (tw - 1))
     a("  reg [%d:0] pos_r;" % (pw - 1))
     for name, size in (("xm", D), ("nm", D), ("qlo", H * h2), ("qhi", H * h2),
@@ -376,7 +404,7 @@ def render(im, lay, lc, nf):
     a("  reg [%d:0] gbase;" % (GA - 1))
     a("  reg [12:0] expect_n;")
     a("  wire [%d:0] hcols = (hk == %d) ? %d : %d;"
-      % (12, V // CHUNK, V - (V // CHUNK) * CHUNK, CHUNK))
+      % (12, nlast, V - nlast * chunk, chunk))
     a("  always @(*) begin")
     a("    wbase = 0; cbase = 0; gbase = 0; pj_depth = %d; pj_cols = %d;" % (D, D))
     a("    expect_n = %d; rn_scale = 0; rn_shift = 0; ra_sa = 0; ra_sb = 0; ra_sh = 0;" % D)
@@ -398,7 +426,7 @@ def render(im, lay, lc, nf):
           % (s_, lay.woff[m], lay.coff[m], depth, rows, rows))
     a("      S_HD: begin wbase = %d + hk * %d; cbase = %d + hk * %d;"
       " pj_cols = hcols; expect_n = hcols; end"
-      % (lay.headw, (CHUNK // N) * D, lay.headc, CHUNK))
+      % (lay.headw, (chunk // N) * D, lay.headc, chunk))
     a("      S_R1: begin ra_sa = c_r1a; ra_sb = c_r1b; ra_sh = c_r1h; end")
     a("      S_R2: begin ra_sa = c_r2a; ra_sb = c_r2b; ra_sh = c_r2h; end")
     a("      S_ATT: expect_n = %d;" % hd)
@@ -427,6 +455,8 @@ def render(im, lay, lc, nf):
     a("  assign v_raddr = kvsel * %d + at_v_addr;" % (L * (hd // N)))
     a("  always @(posedge clk) begin")
     a("    rn_x_data <= xm[rn_x_addr];")
+    if stage:
+        a("    x_rdata <= xm[x_addr];")
     a("    pj_a_data <= (st == S_O) ? cm[pj_a_addr] : (st == S_DN) ? mm[pj_a_addr] : nm[pj_a_addr];")
     if qkn:
         # Element i of head hh: the first half of a head is in the lo
@@ -490,6 +520,8 @@ def render(im, lay, lc, nf):
     a("        endcase")
     a("      end")
     a("      if (in_norm && rn_valid) begin nm[rn_index] <= rn_data; ocnt <= ocnt + 1; end")
+    if stage:
+        a("      if (st == S_IDLE && x_we) xm[x_addr] <= x_wdata;")
     if qkn:
         a("      if (in_hnorm && hn_valid) begin")
         a("        if (st == S_QN) begin")
@@ -520,7 +552,8 @@ def render(im, lay, lc, nf):
     a("      case (st)")
     a("        S_IDLE: if (start) begin")
     a("          tok_r <= tok; pos_r <= pos; hen <= head_en; busy <= 1'b1; lyr <= 0;")
-    a("          hh <= 0; hk <= 0; st <= S_EMB; ed <= 0; ev1 <= 1'b0; ocnt <= 0; ph <= 1'b0;")
+    a("          hh <= 0; hk <= 0; st <= %s; ed <= 0; ev1 <= 1'b0; ocnt <= 0; ph <= 1'b0;"
+      % ("emb_en ? S_EMB : S_N1" if stage else "S_EMB"))
     a("          lane_r <= tok[3:0];")
     a("        end")
     a("        // The embedding row out of the head's weight words, requantized")
@@ -575,7 +608,7 @@ def render(im, lay, lc, nf):
     if qkn:
         a("            else if (in_hnorm) hn_start <= 1'b1;")
     a("            else at_start <= 1'b1;")
-    a("            if (st == S_HD) hbase <= hk * %d;" % CHUNK)
+    a("            if (st == S_HD) hbase <= hk * %d;" % chunk)
     a("          end else if (!blk_busy && ocnt == expect_n && !pj_start && !rn_start && !at_start%s) begin"
       % (" && !hn_start" if qkn else ""))
     a("            ph <= 1'b0; ocnt <= 0; fj <= 0;")
@@ -597,7 +630,7 @@ def render(im, lay, lc, nf):
     a("              S_U: st <= S_GLU;")
     a("              S_DN: st <= S_R2;")
     a("              S_NF: st <= S_HD;")
-    a("              S_HD: if (hk < %d) hk <= hk + 1;" % (V // CHUNK))
+    a("              S_HD: if (hk < %d) hk <= hk + 1;" % nlast)
     a("                    else begin busy <= 1'b0; done <= 1'b1; st <= S_IDLE; end")
     a("              default: st <= S_IDLE;")
     a("            endcase")
@@ -639,6 +672,11 @@ module tb_qfull;
   reg [%(WA)d:0] wlast;
   always #5 clk = ~clk;
   always @(posedge clk) cyc = cyc + 1;
+  // A heartbeat with the sequencer's state, so a hang reads as one.
+  always @(posedge clk) if (cyc %% 10000000 == 0 && cyc > 0) begin
+    $display("PROGRESS cyc=%%0d st=%%0d lyr=%%0d hk=%%0d ocnt=%%0d", cyc, dut.st, dut.lyr, dut.hk, dut.ocnt);
+    $fflush;
+  end
   // What would be DDR: one weight word a cycle, from the image on disk.
   always @(posedge clk) begin
     if (w_addr !== wlast) begin
@@ -702,18 +740,23 @@ def build(prompt, n_gen, work=WORK, log=print, layers=None):
     return tok, ids, want, srcs
 
 
-def build_model(im, ids, n_gen, work, log=print, decode=str):
+def build_model(im, ids, n_gen, work, log=print, decode=str, layers=None,
+                stage=False, want=None, table=True):
     """The sequencer, its blocks, images and testbench for an integer
-    model already built, and the tokens it has to choose."""
+    model already built, and the tokens it has to choose. layers and
+    stage build one pipeline stage of a multi-board run instead: that
+    range of layers, with its own images, and the hidden-state port."""
     # The integer model's own run: what the RTL has to choose.
     t0 = time.time()
-    want = qr.greedy(im, ids, n_gen)
-    log("integer model: %r (%.0f s)" % (decode(want), time.time() - t0))
+    if want is None:
+        want = qr.greedy(im, ids, n_gen)
+        log("integer model: %r (%.0f s)" % (decode(want), time.time() - t0))
     os.makedirs(work, exist_ok=True)
-    lay = Layout(im)
-    norms = write_images(im, lay, work, log)
-    lc, nf = layer_consts(im, norms)
-    rtl, w = render(im, lay, lc, nf)
+    layers = list(range(im.NL)) if layers is None else list(layers)
+    lay = Layout(im, len(layers), table)
+    norms = write_images(im, lay, work, log, layers)
+    lc, nf = layer_consts(im, norms, layers)
+    rtl, w = render(im, lay, lc, nf, stage)
     with open(os.path.join(work, "qwen_full.v"), "w") as f:
         f.write(rtl)
     # The blocks, at Qwen's size.
@@ -751,11 +794,13 @@ def build_model(im, ids, n_gen, work, log=print, decode=str):
     tb = TB % dict(tw=w["tw"] - 1, pw=w["pw"] - 1, WA=w["WA"] - 1,
                    WA1=w["WA"], CA=w["CA"] - 1, CW=w["CW"] - 1,
                    GA=w["GA"] - 1, KA=w["KA"] - 1, VA=w["VA"] - 1,
-                   cn=lay.cwords - 1, gn=gain_words(im) - 1,
+                   cn=lay.cwords - 1, gn=gain_words(im, len(layers)) - 1,
                    kn=w["KWN"] - 1, vn=w["VWN"] - 1, steps="\n".join(steps))
     with open(os.path.join(work, "tb_qfull.v"), "w") as f:
         f.write(tb)
     srcs = ["tb_qfull.v", "qwen_full.v"] + sorted(blocks) + deps
+    if stage:
+        return want, srcs, dict(w, lay=lay, gn=gain_words(im, len(layers)))
     return want, srcs
 
 

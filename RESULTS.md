@@ -38,7 +38,7 @@ The remaining gap is listed at the bottom rather than glossed over.
 ### The full suite
 
 ```
-python3 tests.py            # 349 tests, or 347 without OpenSTA
+python3 tests.py            # 356 tests, or 354 without OpenSTA
 ```
 
 ### Spec to RTL, across the spec space
@@ -592,6 +592,78 @@ Digilent's reference design, and nobody has loaded this bitstream on a
 board. Vivado's `build.tcl` route remains the one the handoff describes;
 this one says the design fits and closes timing on the real part.
 
+## The ZC706, and any Zynq board
+
+```
+python3 board_zybo.py --board zc706      # board_zc706/
+board_zc706/open/build_open.sh           # its bitstream, without Vivado
+```
+
+The package generator takes the board from `boards.py`: its part,
+Vivado preset, pins, DDR size and text. Everything else, the RTL, the
+registers, the DDR layout and the ARM program, is the same on every
+Zynq, whose HP ports and 1 GB of DDR look alike. The ZC706 (XC7Z045-2)
+is the second board; its package runs the same open flow on its own
+chip database, and the whole design routes there too:
+
+| | Zybo Z7-20 (XC7Z020) | ZC706 (XC7Z045) |
+|---|---|---|
+| core clock, post-route | 53.4 MHz | 68.0 MHz |
+| bus clock, post-route | 50.9 MHz | 52.8 MHz |
+| LUT sites / DSPs used | 29% / 132 of 220 | 7% / 132 of 900 |
+| bitstream | 4.0 MB, 7,802 frames round-trip | 13.3 MB, 30,722 frames round-trip |
+
+The ZC706 has room for a far wider core than this one; the design is
+sized for the Zybo. Its LEDs sit in banks of more than one voltage, so
+its package drives none rather than guess an IOSTANDARD; STATUS says the
+same thing over the registers.
+
+## Boards on their own clocks: GALS
+
+```
+python3 cluster.py zc706 zybo_z7_20           # the split and the links
+python3 gals.py                                # stages over fabric UARTs, simulated
+FPGAI_QWEN=qwen3 python3 cluster.py zc706 zybo_z7_20 --package build_cluster
+```
+
+Several boards share one model as a pipeline of stages, globally
+asynchronous and locally synchronous: each board runs its own clock and a
+contiguous range of layers, and boards share nothing but CRC-checked
+messages, the hidden state down the chain and the chosen token back. The
+sequencer generator builds a stage on request: the layers it holds, the
+vocabulary table only on the first and last stage, and a port to load
+the hidden state it starts from and read back the one it ends with.
+`cluster.py` splits the layers by each board's speed (the smaller of its
+DDR rate and what the design consumes at its clock) and capacity, and
+picks each link: UDP over the ARM's Ethernet between two Zynq boards,
+otherwise a UART in the fabric on two pins, which any FPGA can build.
+
+The fabric link is simulated whole. `gals.py` puts each stage's
+sequencer beside `stage_ctrl`, a UART, a byte-wise CRC32 and a message
+parser, and runs the stages on unrelated clocks, 10, 7.9 and 12.3 ns,
+whose UART bit times differ by up to 1.25%, with a host at its own rate
+feeding the prompt and every generated token back. With two boards and
+with three, the middle one holding no vocabulary table, every token and
+logit is the one-board integer model's and no link sees a CRC error; a
+link that sends the hidden state's bytes swapped is caught
+(`test_gals_two_boards`). On the Zynq side, the stage's register block
+gains XADDR and XDATA, whose accesses wait for the core's own edges
+since its clock is held while lines fill (`test_zybo_stage_registers`,
+which fails on a write that does not wait), and the ARM program carries
+the same messages over lwIP UDP, a hidden state split into datagrams
+under one frame.
+
+For Qwen3-0.6B over the ZC706 and a Zybo, the balanced split is layers
+0 to 13 on the ZC706 with the embedding and 14 to 27 on the Zybo with
+the head, both at the 50 MHz bus clock: 0.88 s a token for one stream,
+the same as one board, since a single stream's time is the sum of its
+stages, and 1.8 tokens/s with both stages busy on separate streams.
+`--package` wrote both boards' packages from the real weights, each
+elaborating whole. What is not run: the network code has only been
+compiled, against stand-ins for the Xilinx and lwIP headers, and a board
+without an ARM cannot yet hold a layer, having no DRAM this design
+reaches.
+
 ## Qwen3-0.6B, the model Architect Labs hosted
 
 ```
@@ -626,6 +698,17 @@ product in 32 bits did not help, 5/8 against 6/8 on the first eight
 positions, so it is not the limit; of the three misses in sixteen, one
 is a near tie in float (0.12), one is the first position, where float's
 own top two are 0.07 apart, and one, position 7, is a real miss.
+
+In RTL, the Qwen3 sequencer runs the real weights one layer deep and
+chooses the integer model's token, the head norms and all 151,936 head
+columns included. The first attempt hung in the head: its chunk was a
+fixed 4864 columns, Qwen2.5's MLP width, and Qwen3's projection block,
+sized for its 3072, has a 12-bit column port, so it ran 768 columns while
+the sequencer waited for 4864. The chunk is now the widest matrix the
+model's projection block is sized for, with a last chunk that is never
+empty; the synthetic test's vocabulary now spans several chunks, and the
+testbench prints a heartbeat, so a hang reads as one. Qwen2.5's
+generated RTL is unchanged by it. The 28-layer Qwen3 run is next.
 
 ## Qwen's structure decodes in RTL
 
