@@ -2049,6 +2049,26 @@ def test_spec_to_verified_rtl():
         shutil.rmtree(out, ignore_errors=True)
 
 
+def test_signed_off_modules_are_renamed_however_written():
+    """The score MAC is signed off as the mac it is and renamed mac_s for
+    the attention head, which instances both. The rename matched only
+    "module mac (", so when Haiku wrote "module mac(" two modules named
+    mac reached the head's compile, every agent failed the head for a
+    reason none of them could see, and the run failed."""
+    import spec2rtl
+    ok = all(spec2rtl.rename_module(h + "input a); endmodule", "mac", "mac_s").startswith("module mac_s")
+             for h in ("module mac (", "module mac(", "module mac #(", "module  mac\n("))
+    ok &= spec2rtl.rename_module("module macro (a); endmodule\nmodule mac (b);", "mac", "mac_s") \
+        == "module macro (a); endmodule\nmodule mac_s (b);"
+    try:
+        spec2rtl.rename_module("module other (a);", "mac", "mac_s")
+        ok = False
+    except RuntimeError:
+        pass
+    check('a signed-off module is renamed however its header is written, and a missing one '
+          'is an error', ok)
+
+
 def test_sign_off_survives_a_silent_agent():
     """An LLM agent whose model never answers (its CLI timing out, as
     Sonnet's did on the attention head for 75 minutes) has failed its
@@ -3949,6 +3969,7 @@ if __name__ == '__main__':
     test_weight_streamer_survives_stalls()
     test_full_sequencer_both_qwens()
     test_bridge_end_to_end()
+    test_signed_off_modules_are_renamed_however_written()
     test_sign_off_survives_a_silent_agent()
     test_attention_scores_cannot_overflow()
     test_spec_to_verified_rtl()

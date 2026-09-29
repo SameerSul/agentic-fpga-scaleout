@@ -35,6 +35,7 @@ import argparse
 import json
 import os
 import random
+import re
 import shutil
 import subprocess
 import sys
@@ -216,6 +217,17 @@ def agent_chain(kind):
     return chain
 
 
+def rename_module(src, old, new):
+    """src's module old named new, however its header is written: an LLM
+    writes "module mac(" or "module mac #(" as readily as "module mac (".
+    An exact match missed one, left two modules named mac, and no agent
+    could compile the attention head that instances both."""
+    out, n = re.subn(r"\bmodule\s+%s\b" % re.escape(old), "module " + new, src, count=1)
+    if not n:
+        raise RuntimeError("no module %s to rename %s" % (old, new))
+    return out
+
+
 def sign_off(im, gates, agent_kind, log, dv=False):
     """Each block through the signoff loop, into gates/: its signed-off
     RTL under its design name. Returns one row per block. The flow's
@@ -291,9 +303,9 @@ def _sign_off(im, gates, agent_kind, log, dv=False):
         if report["converged"]:
             src = open(os.path.join(gates, job["rtl_file"])).read()
             if fn == "b_rmsnorm_hd.v":
-                src = src.replace("module rmsnorm (", "module rmsnorm_hd (", 1)
+                src = rename_module(src, "rmsnorm", "rmsnorm_hd")
             if fn == "smac_dep.v":
-                src = src.replace("module mac (", "module mac_s (", 1)
+                src = rename_module(src, "mac", "mac_s")
             with open(os.path.join(gates, fn), "w") as f:
                 f.write(src)
             if dv:

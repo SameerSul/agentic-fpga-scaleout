@@ -89,7 +89,7 @@ times put within 10%.
 ### The full suite
 
 ```
-python3 tests.py            # 396 tests, or 394 without OpenSTA
+python3 tests.py            # 397 tests, or 395 without OpenSTA
 ```
 
 ### Spec to RTL, across the spec space
