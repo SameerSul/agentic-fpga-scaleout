@@ -320,13 +320,18 @@ endmodule
         fl = 1 + ms_
         kbyte = ("k_data[%d*l +: %d]" % (dw, dw) if FIX_KLANE in fixes
                  else "k_data[%d*(%d-l) +: %d]" % (dw, La - 1, dw))
-        awg = aw + g
+        # A score is q times k, both activations, over head_dim: it can
+        # need more bits than the MAC sized for weights times activations,
+        # and then its lanes run a MAC of their own width (mac_s).
+        saw = p.get("score_acc_width", aw)
+        smac = "mac" if saw == aw else "mac_s"
+        awg = saw + g
         widen = ("x" if aw == wsw else
                  "{{%d{x[%d]}}, x}" % (aw - wsw, wsw - 1))
         tsc = ("{shadow[dj[%d:0]][%d], shadow[dj[%d:0]], %d'd0}"
-               % (lw - 1, aw - 1, lw - 1, g) if g else
+               % (lw - 1, saw - 1, lw - 1, g) if g else
                "{shadow[dj[%d:0]][%d], shadow[dj[%d:0]]}"
-               % (lw - 1, aw - 1, lw - 1))
+               % (lw - 1, saw - 1, lw - 1))
         return """module attnn (
   input                    clk,
   input                    rst_n,
@@ -366,15 +371,15 @@ endmodule
   reg [{fl}:0] lastp;
   reg [{nwm}:0] gp [0:{fl}];
   reg mclr;
-  wire signed [{awm}:0] acc [0:{lam}];
+  wire signed [{sawm}:0] acc [0:{lam}];
   genvar l;
   generate
     for (l = 0; l < {La}; l = l + 1) begin : slane
-      mac mc (.clk(clk), .rst_n(rst_n), .clear(mclr), .a(a_data),
+      {smac} mc (.clk(clk), .rst_n(rst_n), .clear(mclr), .a(a_data),
               .b({kbyte}), .valid_in(v1), .acc(acc[l]), .valid_out());
     end
   endgenerate
-  reg signed [{awm}:0] shadow [0:{lam}];
+  reg signed [{sawm}:0] shadow [0:{lam}];
   reg [{nwm}:0] cap0;
   reg [{lw}:0] dj, dn;
   reg pend;
@@ -553,7 +558,7 @@ endmodule
            kbyte=kbyte, lw=lw, lwm=lw - 1, awg=awg, awg1=awg + 1,
            siwm=siw - 1, dgwm=dgw - 1, pwm=ww + dw, wswm=wsw - 1,
            rqsm=rqs - 1, smax=smax, smax1=smax + 1, tsc=tsc, widen=widen,
-           ndg=ndg, dw=dw)
+           ndg=ndg, dw=dw, sawm=saw - 1, smac=smac)
 
     def render_projn(self, spec, fixes):
         """N lanes of the generated MAC under one sequencer. A group of N

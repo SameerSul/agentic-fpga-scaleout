@@ -54,7 +54,7 @@ from different builds are caught before anything runs.
 
 ## What is and is not checked
 
-Simulated here: the register block, and this design with one layer run only through AXI-Lite against the stalling DDR model, matching the direct testbench's token and core cycles, and the sequencer itself through all 28 layers and the head on the direct testbench, choosing " Paris" as the integer model does. The open flow in `open/` places and routes it on this part: 71.5 MHz core, 60.3 MHz bus, both past 50 MHz. Not run: Vivado,
+Simulated here: the register block, and this design with one layer run only through AXI-Lite against the stalling DDR model, matching the direct testbench's token and core cycles, and the sequencer itself through all 28 layers and the head on the direct testbench, choosing " Paris" as the integer model does. The open flow in `open/` places and routes it on this part: 69.5 MHz core, 51.5 MHz bus, both past 50 MHz. Not run: Vivado,
 so its block design, its interconnects and its timing, and the software
 on real hardware. The core clock is gated with a BUFGCE while a port's
 line is still on the bus; that path is the first thing to read in the

@@ -1,6 +1,6 @@
 # What is verified, and what is not
 
-Last run 2026-09-28. Every number here came from a command in this repo, and
+Last run 2026-09-29. Every number here came from a command in this repo, and
 every command is named so it can be re-run.
 
 ## Short answer
@@ -36,7 +36,20 @@ and a streamer that could hand the core another line's weights after a
 jump back. Both are fixed and tested. Several boards
 can share one model as GALS stages on their own clocks, simulated exact
 to one board's tokens over fabric UARTs, with the Zynq's UDP protocol
-run on a host. It still does not host a local LLM the way Architect Labs
+run on a host. One command, `spec2rtl.py`, now takes a model's shape or
+checkpoint and a list of boards, any mix, and returns verified RTL: every
+generated block signed off at that shape's parameters and every width in
+the cluster, and the whole design, one board, a pipeline of up to eight
+mixed boards, or the weights split over several, simulated against the
+one-board integer model to the logit, then every board's package. Split
+by weights, each rank also runs through its own registers and DDR bridge
+with the ARM's side serving every gather, and the ARM's UDP program for
+those gathers has run on a host, asking again for datagrams lost or
+corrupt. Running the gates at the widths the
+design really uses found the attention head's scores could overflow at
+16-bit activations; its score lanes now have their own, wide enough, MAC.
+The links recover from bit errors by CRC and resend, and the planner's
+cycle model is within 0.1% of simulation. It still does not host a local LLM the way Architect Labs
 does, for one reason: nothing has been loaded onto a board, and that is
 now the whole of the remaining step (`HANDOFF.md`).
 The remaining gap is listed at the bottom rather than glossed over.
@@ -550,9 +563,9 @@ and the integer model do, each prompt position in the direct run's
 step in 31,375,557 core cycles and 37,457,732 bus cycles: 1.18 bus
 cycles a core cycle, 0.54 s a position and 0.75 s for the head at
 50 MHz. Four hours of simulation. That run used the streamer before the
-fixes in "32 lanes on the ZC706"; the rerun on the corrected one was
-still going when this was written, its first two positions in
-26,745,870 and 26,895,926 bus cycles, as before.
+fixes in "32 lanes on the ZC706"; the rerun on the corrected one chose
+" Paris" too, its positions in 26.75 to 27.05 million bus cycles and the
+head step in 37,459,001, 1.19 bus cycles a core cycle.
 
 Three tests keep it: `test_weight_streamer_survives_stalls` runs the
 streamer alone on four stalling ports under address streams of 1502
@@ -581,12 +594,14 @@ routes on the real part:
 
 | clock | post-route Fmax | at 50 MHz |
 |---|---|---|
-| core (gated, through a BUFGCTRL) | 65.5 MHz | passes |
-| bus and registers (FCLK0) | 54.5 MHz | passes |
+| core (gated, through a BUFGCTRL) | 73.4 MHz | passes |
+| bus and registers (FCLK0) | 65.4 MHz | passes |
 
 using 28% of the LUT sites (LUT RAM included), 132 of 220 DSPs and 49
-block RAMs (first routed at 53.4 and 50.9 MHz, before the streamer's
-issue decision was registered; see "32 lanes on the ZC706"). The bitstream is 4,045,667 bytes, the
+block RAMs (first routed at 53.4 and 50.9 MHz; then 65.5 and 54.5 once
+the streamer's issue decision was registered, see "32 lanes on the
+ZC706"; these figures are the current design's, with the attention head's
+wider score lanes, from "Spec in, verified RTL out"). The bitstream is 4,045,667 bytes, the
 XC7Z020's full size, and it round-trips: Project X-Ray decodes it back
 to features which, encoded again, give the routed design's frames
 exactly, all 7,802 of them.
@@ -626,13 +641,13 @@ chip database, and the whole design routes there too:
 | | Zybo Z7-20 (XC7Z020) | ZC706 (XC7Z045) |
 |---|---|---|
 | core width | 16 lanes | 32 lanes |
-| core clock, post-route | 65.5 MHz | 65.5 MHz |
-| bus clock, post-route | 54.5 MHz | 50.3 MHz |
+| core clock, post-route | 73.4 MHz | 62.7 MHz |
+| bus clock, post-route | 65.4 MHz | 53.9 MHz |
 | LUT sites / DSPs used | 28% / 132 of 220 | 9% / 196 of 900 |
 | bitstream | 4.0 MB, 7,802 frames round-trip | 13.3 MB, 30,722 frames round-trip |
 
-The Qwen3-0.6B build (`board_zc706_qwen3/`) routes there too, at 71.5 MHz
-core and 60.3 MHz bus. Its conversion to a bitstream first aborted inside
+The Qwen3-0.6B build (`board_zc706_qwen3/`) routes there too, at 69.5 MHz
+core and 51.5 MHz bus. Its conversion to a bitstream first aborted inside
 Project X-Ray: `fasm2frames` adds a glue bit ten rows above the first
 column-62 ground tie it sees, a rule observed on another part, and here
 that tile, `INT_L_X62Y354`, is off the XC7Z045's grid.
@@ -641,6 +656,201 @@ bitstream it then writes round-trips, all 30,722 frames. The ZC706's
 core is now twice the Zybo's width (next section). Its LEDs sit in banks of more than one voltage, so
 its package drives none rather than guess an IOSTANDARD; STATUS says the
 same thing over the registers.
+
+## Spec in, verified RTL out: one board or a heterogeneous cluster
+
+```
+python3 spec2rtl.py examples/tiny_qwen3.json                                   # one board
+python3 spec2rtl.py examples/tiny8_qwen3.json --boards zc706 zybo_z7_20 zc706 zybo_z7_20 zc706 zybo_z7_20 zc706 zybo_z7_20
+FPGAI_QWEN=qwen3 python3 spec2rtl.py --weights qwen_weights/qwen3-0.6b --boards zc706 zybo_z7_20 --package
+```
+
+`spec2rtl.py` is the whole chain as one command, with `report.md` saying
+what checked each part. The input is a model's shape (`model_spec.json`'s
+keys) or a checkpoint; with `--boards`, a list of boards in chain order,
+any mix and any number, several of one kind included. It refuses a shape
+the generator cannot build, with the reason. The planner (`cluster.py`)
+splits the layers over the boards by each one's speed and memory, each
+board's core at its own width. Every generated block the design compiles,
+fifteen of them for a Qwen3-shaped model, goes through the signoff gates
+at that shape's own parameters and at every width in the cluster, leaves
+first, each composite block's testbench compiling the sub-blocks signed
+off before it. The decode step is then generated around exactly those
+files. For one board it is simulated against the integer model; for a
+cluster, the whole pipeline is, each board on its own clock and sharing
+only CRC-checked messages, against the one-board integer model. Every
+chosen token and its logit has to match. With `--package` every board's
+package follows: its layers, its images, its place in the chain.
+
+| run | blocks signed off | simulated | result |
+|---|---|---|---|
+| tiny Qwen3 shape, one Zybo | 15 | 2 of 2 layers, 5 positions | tokens and logits exact |
+| the same over a ZC706 (32 lanes) and a Zybo (16) | 30, at both widths | the 2-board pipeline | exact, no CRC error |
+| tiny 8-layer shape over 8 boards, 32/16/32/16/32/16/32/16 lanes | 30 | the 8-board pipeline | exact, no CRC error |
+| Qwen2.5-0.5B, its checkpoint, the Zybo | 14 | 1 of 24 layers, 2 generated tokens | exact; through the registers, stalling DDR: exact, 1.20 bus cycles a core cycle |
+| Qwen3-0.6B, its checkpoint, the ZC706 | 15 | 1 of 28 layers, 2 generated tokens | exact; through the registers, stalling DDR: exact, 1.70 bus cycles a core cycle |
+| Qwen3-0.6B over a ZC706 (layers 0-15) and a Zybo (16-27) | 30 | 2 of 28 layers, one a stage, the head on the Zybo, 2 generated tokens | exact, no CRC error; each stage's cycles within 0.03% of the planner's; both boards' packages from the checkpoint |
+
+Running the gates at the widths the design actually runs found two
+faults the earlier checks had passed. Every block used to be signed off
+at `model_spec.json`'s 8-bit activations; the sequencer runs 16.
+
+The attention head could overflow its scores. A score is q times k, both
+16-bit activations at a16, summed over head_dim, and the score lanes ran
+in the model's MAC, whose accumulator is sized for an int8 weight times an
+activation: 36 bits for Qwen3-0.6B against 39 for the worst score. Real
+prompts stayed inside it, which is why every decode above matched, but a
+large enough q.k would have wrapped. The head's testbench, run at 16 bits,
+failed on the Qwen3 shape and on the tiny one. The score lanes now run a
+MAC of their own, derived by the same rule for q times k over head_dim
+(`specgen.derive_score_mac_spec`); where that is no wider than the model's
+MAC, as at 8 bits, nothing changes. Because the integer model computes
+scores exactly, and every earlier run matched it, no value of any of them
+changes: the full Qwen runs, rerun on the new head, take the same cycles
+and choose the same tokens. `test_attention_scores_cannot_overflow`
+fails on the old width.
+
+The projection's testbench could fail a correct design. It drew weights
+over the whole 16-bit data port, where the spec's accumulator is derived
+for int8 weights, so at a 256-wide model's 32-bit accumulator a 100-deep
+case overflowed a sum no model's weights can reach. It now draws weights
+in the spec's `weight_bits`, which the spec records; at 8 bits the
+testbench is byte-identical.
+
+The planner's cycle estimate is now the sequencer's own, state by state:
+each projection (rows / lanes) x (depth + 5) + 32, each RMSNorm 2D + 28,
+each head's scores, softmax and weighted sum from the context length, the
+head in chunks. Against simulation:
+
+| | model | simulated |
+|---|---|---|
+| Qwen2.5-0.5B, 24 layers, a position | 22,807,652 | 22,809,961 |
+| its head step | 31,375,800 | 31,375,553 |
+| Qwen2.5-0.5B at 32 lanes, 24 layers, a position | 11,577,380 | 11,582,377 |
+| Qwen3-0.6B at 32 lanes, 28 layers, a position | 14,513,296 | 14,519,235 |
+| Qwen3-0.6B, a layer, a position | 519,331 | 519,546 |
+| tiny shape, each of five positions | 14,242 to 17,276 | 14,243 to 17,277 |
+
+within 0.1% on the real models, where counting only weight bytes had been
+2 to 6% low on them and half the real figure on a small one. The planner
+splits layers by it, at a mid-decode context of 128.
+
+The links now recover from bit errors. A stage takes a message only while
+idle and drops one whose CRC fails; the host resends a position whose
+answer is lost or corrupt, waiting twice as long each time, and knows a
+late answer by its position. A position run twice rewrites its KV entries
+with the same values, so a resend is safe. With a bit flipped in every
+10,000 on every link, 100 times the proposal's 1e-6, the corrupt message is
+caught and resent and the tokens and logits are one board's
+(`test_gals_two_boards`).
+
+## Splitting the weights: every board on every layer
+
+```
+python3 tp.py --ranks 2
+python3 spec2rtl.py examples/tiny_tp4.json --boards zybo_z7_20 zc706 zybo_z7_20 zc706 --split weights
+```
+
+The layer split fits a model bigger than any one board, but one token
+still crosses every board's layers in turn and goes no faster. Decode
+time is set by how fast the weights arrive, so the other split divides
+them: every board works on every layer with a slice of every matrix
+(`tp.py`, `qwen_full.py`'s `tp`). The slices are by output column, so
+every value a board computes is one a single board computes, whole and
+requantized, and the boards only gather each other's slices, four times
+a layer: the attention context (each board's heads), o's output, the
+gated product (each board's share of d_ff) and down's output, and once
+at the head, whose vocabulary they also split, to agree on the argmax
+(the lowest index on a tie, as the integer model's). Norms, RoPE, the
+residual adds and the embedding run on every board on identical vectors.
+A board can be at most one gather ahead of another, and a slice it sends
+early only lands where the receiver is not working, so no buffering is
+needed. Each board reads 1/T of every layer's weights: T boards bring T
+times the memory bandwidth to one token.
+
+| ranks | widths | shape | result |
+|---|---|---|---|
+| 2 | 16/16 | Qwen3's (q/k norms) | tokens and logits exact, 51 gathers |
+| 2 | 32/16 | Qwen3's | exact |
+| 2 | 16/16 | Qwen2.5's (q/k/v biases) | exact |
+| 4 | 16/32/16/32 | Qwen3's, 8 heads over 4 | exact |
+| 4 boards through `spec2rtl.py` | Zybo, ZC706, Zybo, ZC706 | tiny_tp4 | 30 blocks signed off, exact, 42 gathers |
+
+`test_weights_split_over_boards` runs the first four and fails on a
+network that skips the context's gather. The testbench's network uses
+nothing a board lacks: once every rank has asked for the same gather it
+reads each rank's slice through that rank's gather port, `gx_addr` and
+`gx_rdata` beside `g_req`, a word a clock on that rank's clock, and
+writes it into the others' through `gx_wdata`.
+
+### The weight split on the boards
+
+```
+python3 spec2rtl.py examples/tiny_tp4.json --boards zybo_z7_20 zc706 zybo_z7_20 zc706 --split weights --bridge --package
+```
+
+On a board the gathers are the ARM's. A rank's package adds four
+registers: GADDR and GDATA read the rank's slice of the vector being
+gathered and write the others' into it, a word an access, each waiting
+for the core's edges as a stage's XDATA does; GATHER says whether the
+core waits on a gather and which; a write of 1 lets it go on; TP says
+which rank of how many the bitstream is. The ARM program
+(`board_zybo.TP_C`) sends the rank's slice to every other rank over UDP
+in parts of at most 600 words, writes theirs in as they arrive, and at
+the head every rank takes the same winner. A rank can be one gather
+ahead of another and never more, so it keeps parts that come early for
+the next gather and its own previous slice for a rank one behind; a rank
+still missing parts after 250 ms asks their sender again, and the answer
+is the slice once more.
+
+`tp.build_boards` runs every rank as its package does: the register
+block and DDR bridge around the core, a DDR model of its own that stalls
+at random, its own clock, and every gather done through the registers by
+a model of the ARM's side. Only the network between the ARMs is the
+testbench's.
+
+| ranks, through their registers | widths | shape | result |
+|---|---|---|---|
+| 2 | 16/16 | Qwen3's | tokens and logits exact, 51 gathers |
+| 2 | 16/32 | Qwen3's | exact |
+| 2 | 16/16 | Qwen2.5's | exact |
+| 4 | 16/32/16/32 | Qwen3's, 8 heads over 4 | exact |
+| 4 boards through `spec2rtl.py` | Zybo, ZC706, Zybo, ZC706 | tiny_tp4 | 30 blocks signed off; exact directly and through the registers, 42 gathers; four packages, each elaborating whole |
+
+The first register block read GATHER as the core's request itself,
+which stays up until the core's next edge after the answer. An ARM that
+read it again in that window served one gather twice, and the two-rank
+run hung after 33 gathers. GATHER now reads clear once answered;
+`test_weights_split_through_registers` runs the first two rows and
+fails on the old block, which the testbench now stops on at the first
+gather posted out of step.
+
+The program's network half has run on this host
+(`test_tp_network_on_host`): three ranks compiled from the generated
+`main.c`, talking UDP over localhost through the lwIP shim, each with a
+stand-in PL that computes its slice of a fixed integer model and waits
+on the same gathers as the core. One rank's second datagram is lost on
+the wire and another's fifth arrives corrupt; the ranks ask again and
+rank 0 prints the reference's tokens. An ARM that writes the other
+ranks' slices one word off fails it.
+
+The cycle model covers a rank (`cluster.tp_rank_cycles`): its own heads
+and KV heads, its share of d_ff and of o's and down's columns over their
+full depth, the norms and residual adds whole, and its run of the head's
+chunks. Against the cycles a rank computes in the direct simulation, not
+those it spends waiting on a gather:
+
+| ranks | widths | shape | off by, rank by rank |
+|---|---|---|---|
+| 2 | 16/16 | Qwen3's | 0.0%, 0.05% |
+| 2 | 16/16 | Qwen2.5's | 0.13%, 0.09% |
+| 4 | 16/32/16/32 | Qwen3's, head_dim 32 | 0.0%, 3.1%, 0.0%, 3.2% |
+
+The two 3% are the 32-lane ranks, whose head_dim equals their lanes. The
+one-board sequencer at 32 lanes on that shape is 1.1 to 1.5% over the
+model too, a cost the attention block's own testbench does not show,
+while at the real models' head_dim of 64 and 128 the 32-lane model is
+within 0.04%.
 
 ## 32 lanes on the ZC706
 
@@ -693,7 +903,8 @@ cycles for the direct run's core cycles, 1.69 a core cycle, which is
 The routed design uses 196 of the XC7Z045's 900 DSPs (198 for Qwen3) and
 9% of its LUT sites (10%), and closes 50 MHz on both clocks in the open
 flow: 65.5 MHz core and 50.3 MHz bus for Qwen2.5, 71.5 and 60.3 for
-Qwen3. Both bitstreams round-trip, all 30,722 frames.
+Qwen3 (62.7 and 53.9, 69.5 and 51.5 since the attention head's score
+lanes were widened). Every bitstream round-trips, all 30,722 frames.
 
 ### Two bridge faults, found on the way
 
@@ -781,7 +992,7 @@ For Qwen3-0.6B over the ZC706 and a Zybo, the balanced split was layers
 the head, both at the 50 MHz bus clock: 0.88 s a token for one stream,
 the same as one board, since a single stream's time is the sum of its
 stages, and 1.8 tokens/s with both stages busy on separate streams. With
-the ZC706's core at 32 lanes the planner gives it layers 0 to 18: one
+the ZC706's core at 32 lanes the planner gives it layers 0 to 15: one
 stream then takes 0.78 s, slower than the ZC706 alone (0.63 s), and both
 stages busy give 1.97 tokens/s, which is the split's point.
 `--package` wrote both boards' packages from the real weights, each
@@ -1597,6 +1808,17 @@ These are the distance between this repo and a local LLM host.
    its multiplier, the proof becomes multiplier equivalence, and z3 runs
    out of time. Those variants rest on the closed-form bound, the
    testbenches and mutation testing. No other block has a formal proof.
+
+6. **The scale-out's links stop at simulation.** The layer split's
+   links are fabric UARTs in simulation (6.25 Mbaud) and, between Zynq
+   boards, UDP over the ARM's Ethernet, run on a host with lwIP shimmed;
+   the weight split's gathers run through each rank's registers in
+   simulation and over UDP on a host with lwIP shimmed, and neither
+   program has run on a Zynq's ARM or its Ethernet. The generated
+   CRC32 fabric endpoint, signed off at 10G and beyond as a block, is not
+   in the board-to-board path. A board without an ARM holds no layer: it
+   has no DRAM the design reaches, since no fabric DDR controller is
+   generated.
 
 Item 1 is the one that would let this claim what Architect Labs
 demonstrated, and it is no longer blocked on tooling: the board is on

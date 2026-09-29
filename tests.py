@@ -2012,6 +2012,176 @@ def test_bridge_end_to_end():
             shutil.rmtree(work, ignore_errors=True)
 
 
+def test_spec_to_verified_rtl():
+    """spec2rtl.py end to end on a small Qwen3-shaped spec: every block the
+    design compiles signed off through the gates at the spec's own
+    parameters, the decode step generated around exactly those files and
+    matching the integer model's tokens and logits at every layer; and a
+    shape the generator cannot build (a head narrower than the core's
+    lanes) refused with the reason instead of built wrong. The flow's
+    scratch directory has to be the caller's again afterwards: one left
+    pointing at the run's removed gates failed every later flow."""
+    import spec2rtl
+    import chiplet_flow as cf
+    before = cf.BUILD
+    out = os.path.join(ROOT, 'build_s2rtest_%d' % os.getpid())
+    shutil.rmtree(out, ignore_errors=True)
+    try:
+        spec = dict(name='tiny', n_layer=2, d_model=64, n_head=4, n_kv_head=2,
+                    head_dim=32, d_ff=256, vocab=608, qk_norm=True)
+        rep = spec2rtl.run(spec, 'zybo_z7_20', out, log=lambda *a: None)
+        rows = rep['stages'].get('blocks', {}).get('rows', [])
+        d = rep['stages'].get('design', {})
+        check('a spec becomes %d signed-off blocks and a decode step matching the '
+              'integer model' % len(rows),
+              rep['ok'] and len(rows) == 15 and all(r['converged'] for r in rows)
+              and d.get('rtl') == d.get('integer_model') and len(d.get('rtl') or []) == 2
+              and d.get('layers') == d.get('of') == 2)
+        bad = spec2rtl.run(dict(spec, head_dim=8, d_model=32), 'zybo_z7_20', out,
+                           log=lambda *a: None)
+        check('a shape the generator cannot build is refused with its reason',
+              not bad['ok'] and any('narrower than the core' in p for p in
+                                    bad['stages']['spec']['problems']))
+        check('the flow\'s scratch directory is the caller\'s again after a run',
+              cf.BUILD == before)
+    finally:
+        cf.BUILD = before
+        shutil.rmtree(out, ignore_errors=True)
+
+
+def test_attention_scores_cannot_overflow():
+    """A score is q times k, both 16-bit activations at a16, over head_dim;
+    the model's MAC is sized for an int8 weight times an activation. At a
+    head too wide for it the multi-lane head gives its score lanes a MAC
+    of their own width, and its testbench, run at the sequencer's 16-bit
+    width, passes; with the scores squeezed into the model's MAC, as they
+    were, it fails."""
+    import chiplet_flow as cf
+    ms = dict(load_model_spec(), activation_bits=16, d_model=64, d_ff=256,
+              n_head=4, n_kv_head=2, head_dim=32, seq_len=256, lanes=16)
+    spec = specgen_mod.derive_attnn_spec(ms)
+    p = spec['parameters']
+    old = json.loads(json.dumps(spec))
+    old['parameters']['score_acc_width'] = p['acc_width']
+    work = os.path.join(ROOT, 'build_scoretest')
+    shutil.rmtree(work, ignore_errors=True)
+    try:
+        cf.write_attn_deps(ms, work)
+        with open(os.path.join(work, 'tb.v'), 'w') as f:
+            f.write(specgen_mod.render_attnn_testbench(spec))
+        out = {}
+        for label, sp in (('wide', spec), ('old', old)):
+            with open(os.path.join(work, 'h.v'), 'w') as f:
+                f.write(RuleBasedAgent().render_attnn(sp, {agent_mod.FIX_KLANE}))
+            r = subprocess.run(['iverilog', '-g2005', '-o', 's.out', 'tb.v', 'h.v']
+                               + list(cf.ATTN_DEPS), cwd=work, capture_output=True,
+                               text=True)
+            assert r.returncode == 0, r.stdout + r.stderr
+            out[label] = subprocess.run(['vvp', 's.out'], cwd=work, capture_output=True,
+                                        text=True, timeout=900).stdout
+        check('score lanes get %d bits where the model MAC has %d, and every score '
+              'is exact' % (p['score_acc_width'], p['acc_width']),
+              p['score_acc_width'] > p['acc_width'] and 'TB_RESULT: PASS' in out['wide'])
+        check('scores squeezed into the model MAC are caught',
+              'TB_RESULT: PASS' not in out['old'])
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def test_weights_split_over_boards():
+    """Tensor parallelism in RTL (tp.py): every rank on every layer with a
+    slice of every matrix, each on its own clock and at its own width,
+    gathering the attention context, o's output, the gated product and
+    down's output from the others, and agreeing on the head's argmax. Two
+    ranks, four of 16/32/16/32 lanes, and Qwen2.5's biased shape each have
+    to give the one-board integer model's tokens and logits; a network
+    that skips the context's gather has to be caught."""
+    import tp, qwen_synth
+    ids = [3, 77, 12, 140]
+    work = os.path.join(ROOT, 'build_tptest')
+    for style, T, kw, lanes, mut in (
+            ('qwen3', 2, {}, None, False),
+            ('qwen3', 4, dict(vocab=608, hidden=128, heads=8, kv=4), [16, 32, 16, 32], False),
+            ('qwen2.5', 2, {}, None, False),
+            ('qwen3', 2, {}, None, True)):
+        shutil.rmtree(work, ignore_errors=True)
+        try:
+            im, _ = qwen_synth.model(style, nl=2, **kw)
+            want, srcs = tp.build(im, ids, 3, work, T, lanes=lanes, log=lambda *a: None)
+            im.reset()
+            best = []
+            for p in range(len(want) - 1):
+                lg = im.step(want[p], p, logits=p >= len(ids) - 1)
+                if lg is not None:
+                    best.append((max(range(len(lg)), key=lg.__getitem__), max(lg)))
+            if mut:
+                path = os.path.join(work, 'tb_tp.v')
+                src = open(path).read()
+                a = '      1: begin\n'
+                assert a in src
+                open(path, 'w').write(src.replace(a, '      1: begin end\n      5: begin\n', 1))
+            out = tp.run(work, srcs, timeout=1800)
+            # A token that is x (a gather left memory unwritten) is a mismatch.
+            got = [(l.split('tok=')[1].split()[0], l.split('best=')[1].split()[0])
+                   for l in out.splitlines() if l.startswith('TOKEN')]
+            got = [(int(a_), int(b_)) if a_.lstrip('-').isdigit() and b_.lstrip('-').isdigit()
+                   else (a_, b_) for a_, b_ in got]
+            if mut:
+                check('a network that skips the context gather is caught',
+                      len(got) == len(best) and got != best)
+            else:
+                check('the weights split %d ways%s: one board\'s tokens and logits (%s)'
+                      % (T, ', %s lanes' % '/'.join(map(str, lanes)) if lanes else '', style),
+                      got == best and len(best) == 3 and 'bad=0' in out)
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+
+
+def test_weights_split_through_registers():
+    """The split of the weights as the boards run it (tp.build_boards):
+    each rank's package RTL, its register block and DDR bridge around the
+    core, with a DDR model of its own that stalls at random and its own
+    clock, and every gather done by the ARM's side through GADDR, GDATA
+    and GATHER. Two ranks at 16 lanes, and a Zybo's 16 beside a ZC706's
+    32, have to give the one-board integer model's tokens and logits. A
+    register block whose GATHER still reads set once answered lets an ARM
+    serve one gather twice, and has to be caught."""
+    import tp, qwen_synth
+    ids = [3, 77, 12, 140]
+    work = os.path.join(ROOT, 'build_tpregtest')
+    for lanes, mut in ((None, False), ([16, 32], False), (None, True)):
+        shutil.rmtree(work, ignore_errors=True)
+        try:
+            im, _ = qwen_synth.model('qwen3', nl=2)
+            want, srcs = tp.build_boards(im, ids, 3, work, 2, lanes=lanes, jit=1,
+                                         log=lambda *a: None)
+            im.reset()
+            best = []
+            for p in range(len(want) - 1):
+                lg = im.step(want[p], p, logits=p >= len(ids) - 1)
+                if lg is not None:
+                    best.append((max(range(len(lg)), key=lg.__getitem__), max(lg)))
+            if mut:
+                for p in 'ab':
+                    f = os.path.join(work, 'fpgai_zybo_%s.v' % p)
+                    src = open(f).read()
+                    assert 'g_req && !g_done}' in src
+                    open(f, 'w').write(src.replace('g_req && !g_done}', 'g_req}'))
+            out = tp.run(work, srcs, timeout=1800)
+            got = [(int(l.split('tok=')[1].split()[0]), int(l.split('best=')[1].split()[0]))
+                   for l in out.splitlines() if l.startswith('TOKEN')]
+            if mut:
+                check('a GATHER that reads set once answered is caught serving a gather twice',
+                      'TP_FAIL' in out and got != best)
+            else:
+                check('the weights split 2 ways through the registers and DDR bridges%s: '
+                      'one board\'s tokens and logits'
+                      % (', %s lanes' % '/'.join(map(str, lanes)) if lanes else ''),
+                      got == best and len(best) == 3 and 'bad=0' in out)
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+
+
 def test_gals_two_boards():
     """Boards on their own clocks, 10, 7.9 and 12.3 ns, whose UART bit
     times differ by up to 1.25%, each running a stage of the model: layer
@@ -2022,20 +2192,25 @@ def test_gals_two_boards():
     logit has to be the one-board integer model's, the links must see no
     CRC error, and a link that sends the hidden state's bytes swapped is
     caught. Boards need not be alike: a pipeline of 32, 16 and 32 lanes
-    has to give the same tokens, since only the hidden state crosses."""
+    has to give the same tokens, since only the hidden state crosses. And
+    with a bit flipped in every 10,000 on every link, 100 times the
+    proposal's 1e-6, the corrupt messages have to be caught by their CRC
+    and the positions resent until the tokens and logits are still one
+    board's."""
     import gals, qwen_synth
     ids = [3, 77, 12, 140]
     work = os.path.join(ROOT, 'build_galstest')
-    for nl, split, mut, lanes in (
-            (2, [[0], [1]], None, None),
-            (3, [[0], [1], [2]], None, None),
-            (3, [[0], [1], [2]], None, [32, 16, 32]),
+    for nl, split, mut, lanes, ber in (
+            (2, [[0], [1]], None, None, 0),
+            (3, [[0], [1], [2]], None, None, 0),
+            (3, [[0], [1], [2]], None, [32, 16, 32], 0),
+            (2, [[0], [1]], None, None, 10000),
             (2, [[0], [1]], ("tbyte = tx_hid ? (ti[0] ? x_rdata[7:0] : x_rdata[15:8])",
-                             "tbyte = tx_hid ? (ti[0] ? x_rdata[15:8] : x_rdata[7:0])"), None)):
+                             "tbyte = tx_hid ? (ti[0] ? x_rdata[15:8] : x_rdata[7:0])"), None, 0)):
         shutil.rmtree(work, ignore_errors=True)
         try:
             im, _ = qwen_synth.model('qwen3', nl=nl, vocab=608 if lanes else 600)
-            want, srcs = gals.build(im, ids, 3, work, split, lanes=lanes)
+            want, srcs = gals.build(im, ids, 3, work, split, lanes=lanes, ber_inv=ber)
             im.reset()
             best = []
             for p in range(len(want) - 1):
@@ -2050,9 +2225,16 @@ def test_gals_two_boards():
             out = gals.run(work, srcs, timeout=900)
             got = [(int(l.split('tok=')[1].split()[0]), int(l.split('best=')[1].split()[0]))
                    for l in out.splitlines() if l.startswith('TOKEN')]
+            link = next((l for l in out.splitlines() if l.startswith('LINK')), '')
             if mut:
                 check('a link that swaps the hidden state bytes is caught',
                       len(got) == len(best) and got != best)
+            elif ber:
+                errs = int(link.split('crc_errors=')[1].split()[0]) + \
+                    int(link.split('host_bad=')[1].split()[0])
+                check('bit errors on every link at 1 in %d: %d messages caught, %s, '
+                      'and one board\'s tokens' % (ber, errs, link.split()[-1]),
+                      got == best and errs > 0 and 'resends=0' not in link)
             else:
                 check('%d boards on their own clocks%s give one board\'s tokens'
                       % (len(split), ', of %s lanes,' % '/'.join(map(str, lanes)) if lanes else ''),
@@ -2309,6 +2491,8 @@ void udp_recv(struct udp_pcb *u, udp_recv_fn f, void *arg) { (void)arg; cb = f; 
 int udp_sendto(struct udp_pcb *u, struct pbuf *p, const ip_addr_t *dst, u16_t port) { (void)u; (void)port;
   sent++;
   if (getenv("DROP") && atoi(getenv("DROP")) == sent) return 0;     /* a lost datagram */
+  if (getenv("FLIP") && atoi(getenv("FLIP")) == sent)               /* a corrupt one */
+    ((unsigned char *)p->payload)[p->tot_len / 2] ^= 0x10;
   struct sockaddr_in sa = {0}; sa.sin_family = AF_INET; sa.sin_port = htons(port_of(dst->addr));
   sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
   sendto(sock, p->payload, p->tot_len, 0, (struct sockaddr *)&sa, sizeof sa); return 0; }
@@ -2347,6 +2531,188 @@ u32 Xil_In32(UINTPTR a) {
   return 0; }
 """,
 }
+
+
+# A tensor-parallel rank's stand-in PL: a fixed integer model split the
+# way the core splits one, a slice of each vector computed from whole
+# vectors, so a slice gathered to the wrong place changes every token.
+TP_PL = """/* the stand-in PL: one rank of a fixed integer model */
+#define NL_ 2
+#define V_ 97
+#define N1 (FPGAI_HHD / TP_RANKS)
+#define N2 (FPGAI_D / TP_RANKS)
+#define N3 (FPGAI_F / TP_RANKS)
+static u32 r_tok, r_pos, done, gaddr, greq, gvec, phase, head, nxt; static s16 bst;
+static s16 x[FPGAI_D], cm[FPGAI_HHD], am[FPGAI_D], mm[FPGAI_F];
+static s16 wrap(long v) { return (s16)(((v % 20011) + 20011) % 20011 - 10005); }
+static s16 *vec_of(void) { return gvec == 1 ? cm : gvec == 2 ? am : mm; }
+/* phase 4 l + k: k 0 the context, 1 o, 2 the gated product, 3 down; 4 NL_ the head */
+static void slice(void) {
+  int l = phase / 4, k = phase % 4, i;
+  if ((int)phase == 4 * NL_) {
+    int per = (V_ + TP_RANKS - 1) / TP_RANKS, lo = TP_RANK * per, hi = lo + per > V_ ? V_ : lo + per;
+    bst = -32768;
+    for (i = lo; i < hi; i++) { s16 v = wrap((long)x[i % FPGAI_D] * 7 + i);
+      if (i == lo || v > bst) { bst = v; nxt = i; } }
+    gvec = 4; greq = 1; return; }
+  if (k == 0) { for (i = TP_RANK * N1; i < (TP_RANK + 1) * N1; i++)
+      cm[i] = wrap((long)x[i % FPGAI_D] * 3 + x[(i * 7) % FPGAI_D] + l + i + (long)r_pos * 5); gvec = 1; }
+  if (k == 1) { for (i = TP_RANK * N2; i < (TP_RANK + 1) * N2; i++)
+      am[i] = wrap(cm[i % FPGAI_HHD] + (long)cm[(i * 5 + 1) % FPGAI_HHD] * 2 + i); gvec = 2; }
+  if (k == 2) { for (i = TP_RANK * N3; i < (TP_RANK + 1) * N3; i++)
+      mm[i] = wrap((long)x[i % FPGAI_D] * 5 + i + l); gvec = 3; }
+  if (k == 3) { for (i = TP_RANK * N2; i < (TP_RANK + 1) * N2; i++)
+      am[i] = wrap(mm[i % FPGAI_F] + (long)mm[(i * 3) % FPGAI_F] + i); gvec = 2; }
+  greq = 1; }
+static void answered(void) {
+  int k = phase % 4, i;
+  greq = 0;
+  if ((int)phase == 4 * NL_) { done = 1; return; }
+  if (k == 1 || k == 3) for (i = 0; i < FPGAI_D; i++) x[i] = wrap((long)x[i] + am[i]);
+  phase++;
+  if ((int)phase == 4 * NL_ && !head) { done = 1; return; }
+  slice(); }
+void Xil_Out32(UINTPTR a, u32 v) {
+  u32 o = (u32)(a - FPGAI_REGS);
+  if (o == FPGAI_TOK) r_tok = v; else if (o == FPGAI_POS) r_pos = v;
+  else if (o == FPGAI_GADDR) gaddr = v;
+  else if (o == FPGAI_GDATA) { if (greq) vec_of()[gaddr] = (s16)v; gaddr++; }
+  else if (o == FPGAI_GATHER) { if ((v & 1) && greq) answered(); }
+  else if (o == FPGAI_CTRL && (v & 1)) {
+    head = (v >> 1) & 1; done = 0; phase = 0;
+    for (int i = 0; i < FPGAI_D; i++) x[i] = wrap((long)r_tok * 31 + i + (long)r_pos * 7);
+    slice(); } }
+u32 Xil_In32(UINTPTR a) {
+  u32 o = (u32)(a - FPGAI_REGS);
+  if (o == FPGAI_ID) return FPGAI_ID_VALUE; if (o == FPGAI_TP) return TP_VALUE;
+  if (o == FPGAI_KVEND) return (u32)KVEND; if (o == FPGAI_STATUS) return done ? 2 : 0;
+  if (o == FPGAI_NEXT_TOK) return nxt; if (o == FPGAI_BEST) return (u32)(u16)bst;
+  if (o == FPGAI_GATHER) return greq | gvec << 1;
+  if (o == FPGAI_GDATA) return (u32)(u16)vec_of()[gaddr++];
+  return 0; }
+"""
+
+
+def test_tp_network_on_host():
+    """The Zynq program for a split of the weights (board_zybo.TP_C), run
+    for real on this host: compiled once for each of three ranks, talking
+    UDP over localhost through the lwIP shim, each with a stand-in PL that
+    computes its slice of a fixed integer model and waits on the same four
+    gathers a layer, and the head's, as the core. One rank's second
+    datagram is lost on the wire and another's fifth arrives corrupt. The
+    ranks have to ask for what they miss, and rank 0 has to print the
+    one-board reference's tokens; an ARM that writes the other ranks'
+    slices one word off has to be caught."""
+    import board_zybo as bz
+    cc = shutil.which('cc') or shutil.which('clang') or shutil.which('gcc')
+    if not cc:
+        check('the tensor-parallel network program runs on the host (no C compiler: skipped)', True)
+        return
+    work = os.path.join(ROOT, 'build_tpnettest')
+    T, D, HHD, F, V, NL = 3, 600, 1200, 2100, 97, 2
+    prompt, n_gen = [5, 11, 2], 4
+
+    def wrap(v):
+        return ((v % 20011) + 20011) % 20011 - 10005
+    want, pos, tok = [], 0, prompt[0]
+    while pos < len(prompt) + n_gen - 1:
+        if pos < len(prompt):
+            tok = prompt[pos]
+        x = [wrap(tok * 31 + i + pos * 7) for i in range(D)]
+        for l in range(NL):
+            cm = [wrap(x[i % D] * 3 + x[(i * 7) % D] + l + i + pos * 5) for i in range(HHD)]
+            am = [wrap(cm[i % HHD] + cm[(i * 5 + 1) % HHD] * 2 + i) for i in range(D)]
+            x = [wrap(x[i] + am[i]) for i in range(D)]
+            mm = [wrap(x[i % D] * 5 + i + l) for i in range(F)]
+            am = [wrap(mm[i % F] + mm[(i * 3) % F] + i) for i in range(D)]
+            x = [wrap(x[i] + am[i]) for i in range(D)]
+        if pos >= len(prompt) - 1:
+            lg = [wrap(x[t % D] * 7 + t) for t in range(V)]
+            tok = lg.index(max(lg))
+            want.append(tok)
+        pos += 1
+    text = ''.join('<%d>' % t for t in prompt) + ''.join('<%d>' % t for t in want)
+    shim = STAGE_SHIM['shim.c'][:STAGE_SHIM['shim.c'].index('/* the stand-in PL */')] + TP_PL
+    results = {}
+    for label, mut in (('good', None),
+                       ('off', ('Xil_Out32(REG(FPGAI_GADDR), r * n);',
+                                'Xil_Out32(REG(FPGAI_GADDR), r * n + 1);'))):
+        shutil.rmtree(work, ignore_errors=True)
+        port0 = 45000 + (os.getpid() + (label == 'off') * 97) % 2000
+        procs, outs = [], {}
+        try:
+            for r in range(T):
+                d = os.path.join(work, 'r%d' % r)
+                for sub in ('lwip', 'netif', 'sd'):
+                    os.makedirs(os.path.join(d, sub))
+                for name, src in STAGE_SHIM.items():
+                    open(os.path.join(d, name), 'w').write(shim if name == 'shim.c' else src)
+                L = dict(W=dict(tok=18, pos=8, gx_addr=12), wb=0, cb=0, cn=64, kb=0, vb=0,
+                         end=0, words=64, N=16)
+                h = bz.render_header(L, n_gen, 'host', tp=dict(
+                    rank=r, ranks=T, HHD=HHD, D=D, F=F,
+                    ips=[(127, 0, 0, 20 + k) for k in range(T)]))
+                for k, v in (('WBASE', '((UINTPTR)host_ddr)'), ('CBASE', '((UINTPTR)host_ddr + 4096)'),
+                             ('KBASE', '((UINTPTR)host_ddr + 8192)'), ('KVEND', '((UINTPTR)host_ddr + 16384)'),
+                             ('VOCAB_BASE', '((UINTPTR)host_ddr + 65536)'), ('WBYTES', '1024U'),
+                             ('CBYTES', '512U'), ('FPGAI_REGS', '0x43C00000U')):
+                    h = re.sub(r'#define %s\s+\S+' % k, '#define %s %s' % (k, v), h)
+                h = h.replace('#ifndef FPGAI_LAYOUT_H\n#define FPGAI_LAYOUT_H\n',
+                              '#ifndef FPGAI_LAYOUT_H\n#define FPGAI_LAYOUT_H\n'
+                              'extern unsigned char host_ddr[];\n#define PORT0 %d\n' % port0)
+                open(os.path.join(d, 'fpgai_layout.h'), 'w').write(h)
+                src = bz.TP_C
+                if mut:
+                    assert mut[0] in src
+                    src = src.replace(mut[0], mut[1])
+                open(os.path.join(d, 'main.c'), 'w').write(src)
+                open(os.path.join(d, 'sd', 'weights8.bin'), 'wb').write(bytes(1024))
+                open(os.path.join(d, 'sd', 'cparams.bin'), 'wb').write(bytes(512))
+                import struct
+                open(os.path.join(d, 'sd', 'prompt.bin'), 'wb').write(
+                    struct.pack('<%dI' % (len(prompt) + 1), len(prompt), *prompt))
+                if r == 0:
+                    words = ['<%d>' % t for t in range(V)]
+                    blob, offs = b'', [0]
+                    for w_ in words:
+                        blob += w_.encode(); offs.append(len(blob))
+                    open(os.path.join(d, 'sd', 'vocab.bin'), 'wb').write(
+                        struct.pack('<%dI' % (V + 2), V, *offs) + blob)
+                c = subprocess.run([cc, '-O1', '-w', '-I.', '-o', 'rank', 'main.c', 'shim.c'],
+                                   cwd=d, capture_output=True, text=True)
+                assert c.returncode == 0, c.stderr[-2000:]
+            for r in (1, 2, 0):
+                env = dict(os.environ, SD=os.path.join(work, 'r%d' % r, 'sd'))
+                if r == 1:
+                    env['DROP'] = '2'
+                if r == 2:
+                    env['FLIP'] = '5'
+                procs.append((r, subprocess.Popen([os.path.join(work, 'r%d' % r, 'rank')], env=env,
+                                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                                  text=True)))
+            for r, p in procs:
+                try:
+                    outs[r] = p.communicate(timeout=120)[0]
+                except subprocess.TimeoutExpired:
+                    p.kill()
+                    outs[r] = p.communicate()[0] + '\n(timed out)'
+        finally:
+            for _, p in procs:
+                if p.poll() is None:
+                    p.kill()
+            shutil.rmtree(work, ignore_errors=True)
+        results[label] = outs
+    good = results['good']
+    asks = sum(int(m) for o in good.values() for m in re.findall(r'(\d+) asks', o))
+    done = all(re.search(r'rank %d: %d gathers' % (r, 4 * NL * (len(prompt) + n_gen - 1) + n_gen), good[r])
+               for r in range(T))
+    if text not in good[0] or not done:
+        print('\n'.join(good[r][-600:] for r in range(T)))
+    check('three ranks gather their slices over UDP, ask again for a lost and a corrupt '
+          'datagram (%d asks), and print one board\'s tokens' % asks,
+          text in good[0] and done and asks >= 2)
+    check('an ARM that writes the other ranks\' slices one word off is caught',
+          text not in results['off'][0])
 
 
 def test_stage_network_on_host():
@@ -3283,10 +3649,15 @@ if __name__ == '__main__':
     test_weight_streamer_survives_stalls()
     test_full_sequencer_both_qwens()
     test_bridge_end_to_end()
+    test_attention_scores_cannot_overflow()
+    test_spec_to_verified_rtl()
+    test_weights_split_over_boards()
+    test_weights_split_through_registers()
     test_gals_two_boards()
     test_cluster_plan()
     test_zybo_stage_registers()
     test_stage_network_on_host()
+    test_tp_network_on_host()
     test_composite_cell_count()
     test_requant_golden_is_shared()
     test_table_unit_specs_are_implementable()

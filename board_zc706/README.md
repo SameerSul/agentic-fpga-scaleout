@@ -54,7 +54,7 @@ from different builds are caught before anything runs.
 
 ## What is and is not checked
 
-Simulated here: the register block, and this design run only through AXI-Lite against a DDR model with 30 cycles of latency on every port: one layer matching the direct testbench's token and core cycles, with every port always ready and with every port stalling and gapping its beats at random (`--jitter`); and all 24 layers and the head of the Zybo's 16-lane build the same way, on the weight streamer before its last fix, choosing " Paris" (the full rerun on this build is in progress). The open flow in `open/` places and routes it on this part: 65.5 MHz core, 50.3 MHz bus, both past 50 MHz. Not run: Vivado,
+Simulated here: the register block, and this design run only through AXI-Lite against a DDR model with 30 cycles of latency on every port: one layer matching the direct testbench's token and core cycles, with every port always ready and with every port stalling and gapping its beats at random (`--jitter`); and all 24 layers and the head of the Zybo's 16-lane build the same way, choosing " Paris". The attention head's wider score lanes came after that run; with them, all 24 layers and the head on the direct testbench take the same cycles and choose " Paris" again. The open flow in `open/` places and routes it on this part: 62.7 MHz core, 53.9 MHz bus, both past 50 MHz. Not run: Vivado,
 so its block design, its interconnects and its timing, and the software
 on real hardware. The core clock is gated with a BUFGCE while a port's
 line is still on the bus; that path is the first thing to read in the

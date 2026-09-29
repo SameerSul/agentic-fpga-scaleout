@@ -1,0 +1,5 @@
+{
+  "name": "tiny_qwen3",
+  "n_layer": 2, "d_model": 64, "n_head": 4, "n_kv_head": 2, "head_dim": 32,
+  "d_ff": 256, "vocab": 608, "rope_theta": 1000000.0, "qk_norm": true
+}

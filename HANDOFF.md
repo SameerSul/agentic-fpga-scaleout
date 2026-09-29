@@ -12,7 +12,7 @@ needs the hardware. Nothing below needs this repo's author.
 | core width | 16 lanes | 32 lanes, twice the weights a core cycle |
 | Vivado board preset | Digilent's board files | ships with Vivado |
 | Vivado license | free edition | the ZC706 kit's device-locked license (the XC7Z045 is not in the free edition), or the open flow below |
-| open flow, post-route | core 65.5, bus 54.5 MHz | core 65.5, bus 50.3 MHz (Qwen3: 71.5, 60.3) |
+| open flow, post-route | core 73.4, bus 65.4 MHz | core 62.7, bus 53.9 MHz (Qwen3: 69.5, 51.5) |
 | boot from JTAG | JP5 to JTAG | SW11 boot mode to JTAG (UG954) |
 | USB-UART | the PROG/UART micro-USB | J21 |
 | busy LED | LD0 | none driven (STATUS register instead) |
@@ -78,7 +78,7 @@ disagree, and the committed one is what was simulated.
 `board_zc706_qwen3/` is the same package for Qwen3-0.6B, the model
 Architect Labs hosted: 596 MB of int8 weights, which the ZC706's 1 GB
 holds with room to spare. Its open-flow build routes at 50 MHz as well
-(71.5 MHz core, 60.3 MHz bus, post-route), and its bitstream round-trips.
+(69.5 MHz core, 51.5 MHz bus, post-route), and its bitstream round-trips.
 Its SD files come from:
 
 ```bash
@@ -178,6 +178,21 @@ last line prints the core and bus cycles of the last step.
 | different tokens | send the log: the position where it first differs says which block |
 | wrong from the first token, with an SD card made from an older commit | an old `weights8.bin` holds each word's lanes in reverse (RESULTS.md, "the weight image's byte order"), and the layout check cannot see it, since the sizes are the same. Remake step 1 |
 
+## Another model, or another mix of boards
+
+`spec2rtl.py` rebuilds and re-verifies everything above for any
+checkpoint of these shapes and any list of boards, and says what it
+checked in `report.md`:
+
+```bash
+python3 spec2rtl.py --weights qwen_weights --board zybo_z7_20 --package --bridge
+FPGAI_QWEN=qwen3 python3 spec2rtl.py --weights qwen_weights/qwen3-0.6b --boards zc706 zybo_z7_20 --package
+```
+
+The second writes one package a board, as `cluster.py --package` does
+below, after simulating the two-board pipeline against the one-board
+model.
+
 ## Several boards
 
 Any set of the boards can share one model, each running its own clock
@@ -206,3 +221,21 @@ on its UART and waits for each token to come back from the last stage.
 A board with no ARM would take the fabric UART link instead
 (`gals.py`'s `stage_ctrl`), but none of those boards can hold a layer
 yet: they have no DRAM this design reaches.
+
+### Splitting the weights instead
+
+Every board on every layer, each with a slice of every matrix, so a
+token reads each board's share of the weights at once:
+
+```bash
+FPGAI_QWEN=qwen3 python3 spec2rtl.py --weights qwen_weights/qwen3-0.6b --boards zc706 zybo_z7_20 --split weights --package
+```
+
+`rank<i>_<board>/` is each board's package. It builds the same way as a
+stage's, lwIP Echo Server template included; rank i is 192.168.1.(10+i),
+UDP port 5000. Every rank's SD card holds its own `weights8.bin` and
+`cparams.bin` and the prompt; rank 0's also `vocab.bin`, and rank 0
+prints the text. Start them in any order: a rank that misses a slice asks
+for it again every 250 ms, so one started late only costs the others
+that wait. Each prints how many gathers it served and how many times it
+asked again.

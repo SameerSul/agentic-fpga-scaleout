@@ -275,7 +275,7 @@ PACKAGES = {
         "uart": "the micro-USB port (PROG/UART)",
         # nextpnr-xilinx, post-route core and bus clocks, per model built
         # (RESULTS.md); a package quotes only what was measured for it.
-        "open_flow_mhz": {"qwen2.5": (65.46, 54.51)},
+        "open_flow_mhz": {"qwen2.5": (73.38, 65.42)},
     },
     "zc706": {
         "title": "ZC706", "part": "xc7z045ffg900-2", "chip": "xc7z045",
@@ -294,7 +294,7 @@ PACKAGES = {
                    "kit's device-locked license, or the open flow in open/",
         "boot": "set the boot-mode switch (SW11) to JTAG, per UG954",
         "uart": "the USB-UART port (J21)",
-        "open_flow_mhz": {"qwen2.5": (65.45, 50.30), "qwen3": (71.51, 60.26)},
+        "open_flow_mhz": {"qwen2.5": (62.67, 53.86), "qwen3": (69.53, 51.50)},
     },
     "arty_a7_100t": {
         "title": "Arty A7-100T", "part": "xc7a100tcsg324-1", "chip": "xc7a100t",

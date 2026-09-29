@@ -43,8 +43,8 @@ LINK_LATENCY_S = {"ethernet": 200e-6, "uart": 20e-6}
 
 MODELS = {
     # The shapes that set the bytes; the checkpoint's config.json has them.
-    "qwen2.5": dict(D=896, F=4864, H=14, KV=2, hd=64, NL=24, V=151936),
-    "qwen3": dict(D=1024, F=3072, H=16, KV=8, hd=128, NL=28, V=151936),
+    "qwen2.5": dict(D=896, F=4864, H=14, KV=2, hd=64, NL=24, V=151936, qkn=False),
+    "qwen3": dict(D=1024, F=3072, H=16, KV=8, hd=128, NL=28, V=151936, qkn=True),
 }
 
 
@@ -58,6 +58,106 @@ def shape_bytes(m, seq_len=256):
     return dict(layer=w + rows * 8 + 2 * KV * hd * seq_len * 2,
                 layer_weights=w, table=m["V"] * m["D"] + 2 * m["V"] * 8,
                 hidden_msg=2 * D + 15)
+
+
+def proj_cycles(rows, depth, lanes):
+    """One projection through the multi-lane block: every group of lanes
+    columns reads the input once, five cycles to turn the group round,
+    and 32 to start and drain the block."""
+    return -(-rows // lanes) * (depth + 5) + 32
+
+
+def layer_cycles(m, lanes, n):
+    """Core cycles for one layer at context length n, state by state, as
+    the sequencer (qwen_full.py) runs them: the seven projections, the two
+    norms, RoPE on q and k, each head's scores, softmax and weighted sum,
+    the head norms of a model that has them, the SiLU gate and the two
+    residual adds. Measured against its simulation it is within 0.1% on
+    Qwen2.5-0.5B and Qwen3-0.6B (RESULTS.md)."""
+    D, F, H, KV, hd = m["D"], m["F"], m["H"], m["KV"], m["hd"]
+    la = min(lanes, hd)
+    c = (proj_cycles(H * hd, D, lanes) + 2 * proj_cycles(KV * hd, D, lanes)
+         + proj_cycles(D, H * hd, lanes) + 2 * proj_cycles(F, D, lanes)
+         + proj_cycles(D, F, lanes))
+    c += 2 * (2 * D + 28)                               # the two RMSNorms
+    c += (H * hd // 2 + 7) + (KV * hd // 2 + 7)         # RoPE on q, k
+    c += H * (hd + 1)                                   # each head's q in
+    c += H * (-(-n // la) * hd + 3 * n + (hd // la) * n + hd + 43)
+    if m.get("qkn"):
+        c += (H + KV) * (2 * hd + 28)                   # Qwen3's head norms
+    c += F + 23 + 2 * (D + 5)                           # SiLU gate, residuals
+    return c
+
+
+def head_cycles(m, lanes):
+    """The final norm and the tied head, in chunks of the widest matrix."""
+    chunk = max(m["D"], m["F"])
+    V, D = m["V"], m["D"]
+    return 2 * D + 28 + sum(proj_cycles(min(chunk, V - c0), D, lanes)
+                            for c0 in range(0, V, chunk))
+
+
+def stage_cycles(m, lanes, n_layers, n, emb, head):
+    """One position through a stage: its layers, the embedding lookup on
+    the first stage, the head on the last."""
+    c = n_layers * layer_cycles(m, lanes, n)
+    if emb:
+        c += m["D"] + 12
+    if head:
+        c += head_cycles(m, lanes)
+    return c
+
+
+def tp_layer_cycles(m, lanes, T, n):
+    """One layer on one rank of a split of the weights (tp.py), the core
+    cycles it computes, not the ones it waits on a gather: its own heads
+    and KV heads, its share of d_ff, and its share of o's and down's
+    output columns over their full depth; the norms and the residual adds
+    whole, since every rank holds the whole hidden state; and a cycle to
+    ask for each of the four gathers."""
+    D, F, H, KV, hd = m["D"], m["F"], m["H"], m["KV"], m["hd"]
+    Hl, KVl, Fl, Dl = H // T, KV // T, F // T, D // T
+    la = min(lanes, hd)
+    c = (proj_cycles(Hl * hd, D, lanes) + 2 * proj_cycles(KVl * hd, D, lanes)
+         + proj_cycles(Dl, H * hd, lanes) + 2 * proj_cycles(Fl, D, lanes)
+         + proj_cycles(Dl, F, lanes))
+    c += 2 * (2 * D + 28)
+    c += (Hl * hd // 2 + 7) + (KVl * hd // 2 + 7)
+    c += Hl * (hd + 1)
+    c += Hl * (-(-n // la) * hd + 3 * n + (hd // la) * n + hd + 43)
+    if m.get("qkn"):
+        c += (Hl + KVl) * (2 * hd + 28)
+    return c + Fl + 23 + 2 * (D + 5) + 4
+
+
+def tp_head_cycles(m, lanes, T, rank):
+    """The final norm on every rank, then this rank's run of the head's
+    chunks (a rank past the last chunk runs none), and its gather."""
+    chunk = max(m["D"], m["F"])
+    V, D = m["V"], m["D"]
+    nck = -(-V // chunk)
+    per = -(-nck // T)
+    cks = range(rank * per, min(nck, rank * per + per))
+    return 2 * D + 28 + 1 + sum(proj_cycles(min(chunk, V - k * chunk), D, lanes) for k in cks)
+
+
+def tp_rank_cycles(m, lanes, T, rank, n_layers, n, head):
+    """One position on one rank: the embedding, its layers, the head."""
+    return (m["D"] + 12 + n_layers * tp_layer_cycles(m, lanes, T, n)
+            + (tp_head_cycles(m, lanes, T, rank) if head else 0))
+
+
+def stage_seconds(name, m, n_layers, n, emb, head):
+    """The same in seconds on that board: its core's cycles at the bus
+    clock times the bus cycles a core cycle its package measured, and no
+    faster than its DDR can deliver the stage's weights."""
+    pk = boards.PACKAGES.get(name, {})
+    mhz = pk.get("fpgai_mhz", 50)
+    t = stage_cycles(m, pk.get("lanes", 16), n_layers, n, emb, head) \
+        * pk.get("bus_per_core", BUS_PER_CORE) / (mhz * 1e6)
+    sb = shape_bytes(m)
+    byts = n_layers * sb["layer_weights"] + (m["V"] * m["D"] if head else 0)
+    return max(t, byts / (boards.BOARDS[name]["mem_gbytes_per_s"] * 1e9))
 
 
 def speed(name):
@@ -81,74 +181,78 @@ def link_seconds(kind, nbytes):
     return LINK_LATENCY_S[kind] + nbytes / rate
 
 
-def plan(names, model="qwen3", mode="balanced"):
+def plan(names, model="qwen3", mode="balanced", shape=None, ctx=128):
     """Stages in chain order: [{board, layers, emb, head, seconds}], the
     links between them, and the estimated rates. The order given is the
-    chain order; boards that get no layers drop out of it."""
-    m = MODELS[model]
+    chain order; boards that get no layers drop out of it. shape, in
+    MODELS' keys, plans a model that is not one of them."""
+    m = shape or MODELS[model]
     sb = shape_bytes(m)
     NL = m["NL"]
-    usable = [n for n in names if capacity(n) >= sb["layer"]]
+    # Boards by position, so a cluster can hold several of one kind: four
+    # Zybos are four stages, not one.
+    names = list(names)
+    usable = [i for i, n in enumerate(names) if capacity(n) >= sb["layer"]]
     if not usable:
         raise ValueError("no board can hold even one layer")
     cap = {}
-    for i, n in enumerate(usable):
+    for j, i in enumerate(usable):
         # First and last hold the table; a single board is both.
-        t = sb["table"] if i in (0, len(usable) - 1) else 0
-        cap[n] = max(0, (capacity(n) - t) // sb["layer"])
+        t = sb["table"] if j in (0, len(usable) - 1) else 0
+        cap[i] = max(0, (capacity(names[i]) - t) // sb["layer"])
     if sum(cap.values()) < NL:
         raise ValueError("%d layers do not fit: these boards hold %d"
                          % (NL, sum(cap.values())))
-    sp = {n: speed(n) for n in usable}
-    count = {n: 0 for n in usable}
+    # Layers a second, from the cycle model at a mid-decode context.
+    sp = {i: 1.0 / stage_seconds(names[i], m, 1, ctx, False, False) for i in usable}
+    count = {i: 0 for i in usable}
     if mode == "fast":
-        for n in sorted(usable, key=lambda n: -sp[n]):
-            count[n] = min(cap[n], NL - sum(count.values()))
+        for i in sorted(usable, key=lambda i: -sp[i]):
+            count[i] = min(cap[i], NL - sum(count.values()))
     else:
         # Water-filling: layers in proportion to speed, capped by
         # capacity, the remainder spread by largest share.
         left, free = NL, set(usable)
         while left and free:
-            tot = sum(sp[n] for n in free)
-            share = {n: left * sp[n] / tot for n in free}
-            capped = {n for n in free if count[n] + share[n] >= cap[n]}
+            tot = sum(sp[i] for i in free)
+            share = {i: left * sp[i] / tot for i in free}
+            capped = {i for i in free if count[i] + share[i] >= cap[i]}
             if capped:
-                for n in capped:
-                    left -= cap[n] - count[n]
-                    count[n] = cap[n]
+                for i in capped:
+                    left -= cap[i] - count[i]
+                    count[i] = cap[i]
                 free -= capped
                 continue
-            base = {n: int(share[n]) for n in free}
-            for n in free:
-                count[n] += base[n]
+            base = {i: int(share[i]) for i in free}
+            for i in free:
+                count[i] += base[i]
             left -= sum(base.values())
-            for n in sorted(free, key=lambda n: -(share[n] - base[n]))[:left]:
-                count[n] += 1
+            for i in sorted(free, key=lambda i: (-(share[i] - base[i]), i))[:left]:
+                count[i] += 1
             left = 0
-    chain = [n for n in usable if count[n] > 0]
+    chain = [i for i in usable if count[i] > 0]
     stages, l0 = [], 0
-    for i, n in enumerate(chain):
-        layers = list(range(l0, l0 + count[n]))
-        l0 += count[n]
-        last = i == len(chain) - 1
-        t = len(layers) * sb["layer_weights"] / sp[n]
-        if last:
-            t += m["V"] * m["D"] / sp[n]           # the head
-        stages.append(dict(board=n, layers=[layers[0], layers[-1] + 1],
-                           emb=i == 0, head=last, seconds=t))
+    for j, i in enumerate(chain):
+        layers = list(range(l0, l0 + count[i]))
+        l0 += count[i]
+        last = j == len(chain) - 1
+        t = stage_seconds(names[i], m, len(layers), ctx, j == 0, last)
+        stages.append(dict(board=names[i], layers=[layers[0], layers[-1] + 1],
+                           emb=j == 0, head=last, seconds=t))
     links = []
-    for i in range(len(chain)):
-        a, b = chain[i], chain[(i + 1) % len(chain)]
+    for j in range(len(chain)):
+        a, b = chain[j], chain[(j + 1) % len(chain)]
         if a == b:
             continue
-        kind = boards.link_between(a, b)
-        nb = sb["hidden_msg"] if i + 1 < len(chain) else 17
-        links.append(dict(src=a, dst=b, kind=kind, seconds=link_seconds(kind, nb)))
+        kind = boards.link_between(names[a], names[b])
+        nb = sb["hidden_msg"] if j + 1 < len(chain) else 17
+        links.append(dict(src=names[a], dst=names[b], kind=kind,
+                          seconds=link_seconds(kind, nb)))
     single = sum(s["seconds"] for s in stages) + sum(l["seconds"] for l in links)
     piped = max(s["seconds"] for s in stages)
     return dict(model=model, mode=mode, stages=stages, links=links,
-                cannot_hold=[n for n in names if n not in usable],
-                not_needed=[n for n in usable if n not in chain],
+                cannot_hold=[names[i] for i in range(len(names)) if i not in usable],
+                not_needed=[names[i] for i in usable if i not in chain],
                 seconds_per_token=single, tokens_per_s=1.0 / single,
                 pipelined_tokens_per_s=1.0 / piped)
 

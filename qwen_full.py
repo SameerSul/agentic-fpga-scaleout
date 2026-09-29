@@ -72,13 +72,23 @@ class Layout:
             ("g", "mlp.gate_proj"), ("u", "mlp.up_proj"),
             ("d", "mlp.down_proj"))
 
-    def __init__(self, im, nl=None, table=True):
+    def __init__(self, im, nl=None, table=True, tp=None):
         D, F, H, KV, hd = im.D, im.F, im.H, im.KV, im.hd
         nl = im.NL if nl is None else nl
         self.table = table
         self.N = N = lanes_of(im)
-        self.shape = {"q": (H * hd, D), "k": (KV * hd, D), "v": (KV * hd, D),
-                      "o": (D, H * hd), "g": (F, D), "u": (F, D), "d": (D, F)}
+        # tp = (rank, ranks): the weights split by output column, every
+        # matrix a slice of its rows: this rank's heads of q, k and v, its
+        # share of the MLP's rows, and its share of o's and down's output
+        # columns over their full depth. Each value it computes is the one
+        # a single board computes; the ranks gather each other's slices.
+        self.tp = tp
+        r, T = tp if tp else (0, 1)
+        Hr, KVr, Fr, Dr = H // T, KV // T, F // T, D // T
+        self.shape = {"q": (Hr * hd, D), "k": (KVr * hd, D), "v": (KVr * hd, D),
+                      "o": (Dr, H * hd), "g": (Fr, D), "u": (Fr, D), "d": (Dr, F)}
+        self.row0 = {"q": r * Hr * hd, "k": r * KVr * hd, "v": r * KVr * hd,
+                     "o": r * Dr, "g": r * Fr, "u": r * Fr, "d": r * Dr}
         self.woff, self.coff = {}, {}
         w = c = 0
         for m, _ in self.MATS:
@@ -105,12 +115,12 @@ def write_images(im, lay, work, log=print, layers=None):
     t0 = time.time()
     sign = bytes((0xff if b >= 128 else 0) for b in range(256))
     with open(os.path.join(work, "weights.bin"), "wb") as f:
-        def put(key, rows, depth):
+        def put(key, rows, depth, row0=0):
             Q = im.Q[key]
             for g in range(rows // N):
                 buf = bytearray(depth * 2 * N)
                 for j in range(N):
-                    c = g * N + j
+                    c = row0 + g * N + j
                     lo = Q[c * depth:(c + 1) * depth].tobytes()
                     buf[(N - 1 - j) * 2::2 * N] = lo.translate(sign)
                     buf[(N - 1 - j) * 2 + 1::2 * N] = lo
@@ -118,7 +128,8 @@ def write_images(im, lay, work, log=print, layers=None):
         for li in layers:
             for m, name in lay.MATS:
                 rows, depth = lay.shape[m]
-                put("model.layers.%d.%s.weight" % (li, name), rows, depth)
+                put("model.layers.%d.%s.weight" % (li, name), rows, depth,
+                    lay.row0[m])
         if lay.table:
             put("model.embed_tokens.weight", im.V, im.D)
     log("weights.bin: %.0f MB in %.0f s"
@@ -144,9 +155,10 @@ def write_images(im, lay, work, log=print, layers=None):
                 sx, dst = src[m]
                 bias = (W[P + name + ".bias"][0]
                         if P + name + ".bias" in W else None)
-                for b, sc, sh in im.proj_consts(P + name + ".weight",
-                                                s[(sx, li)], s[(dst, li)],
-                                                bias):
+                cs = list(im.proj_consts(P + name + ".weight", s[(sx, li)],
+                                         s[(dst, li)], bias))
+                r0, rows = lay.row0[m], lay.shape[m][0]
+                for b, sc, sh in cs[r0:r0 + rows]:
                     f.write("%x\n" % word(b, sc, sh))
         if lay.table:
             for b, sc, sh in im.proj_consts("model.embed_tokens.weight",
@@ -211,6 +223,18 @@ def layer_consts(im, norms, layers=None):
 
 
 def render(im, lay, lc, nf, stage=False):
+    """(see _render) With lay.tp = (rank, ranks), one rank of a
+    tensor-parallel group: its own heads, its share of every projection's
+    output columns, and a gather at each point the next step needs the
+    whole vector: g_req with g_vec (1 the attention context, 2 o's or
+    down's output, 3 the gated product, 4 the head's best), until g_done,
+    while the network reads this rank's slice and writes the others' into
+    that vector through gx_addr, gx_wdata and gx_rdata, a word a clock.
+    The ranks then hold identical vectors, a single board's."""
+    return _render(im, lay, lc, nf, stage)
+
+
+def _render(im, lay, lc, nf, stage=False):
     """The sequencer. stage: a pipeline stage of a multi-board run, with
     a port to load the hidden state it starts from and read back the one
     it ends with while idle, and emb_en to choose between that and the
@@ -221,6 +245,12 @@ def render(im, lay, lc, nf, stage=False):
     LB = _clog2(N)                  # lane index bits
     L = im.ms["seq_len"]
     grp, h2 = H // KV, hd // 2
+    tp = lay.tp
+    rank, T = tp if tp else (0, 1)
+    # This rank's heads and slices; the offsets of its slice in the
+    # gathered vectors.
+    Hl, KVl, Fl, Dl = H // T, KV // T, F // T, D // T
+    COFF, AOFF, MOFF = rank * Hl * hd, rank * Dl, rank * Fl
     ps = specgen.derive_projn_spec(im.ms, per_column=True)["parameters"]
     rn = im.sp["rmsnorm"]["parameters"]
     ap = specgen.derive_attnn_spec(im.ms)["parameters"]
@@ -234,8 +264,8 @@ def render(im, lay, lc, nf, stage=False):
     qkn = im.qkn
     GA = _clog2(gain_words(im, NL))
     GQ = (2 * NL + 1) * D
-    KWN = NL * KV * (L // N) * hd
-    VWN = NL * KV * L * (hd // N)
+    KWN = NL * KVl * (L // N) * hd
+    VWN = NL * KVl * L * (hd // N)
     KA, VA = _clog2(KWN), _clog2(VWN)
     CW = ps["col_word_width"]
     mw, sw, aw = rq["scale_width"], rq["shift_width"], rq["acc_width"]
@@ -243,7 +273,8 @@ def render(im, lay, lc, nf, stage=False):
     cw_ = 13
     states = ["S_IDLE", "S_EMB", "S_N1", "S_Q", "S_K", "S_V", "S_RQ", "S_RK",
               "S_LQ", "S_ATT", "S_O", "S_R1", "S_N2", "S_G", "S_U", "S_GLU",
-              "S_DN", "S_R2", "S_NF", "S_HD"] + (["S_QN", "S_KN"] if qkn else [])
+              "S_DN", "S_R2", "S_NF", "S_HD"] + (["S_QN", "S_KN"] if qkn else []) \
+        + (["S_GC", "S_GA", "S_GM", "S_GH"] if tp else [])
     stw = _clog2(len(states))
     A = []
     a = A.append
@@ -270,16 +301,28 @@ def render(im, lay, lc, nf, stage=False):
         a("  // The hidden state in and out, while idle: a pipeline stage.")
         a("  input emb_en, input x_we, input [%d:0] x_addr, input signed [15:0] x_wdata," % (_clog2(D) - 1))
         a("  output reg signed [15:0] x_rdata,")
+    if tp:
+        a("  // Rank %d of %d: the gathers, and the port the network fills them" % (rank, T))
+        a("  // through: element gx_addr of the vector g_vec names, while g_req.")
+        a("  output reg g_req, output reg [2:0] g_vec, input g_done,")
+        a("  input gx_we, input [%d:0] gx_addr, input signed [15:0] gx_wdata,"
+          % (_clog2(max(H * hd, D, F)) - 1))
+        a("  output reg signed [15:0] gx_rdata,")
     a("  output reg done, output reg busy")
     a(");")
     a("  localparam " + ", ".join("%s = %d'd%d" % (x, stw, i)
                                   for i, x in enumerate(states)) + ";")
     a("  reg [%d:0] st;" % (stw - 1))
     a("  reg ph, hen;")
-    a("  reg [4:0] lyr;")
-    a("  reg [3:0] hh;")
+    if tp:
+        a("  reg gph;                     // which of o's and down's outputs is gathered")
+    a("  reg [%d:0] lyr;" % (max(5, _clog2(NL)) - 1))
+    a("  reg [%d:0] hh;" % (max(4, _clog2(H)) - 1))
     chunk = head_chunk(im)
     nlast = -(-V // chunk) - 1          # the last chunk, never empty
+    # A rank runs the head over its own run of chunks.
+    per = -(-(nlast + 1) // T)
+    hk0, hk1 = rank * per, min(nlast, rank * per + per - 1)
     a("  reg [%d:0] hk;" % (max(6, _clog2(nlast + 1)) - 1))
     a("  reg [%d:0] tok_r;" % (tw - 1))
     a("  reg [%d:0] pos_r;" % (pw - 1))
@@ -446,9 +489,9 @@ def render(im, lay, lc, nf, stage=False):
           " expect_n = %d; end" % (GQ, 2 * hd, hd))
         a("      S_KN: begin gbase = %d + lyr * %d + %d; hn_scale = c_kns; hn_shift = c_knh;"
           " expect_n = %d; end" % (GQ, 2 * hd, hd, hd))
-    a("      S_RQ: expect_n = %d;" % (H * h2))
-    a("      S_RK: expect_n = %d;" % (KV * h2))
-    a("      S_GLU: expect_n = %d;" % F)
+    a("      S_RQ: expect_n = %d;" % (Hl * h2))
+    a("      S_RK: expect_n = %d;" % (KVl * h2))
+    a("      S_GLU: expect_n = %d;" % Fl)
     a("      default: ;")
     a("    endcase")
     a("  end")
@@ -461,13 +504,15 @@ def render(im, lay, lc, nf, stage=False):
     a("  assign g_addr = gbase + %s;"
       % ("(in_hnorm ? hn_g_addr : rn_g_addr)" if qkn else "rn_g_addr"))
     a("  // The KV head this query head reads.")
-    a("  wire [%d:0] kvsel = lyr * %d + hh / %d;" % (KA - 1, KV, grp))
+    a("  wire [%d:0] kvsel = lyr * %d + hh / %d;" % (KA - 1, KVl, grp))
     a("  assign k_raddr = kvsel * %d + at_k_addr;" % ((L // N) * hd))
     a("  assign v_raddr = kvsel * %d + at_v_addr;" % (L * (hd // N)))
     a("  always @(posedge clk) begin")
     a("    rn_x_data <= xm[rn_x_addr];")
     if stage:
         a("    x_rdata <= xm[x_addr];")
+    if tp:
+        a("    gx_rdata <= (g_vec == 3'd1) ? cm[gx_addr] : (g_vec == 3'd2) ? am[gx_addr] : mm[gx_addr];")
     a("    pj_a_data <= (st == S_O) ? cm[pj_a_addr] : (st == S_DN) ? mm[pj_a_addr] : nm[pj_a_addr];")
     if qkn:
         # Element i of head hh: the first half of a head is in the lo
@@ -489,9 +534,9 @@ def render(im, lay, lc, nf, stage=False):
     a("  wire [12:0] oh = ocnt >> %d, op = ocnt & %d;" % (_clog2(h2), h2 - 1))
     a("  // KV cache words: keys interleaved by position, values by dimension.")
     a("  wire [%d:0] kslot = (lyr * %d + oh) * %d + (pos_r >> %d) * %d;"
-      % (KA - 1, KV, (L // N) * hd, LB, hd))
+      % (KA - 1, KVl, (L // N) * hd, LB, hd))
     a("  wire [%d:0] vslot = ((lyr * %d + (pj_index >> %d)) * %d + pos_r) * %d"
-      " + ((pj_index & %d) >> %d);" % (VA - 1, KV, _clog2(hd), L, hd // N, hd - 1, LB))
+      " + ((pj_index & %d) >> %d);" % (VA - 1, KVl, _clog2(hd), L, hd // N, hd - 1, LB))
     a("  reg ev1;")
     a("  reg [%d:0] lane_r;" % (LB - 1))
     a("  wire signed [15:0] ew = w_data[lane_r * 16 +: 16];")
@@ -501,7 +546,8 @@ def render(im, lay, lc, nf, stage=False):
     a("    if (!rst_n) begin")
     a("      st <= S_IDLE; ph <= 1'b0; busy <= 1'b0; done <= 1'b0; hen <= 1'b0;")
     a("      lyr <= 0; hh <= 0; hk <= 0; tok_r <= 0; pos_r <= 0; next_tok <= 0;")
-    a("      best <= 0; fj <= 0; ocnt <= 0; gcnt <= 0; ed <= 0; ev1 <= 1'b0; lane_r <= 0;")
+    a("      best <= 0; fj <= 0; ocnt <= 0; gcnt <= 0; ed <= 0; ev1 <= 1'b0; lane_r <= 0;%s"
+      % (" g_req <= 1'b0; g_vec <= 0; gph <= 1'b0;" if tp else ""))
     a("      pj_start <= 1'b0; rn_start <= 1'b0; at_start <= 1'b0; at_load_valid <= 1'b0;%s"
       % (" hn_start <= 1'b0;" if qkn else ""))
     a("      at_load_data <= 0; ra_a <= 0; ra_b <= 0; ra_v <= 1'b0; ro_x1 <= 0;")
@@ -522,10 +568,10 @@ def render(im, lay, lc, nf, stage=False):
     a("          S_K: if (pj_half) khi[pj_hadr] <= pj_data; else klo[pj_hadr] <= pj_data;")
     a("          S_V: begin vw_en <= 1'b1; vw_addr <= vslot; vw_lane <= pj_index[%d:0];" % (LB - 1))
     a("                 vw_data <= pj_data; end")
-    a("          S_O, S_DN: am[pj_index] <= pj_data;")
+    a("          S_O, S_DN: am[%spj_index] <= pj_data;" % ("%d + " % AOFF if AOFF else ""))
     a("          S_G: gm[pj_index] <= pj_data;")
     a("          S_U: um[pj_index] <= pj_data;")
-    a("          S_HD: if ((hk == 0 && ocnt == 0) || pj_data > best) begin")
+    a("          S_HD: if ((hk == %d && ocnt == 0) || pj_data > best) begin" % hk0)
     a("                  best <= pj_data; next_tok <= hbase + pj_index; end")
     a("          default: ;")
     a("        endcase")
@@ -533,6 +579,14 @@ def render(im, lay, lc, nf, stage=False):
     a("      if (in_norm && rn_valid) begin nm[rn_index] <= rn_data; ocnt <= ocnt + 1; end")
     if stage:
         a("      if (st == S_IDLE && x_we) xm[x_addr] <= x_wdata;")
+    if tp:
+        a("      if (g_req && gx_we)")
+        a("        case (g_vec)")
+        a("          3'd1: cm[gx_addr] <= gx_wdata;")
+        a("          3'd2: am[gx_addr] <= gx_wdata;")
+        a("          3'd3: mm[gx_addr] <= gx_wdata;")
+        a("          default: ;")
+        a("        endcase")
     if qkn:
         a("      if (in_hnorm && hn_valid) begin")
         a("        if (st == S_QN) begin")
@@ -545,7 +599,8 @@ def render(im, lay, lc, nf, stage=False):
         a("        ocnt <= ocnt + 1;")
         a("      end")
     a("      if (st == S_ATT && at_valid) begin")
-    a("        cm[hh * %d + at_index] <= at_data; ocnt <= ocnt + 1; end" % hd)
+    a("        cm[%shh * %d + at_index] <= at_data; ocnt <= ocnt + 1; end"
+      % ("%d + " % COFF if COFF else "", hd))
     a("      if ((st == S_R1 || st == S_R2) && ra_vout) begin xm[ocnt] <= ra_y; ocnt <= ocnt + 1; end")
     a("      if (st == S_RQ && ro_vout) begin qlo[ocnt] <= ro_y1; qhi[ocnt] <= ro_y2; ocnt <= ocnt + 1; end")
     a("      if (st == S_RK && ro_vout) begin")
@@ -556,15 +611,16 @@ def render(im, lay, lc, nf, stage=False):
     a("      if (st == S_GLU && si_vout) begin")
     a("        rq_acc <= si_y * um[gcnt]; rq_v <= 1'b1; gcnt <= gcnt + 1; end")
     a("      if ((st == S_GLU || st == S_EMB) && rq_vout) begin")
-    a("        if (st == S_GLU) mm[ocnt] <= rq_q; else xm[ocnt] <= rq_q;")
+    a("        if (st == S_GLU) mm[%socnt] <= rq_q; else xm[ocnt] <= rq_q;"
+      % ("%d + " % MOFF if MOFF else ""))
     a("        ocnt <= ocnt + 1;")
     a("      end")
     a("")
     a("      case (st)")
     a("        S_IDLE: if (start) begin")
     a("          tok_r <= tok; pos_r <= pos; hen <= head_en; busy <= 1'b1; lyr <= 0;")
-    a("          hh <= 0; hk <= 0; st <= %s; ed <= 0; ev1 <= 1'b0; ocnt <= 0; ph <= 1'b0;"
-      % ("emb_en ? S_EMB : S_N1" if stage else "S_EMB"))
+    a("          hh <= 0; hk <= %d; st <= %s; ed <= 0; ev1 <= 1'b0; ocnt <= 0; ph <= 1'b0;"
+      % (hk0, "emb_en ? S_EMB : S_N1" if stage else "S_EMB"))
     a("          lane_r <= tok[%d:0];" % (LB - 1))
     a("        end")
     a("        // The embedding row out of the head's weight words, requantized")
@@ -605,12 +661,22 @@ def render(im, lay, lc, nf, stage=False):
     a("        end")
     a("        S_GLU: begin")
     a("          rq_scale <= c_ms; rq_shift <= c_mh;")
-    a("          if (fj < %d) begin" % F)
+    a("          if (fj < %d) begin" % Fl)
     a("            si_x <= (c_gsh >= 0) ? (gm[fj] <<< c_gsh) : (gm[fj] >>> (-c_gsh));")
     a("            si_v <= 1'b1; fj <= fj + 1;")
     a("          end")
-    a("          if (ocnt == %d) begin fj <= 0; ocnt <= 0; gcnt <= 0; ph <= 1'b0; st <= S_DN; end" % F)
+    a("          if (ocnt == %d) begin fj <= 0; ocnt <= 0; gcnt <= 0; ph <= 1'b0; st <= %s; end"
+      % (Fl, "S_GM" if tp else "S_DN"))
     a("        end")
+    if tp:
+        # Each gather: ask once, then wait for the network; the arrays
+        # are written from outside meanwhile, and nothing here reads them.
+        for gs, vec, nxt in (("S_GC", 1, "st <= S_O;"),
+                             ("S_GA", 2, "st <= gph ? S_R2 : S_R1;"),
+                             ("S_GM", 3, "st <= S_DN;"),
+                             ("S_GH", 4, "begin busy <= 1'b0; done <= 1'b1; st <= S_IDLE; end")):
+            a("        %s: if (!ph) begin ph <= 1'b1; g_req <= 1'b1; g_vec <= 3'd%d; end" % (gs, vec))
+            a("            else if (g_done) begin g_req <= 1'b0; ph <= 1'b0; %s end" % nxt)
     a("        default: begin")
     a("          if (!ph) begin")
     a("            ph <= 1'b1; ocnt <= 0;")
@@ -629,20 +695,26 @@ def render(im, lay, lc, nf, stage=False):
     a("              S_K: st <= S_V;")
     a("              S_V: st <= %s;" % ("S_QN" if qkn else "S_RQ"))
     if qkn:
-        a("              S_QN: if (hh + 1 < %d) hh <= hh + 1;" % H)
+        a("              S_QN: if (hh + 1 < %d) hh <= hh + 1;" % Hl)
         a("                    else begin hh <= 0; st <= S_KN; end")
-        a("              S_KN: if (hh + 1 < %d) hh <= hh + 1;" % KV)
+        a("              S_KN: if (hh + 1 < %d) hh <= hh + 1;" % KVl)
         a("                    else begin hh <= 0; st <= S_RQ; end")
-    a("              S_ATT: if (hh + 1 < %d) begin hh <= hh + 1; st <= S_LQ; end" % H)
-    a("                     else begin hh <= 0; st <= S_O; end")
-    a("              S_O: st <= S_R1;")
+    a("              S_ATT: if (hh + 1 < %d) begin hh <= hh + 1; st <= S_LQ; end" % Hl)
+    a("                     else begin hh <= 0; st <= %s; end" % ("S_GC" if tp else "S_O"))
+    a("              S_O: %s" % ("begin gph <= 1'b0; st <= S_GA; end" if tp else "st <= S_R1;"))
     a("              S_N2: st <= S_G;")
     a("              S_G: st <= S_U;")
     a("              S_U: st <= S_GLU;")
-    a("              S_DN: st <= S_R2;")
-    a("              S_NF: st <= S_HD;")
-    a("              S_HD: if (hk < %d) hk <= hk + 1;" % nlast)
-    a("                    else begin busy <= 1'b0; done <= 1'b1; st <= S_IDLE; end")
+    a("              S_DN: %s" % ("begin gph <= 1'b1; st <= S_GA; end" if tp else "st <= S_R2;"))
+    if tp and hk0 > hk1:
+        # A rank with no chunk of the vocabulary left: no head, and a
+        # logit no other rank's can lose to.
+        a("              S_NF: begin best <= -16'sd32768; st <= S_GH; end")
+    else:
+        a("              S_NF: st <= S_HD;")
+    a("              S_HD: if (hk < %d) hk <= hk + 1;" % hk1)
+    a("                    else %s" % ("st <= S_GH;" if tp else
+                                   "begin busy <= 1'b0; done <= 1'b1; st <= S_IDLE; end"))
     a("              default: st <= S_IDLE;")
     a("            endcase")
     a("          end")
@@ -653,7 +725,7 @@ def render(im, lay, lc, nf, stage=False):
     a("endmodule")
     return "\n".join(A) + "\n", dict(WA=WA, CA=CA, GA=GA, KA=KA, VA=VA,
                                      KWN=KWN, VWN=VWN, CW=CW, tw=tw, pw=pw,
-                                     N=N, LB=LB)
+                                     N=N, LB=LB, GX=_clog2(max(H * hd, D, F)))
 
 
 TB = """`timescale 1ns/1ps
@@ -755,7 +827,7 @@ def build(prompt, n_gen, work=WORK, log=print, layers=None, lanes=None):
 
 
 def build_model(im, ids, n_gen, work, log=print, decode=str, layers=None,
-                stage=False, want=None, table=True):
+                stage=False, want=None, table=True, tp=None):
     """The sequencer, its blocks, images and testbench for an integer
     model already built, and the tokens it has to choose. layers and
     stage build one pipeline stage of a multi-board run instead: that
@@ -767,7 +839,7 @@ def build_model(im, ids, n_gen, work, log=print, decode=str, layers=None,
         log("integer model: %r (%.0f s)" % (decode(want), time.time() - t0))
     os.makedirs(work, exist_ok=True)
     layers = list(range(im.NL)) if layers is None else list(layers)
-    lay = Layout(im, len(layers), table)
+    lay = Layout(im, len(layers), table, tp)
     norms = write_images(im, lay, work, log, layers)
     lc, nf = layer_consts(im, norms, layers)
     rtl, w = render(im, lay, lc, nf, stage)
@@ -814,7 +886,7 @@ def build_model(im, ids, n_gen, work, log=print, decode=str, layers=None,
     with open(os.path.join(work, "tb_qfull.v"), "w") as f:
         f.write(tb)
     srcs = ["tb_qfull.v", "qwen_full.v"] + sorted(blocks) + deps
-    if stage:
+    if stage or tp:
         return want, srcs, dict(w, lay=lay, gn=gain_words(im, len(layers)))
     return want, srcs
 

@@ -127,7 +127,10 @@ module stage_ctrl #(parameter DIV = 16, parameter HAS_EMB = 1, parameter HAS_HEA
       if (start && busy) start <= 1'b0;
       // ---- receive a message, writing a hidden state into the core
       if (rv) case (rs)
-        R_S0: if (rb == 8'hA5) rs <= R_S1;
+        // A message is taken only while the stage is idle: a resent one
+        // that arrives while the stage still computes or sends is dropped,
+        // so it can never write into state in use.
+        R_S0: if (rb == 8'hA5 && !busy && !tx_on && !start) rs <= R_S1;
         R_S1: if (rb == 8'h5A) begin rs <= R_HDR; rn <= 0; rcrc <= 32'hFFFFFFFF; end
               else if (rb != 8'hA5) rs <= R_S0;
         R_HDR: begin
@@ -226,6 +229,10 @@ def _mem_block(p, w, lay, gn, half):
     if ({p}_vw_en) begin {p}_kt = {p}_vm[{p}_vw_addr]; {p}_kt[{p}_vw_lane * 16 +: 16] = {p}_vw_data; {p}_vm[{p}_vw_addr] = {p}_kt; end
   end
   wire {p}_start, {p}_head_en, {p}_emb_en, {p}_x_we, {p}_done, {p}_busy;
+  // Its core's cycles with work to do, on its own clock: what the
+  // planner's per-stage estimate is checked against.
+  integer {p}_busyc = 0;
+  always @(posedge {p}_clk) if ({p}_busy) {p}_busyc = {p}_busyc + 1;
   wire [{twm}:0] {p}_tok, {p}_next_tok;
   wire [{pwm}:0] {p}_pos;
   wire [{xam}:0] {p}_x_addr;
@@ -258,16 +265,39 @@ def _mem_block(p, w, lay, gn, half):
            LW=16 * w["N"] - 1, LB=w["LB"] - 1, WB=2 * w["N"])
 
 
-def render_tb(stages, bit_ns, seq, n_prompt, D):
+def _noise(out, src, seed):
+    """A link's line with bit errors: flipped for one bit time at random,
+    with probability 1/BER_INV each bit time (never, at BER_INV 0)."""
+    return """  reg {o}_f = 0;
+  integer {o}_seed = {seed};
+  assign {o} = {src} ^ {o}_f;
+  initial if (BER_INV > 0) forever begin
+    #(BIT);
+    if ({{$random({o}_seed)}} % BER_INV == 0) begin {o}_f = 1; #(BIT); {o}_f = 0; end
+  end
+""".format(o=out, src=src, seed=seed)
+
+
+def render_tb(stages, bit_ns, seq, n_prompt, D, ber_inv=0, timeout_ns=10000000.0):
     """stages: (name, w, lay, gn, half period, divider, has_emb, has_head).
     The host sends every token to the first stage and reads the last
-    stage's answer; the stages pass hidden states down the chain."""
-    blocks, ctrls = [], []
+    stage's answer; the stages pass hidden states down the chain.
+    ber_inv > 0 flips a link's line for one bit time with probability
+    1/ber_inv each bit time, on every link, the host's included; the host
+    then resends a position whose answer is lost or corrupt, after
+    timeout_ns at first and twice as long each time it has to retry."""
+    blocks, ctrls, noise = [], [], []
+    # Every link's two ends up front: a stage's line out, and the line
+    # the next one sees, through that link's bit errors.
+    wires = "  wire %s;\n" % ", ".join(
+        ["%s_tx" % st[0] for st in stages] + ["%s_rxn" % st[0] for st in stages]
+        + ["host_rxn"])
     for i, (p, w, lay, gn, half, div, emb, head) in enumerate(stages):
         blocks.append(_mem_block(p, w, lay, gn, half))
-        rx = "h_tx" if i == 0 else "%s_tx" % stages[i - 1][0]
-        ctrls.append("""  wire {p}_tx;
-  stage_ctrl #(.DIV({div}), .HAS_EMB({emb}), .HAS_HEAD({head})) {p}_ctl (
+        rx = "host_tx" if i == 0 else "%s_tx" % stages[i - 1][0]
+        noise.append(_noise("%s_rxn" % p, rx, 1000 + i))
+        rx = "%s_rxn" % p
+        ctrls.append("""  stage_ctrl #(.DIV({div}), .HAS_EMB({emb}), .HAS_HEAD({head})) {p}_ctl (
     .clk({p}_clk), .rst_n({p}_rst_n), .rx({rx}), .tx({p}_tx), .start({p}_start),
     .head_en({p}_head_en), .emb_en({p}_emb_en), .tok({p}_tok), .pos({p}_pos),
     .x_we({p}_x_we), .x_addr({p}_x_addr), .x_wdata({p}_x_wdata), .x_rdata({p}_x_rdata),
@@ -275,15 +305,18 @@ def render_tb(stages, bit_ns, seq, n_prompt, D):
     .crc_errors({p}_crc_errors), .messages({p}_messages));
 """.format(p=p, div=div, emb=int(emb), head=int(head), rx=rx))
     last = stages[-1][0]
+    noise.append(_noise("host_rxn", "%s_tx" % last, 999))
     steps = "\n".join("    host_step(%d, %d, %d);" % (seq[k], k, int(k >= n_prompt - 1))
                       for k in range(len(seq) - 1))
     errs = " + ".join("%s_crc_errors" % s[0] for s in stages)
     return """`timescale 1ns/1ps
 module tb_gals;
-  reg h_tx = 1;               // the host's UART line into the first stage
-{blocks}{ctrls}
-  // ---- the host: a UART at its own bit time, no clock shared with anyone
   localparam real BIT = {bit};
+  localparam integer BER_INV = {ber_inv};
+  reg host_tx = 1;               // the host's UART line into the first stage
+{wires}{blocks}{ctrls}{noise}
+  // ---- the host: a UART at its own bit time, no clock shared with anyone
+  real tmo = {tmo};
   function [31:0] crc8(input [31:0] c, input [7:0] d);
     integer i; reg [31:0] x;
     begin
@@ -295,9 +328,9 @@ module tb_gals;
   task send_byte(input [7:0] b);
     integer i;
     begin
-      h_tx = 0; #(BIT);
-      for (i = 0; i < 8; i = i + 1) begin h_tx = b[i]; #(BIT); end
-      h_tx = 1; #(BIT);
+      host_tx = 0; #(BIT);
+      for (i = 0; i < 8; i = i + 1) begin host_tx = b[i]; #(BIT); end
+      host_tx = 1; #(BIT);
     end
   endtask
   reg [7:0] msg [0:15];
@@ -306,28 +339,58 @@ module tb_gals;
   task recv_byte(output [7:0] b);
     integer i;
     begin
-      @(negedge {last}_tx); #(BIT * 1.5);
-      for (i = 0; i < 8; i = i + 1) begin b[i] = {last}_tx; #(BIT); end
+      @(negedge host_rxn); #(BIT * 1.5);
+      for (i = 0; i < 8; i = i + 1) begin b[i] = host_rxn; #(BIT); end
     end
   endtask
   reg [7:0] rb;
-  integer bad = 0;
+  reg [7:0] tmsg [0:8];
+  // One answer: find the A5 5A that starts it, then the 13 bytes after.
+  task recv_msg;
+    begin
+      rb = 0;
+      while (rb != 8'h5A) begin
+        recv_byte(rb);
+        while (rb != 8'hA5) recv_byte(rb);
+        recv_byte(rb);
+      end
+      msg[0] = 8'hA5; msg[1] = 8'h5A;
+      for (k = 2; k < 15; k = k + 1) begin recv_byte(rb); msg[k] = rb; end
+    end
+  endtask
+  integer bad = 0, resends = 0, got, okm, j;
   task host_step(input integer t, input integer p, input integer he);
     begin
-      msg[0] = 1; msg[1] = p & 255; msg[2] = p >> 8; msg[3] = t & 255;
-      msg[4] = (t >> 8) & 255; msg[5] = t >> 16; msg[6] = he; msg[7] = 0; msg[8] = 0;
-      c = 32'hFFFFFFFF;
-      for (k = 0; k < 9; k = k + 1) c = crc8(c, msg[k]);
-      c = ~c;
-      send_byte(8'hA5); send_byte(8'h5A);
-      for (k = 0; k < 9; k = k + 1) send_byte(msg[k]);
-      for (k = 0; k < 4; k = k + 1) send_byte(c[k * 8 +: 8]);
-      // The last stage always answers, with a token when the head ran.
-      for (k = 0; k < 15; k = k + 1) begin recv_byte(rb); msg[k] = rb; end
-      c = 32'hFFFFFFFF;
-      for (k = 2; k < 11; k = k + 1) c = crc8(c, msg[k]);
-      if ({{msg[14], msg[13], msg[12], msg[11]}} !== ~c) begin
-        bad = bad + 1; $display("BAD CRC at pos %0d", p);
+      tmsg[0] = 1; tmsg[1] = p & 255; tmsg[2] = p >> 8; tmsg[3] = t & 255;
+      tmsg[4] = (t >> 8) & 255; tmsg[5] = t >> 16; tmsg[6] = he; tmsg[7] = 0; tmsg[8] = 0;
+      okm = 0;
+      while (!okm) begin
+        c = 32'hFFFFFFFF;
+        for (j = 0; j < 9; j = j + 1) c = crc8(c, tmsg[j]);
+        c = ~c;
+        send_byte(8'hA5); send_byte(8'h5A);
+        for (j = 0; j < 9; j = j + 1) send_byte(tmsg[j]);
+        for (j = 0; j < 4; j = j + 1) send_byte(c[j * 8 +: 8]);
+        // The last stage answers every position, with a token when the
+        // head ran. An answer lost or corrupt on any link is resent for:
+        // running a position again rewrites its KV entries with the same
+        // values. A late answer to an earlier try is known by position.
+        got = 0;
+        while (!got) begin
+          fork : wait_answer
+            begin recv_msg; got = 1; disable wait_answer; end
+            begin #(tmo); got = 2; disable wait_answer; end
+          join
+          if (got == 1) begin
+            c = 32'hFFFFFFFF;
+            for (k = 2; k < 11; k = k + 1) c = crc8(c, msg[k]);
+            if ({{msg[14], msg[13], msg[12], msg[11]}} !== ~c) begin
+              bad = bad + 1; got = 2;
+            end else if ({{msg[4], msg[3]}} != p + 1) got = 0;   // an earlier try's
+          end
+        end
+        if (got == 1) okm = 1;
+        else begin resends = resends + 1; tmo = tmo * 2.0; end
       end
       if (he) $display("TOKEN pos=%0d tok=%0d best=%0d", {{msg[4], msg[3]}},
                        {{msg[7], msg[6], msg[5]}}, $signed({{msg[10], msg[9]}}));
@@ -337,16 +400,37 @@ module tb_gals;
   initial begin
     #2000;
 {steps}
-    $display("LINK crc_errors=%0d host_bad=%0d", {errs}, bad);
+    $display("LINK crc_errors=%0d host_bad=%0d resends=%0d", {errs}, bad, resends);
+{busy}
     $finish;
   end
 endmodule
-""".format(blocks="".join(blocks), ctrls="".join(ctrls), bit="%.1f" % bit_ns,
-           last=last, steps=steps, errs=errs)
+""".format(blocks="".join(blocks), ctrls="".join(ctrls), noise="".join(noise),
+           wires=wires, bit="%.1f" % bit_ns,
+           last=last, steps=steps, errs=errs, ber_inv=int(ber_inv),
+           tmo="%.1f" % timeout_ns,
+           busy="\n".join('    $display("STAGE %s busy_cycles=%%0d", %s_busyc);' % (st[0], st[0])
+                          for st in stages))
+
+
+def answer_ns(im, split, stages, bit_ns):
+    """How long the host waits for an answer before it resends: twice a
+    generous estimate of one position through every stage and link, so a
+    run without bit errors never resends."""
+    D, F, H, KV, hd, V = im.D, im.F, im.H, im.KV, im.hd, im.V
+    lw = D * (H * hd + 2 * KV * hd) + H * hd * D + 3 * D * F
+    ns = 0.0
+    for (p, w, lay, gn, half, div, emb, head), layers in zip(stages, split):
+        n = w["N"]
+        cyc = len(layers) * (lw / n + 8 * D + 4 * F + 8 * H * hd + 4 * (H + KV) * hd)
+        if head:
+            cyc += V * D / n + V
+        ns += 4 * cyc * 2 * half + (2 * D + 13) * 10 * bit_ns
+    return 2 * ns + 1e6
 
 
 def build(im, ids, n_gen, work, split, clocks=(10.0, 7.9, 12.3), bit_ns=160.0, log=print,
-          lanes=None):
+          lanes=None, ber_inv=0):
     """Build a pipeline of len(split) stages; split[i] is stage i's layers.
     lanes[i], if given, is stage i's projection width: boards of different
     sizes in one pipeline, which only share the hidden state. Returns the
@@ -392,7 +476,8 @@ def build(im, ids, n_gen, work, split, clocks=(10.0, 7.9, 12.3), bit_ns=160.0, l
     with open(os.path.join(work, "stage_ctrl.v"), "w") as f:
         f.write(board.UART + render_ctrl(im.D, tw, pw))
     with open(os.path.join(work, "tb_gals.v"), "w") as f:
-        f.write(render_tb(stages, bit_ns, want, len(ids), im.D))
+        f.write(render_tb(stages, bit_ns, want, len(ids), im.D, ber_inv,
+                          answer_ns(im, split, stages, bit_ns)))
     return want, (["tb_gals.v", "stage_ctrl.v"]
                   + ["qwen_full_%s.v" % s[0] for s in stages] + sorted(srcs))
 

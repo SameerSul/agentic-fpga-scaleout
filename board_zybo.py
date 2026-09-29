@@ -35,6 +35,7 @@ import os
 import shutil
 import struct
 import sys
+import textwrap
 
 import boards
 import zybo
@@ -66,6 +67,15 @@ STAGE_REGS = [
     (0x38, "XADDR", "hidden-state element to access next (auto-increments)"),
     (0x3C, "XDATA", "that element, 16 bits signed: write to load, read to fetch"),
     (0x40, "STAGE", "bits 7:0 first layer, 15:8 end layer, 16 embeds, 17 has the head"),
+]
+# A tensor-parallel rank's package adds these instead.
+TP_REGS = [
+    (0x38, "GADDR", "element of the vector being gathered to access next (auto-increments)"),
+    (0x3C, "GDATA", "that element, 16 bits signed: read this rank's slice, write the others'"),
+    (0x40, "TP", "bits 7:0 this rank, 15:8 the ranks"),
+    (0x44, "GATHER", "bit 0 the core waits on a gather not yet answered, bits 3:1 which "
+                     "(1 the attention context, 2 o's or down's output, 3 the gated "
+                     "product, 4 the head's best); write 1 once the other ranks' slices are in"),
 ]
 
 
@@ -227,7 +237,9 @@ endmodule
 """.format(busif=busif, ports=ports, ties="".join(ties(m) for m in wm),
            kvties=ties("m_axi_kv", True), lens=lens, conn=conn, rd=rd,
            twm=W["tok"] - 1, pwm=W["pos"] - 1)
-    return stage_wrapper(v, L) if "x_addr" in W else v
+    if "x_addr" in W:
+        return stage_wrapper(v, L)
+    return tp_wrapper(v, L) if "gx_addr" in W else v
 
 
 def stage_wrapper(v, L):
@@ -238,8 +250,24 @@ def stage_wrapper(v, L):
     held while a line fills, so an XDATA access holds its AXI response
     until the core has taken the edges it needs: two to take a write,
     three to have the word read."""
-    xa = L["W"]["x_addr"]
-    st = L.get("stage", dict(l0=0, l1=0, emb=1, head=1))
+    return _window(v, L, "x")
+
+
+def tp_wrapper(v, L):
+    """The register block for one rank of a tensor-parallel run: GADDR
+    and GDATA read this rank's slice of the vector being gathered and
+    write the other ranks' slices into it, a word an access, waiting for
+    the core's edges as XDATA does; GATHER says whether and what the core
+    is waiting for, and a write of 1 lets it go on once the slices are in;
+    TP says which rank of how many this bitstream is."""
+    return _window(v, L, "gx")
+
+
+def _window(v, L, px):
+    """A word-at-a-time window into the core's vectors, at 0x38 and 0x3C,
+    for a stage (px "x") or a tensor-parallel rank (px "gx")."""
+    xa = L["W"][px + "_addr"]
+    stage = px == "x"
     def rep(a, b, n=1):
         nonlocal v
         assert v.count(a) == n, a
@@ -251,33 +279,48 @@ def stage_wrapper(v, L):
     rep("case (s_axi_araddr[5:2])", "case (s_axi_araddr[6:2])")
     for i in range(14):
         rep("          4'h%X: s_axi_rdata <=" % i, "          5'h%02X: s_axi_rdata <=" % i)
-    rep("5'h00: s_axi_rdata <= {30'd0, head_en, 1'b0};",
-        "5'h00: s_axi_rdata <= {29'd0, emb_en, head_en, 1'b0};")
+    if stage:
+        st = L.get("stage", dict(l0=0, l1=0, emb=1, head=1))
+        rep("5'h00: s_axi_rdata <= {30'd0, head_en, 1'b0};",
+            "5'h00: s_axi_rdata <= {29'd0, emb_en, head_en, 1'b0};")
+        ident = "          5'h10: s_axi_rdata <= 32'h%08X;\n" % (
+            st["l0"] | st["l1"] << 8 | st["emb"] << 16 | st["head"] << 17)
+    else:
+        r, T = L["tp"]["rank"], L["tp"]["ranks"]
+        ident = ("          5'h10: s_axi_rdata <= 32'h%08X;\n"
+                 "          5'h11: s_axi_rdata <= {28'd0, g_vec, g_req && !g_done};\n" % (r | T << 8))
     rep("""          default: s_axi_rdata <= 32'd0;""",
-        """          5'h0E: s_axi_rdata <= {%d'd0, x_addr};
-          5'h10: s_axi_rdata <= 32'h%08X;
-          default: s_axi_rdata <= 32'd0;""" % (32 - xa, st["l0"] | st["l1"] << 8
-                                                 | st["emb"] << 16 | st["head"] << 17))
-    rep("""          4'h0: begin head_en <= wd[1];""", """          5'h00: begin head_en <= wd[1]; emb_en <= wd[2];""")
+        """          5'h0E: s_axi_rdata <= {%d'd0, %s_addr};
+%s          default: s_axi_rdata <= 32'd0;""" % (32 - xa, px, ident))
+    if stage:
+        rep("""          4'h0: begin head_en <= wd[1];""",
+            """          5'h00: begin head_en <= wd[1]; emb_en <= wd[2];""")
+    else:
+        rep("""          4'h0: begin head_en <= wd[1];""", """          5'h00: begin head_en <= wd[1];""")
     rep("""          4'h1: tok <= wd[""", """          5'h01: tok <= wd[""")
     rep("""          4'h2: pos <= wd[""", """          5'h02: pos <= wd[""")
+    # A gather's answer is held until the core drops its request.
+    go = "" if stage else "          5'h11: if (wd[0]) g_done <= 1'b1;\n"
+    drop = "" if stage else "      if (g_done && !g_req) g_done <= 1'b0;\n"
     rep("""          default: ;
         endcase
       end
-      if (s_axi_bvalid && s_axi_bready) s_axi_bvalid <= 1'b0;""", """          5'h0E: x_addr <= wd[%d:0];
-          5'h0F: begin x_wdata <= wd[15:0]; x_we <= 1'b1; xcc <= core_cycles; xop <= 2'd1; end
-          default: ;
+      if (s_axi_bvalid && s_axi_bready) s_axi_bvalid <= 1'b0;""", """          5'h0E: {px}_addr <= wd[{xam}:0];
+          5'h0F: begin {px}_wdata <= wd[15:0]; {px}_we <= 1'b1; xcc <= core_cycles; xop <= 2'd1; end
+{go}          default: ;
         endcase
       end
-      // The hidden-state accesses finish on the core's edges.
+      // The {what} accesses finish on the core's edges.
       if (xop == 2'd1 && core_cycles - xcc >= 2) begin
-        x_we <= 1'b0; xop <= 2'd0; s_axi_bvalid <= 1'b1; x_addr <= x_addr + 1;
+        {px}_we <= 1'b0; xop <= 2'd0; s_axi_bvalid <= 1'b1; {px}_addr <= {px}_addr + 1;
       end
       if (xop == 2'd2 && core_cycles - xcc >= 3) begin
-        s_axi_rdata <= {{16{x_rdata[15]}}, x_rdata}; s_axi_rvalid <= 1'b1;
-        xop <= 2'd0; x_addr <= x_addr + 1;
+        s_axi_rdata <= {{{{16{{{px}_rdata[15]}}}}, {px}_rdata}}; s_axi_rvalid <= 1'b1;
+        xop <= 2'd0; {px}_addr <= {px}_addr + 1;
       end
-      if (s_axi_bvalid && s_axi_bready) s_axi_bvalid <= 1'b0;""" % (xa - 1))
+{drop}      if (s_axi_bvalid && s_axi_bready) s_axi_bvalid <= 1'b0;""".format(
+        px=px, xam=xa - 1, go=go, drop=drop,
+        what="hidden-state" if stage else "gather"))
     rep("""        hav_a <= 1'b0; hav_w <= 1'b0; s_axi_bvalid <= 1'b1;""",
         """        hav_a <= 1'b0; hav_w <= 1'b0; s_axi_bvalid <= (wa[6:2] != 5'h0F);""")
     rep("""        s_axi_rvalid <= 1'b1;
@@ -290,18 +333,29 @@ def stage_wrapper(v, L):
         "if (s_axi_wvalid && !s_axi_wready && !hav_w && !s_axi_bvalid && xop == 2'd0)")
     rep("if (s_axi_arvalid && !s_axi_arready && !s_axi_rvalid)",
         "if (s_axi_arvalid && !s_axi_arready && !s_axi_rvalid && xop == 2'd0)")
+    if stage:
+        rst = "      emb_en <= 1'b1; x_we <= 1'b0; x_addr <= 0; x_wdata <= 0; xop <= 2'd0; xcc <= 0;"
+        decl = ("  reg emb_en, x_we; reg [%d:0] x_addr; reg signed [15:0] x_wdata;\n"
+                "  wire signed [15:0] x_rdata; reg [1:0] xop; reg [31:0] xcc;" % (xa - 1))
+        conn = "    .emb_en(emb_en), .x_we(x_we), .x_addr(x_addr), .x_wdata(x_wdata), .x_rdata(x_rdata),\n"
+    else:
+        rst = ("      gx_we <= 1'b0; gx_addr <= 0; gx_wdata <= 0; xop <= 2'd0; xcc <= 0;"
+               " g_done <= 1'b0;")
+        decl = ("  reg gx_we, g_done; reg [%d:0] gx_addr; reg signed [15:0] gx_wdata;\n"
+                "  wire signed [15:0] gx_rdata; wire g_req; wire [2:0] g_vec;\n"
+                "  reg [1:0] xop; reg [31:0] xcc;" % (xa - 1))
+        conn = ("    .g_req(g_req), .g_vec(g_vec), .g_done(g_done), .gx_we(gx_we),\n"
+                "    .gx_addr(gx_addr), .gx_wdata(gx_wdata), .gx_rdata(gx_rdata),\n")
     rep("""      tok <= 0; pos <= 0; bus_cycles <= 0;""",
         """      tok <= 0; pos <= 0; bus_cycles <= 0;
-      emb_en <= 1'b1; x_we <= 1'b0; x_addr <= 0; x_wdata <= 0; xop <= 2'd0; xcc <= 0;""")
+""" + rst)
     rep("""  reg start, head_en, done_s;""", """  reg start, head_en, done_s;
-  reg emb_en, x_we; reg [%d:0] x_addr; reg signed [15:0] x_wdata;
-  wire signed [15:0] x_rdata; reg [1:0] xop; reg [31:0] xcc;""" % (xa - 1))
+""" + decl)
     rep("""    .tok(tok), .pos(pos), .next_tok(next_tok), .best(best), .done(done),
     .busy(busy),
 """, """    .tok(tok), .pos(pos), .next_tok(next_tok), .best(best), .done(done),
     .busy(busy),
-    .emb_en(emb_en), .x_we(x_we), .x_addr(x_addr), .x_wdata(x_wdata), .x_rdata(x_rdata),
-""")
+""" + conn)
     return v
 
 
@@ -678,8 +732,10 @@ CHECKED = {
                 "testbench's token and core cycles, with every port always ready "
                 "and with every port stalling and gapping its beats at random "
                 "(`--jitter`); and all 24 layers and the head of the Zybo's 16-lane "
-                "build the same way, on the weight streamer before its last fix, "
-                "choosing \" Paris\" (the full rerun on this build is in progress)."),
+                "build the same way, choosing \" Paris\". The attention head's wider "
+                "score lanes came after that run; with them, all 24 layers and the "
+                "head on the direct testbench take the same cycles and choose "
+                "\" Paris\" again."),
     "qwen3": ("Qwen3-0.6B",
               "this design with one layer run only through AXI-Lite against the "
               "stalling DDR model, matching the direct testbench's token and core "
@@ -689,7 +745,7 @@ CHECKED = {
 }
 
 
-def render_header(L, n_gen, title="Zybo Z7-20", stage=None):
+def render_header(L, n_gen, title="Zybo Z7-20", stage=None, tp=None):
     lines = ["// GENERATED by board_zybo.py: the DDR layout and registers of",
              "// the bitstream this was generated with.",
              "#ifndef FPGAI_LAYOUT_H", "#define FPGAI_LAYOUT_H",
@@ -724,6 +780,17 @@ def render_header(L, n_gen, title="Zybo Z7-20", stage=None):
                   "#define IP_NEXT         %s" % ip("next_ip"),
                   "#define IP_FIRST        %s" % ip("first_ip"),
                   "#define UDP_PORT        %d" % stage.get("port", 5000)]
+    if tp:
+        lines += ["#define FPGAI_%-10s 0x%02XU  /* %s */" % (n, o, w) for o, n, w in TP_REGS]
+        lines += ["#define FPGAI_HHD       %d" % tp["HHD"],
+                  "#define FPGAI_D         %d" % tp["D"],
+                  "#define FPGAI_F         %d" % tp["F"],
+                  "#define TP_RANK         %d" % tp["rank"],
+                  "#define TP_RANKS        %d" % tp["ranks"],
+                  "#define TP_VALUE        0x%08XU" % (tp["rank"] | tp["ranks"] << 8),
+                  "#define IP_RANKS        %s" % ", ".join(
+                      "{%s}" % ", ".join(str(v) for v in ip) for ip in tp["ips"]),
+                  "#define UDP_PORT        %d" % tp.get("port", 5000)]
     lines += ["#endif", ""]
     return "\n".join(lines)
 
@@ -1150,7 +1217,386 @@ int main(void)
 """
 
 
-def write_sd(L, work, sd, prompt, tokzr, first=True):
+TP_C = r"""// GENERATED by board_zybo.py. One rank of a tensor-parallel run (tp.py)
+// on a Zynq: this rank's slice of every layer in the PL, the gathers on
+// the ARM over UDP. Build it from Vitis's "lwIP Echo Server" template as
+// the stage program is built: replace its main.c with this file, add
+// fpgai_layout.h, and enable xilffs in the BSP.
+//
+// Every rank runs every position. The core stops at each gather with
+// GATHER bit 0 set and the vector's number in bits 3:1; the ARM reads
+// this rank's slice through GADDR and GDATA, sends it to every other
+// rank, writes theirs in as they arrive and writes 1 to GATHER. At the
+// head each rank offers its best logit and that token, and every rank
+// takes the same winner: the largest logit, the lower rank on a tie,
+// which is the lower token, as the integer model's argmax.
+//
+// Gathers are numbered from 1 in the order every rank meets them, and a
+// slice travels in parts of at most PART_WORDS words, each a datagram in
+// gals.py's framing (A5 5A, type, position, token, flags, payload,
+// CRC32). A rank can be one gather ahead of another and never more, so
+// parts that come early are kept for the next gather, and this rank's
+// previous slice is kept for a rank one behind. A rank still missing
+// parts after RESEND_MS asks their sender again (type 5), and the answer
+// is the slice once more: a lost or corrupt datagram costs one timeout.
+#include <stdio.h>
+#include <string.h>
+#include "xil_io.h"
+#include "xil_cache.h"
+#include "xtime_l.h"
+#include "ff.h"
+#include "platform.h"
+#include "platform_config.h"
+#include "netif/xadapter.h"
+#include "lwip/init.h"
+#include "lwip/udp.h"
+#include "lwip/ip_addr.h"
+#include "fpgai_layout.h"
+
+#define REG(o) (FPGAI_REGS + (o))
+#define PART_WORDS 600
+#define MAX2(a, b) ((a) > (b) ? (a) : (b))
+#define VMAX MAX2(MAX2(FPGAI_HHD, FPGAI_D), MAX2(FPGAI_F, 3 * TP_RANKS))
+#define SMAX (VMAX / TP_RANKS + 3)
+#define PMAX ((SMAX + PART_WORDS - 1) / PART_WORDS)
+// Longer than the slowest rank takes between two gathers, so only a
+// lost datagram triggers it.
+#define RESEND_MS 250
+#define LINGER_MS 3000
+enum { T_SLICE = 4, T_ASK = 5 };
+
+struct gather {
+    u32 gid;
+    int vec, n;                   // the vector's number, a slice's words
+    s16 v[VMAX];                  // the whole vector, each rank's slice at rank * n
+    u8 got[TP_RANKS][PMAX];
+};
+
+static FATFS fs;
+static struct netif nif;
+static struct udp_pcb *pcb;
+static const u8 ips[TP_RANKS][4] = {IP_RANKS};
+static ip_addr_t peer[TP_RANKS];
+static struct gather gb[2], *cur = &gb[0], *nxt = &gb[1];
+static s16 mine[SMAX], prev[SMAX];
+static u32 mine_gid, prev_gid;
+static int mine_vec, mine_n, prev_vec, prev_n;
+static u32 g_tok, n_asks, n_gathers;
+static s16 g_best;
+static u8 txb[1500];
+
+static u32 crc32(const u8 *p, int n)
+{
+    u32 c = 0xFFFFFFFFU;
+    while (n--) {
+        c ^= *p++;
+        for (int k = 0; k < 8; k++)
+            c = (c >> 1) ^ (0xEDB88320U & (0U - (c & 1U)));
+    }
+    return ~c;
+}
+
+static int build(int type, const u8 *pay, int n)
+{
+    u8 *b = txb;
+    memset(b, 0, 9);
+    b[0] = 0xA5; b[1] = 0x5A; b[2] = type;
+    memcpy(b + 9, pay, n);
+    u32 c = crc32(b + 2, 7 + n);
+    for (int k = 0; k < 4; k++)
+        b[9 + n + k] = c >> (8 * k);
+    return 13 + n;
+}
+
+static void send_to(int r, int n)
+{
+    struct pbuf *p = pbuf_alloc(PBUF_TRANSPORT, n, PBUF_RAM);
+    if (!p)
+        return;
+    memcpy(p->payload, txb, n);
+    udp_sendto(pcb, p, &peer[r], UDP_PORT);
+    pbuf_free(p);
+}
+
+static void put32(u8 *b, u32 v) { b[0] = v; b[1] = v >> 8; b[2] = v >> 16; b[3] = v >> 24; }
+static u32 get32(const u8 *b) { return b[0] | b[1] << 8 | b[2] << 16 | (u32)b[3] << 24; }
+
+// A slice to rank r: gid, vector, sender, slice words, then its parts.
+static void send_slice(int r, u32 gid, int vec, int n, const s16 *w)
+{
+    static u8 pay[14 + 2 * PART_WORDS];
+    for (int off = 0; off < n; off += PART_WORDS) {
+        int cnt = n - off < PART_WORDS ? n - off : PART_WORDS;
+        put32(pay, gid);
+        pay[4] = vec; pay[5] = TP_RANK;
+        pay[6] = n; pay[7] = n >> 8; pay[8] = off; pay[9] = off >> 8;
+        pay[10] = cnt; pay[11] = cnt >> 8; pay[12] = 0; pay[13] = 0;
+        for (int i = 0; i < cnt; i++) {
+            pay[14 + 2 * i] = (u16)w[off + i];
+            pay[15 + 2 * i] = (u16)w[off + i] >> 8;
+        }
+        send_to(r, build(T_SLICE, pay, 14 + 2 * cnt));
+    }
+}
+
+static void rx(void *arg, struct udp_pcb *u, struct pbuf *p,
+               const ip_addr_t *addr, u16_t port)
+{
+    static u8 b[1500];
+    int n = p->tot_len > (int)sizeof b ? (int)sizeof b : p->tot_len;
+    pbuf_copy_partial(p, b, n, 0);
+    pbuf_free(p);
+    (void)arg; (void)u; (void)addr; (void)port;
+    if (n < 13 + 6 || b[0] != 0xA5 || b[1] != 0x5A)
+        return;
+    if (crc32(b + 2, n - 6) != get32(b + n - 4))
+        return;                          // dropped: its receiver asks again
+    const u8 *q = b + 9;
+    u32 gid = get32(q);
+    int src = q[5];
+    if (src >= TP_RANKS || src == TP_RANK)
+        return;
+    if (b[2] == T_ASK) {
+        // A rank missing this rank's slice: the current one or the last.
+        if (gid == mine_gid && mine_gid)
+            send_slice(src, mine_gid, mine_vec, mine_n, mine);
+        else if (gid == prev_gid && prev_gid)
+            send_slice(src, prev_gid, prev_vec, prev_n, prev);
+        return;
+    }
+    if (b[2] != T_SLICE || n < 13 + 14)
+        return;
+    struct gather *g = gid == cur->gid ? cur : gid == nxt->gid ? nxt : 0;
+    int vec = q[4], sn = q[6] | q[7] << 8, off = q[8] | q[9] << 8, cnt = q[10] | q[11] << 8;
+    if (!g || off % PART_WORDS || off + cnt > sn || (src + 1) * sn > VMAX
+        || 13 + 14 + 2 * cnt > n || (g->n && (g->n != sn || g->vec != vec)))
+        return;
+    g->n = sn; g->vec = vec;
+    for (int i = 0; i < cnt; i++)
+        g->v[src * sn + off + i] = (s16)(q[14 + 2 * i] | q[15 + 2 * i] << 8);
+    g->got[src][off / PART_WORDS] = 1;
+}
+
+static int complete(const struct gather *g, int r)
+{
+    for (int k = 0; k * PART_WORDS < g->n; k++)
+        if (!g->got[r][k])
+            return 0;
+    return 1;
+}
+
+static XTime now_ms(void)
+{
+    XTime t;
+    XTime_GetTime(&t);
+    return t / (COUNTS_PER_SECOND / 1000);
+}
+
+// One gather: this rank's slice out to every other rank, theirs in.
+static void gather(int vec)
+{
+    int n = vec == 1 ? FPGAI_HHD / TP_RANKS : vec == 2 ? FPGAI_D / TP_RANKS
+          : vec == 3 ? FPGAI_F / TP_RANKS : 3;
+    // The next gather becomes this one, with any parts that came early.
+    struct gather *t = cur;
+    cur = nxt;
+    nxt = t;
+    memset(nxt->got, 0, sizeof nxt->got);
+    nxt->gid = cur->gid + 1;
+    nxt->n = 0;
+    if (cur->n && (cur->n != n || cur->vec != vec)) {
+        printf("rank %d: early parts of gather %lu disagree\r\n", TP_RANK,
+               (unsigned long)cur->gid);
+        memset(cur->got, 0, sizeof cur->got);
+    }
+    cur->n = n; cur->vec = vec;
+    memcpy(prev, mine, sizeof mine);
+    prev_gid = mine_gid; prev_vec = mine_vec; prev_n = mine_n;
+    if (vec == 4) {
+        u32 tk = Xil_In32(REG(FPGAI_NEXT_TOK));
+        mine[0] = (s16)Xil_In32(REG(FPGAI_BEST));
+        mine[1] = (s16)(tk & 0xFFFF);
+        mine[2] = (s16)(tk >> 16);
+    } else {
+        Xil_Out32(REG(FPGAI_GADDR), TP_RANK * n);
+        for (int i = 0; i < n; i++)
+            mine[i] = (s16)Xil_In32(REG(FPGAI_GDATA));
+    }
+    mine_gid = cur->gid; mine_vec = vec; mine_n = n;
+    memcpy(cur->v + TP_RANK * n, mine, 2 * n);
+    for (int r = 0; r < TP_RANKS; r++)
+        if (r != TP_RANK)
+            send_slice(r, mine_gid, vec, n, mine);
+    XTime t0 = now_ms();
+    for (;;) {
+        int all = 1;
+        for (int r = 0; r < TP_RANKS; r++)
+            if (r != TP_RANK && !complete(cur, r))
+                all = 0;
+        if (all)
+            break;
+        xemacif_input(&nif);
+        if (now_ms() - t0 > RESEND_MS) {
+            static u8 ask[6];
+            put32(ask, cur->gid);
+            ask[4] = vec; ask[5] = TP_RANK;
+            for (int r = 0; r < TP_RANKS; r++)
+                if (r != TP_RANK && !complete(cur, r)) {
+                    send_to(r, build(T_ASK, ask, 6));
+                    n_asks++;
+                }
+            t0 = now_ms();
+        }
+    }
+    if (vec == 4) {
+        // The largest logit; on a tie the lower rank, whose tokens are lower.
+        g_best = cur->v[0];
+        g_tok = (u16)cur->v[1] | (u32)(u16)cur->v[2] << 16;
+        for (int r = 1; r < TP_RANKS; r++)
+            if (cur->v[3 * r] > g_best) {
+                g_best = cur->v[3 * r];
+                g_tok = (u16)cur->v[3 * r + 1] | (u32)(u16)cur->v[3 * r + 2] << 16;
+            }
+    } else {
+        for (int r = 0; r < TP_RANKS; r++) {
+            if (r == TP_RANK)
+                continue;
+            Xil_Out32(REG(FPGAI_GADDR), r * n);
+            for (int i = 0; i < n; i++)
+                Xil_Out32(REG(FPGAI_GDATA), (u16)cur->v[r * n + i]);
+        }
+    }
+    n_gathers++;
+    Xil_Out32(REG(FPGAI_GATHER), 1);
+}
+
+// One position on this rank, every gather on the way served.
+static void run(u32 tok, u32 pos, int head)
+{
+    Xil_Out32(REG(FPGAI_TOK), tok);
+    Xil_Out32(REG(FPGAI_POS), pos);
+    Xil_Out32(REG(FPGAI_CTRL), 1 | (head ? 2 : 0));
+    for (;;) {
+        u32 g = Xil_In32(REG(FPGAI_GATHER));
+        if (g & 1)
+            gather((g >> 1) & 7);
+        else if (Xil_In32(REG(FPGAI_STATUS)) & 2)
+            break;
+        else
+            xemacif_input(&nif);         // a peer's early parts, or its asks
+    }
+}
+
+static int load(const char *name, UINTPTR addr, u32 want)
+{
+    FIL f;
+    UINT n;
+    u32 got = 0;
+    if (f_open(&f, name, FA_READ) != FR_OK) {
+        printf("missing %s\r\n", name);
+        return -1;
+    }
+    if (want && f_size(&f) != want) {
+        printf("%s is %lu bytes, this bitstream wants %lu\r\n", name,
+               (unsigned long)f_size(&f), (unsigned long)want);
+        return -1;
+    }
+    while (f_read(&f, (void *)(addr + got), 1 << 20, &n) == FR_OK && n)
+        got += n;
+    f_close(&f);
+    printf("%s: %lu bytes\r\n", name, (unsigned long)got);
+    return (int)got;
+}
+
+#if TP_RANK == 0
+static const u32 *vocab;
+static void print_tok(u32 t)
+{
+    u32 n = vocab[0];
+    const char *s = (const char *)(vocab + n + 2);
+    if (t < n)
+        printf("%.*s", (int)(vocab[t + 2] - vocab[t + 1]), s + vocab[t + 1]);
+    fflush(stdout);
+}
+#else
+#define print_tok(t) ((void)(t))
+#endif
+
+int main(void)
+{
+    static u32 prompt[MAX_POS + 1];
+    ip_addr_t ip, mask, gw;
+    unsigned char mac[6] = {0x00, 0x0a, 0x35, 0x00, 0x02, 0x10 + TP_RANK};
+    init_platform();
+    printf("\r\nfpgai rank %d of %d on the " FPGAI_BOARD "\r\n", TP_RANK, TP_RANKS);
+    if (Xil_In32(REG(FPGAI_ID)) != FPGAI_ID_VALUE ||
+        Xil_In32(REG(FPGAI_TP)) != TP_VALUE ||
+        Xil_In32(REG(FPGAI_KVEND)) != (u32)KVEND) {
+        printf("the bitstream is not this rank's\r\n");
+        return 1;
+    }
+    if (f_mount(&fs, "0:/", 1) != FR_OK ||
+        load("weights8.bin", WBASE, WBYTES) < 0 ||
+        load("cparams.bin", CBASE, CBYTES) < 0 ||
+        load("prompt.bin", (UINTPTR)prompt, 0) < 0)
+        return 1;
+#if TP_RANK == 0
+    if (load("vocab.bin", VOCAB_BASE, 0) < 0)
+        return 1;
+    vocab = (const u32 *)VOCAB_BASE;
+#endif
+    memset((void *)KBASE, 0, KVEND - KBASE);
+    Xil_DCacheFlush();
+
+    lwip_init();
+    IP4_ADDR(&ip, ips[TP_RANK][0], ips[TP_RANK][1], ips[TP_RANK][2], ips[TP_RANK][3]);
+    IP4_ADDR(&mask, 255, 255, 255, 0);
+    IP4_ADDR(&gw, 0, 0, 0, 0);
+    for (int r = 0; r < TP_RANKS; r++)
+        IP4_ADDR(&peer[r], ips[r][0], ips[r][1], ips[r][2], ips[r][3]);
+    if (!xemac_add(&nif, &ip, &mask, &gw, mac, PLATFORM_EMAC_BASEADDR)) {
+        printf("no Ethernet\r\n");
+        return 1;
+    }
+    netif_set_default(&nif);
+    platform_enable_interrupts();
+    netif_set_up(&nif);
+    pcb = udp_new();
+    udp_bind(pcb, IP_ADDR_ANY, UDP_PORT);
+    udp_recv(pcb, rx, NULL);
+    cur->gid = 0;
+    nxt->gid = 1;
+    printf("listening on UDP %d\r\n", UDP_PORT);
+
+    XTime a = 0, b = 0;
+    u32 n = prompt[0], tok = 0;
+    for (u32 pos = 0; pos < n + N_GEN - 1 && pos < MAX_POS; pos++) {
+        int head = pos >= n - 1;
+        if (pos < n) {
+            tok = prompt[pos + 1];
+            print_tok(tok);
+        }
+        XTime_GetTime(&a);
+        run(tok, pos, head);
+        XTime_GetTime(&b);
+        if (head) {
+            tok = g_tok;
+            print_tok(tok);
+        }
+    }
+    printf("\r\nrank %d: %lu gathers, %lu asks, last step %.3f s\r\n", TP_RANK,
+           (unsigned long)n_gathers, (unsigned long)n_asks,
+           (double)(b - a) / COUNTS_PER_SECOND);
+    // A rank that lost this one's last slice asks for it: keep answering.
+    XTime t0 = now_ms();
+    while (now_ms() - t0 < LINGER_MS)
+        xemacif_input(&nif);
+    return 0;
+}
+"""
+
+
+def write_sd(L, work, sd, prompt, tokzr, first=True, vocab=True):
     os.makedirs(sd, exist_ok=True)
     w8 = zybo.write_w8(work)
     dst = os.path.join(sd, "weights8.bin")
@@ -1173,15 +1619,16 @@ def write_sd(L, work, sd, prompt, tokzr, first=True):
                 g.write(struct.pack("<Q", int(line, 16)))
     if not first:
         return                  # only the first stage prints, and holds the prompt
-    # vocab.bin: n, n+1 offsets, then every token's bytes.
-    n = max(tokzr.inv) + 1
-    blob, offs = bytearray(), [0]
-    for t in range(n):
-        s = tokzr.inv.get(t, "")
-        blob += bytes(tokzr.u2b.get(c, 63) for c in s)
-        offs.append(len(blob))
-    with open(os.path.join(sd, "vocab.bin"), "wb") as g:
-        g.write(struct.pack("<%dI" % (n + 2), n, *offs) + bytes(blob))
+    if vocab:
+        # vocab.bin: n, n+1 offsets, then every token's bytes.
+        n = max(tokzr.inv) + 1
+        blob, offs = bytearray(), [0]
+        for t in range(n):
+            s = tokzr.inv.get(t, "")
+            blob += bytes(tokzr.u2b.get(c, 63) for c in s)
+            offs.append(len(blob))
+        with open(os.path.join(sd, "vocab.bin"), "wb") as g:
+            g.write(struct.pack("<%dI" % (n + 2), n, *offs) + bytes(blob))
     with open(os.path.join(sd, "prompt.bin"), "wb") as g:
         g.write(struct.pack("<%dI" % (len(prompt) + 1), len(prompt), *prompt))
 
@@ -1191,7 +1638,7 @@ README = """# fpgai on the {title}
 GENERATED by `board_zybo.py`. The generated {model} sequencer, {lanes}
 lanes wide, in the Zynq's PL, fed from DDR; the ARM loads the model
 from the SD card and drives it a position at a time.
-
+{role}
 ## Build
 
 1. `vivado -mode batch -source build.tcl` on an x86 host with
@@ -1237,6 +1684,19 @@ timing report.
 """
 
 
+def _readme(role, text):
+    """A stage's or a rank's program talks UDP: its application comes
+    from the lwIP template, not an empty one."""
+    if not role:
+        return text
+    a = ("   with `xilffs` enabled in the BSP; an empty C application with\n"
+         "   `sw/main.c` and `sw/fpgai_layout.h`.")
+    assert a in text
+    return text.replace(a, "   with `xilffs` enabled in the BSP; an application from the lwIP Echo\n"
+                           "   Server template, its `main.c` replaced by `sw/main.c`, and\n"
+                           "   `sw/fpgai_layout.h`.")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--work", default=os.path.join(ROOT, "build_qfull"),
@@ -1263,10 +1723,17 @@ def model_name():
 
 
 def package(work, board="zybo_z7_20", out=None, prompt="The capital of France is",
-            tokens=16, sd=True, stage=None, sim=False, latency=30, jitter=False):
+            tokens=16, sd=True, stage=None, sim=False, latency=30, jitter=False,
+            model=None, checked=None, tp=None):
     """Write a board's package from a qwen_full.py build. stage: one
     stage of a multi-board run, from cluster.py (its layers, its place in
-    the chain, its peers' addresses); the build must be a stage build."""
+    the chain, its peers' addresses); the build must be a stage build.
+    tp: one rank of a split of the weights (tp.py): rank, ranks, the
+    gathered vectors' lengths HHD, D and F, and every rank's address; the
+    build must be that rank's.
+    model and checked name the model and say what was verified, for a
+    build that is not one of the checkpoints CHECKED describes (spec2rtl.py
+    passes its own report); such a package quotes no routed clocks."""
     pk = boards.PACKAGES[board]
     out = out or os.path.join(ROOT, pk["out"])
     L = zybo.layout(work, BASE)
@@ -1275,6 +1742,10 @@ def package(work, board="zybo_z7_20", out=None, prompt="The capital of France is
                  "qwen_full.py --lanes %d" % (pk["title"], pk["lanes"], L["N"], pk["lanes"]))
     if stage:
         L["stage"] = stage
+    if tp:
+        if "gx_addr" not in L["W"]:
+            sys.exit("%s: a rank's package needs a rank's build (qwen_full's tp)" % pk["title"])
+        L["tp"] = tp
     # The weights, constants, KV cache and the vocabulary all sit in the
     # PS's DDR; a board whose DDR is smaller cannot hold this build.
     if L["end"] + (4 << 20) > pk["ddr_bytes"]:
@@ -1313,28 +1784,54 @@ def package(work, board="zybo_z7_20", out=None, prompt="The capital of France is
     sw = os.path.join(out, "sw")
     os.makedirs(sw, exist_ok=True)
     with open(os.path.join(sw, "fpgai_layout.h"), "w") as f:
-        f.write(render_header(L, tokens, pk["title"], stage))
+        f.write(render_header(L, tokens, pk["title"], stage, tp))
     with open(os.path.join(sw, "main.c"), "w") as f:
-        f.write(STAGE_C if stage else MAIN_C)
+        f.write(STAGE_C if stage else TP_C if tp else MAIN_C)
+    if stage:
+        role = ("\nThis is stage %d of %d of a split of the layers (cluster.py, gals.py): "
+                "layers %d to %d%s%s. The stages talk UDP on port %d; `sw/main.c` is "
+                "built from Vitis's lwIP Echo Server template, as its header says, and "
+                "the first stage prints the text.\n"
+                % (stage["index"], stage["count"], stage["l0"], stage["l1"] - 1,
+                   ", with the embedding" if stage["emb"] else "",
+                   ", with the head" if stage["head"] else "", stage.get("port", 5000)))
+    elif tp:
+        role = ("\nThis is rank %d of %d of a split of the weights (tp.py): every layer, "
+                "with this rank's heads and its share of every matrix's columns and "
+                "of the vocabulary. The ranks gather each other's slices over UDP on "
+                "port %d at %s; `sw/main.c` is built from Vitis's lwIP Echo Server "
+                "template, as its header says. Every rank's SD card holds its own "
+                "weights and the prompt, rank 0's also the vocabulary, and rank 0 "
+                "prints the text.\n"
+                % (tp["rank"], tp["ranks"], tp.get("port", 5000),
+                   ", ".join(".".join(map(str, ip)) for ip in tp["ips"])))
+    else:
+        role = ""
+    if role:
+        role = "\n" + textwrap.fill(role.strip(), 72) + "\n"
     with open(os.path.join(out, "README.md"), "w") as f:
-        f.write(README.format(
+        f.write(_readme(role, README.format(
             wb=L["wb"], wbytes=L["words"] * L["N"], cb=L["cb"], cbytes=L["cn"] * 8,
             kb=L["kb"], kbytes=L["kn"] * 2 * L["N"], vb=L["vb"], vbytes=L["vn"] * 2 * L["N"],
             end=L["end"], regs=REG_BASE, mhz=MHZ, title=pk["title"], lanes=L["N"],
-            model=CHECKED[model_name()][0], checked=CHECKED[model_name()][1],
+            model=model or CHECKED[model_name()][0],
+            checked=checked if checked is not None else CHECKED[model_name()][1],
             board_files=pk["board_files"], license=pk["license"],
             boot=pk["boot"], uart=pk["uart"],
             open_flow=("The open flow in `open/` places and routes it on this part: "
                        "%.1f MHz core, %.1f MHz bus, both past %d MHz. "
                        % (pk["open_flow_mhz"][model_name()] + (MHZ,))
-                       if model_name() in pk.get("open_flow_mhz", {}) else ""),
+                       if checked is None and model_name() in pk.get("open_flow_mhz", {})
+                       else ""),
+            role=role,
             regtab="\n".join("| 0x%02X | %s | %s |" % r
-                              for r in REGS + (STAGE_REGS if stage else []))))
+                              for r in REGS + (STAGE_REGS if stage else TP_REGS if tp
+                                               else [])))))
     if sd:
         import qwen_real
         tk = qwen_real.Tokenizer()
         write_sd(L, work, os.path.join(out, "sd"), tk.encode(prompt), tk,
-                 first=not stage or stage["emb"])
+                 first=not stage or stage["emb"], vocab=not tp or tp["rank"] == 0)
     print("package in", out)
     if sim:
         zybo.write_w8(work)                 # the DDR model's weight image

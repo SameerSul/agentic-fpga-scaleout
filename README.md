@@ -473,6 +473,46 @@ checked against another model. Read that list before quoting any number here.
 
 ## End to end: what goes in, what happens, what comes out
 
+### One command: a spec in, verified RTL out
+
+```bash
+python3 spec2rtl.py examples/tiny_qwen3.json                      # any shape, random weights, minutes
+python3 spec2rtl.py --weights qwen_weights --package --bridge     # Qwen2.5-0.5B for the Zybo
+FPGAI_QWEN=qwen3 python3 spec2rtl.py --weights qwen_weights/qwen3-0.6b --board zc706 --package
+```
+
+`spec2rtl.py` runs the whole chain below for one model and says, in
+`report.md`, what checked each part. It takes the model's shape in
+`model_spec.json`'s keys (`n_layer`, `d_model`, `n_head`, `n_kv_head`,
+`head_dim`, `d_ff`, `vocab`, and `qk_norm` for Qwen3's per-head norms or
+`qkv_bias` for Qwen2.5's biases), or a checkpoint directory whose
+`config.json` is the shape. It refuses a shape the generator cannot build,
+and says why. Every generated block the design compiles goes through the
+signoff gates at that shape's own parameters, leaves first, each composite
+block's testbench compiling the sub-blocks just signed off. The decode step
+is generated around exactly those files and simulated against the integer
+model: every chosen token and its logit has to match, at every layer for a
+small model and at `--sim-layers` of them for a real one. It then writes
+the full-depth design, with `--package` the board package, and with
+`--bridge` runs the simulation through that package's registers against a
+DDR model that stalls at random. Without `--weights` the checkpoint is
+random, which checks the arithmetic as thoroughly and says nothing about
+the text.
+
+With `--boards` (any mix, in chain order, several of one kind included)
+it verifies a whole heterogeneous cluster instead: the planner splits the
+layers by each board's speed and memory, every block is signed off at
+every width the cluster has, and the pipeline, each board on its own
+clock and sharing only CRC-checked messages, is simulated against the
+one-board integer model. `--split weights` puts every board on every
+layer with a slice of every matrix instead (`tp.py`), which divides the
+weight bytes a token reads by the number of boards; the boards gather
+each other's slices four times a layer. There `--bridge` runs every rank
+again as its package does, through its own registers and DDR bridge, with
+the ARM's side of every gather done through the registers, and
+`--package` writes every rank's Zynq package, whose ARM program carries
+the gathers over UDP.
+
 ### Inputs
 
 | input | what it holds | where it is used |

@@ -50,7 +50,8 @@ MLP_JOB = {
     "extra_sources": ("mv_dep.v", "mac_dep.v", "rq_dep.v"),
 }
 ATTN_DEPS = ("mv_dep.v", "mac_dep.v", "rq_dep.v", "sm_dep.v",
-             "expu_dep.v", "recip_dep.v", "exp_rom.v", "recip_rom.v")
+             "expu_dep.v", "recip_dep.v", "exp_rom.v", "recip_rom.v",
+             "smac_dep.v")
 ATTN_JOB = {
     "spec_file": "spec_attn.json", "tb_file": "tb_attn.v",
     "rtl_file": "attn.v", "profile_file": "attn_profile.json",
@@ -83,6 +84,11 @@ def write_attn_deps(ms, build):
         "recip_dep.v": r.render_recip(rc, {FIX_NORM}),
         "exp_rom.v": specgen.exp_rom(e),
         "recip_rom.v": specgen.recip_rom(rc),
+        # The multi-lane head's score MAC (specgen.derive_score_mac_spec),
+        # used only where it is wider than the model's MAC.
+        "smac_dep.v": r.render_mac(specgen.derive_score_mac_spec(ms),
+                                   {FIX_WIDTH, FIX_CLEAR}).replace(
+                                       "module mac (", "module mac_s (", 1),
     }
     os.makedirs(build, exist_ok=True)
     for fn in ATTN_DEPS:

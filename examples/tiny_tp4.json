@@ -1,0 +1,5 @@
+{
+  "name": "tiny_tp4",
+  "n_layer": 2, "d_model": 128, "n_head": 8, "n_kv_head": 4, "head_dim": 32,
+  "d_ff": 256, "vocab": 608, "rope_theta": 1000000.0, "qk_norm": true
+}

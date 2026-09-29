@@ -11,19 +11,44 @@ vocabulary is more than twice the MLP width, so the head runs in several
 chunks with a short last one, as the real vocabularies do.
 """
 import array
+import math
 import random
+import sys
 
 import qwen_int as qi
 import qwen_real as qr
 
 
-def config(style="qwen3", nl=2, vocab=600, hidden=64):
-    c = {"hidden_size": hidden, "intermediate_size": 256, "num_attention_heads": 4,
-         "num_key_value_heads": 2, "num_hidden_layers": nl, "vocab_size": vocab,
+def config(style="qwen3", nl=2, vocab=600, hidden=64, heads=4, kv=2):
+    c = {"hidden_size": hidden, "intermediate_size": 256, "num_attention_heads": heads,
+         "num_key_value_heads": kv, "num_hidden_layers": nl, "vocab_size": vocab,
          "rms_norm_eps": 1e-6, "rope_theta": 1000000.0}
     if style == "qwen3":
         c["head_dim"] = 32
     return c
+
+
+def _fast_floats(rnd, n, std):
+    """n float32s of random sign, magnitudes spread over the four octaves
+    around std, built as bit patterns from random bytes: a checkpoint at a
+    real model's size in seconds where gauss() per element takes minutes
+    and a list of every value gigabytes."""
+    raw = bytearray()
+    left = 4 * n
+    while left:                     # randbytes takes at most 2**31 bits
+        raw += rnd.randbytes(min(left, 1 << 24))
+        left -= min(left, 1 << 24)
+    k = (127 + int(math.floor(math.log2(std)))) // 2
+    # The top byte of a little-endian float32: the sign and the exponent's
+    # high seven bits, k - 1 or k; the exponent's low bit is byte 2's
+    # random top bit, so the exponent is one of 2k - 2 to 2k + 1.
+    raw[3::4] = raw[3::4].translate(bytes((b & 0x80) | (k - 1 + (b & 1))
+                                          for b in range(256)))
+    a = array.array("f")
+    a.frombytes(bytes(raw))
+    if sys.byteorder == "big":
+        a.byteswap()
+    return a
 
 
 def weights(cfg, style="qwen3", seed=5):
@@ -37,6 +62,9 @@ def weights(cfg, style="qwen3", seed=5):
         n = 1
         for d in shape:
             n *= d
+        if n >= 1 << 20 and mean == 0.0:
+            W[name] = (_fast_floats(rnd, n, std), list(shape))
+            return
         W[name] = (array.array("f", [mean + rnd.gauss(0.0, std) for _ in range(n)]),
                    list(shape))
     put("model.embed_tokens.weight", (cfg["vocab_size"], D), 1.0)
@@ -69,10 +97,10 @@ class _Ids:
         return self.ids
 
 
-def model(style="qwen3", seed=5, nl=2, lanes=None, vocab=600, hidden=64):
+def model(style="qwen3", seed=5, nl=2, lanes=None, vocab=600, hidden=64, heads=4, kv=2):
     """(integer model, float model) for a synthetic checkpoint. lanes
     sets the projection's width instead of the board's rule."""
-    cfg = config(style, nl, vocab, hidden)
+    cfg = config(style, nl, vocab, hidden, heads, kv)
     W = weights(cfg, style, seed)
     rnd = random.Random(seed + 1)
     calib = [rnd.randrange(cfg["vocab_size"]) for _ in range(12)]

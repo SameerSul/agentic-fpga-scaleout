@@ -37,28 +37,28 @@ module attnn (
   reg [4:0] lastp;
   reg [8:0] gp [0:4];
   reg mclr;
-  wire signed [35:0] acc [0:31];
+  wire signed [38:0] acc [0:31];
   genvar l;
   generate
     for (l = 0; l < 32; l = l + 1) begin : slane
-      mac mc (.clk(clk), .rst_n(rst_n), .clear(mclr), .a(a_data),
+      mac_s mc (.clk(clk), .rst_n(rst_n), .clear(mclr), .a(a_data),
               .b(k_data[16*l +: 16]), .valid_in(v1), .acc(acc[l]), .valid_out());
     end
   endgenerate
-  reg signed [35:0] shadow [0:31];
+  reg signed [38:0] shadow [0:31];
   reg [8:0] cap0;
   reg [5:0] dj, dn;
   reg pend;
   wire [8:0] next0 = g0 + 32;
 
   // Score quantizer, as the one-lane head's: round, shift, clamp.
-  wire signed [40:0] rnd_s = (shift_s == 5'd0) ? 41'sd0
-                                : (41'sd1 <<< (shift_s - 5'd1));
-  reg  signed [40:0] rnd_r;
+  wire signed [43:0] rnd_s = (shift_s == 5'd0) ? 44'sd0
+                                : (44'sd1 <<< (shift_s - 5'd1));
+  reg  signed [43:0] rnd_r;
   reg  sv1;
-  reg  signed [40:0] st1;
+  reg  signed [43:0] st1;
   reg  [7:0] si1;
-  wire signed [40:0] shv = st1 >>> shift_s;
+  wire signed [43:0] shv = st1 >>> shift_s;
   reg  [8:0] scnt;
 
   // ---- the softmax, one lane
@@ -146,11 +146,11 @@ module attnn (
         end else pend <= 1'b1;
       end
       if (dj != dn) begin
-        st1 <= {shadow[dj[4:0]][35], shadow[dj[4:0]], 4'd0} + rnd_r; si1 <= cap0 + dj; sv1 <= 1'b1; dj <= dj + 1;
+        st1 <= {shadow[dj[4:0]][38], shadow[dj[4:0]], 4'd0} + rnd_r; si1 <= cap0 + dj; sv1 <= 1'b1; dj <= dj + 1;
       end
       if (sv1) begin
-        if (shv > 41'sd1048575) sbuf[si1] <= 21'sd1048575;
-        else if (shv < -41'sd1048576) sbuf[si1] <= -21'sd1048576;
+        if (shv > 44'sd1048575) sbuf[si1] <= 21'sd1048575;
+        else if (shv < -44'sd1048576) sbuf[si1] <= -21'sd1048576;
         else sbuf[si1] <= shv[20:0];
         scnt <= scnt + 1;
       end

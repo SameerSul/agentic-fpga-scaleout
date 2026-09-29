@@ -2236,6 +2236,18 @@ endmodule
 """
 
 
+def derive_score_mac_spec(ms):
+    """The MAC a head's score lanes run: q times k over head_dim, both
+    16-bit activations at a16, where the model's MAC multiplies an int8
+    weight by an activation over d_ff. Its accumulator follows the same
+    rule for that reduction, so no score can overflow it: at Qwen3-0.6B's
+    head_dim of 128 that is 39 bits, where the model's MAC has 36."""
+    ab = ms["activation_bits"]
+    hd = ms.get("head_dim") or ms["d_model"] // ms["n_head"]
+    return derive_chiplet_spec(dict(ms, weight_bits=ab, d_model=hd, d_ff=hd,
+                                    name=ms["name"] + "_qk"))
+
+
 def derive_attnn_spec(ms, board=None):
     """model spec -> multi-lane attention head spec.
 
@@ -2259,7 +2271,11 @@ def derive_attnn_spec(ms, board=None):
              k_addr_width=max(1, (kwords - 1).bit_length()),
              v_addr_width=max(1, (vwords - 1).bit_length()),
              mac_stages=derive_chiplet_spec(ms)["parameters"]
-             ["pipeline_stages"])
+             ["pipeline_stages"],
+             # The score lanes' accumulator: the model's MAC's, or the q.k
+             # rule's when that is wider (16-bit activations).
+             score_acc_width=max(p["acc_width"], derive_score_mac_spec(ms)
+                                 ["parameters"]["acc_width"]))
     spec = dict(base)
     spec.update(name="attnn%d_%s" % (La, ms["name"]), top_module="attnn",
                 description="Multi-lane attention head, %d lanes: scores "
@@ -2287,6 +2303,13 @@ def derive_attnn_spec(ms, board=None):
         "Key words: word g*%d + d holds element d of positions g*%d + l "
         "in lane l. Value words: word j*%d + dg holds V[j][dg*%d + l] in "
         "lane l." % (hd, La, hd // La, La)]
+    if p["score_acc_width"] != p["acc_width"]:
+        spec["behavior"].append(
+            "Each score lane is an instance of mac_s (smac_dep.v), the MAC "
+            "derived for q times k over head_dim, whose acc output is %d "
+            "bits: the model's mac, at %d, can overflow on a score. The "
+            "score path runs at %d bits up to the score quantizer."
+            % (p["score_acc_width"], p["acc_width"], p["score_acc_width"]))
     return spec
 
 
@@ -3838,6 +3861,9 @@ def derive_proj_spec(ms):
             "data_width": dw, "acc_width": aw, "depth_width": dep_w,
             "col_width": col_w, "addr_width": mva, "scale_width": mw,
             "shift_width": shw,
+            # The accumulator is sized for weights of this many bits on
+            # the data_width port, as the model's int8 weights arrive.
+            "weight_bits": min(ms["weight_bits"], dw),
             "requant_stages": rq["parameters"]["pipeline_stages"],
             "max_dim": top, "signed": True, "pipeline_stages": 1,
             "target_clock_mhz": 100,
@@ -3924,15 +3950,19 @@ def proj_x(i, seed, dw):
     return v - (1 << dw) if v >> (dw - 1) else v
 
 
-def proj_w(i, seed, dw):
+def proj_w(i, seed, dw, wb=None):
+    """A weight of wb bits (dw when not given), as the testbench's hw()
+    makes it: past the accumulator's derivation, a wider one could
+    overflow a sum no model's weights can reach."""
+    wb = wb or dw
     v = ((i * 2654435761 + seed * 131 + 12345) & _HMASK) >> 13
-    v &= (1 << dw) - 1
-    return v - (1 << dw) if v >> (dw - 1) else v
+    v &= (1 << wb) - 1
+    return v - (1 << wb) if v >> (wb - 1) else v
 
 
-def proj_golden(depth, cols, seed, dw, scale, shift):
+def proj_golden(depth, cols, seed, dw, scale, shift, wb=None):
     x = [proj_x(r, seed, dw) for r in range(depth)]
-    acc = [sum(x[r] * proj_w(c * depth + r, seed, dw) for r in range(depth))
+    acc = [sum(x[r] * proj_w(c * depth + r, seed, dw, wb) for r in range(depth))
            for c in range(cols)]
     return acc, [requant_golden(a, scale, shift, dw)[0] for a in acc]
 
@@ -3958,11 +3988,18 @@ def render_proj_testbench(spec, cases=None, colfn=None):
         cases = ((16, 8, 1), (100, 40, 2), (7, 130, 3), (3, 60, 4),
                  (dwide, cwide, 5))
     dw, mw, sw_o = p["data_width"], p["scale_width"], p["shift_width"]
+    # Weights span the width the accumulator was derived for. At 16-bit
+    # activations they used to span all 16 bits: a 100-deep sum then
+    # overflowed a 256-wide model's 32-bit accumulator, which int8
+    # weights cannot, and the testbench failed a correct design.
+    wb = p.get("weight_bits", dw)
+    hwx = ("h[13 + %d - 1:13]" % dw if wb == dw else
+           "{{%d{h[%d]}}, h[%d:13]}" % (dw - wb, 12 + wb, 12 + wb))
     body, maxc = [], max(c for _, c, _ in cases)
     for depth, cols, seed in cases:
-        acc, _ = proj_golden(depth, cols, seed, dw, 1, 0)
+        acc, _ = proj_golden(depth, cols, seed, dw, 1, 0, wb)
         sc, sh = _mlp_scale(acc, dw, mw, sw_o)
-        _, y = proj_golden(depth, cols, seed, dw, sc, sh)
+        _, y = proj_golden(depth, cols, seed, dw, sc, sh, wb)
         body.append("    // depth %d, cols %d" % (depth, cols))
         if colfn:
             # Each column its own bias, scale and shift, from a small
@@ -3981,7 +4018,7 @@ def render_proj_testbench(spec, cases=None, colfn=None):
     return PROJ_TB.format(
         dwm=dw - 1, depwm=p["depth_width"] - 1, colwm=p["col_width"] - 1,
         addrwm=p["addr_width"] - 1, mwm=mw - 1, swm=sw_o - 1, maxc=maxc,
-        dw=dw, cases="\n".join(body), ncases=len(cases))
+        dw=dw, cases="\n".join(body), ncases=len(cases), hwx=hwx)
 
 
 PROJ_TB = """`timescale 1ns/1ps
@@ -4022,7 +4059,7 @@ module tb_proj;
     reg [31:0] h;
     begin
       h = i * 32'd2654435761 + s * 32'd131 + 32'd12345;
-      hw = h[13 + {dw} - 1:13];
+      hw = {hwx};
     end
   endfunction
 
