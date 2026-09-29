@@ -64,6 +64,26 @@ does, for one reason: nothing has been loaded onto a board, and that is
 now the whole of the remaining step (`HANDOFF.md`).
 The remaining gap is listed at the bottom rather than glossed over.
 
+## Against Redwood
+
+Redwood, Architect Labs' result as the proposal cites it, and this repo
+as of this file:
+
+| | Redwood | this repo |
+|---|---|---|
+| what the agent was given | an architecture two human architects specified | the model's shape or checkpoint and a list of boards: the widths, lanes, split and shares are derived |
+| what it wrote | RTL, a UVM environment, formal properties, firmware and drivers | every block through five gates, the sequencer, the DDR bridge, the register block, the gather mover and the ARM programs, for each board |
+| model | Qwen3-0.6B | Qwen3-0.6B and Qwen2.5-0.5B |
+| hardware | one AMD Versal VPK180, \$17,995 | any mix of Zynq boards, the Zybo Z7-20 (\$300) and the ZC706 today; other FPGAs over the fabric UART |
+| across chips | none | the layers split or the weights split over 1 to 8 boards, each board's share sized by its speed, bit-exact to one board |
+| verification | UVM, over 95% functional coverage | each block bit-exact to its golden model with its testbench mutation-tested; the whole decode at every layer of both real models; each package's own ARM program on its own RTL, 16 tokens with every logit, alone, split by layers and split by weights |
+| on a board | yes, 12.1 tokens/s | not yet: the bitstreams route and round-trip in the open flow, and `HANDOFF.md` is the bring-up |
+| tokens/s per dollar | 12.1 / \$17,995 | estimated: one 32-lane Zybo 1.47 / \$300, about 7 times; two split by weights 2.55 / \$600, about 6 times |
+
+The one row that is Redwood's alone is the board. Until one runs, the
+throughput here is the planner's, which the co-simulation's own step
+times put within 10%.
+
 ## Verified
 
 ### The full suite
