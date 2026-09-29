@@ -269,8 +269,9 @@ PACKAGES = {
         "license": "the free edition covers the XC7Z020",
         "boot": "set the boot jumper (JP5) to JTAG",
         "uart": "the micro-USB port (PROG/UART)",
-        # nextpnr-xilinx, post-route, core and bus clocks (RESULTS.md)
-        "open_flow_mhz": (53.4, 50.9),
+        # nextpnr-xilinx, post-route core and bus clocks, per model built
+        # (RESULTS.md); a package quotes only what was measured for it.
+        "open_flow_mhz": {"qwen2.5": (53.4, 50.9)},
     },
     "zc706": {
         "title": "ZC706", "part": "xc7z045ffg900-2", "chip": "xc7z045",
@@ -285,7 +286,7 @@ PACKAGES = {
                    "kit's device-locked license, or the open flow in open/",
         "boot": "set the boot-mode switch (SW11) to JTAG, per UG954",
         "uart": "the USB-UART port (J21)",
-        "open_flow_mhz": (68.0, 52.8),
+        "open_flow_mhz": {"qwen2.5": (68.0, 52.8), "qwen3": (61.0, 51.0)},
     },
     "arty_a7_100t": {
         "title": "Arty A7-100T", "part": "xc7a100tcsg324-1", "chip": "xc7a100t",

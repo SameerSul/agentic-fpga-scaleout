@@ -1,0 +1,19 @@
+diff --git a/xilinx/pack_dsp_xc7.cc b/xilinx/pack_dsp_xc7.cc
+index c78250a..4c563fb 100644
+--- a/xilinx/pack_dsp_xc7.cc
++++ b/xilinx/pack_dsp_xc7.cc
+@@ -162,6 +162,14 @@ void XC7Packer::pack_dsps()
+         root->constr_abs_z = true;
+         root->constr_z = BEL_LOWER_DSP;
+         walk_dsp(root, root, BEL_UPPER_DSP);
++        // A DSP with no cascade is not a chain root: either DSP48E1 of the
++        // tile will do. Pinning every one to the lower bel leaves half the
++        // die's DSPs unusable, and a design with more lone DSPs than DSP
++        // tiles fails legalisation outright.
++        if (root->constr_children.empty()) {
++            root->constr_abs_z = false;
++            root->constr_z = root->UNCONSTR;
++        }
+     }
+ }
+ 

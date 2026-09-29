@@ -9,7 +9,8 @@
 #   python3 xilinx/python/bbaexport.py --device xc7z020clg400-1 --bba xilinx/xc7z020.bba
 #   build/bbasm --l xilinx/xc7z020.bba xilinx/xc7z020.bin
 #   git clone --recurse-submodules https://github.com/openXC7/prjxray
-#     (tested at 9553f1ad), cmake -B build, cmake --build build
+#     (tested at 9553f1ad), git apply prjxray-glue.patch, cmake -B build,
+#     cmake --build build
 # Set NEXTPNR_XILINX to the
 # nextpnr-xilinx checkout (with xilinx/xc7z020.bin built) and XRAY_DIR to
 # a built prjxray checkout, and PYTHON to a python3 that has prjxray's

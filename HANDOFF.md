@@ -63,6 +63,29 @@ python3 board_zybo.py --board zc706        # or board_zc706/, for the ZC706
 `board_zybo/rtl/`; if it does, the generator and the committed RTL
 disagree, and the committed one is what was simulated.
 
+### Qwen3-0.6B on the ZC706
+
+`board_zc706_qwen3/` is the same package for Qwen3-0.6B, the model
+Architect Labs hosted: 596 MB of int8 weights, which the ZC706's 1 GB
+holds with room to spare. Its open-flow build routes at 50 MHz as well
+(61.0 MHz core, 51.0 MHz bus, post-route), and its bitstream round-trips.
+Its SD files come from:
+
+```bash
+python3 fetch_qwen.py --model qwen3                              # ~1.5 GB
+FPGAI_QWEN=qwen3 python3 qwen_full.py --no-sim --work build_q3full
+FPGAI_QWEN=qwen3 python3 board_zybo.py --work build_q3full --board zc706 --out board_zc706_qwen3
+```
+
+Everything below is the same, from inside `board_zc706_qwen3/`.
+The UART should then print Qwen3's integer greedy continuation, 16
+tokens, whose first, " Paris", the RTL chose in simulation through all
+28 layers and the head:
+
+```
+The capital of France is Paris. The capital of the United States is Washington, D.C. The capital
+```
+
 ## 2. Build the bitstream and the platform
 
 ```bash

@@ -24,9 +24,8 @@ text, and a generated RTL sequencer decodes the real Qwen2.5-0.5B, all
 24 layers on its own weights, completing "The capital of France is" with
 " Paris" in simulation, through the board package's own registers
 against a DDR model that stalls at random. Qwen3-0.6B, the model
-Architect Labs hosted, is ported the same way: its integer model
-completes the prompt with " Paris", and its first layer on real weights
-is bit-exact in RTL. The package is generated for any Zynq board in
+Architect Labs hosted, decodes the same way: all 28 layers and the head
+in generated RTL choose " Paris", the integer model's token. The package is generated for any Zynq board in
 `boards.py`, today the Zybo Z7-20 and the ZC706, and without Vivado the
 open 7-series flow places and routes the whole design on both parts at
 50 MHz, with bitstreams that round-trip frame for frame. Several boards
@@ -617,8 +616,14 @@ chip database, and the whole design routes there too:
 | LUT sites / DSPs used | 29% / 132 of 220 | 7% / 132 of 900 |
 | bitstream | 4.0 MB, 7,802 frames round-trip | 13.3 MB, 30,722 frames round-trip |
 
-The ZC706 has room for a far wider core than this one; the design is
-sized for the Zybo. Its LEDs sit in banks of more than one voltage, so
+The Qwen3-0.6B build (`board_zc706_qwen3/`) routes there too, at 61.0 MHz
+core and 51.0 MHz bus. Its conversion to a bitstream first aborted inside
+Project X-Ray: `fasm2frames` adds a glue bit ten rows above the first
+column-62 ground tie it sees, a rule observed on another part, and here
+that tile, `INT_L_X62Y354`, is off the XC7Z045's grid.
+`prjxray-glue.patch` skips the glue where its tile does not exist. The
+bitstream it then writes round-trips, all 30,722 frames. The ZC706 has room for a far wider core than
+this one; the design is sized for the Zybo. Its LEDs sit in banks of more than one voltage, so
 its package drives none rather than guess an IOSTANDARD; STATUS says the
 same thing over the registers.
 
@@ -720,7 +725,21 @@ the sequencer waited for 4864. The chunk is now the widest matrix the
 model's projection block is sized for, with a last chunk that is never
 empty; the synthetic test's vocabulary now spans several chunks, and the
 testbench prints a heartbeat, so a hang reads as one. Qwen2.5's
-generated RTL is unchanged by it. The 28-layer Qwen3 run is next.
+generated RTL is unchanged by it.
+
+The whole Qwen3-0.6B then decodes in RTL: all 28 layers and the full
+head on its own weights, the prompt's five positions, choosing token
+12095, " Paris", as the integer model does. A prompt position takes
+28.3 million core cycles and a step with the head 38.1 million; through
+the ZC706 package's registers against the stalling DDR model, one layer
+of the same design matches the direct testbench's token and core cycles
+at 1.19 bus cycles a core cycle, so a Qwen3 token is about 0.9 s at the
+50 MHz the design closes. That board-level run first read back a token
+of 0: the DDR model had no weight image to serve, since the package's
+simulation path relied on one a different script writes, and every
+weight read returned X while the data-independent timing still looked
+right. The simulation now writes its own image and stops if one is
+missing.
 
 ## Qwen's structure decodes in RTL
 

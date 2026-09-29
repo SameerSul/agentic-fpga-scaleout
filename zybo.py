@@ -35,7 +35,7 @@ def widths(core_src):
         m = re.search(r"\[(\d+):0\]\s+%s\b" % name, core_src)
         return int(m.group(1)) + 1
     out = {n: w(n) for n in ("tok", "pos", "w_addr", "c_addr", "g_addr",
-                              "k_raddr", "v_raddr")}
+                              "k_raddr", "v_raddr", "c_data")}
     if "input emb_en" in core_src:
         out["x_addr"] = w("x_addr")          # a pipeline stage's core
     return out
@@ -88,7 +88,7 @@ module qwen_zybo (
   wire [3:0] kw0_lane, kw1_lane, vw_lane;
   wire signed [15:0] kw0_data, kw1_data, vw_data;
   wire [255:0] w_data, k_rdata, v_rdata;
-  wire [61:0] c_data;
+  wire [{cdm}:0] c_data;
   reg signed [15:0] g_data;
   qwen_full core (.clk(cclk), .rst_n(rst_n), .start(start), .head_en(head_en),
     .tok(tok), .pos(pos), .w_addr(w_addr), .w_data(w_data), .c_addr(c_addr),
@@ -115,7 +115,7 @@ module qwen_zybo (
   wire hk = kv && (kq >> 2) == (kbl >> 2);
   wire hv = vv && (vq >> 2) == (vbl >> 2);
 {wdata}
-  assign c_data = cl[cq[3:0]][61:0];
+  assign c_data = cl[cq[3:0]][{cdm}:0];
   assign k_rdata = kl[kq[1:0]];
   assign v_rdata = vl[vq[1:0]];
 
@@ -215,7 +215,7 @@ endmodule
 """.format(twm=W["tok"] - 1, pwm=W["pos"] - 1, wam=wa - 1, cam=ca - 1,
            gam=ga - 1, kam=ka - 1, vam=va - 1, gn=gwords - 1, cb=cb, kb=kb,
            vb=vb, streamer=render_streamer(np_, wa - 1, wbase=wbase),
-           sports=sports, sconn=sconn,
+           sports=sports, sconn=sconn, cdm=W["c_data"] - 1,
            wports=render_wports(np_)[0], wassign=render_wports(np_)[1],
            wdata=render_wports(np_)[2])
 
@@ -368,7 +368,7 @@ module tb_zybo;
 %(dut)s
   // ---- DDR: weights from the image on disk, the rest in arrays
   reg [63:0] cmem [0:%(cn)d];
-  reg [61:0] c62 [0:%(cn)d];
+  reg [%(cdm)d:0] c62 [0:%(cn)d];
   reg [255:0] km [0:%(kn)d];
   reg [255:0] vm [0:%(vn)d];
   integer fd, fd8, r, i, cyc = 0, t0 = 0, c0 = 0, lat;
@@ -440,8 +440,11 @@ module tb_zybo;
 %(step)s  initial begin
     fd = $fopen("weights.bin", "rb");
     fd8 = $fopen("weights8.bin", "rb");
+    // Without it every weight read is X, and the timing, which does
+    // not depend on the data, would still look right.
+    if (fd8 == 0) begin $display("FAIL: no weights8.bin in the build"); $finish; end
     $readmemh("cparams.hex", c62);
-    for (i = 0; i <= %(cn)d; i = i + 1) cmem[i] = {2'b00, c62[i]};
+    for (i = 0; i <= %(cn)d; i = i + 1) cmem[i] = c62[i];
     for (i = 0; i <= %(kn)d; i = i + 1) km[i] = 0;
     for (i = 0; i <= %(vn)d; i = i + 1) vm[i] = 0;
     repeat (4) @(negedge clk); rst_n = 1; repeat (4) @(negedge clk);
@@ -566,7 +569,7 @@ def layout(work, base=0):
 def tb_text(L, np_, lat, dut=DUT, step=STEP, fs="dut.fs", jit=0):
     wd, wc, wr = render_tb_weights(np_, lat, L["wb"])
     W = L["W"]
-    return TB % dict(twm=W["tok"] - 1, pwm=W["pos"] - 1, cn=L["cn"] - 1,
+    return TB % dict(twm=W["tok"] - 1, pwm=W["pos"] - 1, cn=L["cn"] - 1, cdm=W["c_data"] - 1,
                      kn=L["kn"] - 1, vn=L["vn"] - 1, wb=L["wb"], cb=L["cb"],
                      kb=L["kb"], vb=L["vb"], lat=lat, wdecl=wd, jit=jit,
                      wresp=wr, dut=dut % dict(wconn=wc), step=step, fs=fs,

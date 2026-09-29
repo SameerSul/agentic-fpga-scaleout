@@ -536,6 +536,6 @@ checked against another model. Read that list before quoting any number here.
 |---|---|
 | `build*/`, `chiplet_profile.json`, `fabric_profile.json` | per-block RTL that passed every gate, with measured cycles, timing and resources |
 | `build_qfull/qwen_full.v` and its images | the full decode step as one RTL design, with `weights.bin`, `cparams.hex` and `gains.hex` |
-| `board_zybo/`, `board_zc706/` | one board's package: RTL, `build.tcl`, `open/build_open.sh` (a bitstream without Vivado), `sw/main.c`, and `sd/` (the model, 494 MB) |
+| `board_zybo/`, `board_zc706/`, `board_zc706_qwen3/` | one board's package: RTL, `build.tcl`, `open/build_open.sh` (a bitstream without Vivado), `sw/main.c`, and `sd/` (the model: 494 MB for Qwen2.5-0.5B, 596 MB for Qwen3-0.6B) |
 | `cluster.py --package DIR` | one package a stage, `DIR/stage<i>_<board>/`, each with its layers, its images, and an ARM program that knows its neighbours' addresses; `plan.json` records the split |
 | on the board | generated text over the USB-UART: `The capital of France is Paris. Paris is the capital of France. ...`, the integer model's tokens; RTL simulation has checked the first one, " Paris", through all 24 layers and the head |
