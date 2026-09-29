@@ -49,6 +49,7 @@ import qwen_synth
 import specgen
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
+SIM = "iverilog"              # run() sets it (vsim.pick)
 SEQ_LEN = 256            # the integer model's and the sequencer's context
 COUNTER_MAX = 8191       # the sequencer's 13-bit row and column counters
 
@@ -317,15 +318,14 @@ def use_signed_off(work, gates, files):
 
 
 # ---------------------------------------------------------------- design
-def simulate(work, srcs, n_prompt, log, timeout=None):
+def simulate(work, srcs, n_prompt, log, timeout=None, sim="iverilog"):
     """The direct testbench: every head step's token and logit."""
-    r = subprocess.run(["iverilog", "-g2005", "-o", "q.out"] + srcs, cwd=work,
-                       capture_output=True, text=True)
-    if r.returncode:
-        return None, (r.stdout + r.stderr)[-2000:]
+    import vsim
+    try:
+        p = vsim.stream(work, srcs, sim, tag="q")
+    except RuntimeError as e:
+        return None, str(e)[-2000:]
     t0 = time.time()
-    p = subprocess.Popen(["vvp", "q.out"], cwd=work, stdout=subprocess.PIPE,
-                         text=True)
     got, cycles = [], []
     for line in p.stdout:
         if line.startswith(("STEP", "PROGRESS")):
@@ -354,12 +354,17 @@ def reference(im, want, n_prompt):
 def run(spec=None, board="zybo_z7_20", out=None, weights=None, lanes=None,
         sim_layers=None, gen=2, agent="rules", package=False, bridge=False,
         dv=False, prompt="The capital of France is", seed=5, log=print,
-        cluster=None, mode="balanced", split="layers"):
+        cluster=None, mode="balanced", split="layers", sim="fast"):
     """One board, or with cluster (a list of boards, any mix) the whole
-    heterogeneous pipeline: see run_cluster."""
+    heterogeneous pipeline: see run_cluster. sim: the simulator (vsim.py);
+    "fast", the default, is Verilator where it is installed, and then a
+    real model is simulated at every layer, not one."""
+    import vsim
+    global SIM
+    SIM = vsim.pick(sim)
     out = os.path.abspath(out or os.path.join(ROOT, "build_spec2rtl"))
     os.makedirs(out, exist_ok=True)
-    rep = {"board": board, "agent": agent, "stages": {}}
+    rep = {"board": board, "agent": agent, "stages": {}, "simulator": SIM}
     t_all = time.time()
     lanes = lanes or boards.PACKAGES[board]["lanes"]
 
@@ -405,7 +410,8 @@ def run(spec=None, board="zybo_z7_20", out=None, weights=None, lanes=None,
     if cluster and len(cluster) > 1:
         if split == "weights":
             return run_tp(s, cfg, W, cal, tok, cluster, out, rep, t_all, sim_layers,
-                          gen, agent, dv, prompt, seed, log, package, bridge)
+                          gen, agent, dv, prompt, seed, log, package, bridge,
+                          even=mode == "even")
         done, board = run_cluster(s, cfg, W, cal, tok, cluster, mode, out, rep,
                                   t_all, sim_layers, gen, agent, package, dv,
                                   prompt, seed, log)
@@ -423,9 +429,10 @@ def run(spec=None, board="zybo_z7_20", out=None, weights=None, lanes=None,
     if sim_layers == "all":
         k = NL
     elif sim_layers is None:
-        # A real model's size takes hours a layer set in iverilog; one
-        # layer checks the same generator and the same blocks.
-        k = NL if s["d_model"] <= 256 else 1
+        # A real model's size takes hours a layer set in Icarus; one layer
+        # checks the same generator and the same blocks. Verilator runs
+        # them all in minutes.
+        k = NL if s["d_model"] <= 256 or SIM == "verilator" else 1
     else:
         k = max(1, min(int(sim_layers), NL))
     im = qi.IntQwen(dict(cfg, num_hidden_layers=k), W, 16, True, cal,
@@ -453,7 +460,7 @@ def run(spec=None, board="zybo_z7_20", out=None, weights=None, lanes=None,
     want, srcs = qwen_full.build_model(im, ids, gen, work, log=lambda *a: None)
     differed = use_signed_off(work, gates, files)
     ref = reference(im, want, len(ids))
-    res, err = simulate(work, srcs, len(ids), log)
+    res, err = simulate(work, srcs, len(ids), log, sim=SIM)
     if err:
         rep["stages"]["design"] = {"ok": False, "error": err}
         return finish(out, rep, t_all, log)
@@ -516,7 +523,7 @@ def run(spec=None, board="zybo_z7_20", out=None, weights=None, lanes=None,
             buf = io.StringIO()
             with contextlib.redirect_stdout(buf):
                 board_zybo.package(work, board, os.path.join(out, "board_sim"),
-                                   prompt, 16, sd=False, sim=True, jitter=True,
+                                   prompt, 16, sd=False, sim=True, jitter=True, simulator=SIM,
                                    model=s["name"], checked=checked)
             steps = [l for l in buf.getvalue().splitlines() if l.startswith("STEP")]
             nxt = [int(l.split("next=")[1].split()[0]) for l in steps
@@ -581,7 +588,8 @@ def run_cluster(s, cfg, W, cal, tok, names, mode, out, rep, t_all, sim_layers,
         for x, N in zip(st, widths))))
     if p["cannot_hold"]:
         log("  cannot hold a layer: %s" % ", ".join(p["cannot_hold"]))
-    if sim_layers == "all" or (sim_layers is None and s["d_model"] <= 256):
+    if sim_layers == "all" or (sim_layers is None and (s["d_model"] <= 256
+                                                        or SIM == "verilator")):
         split = [list(range(*x["layers"])) for x in st]
     else:
         per = 1 if sim_layers is None else max(1, int(sim_layers))
@@ -632,7 +640,7 @@ def run_cluster(s, cfg, W, cal, tok, names, mode, out, rep, t_all, sim_layers,
                 "module %s (" % m, "module %s_%s (" % (m, pch), 1)
             with open(os.path.join(work, "b_%s_%s.v" % (m, pch)), "w") as f:
                 f.write(src)
-    txt = gals.run(work, srcs, timeout=48 * 3600)
+    txt = gals.run(work, srcs, timeout=48 * 3600, sim=SIM)
     got = [(int(l.split("tok=")[1].split()[0]), int(l.split("best=")[1].split()[0]))
            for l in txt.splitlines() if l.startswith("TOKEN")]
     link = next((l for l in txt.splitlines() if l.startswith("LINK")), "")
@@ -702,24 +710,17 @@ def run_cluster(s, cfg, W, cal, tok, names, mode, out, rep, t_all, sim_layers,
     return finish(out, rep, t_all, log), None
 
 
-def tp_problems(s, widths):
-    """What a split of the weights over these ranks cannot build."""
-    T = len(widths)
+def tp_problems(s, widths, part):
+    """What this split of the weights over these ranks cannot build."""
     out = []
-    for what, n in (("n_head", s["n_head"]), ("n_kv_head", s["n_kv_head"]),
-                    ("d_ff", s["d_ff"]), ("d_model", s["d_model"])):
-        if n % T:
-            out.append("%s %d does not split %d ways" % (what, n, T))
-    if out:
-        return out
-    Hl, KVl, Fl, Dl = (s["n_head"] // T, s["n_kv_head"] // T, s["d_ff"] // T,
-                       s["d_model"] // T)
-    for N in sorted(set(widths)):
-        for what, rows in (("a rank's q rows", Hl * s["head_dim"]),
-                           ("a rank's k and v rows", KVl * s["head_dim"]),
-                           ("a rank's share of d_model", Dl), ("a rank's share of d_ff", Fl)):
-            if rows % N:
-                out.append("%s, %d, is not a multiple of %d lanes" % (what, rows, N))
+    grp = s["n_head"] // s["n_kv_head"]
+    for r, N in enumerate(widths):
+        for what, rows in (("q rows", grp * part["kv"][r] * s["head_dim"]),
+                           ("k and v rows", part["kv"][r] * s["head_dim"]),
+                           ("share of d_model", part["d"][r]), ("share of d_ff", part["f"][r])):
+            if rows % N or rows <= 0:
+                out.append("rank %d's %s, %d, is not a positive multiple of its %d lanes"
+                           % (r, what, rows, N))
     return out
 
 
@@ -740,7 +741,7 @@ def _tp_signed_off(work, gates, files, widths):
 
 
 def run_tp(s, cfg, W, cal, tok, names, out, rep, t_all, sim_layers, gen, agent,
-           dv, prompt, seed, log, package=False, bridge=False):
+           dv, prompt, seed, log, package=False, bridge=False, even=False):
     """The weights split over the boards (tp.py): every board on every
     layer with a slice of every matrix, each at its own width and on its own
     clock, gathering each other's slices; the whole group simulated against
@@ -749,18 +750,36 @@ def run_tp(s, cfg, W, cal, tok, names, out, rep, t_all, sim_layers, gen, agent,
     with a stalling DDR model of its own, every gather done by the ARM's
     side through the registers. package: every rank's Zynq package."""
     import tp
+    import cluster
     widths = [boards.PACKAGES[n]["lanes"] for n in names]
     rep.update(lanes=widths, board=" + ".join(names), split="weights")
-    bad = sorted({q for N in set(widths) for q in problems(s, N)}) + tp_problems(s, widths)
+    bad = sorted({q for N in set(widths) for q in problems(s, N)})
+    plan = None
+    if not bad:
+        try:
+            plan = cluster.tp_plan(names, shape_of(s), even=even)
+        except ValueError as e:
+            bad = [str(e)]
+    if plan:
+        bad += tp_problems(s, widths, plan["part"])
     if bad:
         rep["stages"]["spec"] = {"ok": False, "problems": bad}
         log("  cannot split this shape's weights:\n    " + "\n    ".join(bad))
         return finish(out, rep, t_all, log)
     T = len(names)
-    log("  the weights split %d ways: %s" % (T, ", ".join(
-        "%s at %d lanes" % (n, N) for n, N in zip(names, widths))))
+    part = plan["part"]
+    rep["tp_plan"] = plan
+    log("  the weights split %d ways, %s: %s" % (T, "evenly" if even else "by speed", ", ".join(
+        "%s at %d lanes: %d KV head%s, %d of d_ff, %d of d_model, %s"
+        % (n, N, part["kv"][r], "" if part["kv"][r] == 1 else "s", part["f"][r], part["d"][r],
+           "head chunks %d-%d" % tuple(part["hk"][r]) if part["hk"][r][1] >= part["hk"][r][0]
+           else "no head chunk")
+        for r, (n, N) in enumerate(zip(names, widths)))))
+    log("  planner: %.1f ms a layer, gathers about %.1f ms more, %.3f s a token"
+        % (1e3 * plan["layer_seconds"], 1e3 * plan["gather_seconds"], plan["seconds_per_token"]))
     NL = s["n_layer"]
-    if sim_layers == "all" or (sim_layers is None and s["d_model"] <= 256):
+    if sim_layers == "all" or (sim_layers is None and (s["d_model"] <= 256
+                                                        or SIM == "verilator")):
         k = NL
     else:
         k = 1 if sim_layers is None else max(1, min(int(sim_layers), NL))
@@ -788,9 +807,9 @@ def run_tp(s, cfg, W, cal, tok, names, out, rep, t_all, sim_layers, gen, agent,
     work = os.path.join(out, "tp")
     shutil.rmtree(work, ignore_errors=True)
     t0 = time.time()
-    want, srcs = tp.build(im, ids, gen, work, T, lanes=widths, log=lambda *a: None)
+    want, srcs = tp.build(im, ids, gen, work, T, lanes=widths, log=lambda *a: None, part=part)
     _tp_signed_off(work, gates, files, widths)
-    txt = tp.run(work, srcs, timeout=48 * 3600)
+    txt = tp.run(work, srcs, timeout=48 * 3600, sim=SIM)
     got = [(int(l.split("tok=")[1].split()[0]), int(l.split("best=")[1].split()[0]))
            for l in txt.splitlines() if l.startswith("TOKEN")]
     net = next((l for l in txt.splitlines() if l.startswith("TP ")), "")
@@ -798,8 +817,11 @@ def run_tp(s, cfg, W, cal, tok, names, out, rep, t_all, sim_layers, gen, agent,
     busy = [int(l.split("busy_cycles=")[1].split()[0]) for l in rk]
     comp = [int(l.split("compute_cycles=")[1].split()[0]) for l in rk]
     import cluster
-    pred = [sum(cluster.tp_rank_cycles(shape_of(s), N, T, r, k, p + 1, p >= len(ids) - 1)
-                for p in range(len(want) - 1)) for r, N in enumerate(widths)]
+    grp = s["n_head"] // s["n_kv_head"]
+    pred = [sum(cluster.tp_rank_cycles(
+        shape_of(s), N, T, r, k, p + 1, p >= len(ids) - 1,
+        dict(H=grp * part["kv"][r], KV=part["kv"][r], F=part["f"][r], D=part["d"][r]),
+        part["hk"][r]) for p in range(len(want) - 1)) for r, N in enumerate(widths)]
     err = [round(100.0 * (b - c) / b, 1) if b else None for b, c in zip(comp, pred)]
     if not net:
         rep["stages"]["design"] = {"ok": False, "boards": T, "error": txt[-3000:]}
@@ -831,9 +853,9 @@ def run_tp(s, cfg, W, cal, tok, names, out, rep, t_all, sim_layers, gen, agent,
         shutil.rmtree(wb, ignore_errors=True)
         t0 = time.time()
         want_b, srcs_b = tp.build_boards(im, ids, gen, wb, T, lanes=widths, jit=1,
-                                         log=lambda *a: None)
+                                         log=lambda *a: None, part=part)
         _tp_signed_off(wb, gates, files, widths)
-        txt = tp.run(wb, srcs_b, timeout=48 * 3600)
+        txt = tp.run(wb, srcs_b, timeout=48 * 3600, sim=SIM)
         got_b = [(int(l.split("tok=")[1].split()[0]), int(l.split("best=")[1].split()[0]))
                  for l in txt.splitlines() if l.startswith("TOKEN")]
         cyc = [(int(l.split("core_cycles=")[1].split()[0]), int(l.split("clk_cycles=")[1]))
@@ -861,11 +883,13 @@ def run_tp(s, cfg, W, cal, tok, names, out, rep, t_all, sim_layers, gen, agent,
             wk = os.path.join(out, "rank%d_build" % i)
             shutil.rmtree(wk, ignore_errors=True)
             qwen_full.build_model(imf, ids, 0, wk, log=lambda *a: None,
-                                  want=list(ids) + [0], tp=(i, T))
+                                  want=list(ids) + [0], tp=(i, T, part))
             use_signed_off(wk, gates[N], files)
             o = os.path.join(out, "rank%d_%s" % (i, n))
             board_zybo.package(wk, n, o, prompt, 16, sd=bool(tok), tp=dict(
-                rank=i, ranks=T, HHD=imf.H * imf.hd, D=imf.D, F=imf.F, ips=ips),
+                rank=i, ranks=T, HHD=imf.H * imf.hd, D=imf.D, F=imf.F, ips=ips,
+                slices=[(grp * part["kv"][r] * imf.hd, part["d"][r], part["f"][r])
+                        for r in range(T)]),
                 model=s["name"], checked=(
                     "every generated block signed off at this board's %d lanes, the "
                     "%d ranks this one belongs to simulated each on its own clock%s, "
@@ -983,6 +1007,27 @@ def render_report(rep):
     if d and d.get("boards") and "error" in d:
         L += ["## The pipeline", "", "Did not run:", "", "```", d["error"], "```", ""]
     elif d and d.get("split_weights"):
+        tpp = rep.get("tp_plan")
+        if tpp:
+            pt = tpp["part"]
+            L += ["## Shares", "",
+                  "Each board's share of every layer (`cluster.tp_plan`): whole KV heads "
+                  "with their query heads, and d_ff and d_model columns in multiples of "
+                  "every rank's lanes, sized so the slowest rank finishes each layer "
+                  "soonest; the head's chunks in contiguous runs.", "",
+                  "| rank | board | lanes | KV heads | d_ff | d_model | head chunks | "
+                  "planner, ms a layer |", "|---|---|---|---|---|---|---|---|"]
+            for r, n in enumerate(rep["board"].split(" + ")):
+                hk = pt["hk"][r]
+                L.append("| %d | %s | %d | %d | %d | %d | %s | %.2f |" % (
+                    r, n, tpp["lanes"][r], pt["kv"][r], pt["f"][r], pt["d"][r],
+                    "%d-%d" % tuple(hk) if hk[1] >= hk[0] else "none",
+                    1e3 * tpp["rank_layer_seconds"][r]))
+            L += ["", "A layer, gather by gather the slowest rank: %.2f ms, and about %.2f "
+                  "ms of gathers on the ARMs (an estimate: %.2f us a register access); "
+                  "%.3f s a token at a context of 128." % (
+                      1e3 * tpp["layer_seconds"], 1e3 * tpp["gather_seconds"],
+                      1e6 * 0.25e-6, tpp["seconds_per_token"]), ""]
         L += ["## The weights split %d ways" % d["boards"], "",
               "Every board on every layer with a slice of every matrix, at its own "
               "width (%s lanes) and on its own clock, gathering the others' slices "
@@ -1089,7 +1134,9 @@ def main():
     ap.add_argument("--boards", nargs="+", choices=sorted(boards.PACKAGES),
                     help="a heterogeneous cluster, in chain order: the planner splits "
                     "the layers over them and the whole pipeline is verified")
-    ap.add_argument("--mode", default="balanced", choices=("balanced", "fast"))
+    ap.add_argument("--mode", default="balanced", choices=("balanced", "fast", "even"),
+                    help="the layer split: balanced (by speed) or fast (fewest, fastest "
+                    "boards); the weight split: balanced (shares by speed) or even")
     ap.add_argument("--split", default="layers", choices=("layers", "weights"),
                     help="with --boards: a pipeline of layer ranges (layers), or every "
                     "board on every layer with a slice of every matrix (weights)")
@@ -1098,6 +1145,9 @@ def main():
                     help="layers to simulate: a number, or all (default: all for a "
                     "small model, 1 for one at a real model's size)")
     ap.add_argument("--gen", type=int, default=2, help="tokens to generate in simulation")
+    ap.add_argument("--sim", default="fast", choices=("fast", "iverilog", "verilator"),
+                    help="the simulator: fast is Verilator where installed (every layer of "
+                    "a real model in minutes), else Icarus")
     ap.add_argument("--agent", default="rules", choices=("rules", "llm", "swarm"))
     ap.add_argument("--dv", action="store_true", help="mutation-test every testbench")
     ap.add_argument("--package", action="store_true", help="write the board package")
@@ -1111,7 +1161,7 @@ def main():
     spec = json.load(open(a.spec)) if a.spec else None
     rep = run(spec, a.board, a.out, a.weights, a.lanes, a.sim_layers, a.gen,
               a.agent, a.package, a.bridge, a.dv, a.prompt, cluster=a.boards,
-              mode=a.mode, split=a.split)
+              mode=a.mode, split=a.split, sim=a.sim)
     sys.exit(0 if rep["ok"] else 1)
 
 

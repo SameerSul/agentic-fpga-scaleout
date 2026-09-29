@@ -659,19 +659,17 @@ def tb_text(L, np_, lat, dut=DUT, step=STEP, fs="dut.fs", jit=0):
                                      for s in L["steps"]))
 
 
-def simulate(work, tb, top_srcs):
+def simulate(work, tb, top_srcs, sim="iverilog"):
     """Compile tb with the build's blocks and stream its output."""
+    import vsim
     srcs = sorted(f for f in os.listdir(work) if f.endswith(".v")
                   and not f.startswith(("tb_", "bz_")) and f != "qwen_zybo.v")
-    r = subprocess.run(["iverilog", "-g2005", "-DSIM", "-o", "z.out", tb]
-                       + list(top_srcs) + srcs,
-                       cwd=work, capture_output=True, text=True)
-    if r.returncode:
-        print(r.stdout[-3000:], r.stderr[-3000:])
+    try:
+        p = vsim.stream(work, [tb] + list(top_srcs) + srcs, sim, tag="z")
+    except RuntimeError as e:
+        print(str(e))
         sys.exit(1)
     t0 = time.time()
-    p = subprocess.Popen(["vvp", "z.out"], cwd=work, stdout=subprocess.PIPE,
-                         text=True)
     for line in p.stdout:
         print(line.rstrip(), "(%.0f s)" % (time.time() - t0))
         sys.stdout.flush()

@@ -62,9 +62,11 @@ def shape_bytes(m, seq_len=256):
 
 def proj_cycles(rows, depth, lanes):
     """One projection through the multi-lane block: every group of lanes
-    columns reads the input once, five cycles to turn the group round,
-    and 32 to start and drain the block."""
-    return -(-rows // lanes) * (depth + 5) + 32
+    columns reads the input once, five cycles to turn the group round;
+    then the last group's sums drain through the one requantizer, a cycle
+    a lane, and 16 more start and finish the block (32 in all at 16 lanes,
+    48 at 32)."""
+    return -(-rows // lanes) * (depth + 5) + lanes + 16
 
 
 def layer_cycles(m, lanes, n):
@@ -108,43 +110,171 @@ def stage_cycles(m, lanes, n_layers, n, emb, head):
     return c
 
 
-def tp_layer_cycles(m, lanes, T, n):
-    """One layer on one rank of a split of the weights (tp.py), the core
-    cycles it computes, not the ones it waits on a gather: its own heads
-    and KV heads, its share of d_ff, and its share of o's and down's
-    output columns over their full depth; the norms and the residual adds
-    whole, since every rank holds the whole hidden state; and a cycle to
-    ask for each of the four gathers."""
-    D, F, H, KV, hd = m["D"], m["F"], m["H"], m["KV"], m["hd"]
-    Hl, KVl, Fl, Dl = H // T, KV // T, F // T, D // T
+def _even(m, T):
+    return dict(H=m["H"] // T, KV=m["KV"] // T, F=m["F"] // T, D=m["D"] // T)
+
+
+def tp_segments(m, lanes, share, n):
+    """One layer on one rank of a split of the weights (tp.py), as the
+    core cycles it computes between its four gathers, not the ones it
+    waits: up to the context's (the residual add, the first norm, its own
+    q, k and v heads, their norms and RoPE, and its heads' attention), up
+    to o's output (its share of o's columns over their full depth), up to
+    the gated product's (the second norm and its share of d_ff), and up
+    to down's output. share: this rank's H, KV, F and D. Each ends in a
+    cycle to ask for the gather."""
+    D, F, H, hd = m["D"], m["F"], m["H"], m["hd"]
+    Hl, KVl, Fl, Dl = share["H"], share["KV"], share["F"], share["D"]
     la = min(lanes, hd)
-    c = (proj_cycles(Hl * hd, D, lanes) + 2 * proj_cycles(KVl * hd, D, lanes)
-         + proj_cycles(Dl, H * hd, lanes) + 2 * proj_cycles(Fl, D, lanes)
-         + proj_cycles(Dl, F, lanes))
-    c += 2 * (2 * D + 28)
-    c += (Hl * hd // 2 + 7) + (KVl * hd // 2 + 7)
-    c += Hl * (hd + 1)
-    c += Hl * (-(-n // la) * hd + 3 * n + (hd // la) * n + hd + 43)
+    s1 = (D + 5) + (2 * D + 28) + proj_cycles(Hl * hd, D, lanes) \
+        + 2 * proj_cycles(KVl * hd, D, lanes) + (Hl * hd // 2 + 7) + (KVl * hd // 2 + 7) \
+        + Hl * (hd + 1) + Hl * (-(-n // la) * hd + 3 * n + (hd // la) * n + hd + 43) + 1
     if m.get("qkn"):
-        c += (Hl + KVl) * (2 * hd + 28)
-    return c + Fl + 23 + 2 * (D + 5) + 4
+        s1 += (Hl + KVl) * (2 * hd + 28)
+    s2 = proj_cycles(Dl, H * hd, lanes) + 1
+    s3 = (D + 5) + (2 * D + 28) + 2 * proj_cycles(Fl, D, lanes) + Fl + 23 + 1
+    s4 = proj_cycles(Dl, F, lanes) + 1
+    return [s1, s2, s3, s4]
 
 
-def tp_head_cycles(m, lanes, T, rank):
-    """The final norm on every rank, then this rank's run of the head's
-    chunks (a rank past the last chunk runs none), and its gather."""
+def tp_layer_cycles(m, lanes, T, n, share=None):
+    """The same layer's cycles in all, even shares unless share."""
+    return sum(tp_segments(m, lanes, share or _even(m, T), n))
+
+
+def _chunks(m):
     chunk = max(m["D"], m["F"])
-    V, D = m["V"], m["D"]
-    nck = -(-V // chunk)
-    per = -(-nck // T)
-    cks = range(rank * per, min(nck, rank * per + per))
-    return 2 * D + 28 + 1 + sum(proj_cycles(min(chunk, V - k * chunk), D, lanes) for k in cks)
+    return chunk, -(-m["V"] // chunk)
 
 
-def tp_rank_cycles(m, lanes, T, rank, n_layers, n, head):
+def tp_head_cycles(m, lanes, T, rank, hk=None):
+    """The final norm on every rank, then this rank's run of the head's
+    chunks, hk = (first, last), even runs unless given (a rank past the
+    last chunk runs none), and its gather."""
+    chunk, nck = _chunks(m)
+    if hk is None:
+        per = -(-nck // T)
+        hk = (rank * per, min(nck - 1, rank * per + per - 1))
+    return 2 * m["D"] + 28 + 1 + sum(proj_cycles(min(chunk, m["V"] - k * chunk), m["D"], lanes)
+                                     for k in range(hk[0], hk[1] + 1))
+
+
+def tp_rank_cycles(m, lanes, T, rank, n_layers, n, head, share=None, hk=None):
     """One position on one rank: the embedding, its layers, the head."""
-    return (m["D"] + 12 + n_layers * tp_layer_cycles(m, lanes, T, n)
-            + (tp_head_cycles(m, lanes, T, rank) if head else 0))
+    return (m["D"] + 12 + n_layers * tp_layer_cycles(m, lanes, T, n, share)
+            + (tp_head_cycles(m, lanes, T, rank, hk) if head else 0))
+
+
+def seconds_per_cycle(name):
+    """A core cycle on this board, in seconds: its bus clock over the bus
+    cycles a core cycle its package measured."""
+    pk = boards.PACKAGES.get(name, {})
+    return pk.get("bus_per_core", BUS_PER_CORE) / (pk.get("fpgai_mhz", 50) * 1e6)
+
+
+# The ARM's side of a gather: one GADDR/GDATA access through GP0, which
+# waits for the core's edges. An estimate: no board has timed one yet.
+ARM_ACCESS_S = 0.25e-6
+
+
+def tp_plan(names, m, ctx=128, even=False):
+    """Shares of a split of the weights over these boards, in rank order.
+    Each rank holds whole KV heads (with their query heads), and d_ff and
+    d_model columns in multiples of every rank's lanes; the head's chunks
+    go in contiguous runs, so a tie still goes to the lower token. The
+    shares start in proportion to each board's rate and then move a unit
+    at a time while that shortens the layer, whose time is, gather by
+    gather, the slowest rank's; the head's runs likewise. even: the
+    equal shares, for comparison. Returns the part (qwen_full.tp_share),
+    each rank's seconds a layer and for the head, and the group's
+    seconds a token with the ARMs' gathers estimated."""
+    T = len(names)
+    lanes = [boards.PACKAGES[n]["lanes"] for n in names]
+    spc = [seconds_per_cycle(n) for n in names]
+    unit = 1
+    for N in lanes:
+        unit = unit * N // math.gcd(unit, N)
+    grp = m["H"] // m["KV"]
+    chunk, nck = _chunks(m)
+
+    def layer_s(kv, f, d):
+        seg = [[c * spc[r] for c in tp_segments(m, lanes[r], dict(
+            H=grp * kv[r], KV=kv[r], F=f[r] * unit, D=d[r] * unit), ctx)] for r in range(T)]
+        return sum(max(seg[r][k] for r in range(T)) for k in range(4)), seg
+
+    def head_s(c):
+        hk, k0 = [], 0
+        for r in range(T):
+            hk.append((k0, k0 + c[r] - 1))
+            k0 += c[r]
+        t = [tp_head_cycles(m, lanes[r], T, r, hk[r]) * spc[r] for r in range(T)]
+        return max(t), t, hk
+
+    def apportion(total, lo):
+        rate = [lanes[r] / spc[r] for r in range(T)]
+        want = [total * x / sum(rate) for x in rate]
+        c = [max(lo, int(w)) for w in want]
+        while sum(c) > total:
+            c[max(range(T), key=lambda r: c[r] - want[r] if c[r] > lo else -1e9)] -= 1
+        while sum(c) < total:
+            c[max(range(T), key=lambda r: want[r] - c[r])] += 1
+        return c
+
+    def improve(cs, cost, lo):
+        best = cost(cs)
+        moved = True
+        while moved:
+            moved = False
+            for a in range(T):
+                for b in range(T):
+                    if a == b or cs[a] <= lo:
+                        continue
+                    t = list(cs)
+                    t[a] -= 1
+                    t[b] += 1
+                    c = cost(t)
+                    if c < best - 1e-12:
+                        cs, best, moved = t, c, True
+        return cs
+
+    if m["D"] % unit or m["F"] % unit or m["D"] // unit < T or m["F"] // unit < T \
+            or m["KV"] < T or any(m["hd"] % N for N in lanes):
+        raise ValueError("this shape does not split %d ways at %s lanes"
+                         % (T, "/".join(map(str, lanes))))
+    if even:
+        if m["KV"] % T or (m["D"] // unit) % T or (m["F"] // unit) % T:
+            raise ValueError("this shape does not split evenly %d ways" % T)
+        kv, f, d = [m["KV"] // T] * T, [m["F"] // unit // T] * T, [m["D"] // unit // T] * T
+        per = -(-nck // T)
+        c = [max(0, min(nck, (r + 1) * per) - r * per) for r in range(T)]
+    else:
+        kv, f, d = (apportion(m["KV"], 1), apportion(m["F"] // unit, 1),
+                    apportion(m["D"] // unit, 1))
+        for _ in range(3):
+            kv = improve(kv, lambda x: layer_s(x, f, d)[0], 1)
+            f = improve(f, lambda x: layer_s(kv, x, d)[0], 1)
+            d = improve(d, lambda x: layer_s(kv, f, x)[0], 1)
+        c = improve(apportion(nck, 0), lambda x: head_s(x)[0], 0)
+    lay, seg = layer_s(kv, f, d)
+    hs, ht, hk = head_s(c)
+    part = dict(kv=kv, f=[x * unit for x in f], d=[x * unit for x in d], hk=[list(x) for x in hk])
+    # The gathers, four a layer and the head's: each rank reads its slice
+    # through the registers and writes everyone else's, and the slices
+    # cross the Ethernet once.
+    hd = m["hd"]
+    vecs = [[grp * kv[r] * hd for r in range(T)], [x * unit for x in d],
+            [x * unit for x in f], [x * unit for x in d]]
+    g = 0.0
+    for sl in vecs:
+        # Every rank reads its own words and writes all the others'.
+        tot = sum(sl)
+        g += tot * ARM_ACCESS_S + LINK_LATENCY_S["ethernet"] \
+            + max(2 * (tot - x) for x in sl) / ETH_BYTES_S
+    head_g = 3 * T * ARM_ACCESS_S + LINK_LATENCY_S["ethernet"]
+    tok = m["NL"] * (lay + g) + hs + head_g + (m["D"] + 12) * max(spc)
+    return dict(part=part, lanes=lanes, layer_seconds=lay, gather_seconds=g,
+                rank_layer_seconds=[sum(x) for x in seg], head_seconds=ht,
+                seconds_per_token=tok, tokens_per_s=1.0 / tok)
 
 
 def stage_seconds(name, m, n_layers, n, emb, head):

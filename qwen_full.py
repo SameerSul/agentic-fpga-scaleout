@@ -64,6 +64,34 @@ def _clog2(n):
     return max(1, (n - 1).bit_length())
 
 
+def tp_share(im, tp):
+    """Rank r's share of a split of the weights, tp = (rank, ranks) for
+    even shares or (rank, ranks, part) with part's per-rank lists: "kv",
+    KV heads (each with its query heads); "f", d_ff columns; "d", d_model
+    columns of o's and down's outputs; "hk", [first, last] head chunks
+    (last < first for none). Returns this rank's counts, the offsets of
+    its slices in the gathered vectors, and every rank's (for the
+    network): {H, KV, F, D, coff, kvoff, aoff, moff, hk0, hk1, all}."""
+    r, T = tp[0], tp[1]
+    part = tp[2] if len(tp) > 2 and tp[2] else None
+    H, KV, F, D, hd = im.H, im.KV, im.F, im.D, im.hd
+    grp = H // KV
+    nck = -(-im.V // head_chunk(im))
+    if part is None:
+        per = -(-nck // T)
+        part = dict(kv=[KV // T] * T, f=[F // T] * T, d=[D // T] * T,
+                    hk=[[k * per, min(nck - 1, k * per + per - 1)] for k in range(T)])
+    kv, f, d = list(part["kv"]), list(part["f"]), list(part["d"])
+    assert len(kv) == len(f) == len(d) == T and sum(kv) == KV and sum(f) == F \
+        and sum(d) == D and min(kv + f + d) > 0, "a split of the weights must cover them"
+    pre = lambda xs, i: sum(xs[:i])
+    ranks = [dict(H=grp * kv[i], KV=kv[i], F=f[i], D=d[i],
+                  coff=grp * pre(kv, i) * hd, kvoff=pre(kv, i) * hd,
+                  aoff=pre(d, i), moff=pre(f, i),
+                  hk0=part["hk"][i][0], hk1=part["hk"][i][1]) for i in range(T)]
+    return dict(ranks[r], all=ranks)
+
+
 class Layout:
     """Where every matrix, column constant and gain lives."""
 
@@ -83,12 +111,13 @@ class Layout:
         # columns over their full depth. Each value it computes is the one
         # a single board computes; the ranks gather each other's slices.
         self.tp = tp
-        r, T = tp if tp else (0, 1)
-        Hr, KVr, Fr, Dr = H // T, KV // T, F // T, D // T
+        sh = tp_share(im, tp) if tp else dict(H=H, KV=KV, F=F, D=D, coff=0,
+                                             kvoff=0, aoff=0, moff=0)
+        Hr, KVr, Fr, Dr = sh["H"], sh["KV"], sh["F"], sh["D"]
         self.shape = {"q": (Hr * hd, D), "k": (KVr * hd, D), "v": (KVr * hd, D),
                       "o": (Dr, H * hd), "g": (Fr, D), "u": (Fr, D), "d": (Dr, F)}
-        self.row0 = {"q": r * Hr * hd, "k": r * KVr * hd, "v": r * KVr * hd,
-                     "o": r * Dr, "g": r * Fr, "u": r * Fr, "d": r * Dr}
+        self.row0 = {"q": sh["coff"], "k": sh["kvoff"], "v": sh["kvoff"],
+                     "o": sh["aoff"], "g": sh["moff"], "u": sh["moff"], "d": sh["aoff"]}
         self.woff, self.coff = {}, {}
         w = c = 0
         for m, _ in self.MATS:
@@ -246,11 +275,12 @@ def _render(im, lay, lc, nf, stage=False):
     L = im.ms["seq_len"]
     grp, h2 = H // KV, hd // 2
     tp = lay.tp
-    rank, T = tp if tp else (0, 1)
+    rank, T = tp[:2] if tp else (0, 1)
     # This rank's heads and slices; the offsets of its slice in the
     # gathered vectors.
-    Hl, KVl, Fl, Dl = H // T, KV // T, F // T, D // T
-    COFF, AOFF, MOFF = rank * Hl * hd, rank * Dl, rank * Fl
+    sh = tp_share(im, tp) if tp else dict(H=H, KV=KV, F=F, D=D, coff=0, aoff=0, moff=0)
+    Hl, KVl, Fl, Dl = sh["H"], sh["KV"], sh["F"], sh["D"]
+    COFF, AOFF, MOFF = sh["coff"], sh["aoff"], sh["moff"]
     ps = specgen.derive_projn_spec(im.ms, per_column=True)["parameters"]
     rn = im.sp["rmsnorm"]["parameters"]
     ap = specgen.derive_attnn_spec(im.ms)["parameters"]
@@ -321,8 +351,7 @@ def _render(im, lay, lc, nf, stage=False):
     chunk = head_chunk(im)
     nlast = -(-V // chunk) - 1          # the last chunk, never empty
     # A rank runs the head over its own run of chunks.
-    per = -(-(nlast + 1) // T)
-    hk0, hk1 = rank * per, min(nlast, rank * per + per - 1)
+    hk0, hk1 = (sh["hk0"], sh["hk1"]) if tp else (0, nlast)
     a("  reg [%d:0] hk;" % (max(6, _clog2(nlast + 1)) - 1))
     a("  reg [%d:0] tok_r;" % (tw - 1))
     a("  reg [%d:0] pos_r;" % (pw - 1))

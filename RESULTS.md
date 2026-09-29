@@ -42,14 +42,22 @@ generated block signed off at that shape's parameters and every width in
 the cluster, and the whole design, one board, a pipeline of up to eight
 mixed boards, or the weights split over several, simulated against the
 one-board integer model to the logit, then every board's package. Split
-by weights, each rank also runs through its own registers and DDR bridge
+by weights, each board's share is sized by its speed, each rank also runs
+through its own registers and DDR bridge
 with the ARM's side serving every gather, and the ARM's UDP program for
 those gathers has run on a host, asking again for datagrams lost or
-corrupt. Running the gates at the widths the
+corrupt. The ARM programs themselves, compiled unchanged, now run on
+their own packages' RTL under Verilator: the Zybo's and the ZC706's print
+"The capital of France is Paris. Paris is the capital of France. Paris is
+the capital of France.", and the ZC706's Qwen3 package "The capital of
+France is Paris. The capital of the United States is Washington, D.C.",
+all 16 tokens of each and their logits the integer model's; so does that
+Qwen3 split by weights over a ZC706 and a Zybo, both ranks' programs on
+their own RTL, gathering over UDP. Running the gates at the widths the
 design really uses found the attention head's scores could overflow at
 16-bit activations; its score lanes now have their own, wide enough, MAC.
 The links recover from bit errors by CRC and resend, and the planner's
-cycle model is within 0.1% of simulation. It still does not host a local LLM the way Architect Labs
+cycle model is within 0.02% of simulation on the real models. It still does not host a local LLM the way Architect Labs
 does, for one reason: nothing has been loaded onto a board, and that is
 now the whole of the remaining step (`HANDOFF.md`).
 The remaining gap is listed at the bottom rather than glossed over.
@@ -59,7 +67,7 @@ The remaining gap is listed at the bottom rather than glossed over.
 ### The full suite
 
 ```
-python3 tests.py            # 363 tests, or 361 without OpenSTA
+python3 tests.py            # 392 tests, or 390 without OpenSTA
 ```
 
 ### Spec to RTL, across the spec space
@@ -689,6 +697,7 @@ package follows: its layers, its images, its place in the chain.
 | tiny 8-layer shape over 8 boards, 32/16/32/16/32/16/32/16 lanes | 30 | the 8-board pipeline | exact, no CRC error |
 | Qwen2.5-0.5B, its checkpoint, the Zybo | 14 | 1 of 24 layers, 2 generated tokens | exact; through the registers, stalling DDR: exact, 1.20 bus cycles a core cycle |
 | Qwen3-0.6B, its checkpoint, the ZC706 | 15 | 1 of 28 layers, 2 generated tokens | exact; through the registers, stalling DDR: exact, 1.70 bus cycles a core cycle |
+| Qwen2.5-0.5B, its checkpoint, the Zybo, in Verilator | 14 | all 24 layers, 2 generated tokens | exact; all 24 through the registers, stalling DDR: exact, 1.19 bus cycles a core cycle |
 | Qwen3-0.6B over a ZC706 (layers 0-15) and a Zybo (16-27) | 30 | 2 of 28 layers, one a stage, the head on the Zybo, 2 generated tokens | exact, no CRC error; each stage's cycles within 0.03% of the planner's; both boards' packages from the checkpoint |
 
 Running the gates at the widths the design actually runs found two
@@ -844,13 +853,68 @@ those it spends waiting on a gather:
 |---|---|---|---|
 | 2 | 16/16 | Qwen3's | 0.0%, 0.05% |
 | 2 | 16/16 | Qwen2.5's | 0.13%, 0.09% |
-| 4 | 16/32/16/32 | Qwen3's, head_dim 32 | 0.0%, 3.1%, 0.0%, 3.2% |
+| 4 | 16/32/16/32 | Qwen3's, head_dim 32 | 0.0%, 0.13%, 0.0%, 0.14% |
 
-The two 3% are the 32-lane ranks, whose head_dim equals their lanes. The
-one-board sequencer at 32 lanes on that shape is 1.1 to 1.5% over the
-model too, a cost the attention block's own testbench does not show,
-while at the real models' head_dim of 64 and 128 the 32-lane model is
-within 0.04%.
+
+### Shares by speed
+
+```
+python3 spec2rtl.py examples/tiny_tp4.json --boards zc706 zybo_z7_20 zybo_z7_20 --split weights --bridge --package
+```
+
+Even shares waste the faster board of a mixed set: every gather waits for
+the slowest rank, so a ZC706 beside a Zybo idles a quarter of each layer.
+The shares no longer have to be equal. Each rank holds whole KV heads with
+their query heads, and d_ff and d_model columns in multiples of every
+rank's lanes; the head's chunks go in contiguous runs in rank order, so a
+tie still goes to the lower token (`qwen_full.tp_share`). The planner
+(`cluster.tp_plan`) starts from each board's rate and moves a head or a
+group of columns at a time while the layer gets shorter, the layer's time
+being, gather by gather, the slowest rank's. `--mode even` keeps equal
+shares.
+
+For Qwen3-0.6B at a context of 128, from the cycle model and each
+package's measured bus cycles a core cycle:
+
+| boards | shares, KV heads / d_ff | a layer, computing | gathers on the ARMs, estimated | a token |
+|---|---|---|---|---|
+| ZC706 alone | | 18.3 ms | | 0.68 s |
+| ZC706 + Zybo, even | 4/4, 1536/1536 | 12.4 ms | 2.7 ms | 0.54 s |
+| ZC706 + Zybo, by speed | 5/3, 1760/1312 | 11.1 ms | 2.7 ms | 0.48 s |
+| ZC706 + 2 Zybos | 3/3/2, 1248/928/896 | 8.2 ms | 2.7 ms | 0.38 s |
+| 4 Zybos | 2 each, 768 each | 6.3 ms | 2.7 ms | 0.31 s |
+| 8 Zybos | 1 each, 384 each | 3.2 ms | 2.7 ms | 0.20 s |
+
+Eight KV heads do not split three ways evenly, so three boards had no even
+split at all. The gathers are estimated, not measured: 0.25 us an ARM
+register access, every rank reading its slice and writing the others'
+through GADDR and GDATA, 200 us of Ethernet latency a gather and 100 MB/s.
+At eight boards they are nearly as long as the layer, so moving the slices
+in the PL rather than a word an access from the ARM is the next thing that
+would pay.
+
+| run | shares | result |
+|---|---|---|
+| 4 ranks, 16/32/16/32 lanes, direct | d_ff 32/96/32/96, d_model 16/32/16/64, two ranks with no head chunk | tokens and logits exact |
+| 2 ranks, 16/32 lanes, through the registers | d_ff 96/160 | exact |
+| ZC706 + 2 Zybos through `spec2rtl.py` | 1/2/1 KV heads, d_ff 96/96/64, d_model 64/32/32 | 30 blocks signed off; exact directly and through the registers; three packages |
+| the ARM program on the host, 3 ranks | slices of 300/500/400, 100/300/200, 600/900/600 words | the reference's tokens after a lost and a corrupt datagram |
+| Qwen3-0.6B's checkpoint over a ZC706 and a Zybo through `spec2rtl.py` | 5/3 KV heads, d_ff 1760/1312, d_model 608/416, head chunks 0-28/29-49 | 30 blocks signed off; exact at 1 of 28 layers; each rank's computing cycles within 0.003% of `cluster.tp_rank_cycles`; both packages from the checkpoint |
+| the same through `spec2rtl.py --bridge` in Verilator | the same | all 28 layers exact directly, and again through each rank's registers and DDR bridge against stalling DDR (1.69 and 1.13 bus cycles a core cycle), 674 gathers; computing cycles within 0.01% of the cycle model; 37 minutes in all |
+| the same two packages' ARM programs on their RTL (`cosim.py`) | the same | "The capital of France is Paris. The capital of the United States is Washington, D.C. The capital", every token and logit the integer model's, 2,256 gathers a rank over UDP, 222 s |
+
+`test_tp_plan` checks the planner's shares on four board sets: they cover
+the model, sit in every rank's lanes, tile the vocabulary, and are never
+slower than even ones.
+
+The cycle model's projections were 16 cycles short at 32 lanes: the last
+group's sums drain through the one requantizer a cycle a lane, 32 at 32
+lanes, where the model had a fixed 32 for starting and draining in all.
+With that, both real models at 32 lanes are within 0.02% at every
+position. What remains is the weighted sum's cost per cached position,
+which the model gives as 3 + head_dim / lanes and the block takes as 5 at
+short contexts: within 0.2% of a layer at the real models' head_dim of 64
+and 128, and 1 to 3% on a tiny head_dim-32 shape at 32 lanes.
 
 ## 32 lanes on the ZC706
 
@@ -951,6 +1015,85 @@ A pipeline need not be one kind of board. `gals.build` takes each
 stage's width, and three boards of 32, 16 and 32 lanes give the one-board
 integer model's tokens and logits exactly, with no CRC error: only the
 hidden state crosses between them.
+
+## Every layer of a real model, in minutes
+
+Icarus took two and a half hours for Qwen3-0.6B's 28 layers and the head
+over five positions, so `spec2rtl.py` simulated a real checkpoint at one
+layer. Verilator compiles the same testbenches unchanged, delays, forks
+and hierarchical references included (`vsim.py`), and runs that one in
+two minutes: 19,418,465 cycles for the head step, token 12095 at logit
+15025, exactly as Icarus. `spec2rtl.py` now uses it where it is
+installed (`--sim fast`, the default) and then simulates every layer of
+a real model, and every layer again through the registers with
+`--bridge`; `--sim iverilog` keeps the old behaviour. Every test in
+`tests.py` still runs on Icarus, which is four-state, so a word never
+written reads as x; `test_simulators_agree` holds Verilator to Icarus's
+steps, tokens, logits and cycles on a small checkpoint and on a weight
+split's ranks. The layer split's bit-error test stays on Icarus: the two
+draw different random streams, and Verilator's flipped no bit on that
+run.
+
+| run | Icarus | Verilator |
+|---|---|---|
+| Qwen3-0.6B at 32 lanes, 28 layers and the head, five positions, direct | 2.5 hours | 2 minutes: the same cycles, token and logit |
+| a weight split's two ranks, and its two ranks through their registers | 14 s and 24 s | under a second each: the same tokens and logits |
+| `spec2rtl.py` on Qwen3-0.6B split by weights over a ZC706 and a Zybo, `--bridge` | 1 layer | all 28 layers on both ranks, then all 28 through each rank's registers, 37 minutes in all |
+| `spec2rtl.py --weights qwen_weights --bridge`, Qwen2.5-0.5B on the Zybo | 1 layer, then 1 layer through the registers | all 24 layers and the head, every position within 0.01% of the cycle model, then all 24 through the registers against stalling DDR at 1.19 bus cycles a core cycle: " Paris" and "." with the integer model's logits, 19 minutes in all |
+
+## The ARM programs on their own RTL
+
+```
+python3 cosim.py board_zc706 --jitter
+FPGAI_QWEN=qwen3 python3 cosim.py board_zc706_qwen3 --jitter
+```
+
+Until now each half of a board ran against a model of the other: the RTL
+against a Verilog model of the ARM's register accesses, and the ARM
+programs against a stand-in PL written in C. `cosim.py` joins the real
+halves. It compiles a package's `sw/main.c`, unchanged, for this host
+and links it with the package's own RTL built by Verilator: the register
+block, the DDR bridge and the core. Every `Xil_In32` and `Xil_Out32` is
+an AXI-Lite transaction on that RTL. DDR is one array: the program's
+loads from the SD card write into it at the header's bus addresses, and
+the PL's five AXI masters read and write the same bytes, answered after
+30 cycles and, with `--jitter`, stalling and gapping at random. So the
+weight image's byte order, the constants' format, the KV cache's
+clearing and the vocabulary all cross the path they will on a Zynq, and
+the program prints what its UART will. Beside the program's own read of
+each step's token, the harness reads the logit too, so a run is checked
+to the logit. The stand-ins left are FatFs (a directory), lwIP (a UDP
+socket on localhost) and coherent caches. Verilator runs the ZC706's
+core at about two million bus cycles a second, so a real model's whole
+run takes minutes.
+
+The three packages in this repo, each with its SD card from the real
+checkpoint, every port stalling at random, the prompt "The capital of
+France is" and the program's 16 tokens:
+
+| package | the program printed | 16 head steps against the integer model | bus cycles | wall time |
+|---|---|---|---|---|
+| `board_zybo/`, Qwen2.5-0.5B, 16 lanes | The capital of France is Paris. Paris is the capital of France. Paris is the capital of France. | every token and logit | 710 million | 6.6 min |
+| `board_zc706/`, Qwen2.5-0.5B, 32 lanes | the same | every token and logit | 476 million | 3.9 min |
+| `board_zc706_qwen3/`, Qwen3-0.6B, 32 lanes | The capital of France is Paris. The capital of the United States is Washington, D.C. The capital | every token and logit | 608 million | 5.0 min |
+
+That is the whole of what a board would print, where simulation had
+checked the first generated token and the ARM programs had never run on
+the RTL at all. Both Qwen2.5 packages print the continuation `HANDOFF.md`
+tells the team to expect. Qwen3-0.6B split by weights over a ZC706 and a
+Zybo, its shares by speed, runs the same way as two processes, each rank's
+program on its own package's RTL, gathering over UDP: rank 0 prints the
+single board's text, and the logit the ranks agree on at every step is
+the integer model's (2,256 gathers a rank, 222 s).
+
+`test_arm_programs_on_their_rtl` runs all three programs on small
+checkpoints and checks tokens and logits against the integer model: the
+single board's with every port stalling; two stages of a layer split with
+the first datagram lost; and two ranks of a weight split, a Zybo's 16
+lanes beside a ZC706's 32 with uneven shares, a datagram lost. A weight
+image in the byte order the ARM once had fails it, and so do ranks whose
+ARM writes the others' slices one word off, which moved no token of that
+small checkpoint and every logit.
 
 ## Boards on their own clocks: GALS
 
@@ -1787,8 +1930,9 @@ These are the distance between this repo and a local LLM host.
    does; that integer model agrees with float on 14 of 16 positions at
    int16 activations, and Qwen3-0.6B's on 13 of 16. The weights reach it through AXI masters shaped
    like the Zynq's HP ports, against a DDR model that stalls and gaps at
-   random; the Zynq's own DDR controller and interconnect have not
-   carried them.
+   random, and the packages' own ARM programs have driven it through
+   their registers from their own SD images (`cosim.py`); the Zynq's own
+   DDR controller, interconnect and Cortex-A9 have not.
 4. **Throughput is simulated, not measured on a board.** The decode's
    own cycles are exact: through the Zybo package's registers against
    the stalling DDR model, a Qwen2.5-0.5B position takes 26.9 million bus
@@ -1813,8 +1957,9 @@ These are the distance between this repo and a local LLM host.
    links are fabric UARTs in simulation (6.25 Mbaud) and, between Zynq
    boards, UDP over the ARM's Ethernet, run on a host with lwIP shimmed;
    the weight split's gathers run through each rank's registers in
-   simulation and over UDP on a host with lwIP shimmed, and neither
-   program has run on a Zynq's ARM or its Ethernet. The generated
+   simulation and over UDP on a host with lwIP shimmed, both programs
+   against their packages' own RTL; neither has run on a Zynq's ARM or
+   its Ethernet. The generated
    CRC32 fabric endpoint, signed off at 10G and beyond as a block, is not
    in the board-to-board path. A board without an ARM holds no layer: it
    has no DRAM the design reaches, since no fabric DDR controller is

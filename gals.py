@@ -482,13 +482,9 @@ def build(im, ids, n_gen, work, split, clocks=(10.0, 7.9, 12.3), bit_ns=160.0, l
                   + ["qwen_full_%s.v" % s[0] for s in stages] + sorted(srcs))
 
 
-def run(work, srcs, timeout=1800):
-    r = subprocess.run(["iverilog", "-g2005", "-o", "g.out"] + srcs, cwd=work,
-                       capture_output=True, text=True)
-    if r.returncode:
-        return r.stdout + r.stderr
-    return subprocess.run(["vvp", "g.out"], cwd=work, capture_output=True,
-                          text=True, timeout=timeout).stdout
+def run(work, srcs, timeout=1800, sim="iverilog"):
+    import vsim
+    return vsim.run(work, srcs, sim, timeout=timeout, defines=(), tag="g")
 
 
 def main():

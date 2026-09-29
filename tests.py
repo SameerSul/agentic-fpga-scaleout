@@ -2094,20 +2094,26 @@ def test_weights_split_over_boards():
     gathering the attention context, o's output, the gated product and
     down's output from the others, and agreeing on the head's argmax. Two
     ranks, four of 16/32/16/32 lanes, and Qwen2.5's biased shape each have
-    to give the one-board integer model's tokens and logits; a network
+    to give the one-board integer model's tokens and logits, and so do
+    uneven shares, four ranks' with two holding no head chunk; a network
     that skips the context's gather has to be caught."""
     import tp, qwen_synth
     ids = [3, 77, 12, 140]
     work = os.path.join(ROOT, 'build_tptest')
-    for style, T, kw, lanes, mut in (
-            ('qwen3', 2, {}, None, False),
-            ('qwen3', 4, dict(vocab=608, hidden=128, heads=8, kv=4), [16, 32, 16, 32], False),
-            ('qwen2.5', 2, {}, None, False),
-            ('qwen3', 2, {}, None, True)):
+    k4 = dict(vocab=608, hidden=128, heads=8, kv=4)
+    u4 = dict(kv=[1, 1, 1, 1], f=[32, 96, 32, 96], d=[16, 32, 16, 64],
+              hk=[[0, 1], [2, 2], [3, 2], [3, 2]])
+    for style, T, kw, lanes, mut, part in (
+            ('qwen3', 2, {}, None, False, None),
+            ('qwen3', 4, k4, [16, 32, 16, 32], False, None),
+            ('qwen2.5', 2, {}, None, False, None),
+            ('qwen3', 4, k4, [16, 32, 16, 32], False, u4),
+            ('qwen3', 2, {}, None, True, None)):
         shutil.rmtree(work, ignore_errors=True)
         try:
             im, _ = qwen_synth.model(style, nl=2, **kw)
-            want, srcs = tp.build(im, ids, 3, work, T, lanes=lanes, log=lambda *a: None)
+            want, srcs = tp.build(im, ids, 3, work, T, lanes=lanes, log=lambda *a: None,
+                                  part=part)
             im.reset()
             best = []
             for p in range(len(want) - 1):
@@ -2130,11 +2136,63 @@ def test_weights_split_over_boards():
                 check('a network that skips the context gather is caught',
                       len(got) == len(best) and got != best)
             else:
-                check('the weights split %d ways%s: one board\'s tokens and logits (%s)'
-                      % (T, ', %s lanes' % '/'.join(map(str, lanes)) if lanes else '', style),
+                check('the weights split %d ways%s%s: one board\'s tokens and logits (%s)'
+                      % (T, ', %s lanes' % '/'.join(map(str, lanes)) if lanes else '',
+                         ', shares %s of d_ff' % '/'.join(map(str, part['f'])) if part else '',
+                         style),
                       got == best and len(best) == 3 and 'bad=0' in out)
         finally:
             shutil.rmtree(work, ignore_errors=True)
+
+
+def test_tp_plan():
+    """The weight split's planner (cluster.tp_plan): every share covers
+    the model, whole KV heads and every rank's d_ff and d_model a positive
+    multiple of its lanes, the head's chunks in runs that tile the
+    vocabulary in rank order; never slower a layer than even shares; on
+    a ZC706 beside a Zybo, more of every matrix on the ZC706; three boards
+    split Qwen3's eight KV heads, which even shares cannot; and a split
+    with more ranks than KV heads is refused."""
+    import cluster
+    ok = True
+    m = cluster.MODELS['qwen3']
+    _, nck = cluster._chunks(m)
+    for names in (['zc706', 'zybo_z7_20'], ['zc706', 'zybo_z7_20', 'zybo_z7_20'],
+                  ['zybo_z7_20', 'zc706', 'zybo_z7_20', 'zc706'], ['zc706', 'zc706']):
+        p = cluster.tp_plan(names, m)
+        pt, lanes = p['part'], p['lanes']
+        ok &= sum(pt['kv']) == m['KV'] and sum(pt['f']) == m['F'] and sum(pt['d']) == m['D']
+        ok &= all(x > 0 and x % N == 0 for k in ('f', 'd') for x, N in zip(pt[k], lanes))
+        ok &= all(k > 0 and k * m['hd'] % N == 0 for k, N in zip(pt['kv'], lanes))
+        runs = [r for r in pt['hk'] if r[1] >= r[0]]
+        ok &= runs[0][0] == 0 and runs[-1][1] == nck - 1 and all(
+            a[1] + 1 == b[0] for a, b in zip(runs, runs[1:]))
+        if len(names) != 3:
+            ok &= p['layer_seconds'] <= cluster.tp_plan(names, m, even=True)['layer_seconds'] + 1e-12
+    check('the weight split\'s shares cover the model in every rank\'s lanes, and are '
+          'never slower than even ones', ok)
+    two = cluster.tp_plan(['zc706', 'zybo_z7_20'], m)
+    ev = cluster.tp_plan(['zc706', 'zybo_z7_20'], m, even=True)
+    check('a ZC706 beside a Zybo gets more of every matrix (%s KV heads, %s of d_ff), '
+          '%.1f ms a layer against %.1f even' % (
+              '/'.join(map(str, two['part']['kv'])), '/'.join(map(str, two['part']['f'])),
+              1e3 * two['layer_seconds'], 1e3 * ev['layer_seconds']),
+          two['part']['kv'][0] > two['part']['kv'][1] and two['part']['f'][0] > two['part']['f'][1]
+          and two['layer_seconds'] < ev['layer_seconds'])
+    try:
+        cluster.tp_plan(['zc706', 'zybo_z7_20', 'zybo_z7_20'], m, even=True)
+        refused = False
+    except ValueError:
+        refused = True
+    three = cluster.tp_plan(['zc706', 'zybo_z7_20', 'zybo_z7_20'], m)
+    check('three boards split eight KV heads %s, which even shares cannot'
+          % '/'.join(map(str, three['part']['kv'])), refused and sum(three['part']['kv']) == 8)
+    try:
+        cluster.tp_plan(['zc706'] * 9, m)
+        refused = False
+    except ValueError:
+        refused = True
+    check('nine ranks for eight KV heads are refused', refused)
 
 
 def test_weights_split_through_registers():
@@ -2142,19 +2200,22 @@ def test_weights_split_through_registers():
     each rank's package RTL, its register block and DDR bridge around the
     core, with a DDR model of its own that stalls at random and its own
     clock, and every gather done by the ARM's side through GADDR, GDATA
-    and GATHER. Two ranks at 16 lanes, and a Zybo's 16 beside a ZC706's
-    32, have to give the one-board integer model's tokens and logits. A
-    register block whose GATHER still reads set once answered lets an ARM
-    serve one gather twice, and has to be caught."""
+    and GATHER. Two ranks at 16 lanes, a Zybo's 16 beside a ZC706's 32,
+    and the same two with the ZC706 holding more of d_ff, have to give the
+    one-board integer model's tokens and logits. A register block whose
+    GATHER still reads set once answered lets an ARM serve one gather
+    twice, and has to be caught."""
     import tp, qwen_synth
     ids = [3, 77, 12, 140]
     work = os.path.join(ROOT, 'build_tpregtest')
-    for lanes, mut in ((None, False), ([16, 32], False), (None, True)):
+    u2 = dict(kv=[1, 1], f=[96, 160], d=[32, 32], hk=[[0, 0], [1, 2]])
+    for lanes, mut, part in ((None, False, None), ([16, 32], False, None),
+                             ([16, 32], False, u2), (None, True, None)):
         shutil.rmtree(work, ignore_errors=True)
         try:
             im, _ = qwen_synth.model('qwen3', nl=2)
             want, srcs = tp.build_boards(im, ids, 3, work, 2, lanes=lanes, jit=1,
-                                         log=lambda *a: None)
+                                         log=lambda *a: None, part=part)
             im.reset()
             best = []
             for p in range(len(want) - 1):
@@ -2174,9 +2235,10 @@ def test_weights_split_through_registers():
                 check('a GATHER that reads set once answered is caught serving a gather twice',
                       'TP_FAIL' in out and got != best)
             else:
-                check('the weights split 2 ways through the registers and DDR bridges%s: '
+                check('the weights split 2 ways through the registers and DDR bridges%s%s: '
                       'one board\'s tokens and logits'
-                      % (', %s lanes' % '/'.join(map(str, lanes)) if lanes else ''),
+                      % (', %s lanes' % '/'.join(map(str, lanes)) if lanes else '',
+                         ', shares %s of d_ff' % '/'.join(map(str, part['f'])) if part else ''),
                       got == best and len(best) == 3 and 'bad=0' in out)
         finally:
             shutil.rmtree(work, ignore_errors=True)
@@ -2539,9 +2601,9 @@ u32 Xil_In32(UINTPTR a) {
 TP_PL = """/* the stand-in PL: one rank of a fixed integer model */
 #define NL_ 2
 #define V_ 97
-#define N1 (FPGAI_HHD / TP_RANKS)
-#define N2 (FPGAI_D / TP_RANKS)
-#define N3 (FPGAI_F / TP_RANKS)
+static const int sl_[TP_RANKS][3] = {TP_SLICES}, of_[TP_RANKS][3] = {TP_OFFSETS};
+#define LO(k) (of_[TP_RANK][k])
+#define HI(k) (of_[TP_RANK][k] + sl_[TP_RANK][k])
 static u32 r_tok, r_pos, done, gaddr, greq, gvec, phase, head, nxt; static s16 bst;
 static s16 x[FPGAI_D], cm[FPGAI_HHD], am[FPGAI_D], mm[FPGAI_F];
 static s16 wrap(long v) { return (s16)(((v % 20011) + 20011) % 20011 - 10005); }
@@ -2555,13 +2617,13 @@ static void slice(void) {
     for (i = lo; i < hi; i++) { s16 v = wrap((long)x[i % FPGAI_D] * 7 + i);
       if (i == lo || v > bst) { bst = v; nxt = i; } }
     gvec = 4; greq = 1; return; }
-  if (k == 0) { for (i = TP_RANK * N1; i < (TP_RANK + 1) * N1; i++)
+  if (k == 0) { for (i = LO(0); i < HI(0); i++)
       cm[i] = wrap((long)x[i % FPGAI_D] * 3 + x[(i * 7) % FPGAI_D] + l + i + (long)r_pos * 5); gvec = 1; }
-  if (k == 1) { for (i = TP_RANK * N2; i < (TP_RANK + 1) * N2; i++)
+  if (k == 1) { for (i = LO(1); i < HI(1); i++)
       am[i] = wrap(cm[i % FPGAI_HHD] + (long)cm[(i * 5 + 1) % FPGAI_HHD] * 2 + i); gvec = 2; }
-  if (k == 2) { for (i = TP_RANK * N3; i < (TP_RANK + 1) * N3; i++)
+  if (k == 2) { for (i = LO(2); i < HI(2); i++)
       mm[i] = wrap((long)x[i % FPGAI_D] * 5 + i + l); gvec = 3; }
-  if (k == 3) { for (i = TP_RANK * N2; i < (TP_RANK + 1) * N2; i++)
+  if (k == 3) { for (i = LO(1); i < HI(1); i++)
       am[i] = wrap(mm[i % FPGAI_F] + (long)mm[(i * 3) % FPGAI_F] + i); gvec = 2; }
   greq = 1; }
 static void answered(void) {
@@ -2601,8 +2663,9 @@ def test_tp_network_on_host():
     gathers a layer, and the head's, as the core. One rank's second
     datagram is lost on the wire and another's fifth arrives corrupt. The
     ranks have to ask for what they miss, and rank 0 has to print the
-    one-board reference's tokens; an ARM that writes the other ranks'
-    slices one word off has to be caught."""
+    one-board reference's tokens, with even shares and with every rank's
+    slice a different size; an ARM that writes the other ranks' slices
+    one word off has to be caught."""
     import board_zybo as bz
     cc = shutil.which('cc') or shutil.which('clang') or shutil.which('gcc')
     if not cc:
@@ -2634,11 +2697,13 @@ def test_tp_network_on_host():
     text = ''.join('<%d>' % t for t in prompt) + ''.join('<%d>' % t for t in want)
     shim = STAGE_SHIM['shim.c'][:STAGE_SHIM['shim.c'].index('/* the stand-in PL */')] + TP_PL
     results = {}
-    for label, mut in (('good', None),
-                       ('off', ('Xil_Out32(REG(FPGAI_GADDR), r * n);',
-                                'Xil_Out32(REG(FPGAI_GADDR), r * n + 1);'))):
+    uneven = [(300, 100, 600), (500, 300, 900), (400, 200, 600)]
+    for k, (label, mut, slices) in enumerate((
+            ('good', None, None), ('uneven', None, uneven),
+            ('off', ('Xil_Out32(REG(FPGAI_GADDR), ra);',
+                     'Xil_Out32(REG(FPGAI_GADDR), ra + 1);'), uneven))):
         shutil.rmtree(work, ignore_errors=True)
-        port0 = 45000 + (os.getpid() + (label == 'off') * 97) % 2000
+        port0 = 45000 + (os.getpid() + k * 97) % 2000
         procs, outs = [], {}
         try:
             for r in range(T):
@@ -2650,8 +2715,8 @@ def test_tp_network_on_host():
                 L = dict(W=dict(tok=18, pos=8, gx_addr=12), wb=0, cb=0, cn=64, kb=0, vb=0,
                          end=0, words=64, N=16)
                 h = bz.render_header(L, n_gen, 'host', tp=dict(
-                    rank=r, ranks=T, HHD=HHD, D=D, F=F,
-                    ips=[(127, 0, 0, 20 + k) for k in range(T)]))
+                    rank=r, ranks=T, HHD=HHD, D=D, F=F, slices=slices,
+                    ips=[(127, 0, 0, 20 + j) for j in range(T)]))
                 for k, v in (('WBASE', '((UINTPTR)host_ddr)'), ('CBASE', '((UINTPTR)host_ddr + 4096)'),
                              ('KBASE', '((UINTPTR)host_ddr + 8192)'), ('KVEND', '((UINTPTR)host_ddr + 16384)'),
                              ('VOCAB_BASE', '((UINTPTR)host_ddr + 65536)'), ('WBYTES', '1024U'),
@@ -2702,17 +2767,177 @@ def test_tp_network_on_host():
                     p.kill()
             shutil.rmtree(work, ignore_errors=True)
         results[label] = outs
-    good = results['good']
-    asks = sum(int(m) for o in good.values() for m in re.findall(r'(\d+) asks', o))
-    done = all(re.search(r'rank %d: %d gathers' % (r, 4 * NL * (len(prompt) + n_gen - 1) + n_gen), good[r])
-               for r in range(T))
-    if text not in good[0] or not done:
-        print('\n'.join(good[r][-600:] for r in range(T)))
-    check('three ranks gather their slices over UDP, ask again for a lost and a corrupt '
-          'datagram (%d asks), and print one board\'s tokens' % asks,
-          text in good[0] and done and asks >= 2)
+    for label, what in (('good', 'even shares'), ('uneven', 'slices of three sizes')):
+        good = results[label]
+        asks = sum(int(m) for o in good.values() for m in re.findall(r'(\d+) asks', o))
+        done = all(re.search(r'rank %d: %d gathers' % (r, 4 * NL * (len(prompt) + n_gen - 1) + n_gen),
+                             good[r]) for r in range(T))
+        if text not in good[0] or not done:
+            print('\n'.join(good[r][-600:] for r in range(T)))
+        check('three ranks, %s, gather over UDP, ask again for a lost and a corrupt '
+              'datagram (%d asks), and print one board\'s tokens' % (what, asks),
+              text in good[0] and done and asks >= 2)
     check('an ARM that writes the other ranks\' slices one word off is caught',
           text not in results['off'][0])
+
+
+def test_simulators_agree():
+    """Verilator (vsim.py), which spec2rtl.py uses to simulate a real
+    model at every layer, against Icarus, which every other test uses: the
+    direct testbench of a small checkpoint, and two ranks of a weight
+    split, have to print the same steps, tokens, logits and cycles in
+    both."""
+    import qwen_full, qwen_synth, tp, vsim
+    if not shutil.which('verilator'):
+        check('the two simulators agree (no Verilator: skipped)', True)
+        return
+    ids = [3, 77, 12, 140]
+    work = os.path.join(ROOT, 'build_simtest')
+    try:
+        shutil.rmtree(work, ignore_errors=True)
+        im, _ = qwen_synth.model('qwen3', nl=2)
+        _, srcs = qwen_full.build_model(im, ids, 3, work, log=lambda *a: None)
+        out = {sim: [l for l in vsim.run(work, srcs, sim, timeout=900, tag=sim).splitlines()
+                     if l.startswith('STEP')] for sim in ('iverilog', 'verilator')}
+        check('Verilator prints the direct testbench\'s %d steps as Icarus does, cycles '
+              'included' % len(out['iverilog']),
+              len(out['iverilog']) == 6 and out['iverilog'] == out['verilator'])
+        shutil.rmtree(work, ignore_errors=True)
+        _, srcs = tp.build(im, ids, 3, work, 2, log=lambda *a: None)
+        out = {sim: [l for l in tp.run(work, srcs, sim=sim, timeout=900).splitlines()
+                     if l.startswith(('TOKEN', 'TP', 'RANK'))] for sim in ('iverilog', 'verilator')}
+        check('and the weight split\'s ranks, gathers and busy cycles',
+              len(out['iverilog']) == 6 and out['iverilog'] == out['verilator'])
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def test_arm_programs_on_their_rtl():
+    """Every generated ARM program, compiled unchanged, against its own
+    package's RTL under Verilator (cosim.py): the program loads its SD
+    card into DDR, the PL's AXI masters read those bytes back, and every
+    register access is an AXI-Lite transaction. The single board's, with
+    every AXI port stalling at random; two stages of a layer split, the
+    first datagram lost; and two ranks of a weight split, a Zybo's 16
+    lanes beside a ZC706's 32 with uneven shares, a datagram lost. Each
+    has to print the integer model's tokens, and the head's logits, which
+    the harness reads beside the program's own reads, have to be the
+    integer model's. A weight image in the byte order the ARM once had,
+    and ranks whose ARM writes the others' slices one word off, have to
+    be caught."""
+    import board_zybo as bz, cosim, qwen_full, qwen_synth, zybo
+    import qwen_real as qr
+    cc = shutil.which('cc') or shutil.which('clang') or shutil.which('gcc')
+    if not cc or not shutil.which('verilator'):
+        check('the ARM programs run on their RTL (no C compiler or Verilator: skipped)', True)
+        return
+    work = os.path.join(ROOT, 'build_cosimtest')
+    shutil.rmtree(work, ignore_errors=True)
+    ids, n_gen = [3, 77, 12, 140], 3
+
+    def ref(im, want):
+        im.reset()
+        best = []
+        for p in range(len(want) - 1):
+            lg = im.step(want[p], p, logits=p >= len(ids) - 1)
+            if lg is not None:
+                best.append((max(range(len(lg)), key=lg.__getitem__), max(lg)))
+        return best
+
+    def agreed(outs):
+        # Every rank's best over its run of the vocabulary; the ranks take
+        # the largest, the lower rank on a tie.
+        hs = [cosim.heads(o) for o in outs]
+        return [max((h[k] for h in hs), key=lambda x: x[1]) for k in range(min(map(len, hs)))]
+    try:
+        def pkg(im, want, name, board, **kw):
+            b = os.path.join(work, name + '_build')
+            im.ms['lanes'] = boards_mod.PACKAGES[board]['lanes']
+            bkw = {k: kw[k] for k in ('tp', 'layers', 'stage', 'table') if k in kw}
+            if 'tp' in bkw:
+                bkw['tp'] = bkw['tp'][:3]
+            qwen_full.build_model(im, ids, n_gen, b, log=lambda *a: None, want=want, **bkw)
+            o = os.path.join(work, name)
+            import io, contextlib
+            with contextlib.redirect_stdout(io.StringIO()):
+                bz.package(b, board, o, '', n_gen, sd=False, model='tiny', checked='-',
+                           stage=kw.get('st'), tp=kw.get('tpd'))
+            bz.write_sd(zybo.layout(b, bz.BASE), b, os.path.join(o, 'sd'), ids, cosim.Tokens(im.V),
+                        first=kw.get('first', True), vocab=kw.get('vocab', True))
+            return o
+        # One board.
+        im, _ = qwen_synth.model('qwen3', nl=2)
+        want = qr.greedy(im, ids, n_gen)
+        text, best = ''.join('<%d>' % t for t in want), ref(im, want)
+        one = pkg(im, want, 'one', 'zybo_z7_20')
+        exe = cosim.build(one, os.path.join(work, 'one_sim'), log=lambda *a: None)
+        out = cosim.run(exe, os.path.join(one, 'sd'), {'JITTER': '1'}, timeout=900)
+        check('the single board\'s program on its RTL, every AXI port stalling: '
+              'the integer model\'s tokens and logits', text in cosim.uart(out) and cosim.heads(out) == best)
+        # Its weight image in the old byte order: lane j at byte N - 1 - j.
+        w8 = os.path.join(one, 'sd', 'weights8.bin')
+        img = bytearray(open(w8, 'rb').read())
+        for k in range(0, len(img), 16):
+            img[k:k + 16] = img[k:k + 16][::-1]
+        open(w8, 'wb').write(bytes(img))
+        out = cosim.run(exe, os.path.join(one, 'sd'), {'JITTER': '0'}, timeout=900)
+        check('a weight image in the old byte order is caught',
+              cosim.heads(out) != best and len(cosim.heads(out)) == len(best))
+        # Two stages of a layer split.
+        im, _ = qwen_synth.model('qwen3', nl=2, vocab=608)
+        want = qr.greedy(im, ids, n_gen)
+        text, best = ''.join('<%d>' % t for t in want), ref(im, want)
+        ips = [(192, 168, 1, 10), (192, 168, 1, 11)]
+        runs = []
+        for i, board in enumerate(('zc706', 'zybo_z7_20')):
+            st = dict(D=im.D, index=i, count=2, l0=i, l1=i + 1, emb=i == 0, head=i == 1,
+                      ip=ips[i], next_ip=ips[1 - i], first_ip=ips[0])
+            o = pkg(im, want, 'stage%d' % i, board, layers=[i], stage=True, table=True, st=st,
+                    first=i == 0)
+            runs.append((cosim.build(o, os.path.join(work, 'stage%d_sim' % i), log=lambda *a: None),
+                         os.path.join(o, 'sd'), {'JITTER': '1', 'DROP': '1' if i == 0 else '0'}))
+        outs = cosim.run_group(runs)
+        check('two stages\' programs on their RTL, the first datagram lost: '
+              'the integer model\'s tokens and logits',
+              text in cosim.uart(outs[0]) and cosim.heads(outs[1]) == best)
+        # Two ranks of a weight split, uneven shares.
+        im, _ = qwen_synth.model('qwen3', nl=2)
+        want = qr.greedy(im, ids, n_gen)
+        text, best = ''.join('<%d>' % t for t in want), ref(im, want)
+        part = dict(kv=[1, 1], f=[96, 160], d=[32, 32], hk=[[0, 0], [1, 2]])
+        grp = im.H // im.KV
+        runs = []
+        for r, board in enumerate(('zybo_z7_20', 'zc706')):
+            tpd = dict(rank=r, ranks=2, HHD=im.H * im.hd, D=im.D, F=im.F, ips=ips,
+                       slices=[(grp * part['kv'][k] * im.hd, part['d'][k], part['f'][k])
+                               for k in range(2)])
+            o = pkg(im, want, 'rank%d' % r, board, tp=(r, 2, part), tpd=tpd, vocab=r == 0)
+            runs.append((cosim.build(o, os.path.join(work, 'rank%d_sim' % r), log=lambda *a: None),
+                         os.path.join(o, 'sd'), {'JITTER': '1', 'DROP': '3' if r == 1 else '0'}))
+        outs = cosim.run_group(runs)
+        asks = sum(int(m) for o in outs for m in re.findall(r'(\d+) asks', o))
+        if text not in cosim.uart(outs[0]):
+            print(outs[0][-800:], outs[1][-400:])
+        check('two ranks\' programs on their RTL, 16 and 32 lanes, uneven shares, a '
+              'datagram lost (%d asks): the integer model\'s tokens and logits' % asks,
+              text in cosim.uart(outs[0]) and agreed(outs) == best and asks >= 1)
+        # The same ranks, their ARM writing the others' slices one word off.
+        bad = []
+        for r in range(2):
+            o = os.path.join(work, 'rank%d' % r)
+            m = os.path.join(work, 'rank%d_mut' % r)
+            shutil.copytree(o, m)
+            src = open(os.path.join(m, 'sw', 'main.c')).read()
+            a = 'Xil_Out32(REG(FPGAI_GADDR), ra);'
+            assert a in src
+            open(os.path.join(m, 'sw', 'main.c'), 'w').write(src.replace(a, 'Xil_Out32(REG(FPGAI_GADDR), ra + 1);'))
+            bad.append((cosim.build(m, os.path.join(work, 'rank%d_mutsim' % r), log=lambda *a: None),
+                        os.path.join(m, 'sd'), {'JITTER': '0'}))
+        outs = cosim.run_group(bad)
+        check('ranks whose ARM writes the others\' slices one word off are caught',
+              agreed(outs) != best and len(agreed(outs)) == len(best))
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
 
 
 def test_stage_network_on_host():
@@ -3653,11 +3878,14 @@ if __name__ == '__main__':
     test_spec_to_verified_rtl()
     test_weights_split_over_boards()
     test_weights_split_through_registers()
+    test_tp_plan()
     test_gals_two_boards()
     test_cluster_plan()
     test_zybo_stage_registers()
     test_stage_network_on_host()
     test_tp_network_on_host()
+    test_simulators_agree()
+    test_arm_programs_on_their_rtl()
     test_composite_cell_count()
     test_requant_golden_is_shared()
     test_table_unit_specs_are_implementable()

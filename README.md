@@ -491,8 +491,10 @@ and says why. Every generated block the design compiles goes through the
 signoff gates at that shape's own parameters, leaves first, each composite
 block's testbench compiling the sub-blocks just signed off. The decode step
 is generated around exactly those files and simulated against the integer
-model: every chosen token and its logit has to match, at every layer for a
-small model and at `--sim-layers` of them for a real one. It then writes
+model: every chosen token and its logit has to match, at every layer. A
+real model takes minutes in Verilator (`vsim.py`), which spec2rtl uses
+where it is installed; with only Icarus (`--sim iverilog`) a real model
+is simulated at one layer, or at `--sim-layers`. It then writes
 the full-depth design, with `--package` the board package, and with
 `--bridge` runs the simulation through that package's registers against a
 DDR model that stalls at random. Without `--weights` the checkpoint is
@@ -507,7 +509,9 @@ clock and sharing only CRC-checked messages, is simulated against the
 one-board integer model. `--split weights` puts every board on every
 layer with a slice of every matrix instead (`tp.py`), which divides the
 weight bytes a token reads by the number of boards; the boards gather
-each other's slices four times a layer. There `--bridge` runs every rank
+each other's slices four times a layer, and each board's share of the
+heads and columns is sized by its speed (`cluster.tp_plan`; `--mode even`
+for equal shares). There `--bridge` runs every rank
 again as its package does, through its own registers and DDR bridge, with
 the ARM's side of every gather done through the registers, and
 `--package` writes every rank's Zynq package, whose ARM program carries
@@ -574,6 +578,13 @@ the gathers over UDP.
    load and read the hidden state, and its ARM program the network.
    Stages need not match: each board's core has its own width, and only
    the hidden state crosses between them.
+8. **The programs on their RTL** (`cosim.py`). A package's `sw/main.c`,
+   compiled unchanged for this host, drives the package's own RTL under
+   Verilator: every register access an AXI-Lite transaction, the SD
+   card's files loaded into the same DDR array the PL's masters read. It
+   prints what the board's UART will, and the harness checks each step's
+   logit. A real model's whole run takes minutes; several boards run as
+   several processes over localhost UDP.
 
 ### Outputs
 

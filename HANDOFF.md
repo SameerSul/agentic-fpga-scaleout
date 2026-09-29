@@ -96,6 +96,18 @@ tokens, whose first, " Paris", the RTL chose in simulation through all
 The capital of France is Paris. The capital of the United States is Washington, D.C. The capital
 ```
 
+### Before the board: run the package on this host
+
+```bash
+python3 cosim.py board_zybo --jitter
+```
+
+This runs the package's own `sw/main.c`, unchanged, against the
+package's own RTL (Verilator) and the SD card files just written, every
+register access an AXI-Lite transaction and every DDR port stalling at
+random. It prints what the UART should print, in under ten minutes; if
+it does not, the fault is in the files or the RTL, not the board.
+
 ## 2. Build the bitstream and the platform
 
 ```bash
@@ -154,10 +166,10 @@ The capital of France is Paris. Paris is the capital of France. Paris is the cap
 ```
 
 That is the integer model's greedy continuation, 16 tokens, which the
-RTL is built to match exactly. What simulation has checked: the first
-generated token, " Paris", through all 24 layers and the head, and
-several generated tokens in a row on small test models. So a board that
-prints " Paris" and then differs later is a finding worth reporting. At 50 MHz each
+RTL is built to match exactly. `cosim.py` has run this very program on
+this package's RTL and printed exactly that line, every token's logit the
+integer model's, so a board that prints anything else is a finding worth
+reporting. At 50 MHz each
 position should take about 0.5 s and the head step about 0.7 s (on the
 ZC706, about 0.4 s a position); the
 last line prints the core and bus cycles of the last step.
@@ -231,7 +243,8 @@ token reads each board's share of the weights at once:
 FPGAI_QWEN=qwen3 python3 spec2rtl.py --weights qwen_weights/qwen3-0.6b --boards zc706 zybo_z7_20 --split weights --package
 ```
 
-`rank<i>_<board>/` is each board's package. It builds the same way as a
+`rank<i>_<board>/` is each board's package, its share of every layer
+sized by its speed (`report.md` lists them). It builds the same way as a
 stage's, lwIP Echo Server template included; rank i is 192.168.1.(10+i),
 UDP port 5000. Every rank's SD card holds its own `weights8.bin` and
 `cparams.bin` and the prompt; rank 0's also `vocab.bin`, and rank 0
@@ -239,3 +252,12 @@ prints the text. Start them in any order: a rank that misses a slice asks
 for it again every 250 ms, so one started late only costs the others
 that wait. Each prints how many gathers it served and how many times it
 asked again.
+
+Before the boards, the same packages run on this host, each rank's own
+program on its own RTL, talking UDP on localhost:
+
+```bash
+python3 cosim.py <out>/rank0_zc706 <out>/rank1_zybo_z7_20 --jitter
+```
+
+Rank 0 prints the text the boards should.

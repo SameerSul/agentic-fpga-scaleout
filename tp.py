@@ -131,14 +131,13 @@ def _rank_block(p, w, lay, gn, half):
            WB=2 * w["N"], GX=w["GX"] - 1)
 
 
-def render_tb(ranks, im, seq, n_prompt):
+def render_tb(ranks, im, seq, n_prompt, part=None):
     """ranks: (name, w, lay, gn, half period). The host starts every rank
     on each position and prints the token the ranks agreed on; the network
     serves each gather once every rank has asked for it, through the
     ranks' gather ports only."""
     T = len(ranks)
-    H, KV, hd, D, F = im.H, im.KV, im.hd, im.D, im.F
-    Hl, Dl, Fl = H // T, D // T, F // T
+    sh = qwen_full.tp_share(im, (0, T, part))["all"]
     P = [r[0] for r in ranks]
     blocks = "".join(_rank_block(*r) for r in ranks)
     allreq = " && ".join("%s_g_req" % p for p in P)
@@ -146,11 +145,12 @@ def render_tb(ranks, im, seq, n_prompt):
     # Each slice is read from its rank's gather port a word a clock, on
     # that rank's clock, and written into every other rank's on theirs.
     copies = []
-    for vec, n, off in ((1, Hl * hd, lambda s: s * Hl * hd), (2, Dl, lambda s: s * Dl),
-                        (3, Fl, lambda s: s * Fl)):
+    for vec, n, off in ((1, lambda s: sh[s]["H"] * im.hd, lambda s: sh[s]["coff"]),
+                        (2, lambda s: sh[s]["D"], lambda s: sh[s]["aoff"]),
+                        (3, lambda s: sh[s]["F"], lambda s: sh[s]["moff"])):
         body = []
         for s, ps in enumerate(P):
-            body.append("        for (i = %d; i < %d; i = i + 1) begin" % (off(s), off(s) + n))
+            body.append("        for (i = %d; i < %d; i = i + 1) begin" % (off(s), off(s) + n(s)))
             body.append("          %s_gx_addr = i; @(posedge %s_clk); #1 gv = %s_gx_rdata;" % (ps, ps, ps))
             for d, pd in enumerate(P):
                 if s != d:
@@ -219,13 +219,15 @@ endmodule
 
 
 def build(im, ids, n_gen, work, ranks=2, clocks=(10.0, 7.9, 12.3), lanes=None,
-          log=print):
+          log=print, part=None):
     """ranks tensor-parallel ranks over the whole model; lanes[i], if
-    given, is rank i's width. Returns the integer model's tokens and the
-    testbench sources."""
+    given, is rank i's width; part, if given, each rank's share
+    (qwen_full.tp_share), else even shares. Returns the integer model's
+    tokens and the testbench sources."""
     T = ranks
-    assert im.H % T == 0 and im.KV % T == 0 and im.F % T == 0 and im.D % T == 0, \
-        "the heads, KV heads, d_ff and d_model must split %d ways" % T
+    if part is None:
+        assert im.H % T == 0 and im.KV % T == 0 and im.F % T == 0 and im.D % T == 0, \
+            "the heads, KV heads, d_ff and d_model must split %d ways" % T
     want = qr.greedy(im, ids, n_gen)
     os.makedirs(work, exist_ok=True)
     own = im.ms.get("lanes")
@@ -236,7 +238,7 @@ def build(im, ids, n_gen, work, ranks=2, clocks=(10.0, 7.9, 12.3), lanes=None,
         if lanes:
             im.ms["lanes"] = lanes[r]
         _, s, w = qwen_full.build_model(im, ids, n_gen, d, log=lambda *a: None,
-                                        want=want, tp=(r, T))
+                                        want=want, tp=(r, T, part))
         rtl = open(os.path.join(d, "qwen_full.v")).read().replace(
             "module qwen_full (", "module qwen_full_%s (" % p, 1).replace(
             "  projn u_proj (", "  projn_%s u_proj (" % p, 1).replace(
@@ -256,7 +258,7 @@ def build(im, ids, n_gen, work, ranks=2, clocks=(10.0, 7.9, 12.3), lanes=None,
         rks.append((p, w, w["lay"], w["gn"], clocks[r % len(clocks)] / 2))
     im.ms["lanes"] = own
     with open(os.path.join(work, "tb_tp.v"), "w") as f:
-        f.write(render_tb(rks, im, want, len(ids)))
+        f.write(render_tb(rks, im, want, len(ids), part))
     return want, (["tb_tp.v"] + ["qwen_full_%s.v" % r[0] for r in rks] + sorted(srcs))
 
 
@@ -267,7 +269,14 @@ ARM = """  // ---- the ARM's side of each gather, as the rank's program does it:
   reg signed [15:0] vbuf [0:{vm}];
   reg post = 0, ack = 0, inpos = 0;
   reg [2:0] pvec = 0;
-  integer pn, k, s_, gathers = 0;
+  integer pn, po, k, s_, gathers = 0;
+  // Rank s_'s slice of vector pvec: pn words from po.
+  task slice_of(input integer s);
+    case (s)
+{n_of}
+      default: begin pn = 0; po = 0; end
+    endcase
+  endtask
   reg [{twm}:0] ltok = 0, gtok = 0;
   reg signed [15:0] lbest = 0, gbest = 0;
   task run_pos(input integer tk, input integer p, input integer he);
@@ -281,19 +290,20 @@ ARM = """  // ---- the ARM's side of each gather, as the rank's program does it:
         rd(7'h44);
         if (rv[0]) begin
           pvec = rv[3:1];
-          pn = pvec == 1 ? {n1} : pvec == 2 ? {n2} : {n3};
           if (pvec == 4) begin
             rd(7'h10); ltok = rv; rd(7'h14); lbest = rv[15:0];
           end else begin
-            wr(7'h38, RANK * pn);
-            for (k = 0; k < pn; k = k + 1) begin rd(7'h3c); vbuf[RANK * pn + k] = rv[15:0]; end
+            slice_of(RANK);
+            wr(7'h38, po);
+            for (k = 0; k < pn; k = k + 1) begin rd(7'h3c); vbuf[po + k] = rv[15:0]; end
           end
           post = 1; wait (ack); post = 0; wait (!ack);
           if (pvec != 4)
             for (s_ = 0; s_ < RANKS; s_ = s_ + 1)
               if (s_ != RANK) begin
-                wr(7'h38, s_ * pn);
-                for (k = 0; k < pn; k = k + 1) wr(7'h3c, vbuf[s_ * pn + k]);
+                slice_of(s_);
+                wr(7'h38, po);
+                for (k = 0; k < pn; k = k + 1) wr(7'h3c, vbuf[po + k]);
               end
           wr(7'h44, 1);
           gathers = gathers + 1;
@@ -315,7 +325,7 @@ def _rename(src, p, mods):
 
 
 def build_boards(im, ids, n_gen, work, ranks=2, clocks=(10.0, 7.9, 12.3), lanes=None,
-                 lat=30, jit=1, log=print):
+                 lat=30, jit=1, log=print, part=None):
     """The same ranks as build, each as its board runs it: the package's
     register block and DDR bridge around the core, a DDR model of its own
     (from the rank's weights8.bin and cparams.hex) that stalls at random
@@ -325,9 +335,9 @@ def build_boards(im, ids, n_gen, work, ranks=2, clocks=(10.0, 7.9, 12.3), lanes=
     import board_zybo
     import zybo
     T = ranks
-    want, srcs = build(im, ids, n_gen, work, ranks, clocks, lanes, log)
+    want, srcs = build(im, ids, n_gen, work, ranks, clocks, lanes, log, part)
     H, hd, D, F = im.H, im.hd, im.D, im.F
-    n1, n2, n3 = H * hd // T, D // T, F // T
+    sh = qwen_full.tp_share(im, (0, T, part))["all"]
     P = [chr(ord("a") + r) for r in range(T)]
     tops, mods = [], []
     for r, p in enumerate(P):
@@ -356,7 +366,11 @@ def build_boards(im, ids, n_gen, work, ranks=2, clocks=(10.0, 7.9, 12.3), lanes=
         assert tb.endswith(tail)
         tb = tb[:-len(tail)] + "\n    up = 1;\n  end\n" + ARM.format(
             r=r, T=T, vm=max(H * hd, D, F) - 1, twm=L["W"]["tok"] - 1,
-            n1=n1, n2=n2, n3=n3) + "endmodule\n"
+            n_of="\n".join(
+                "      %d: begin pn = pvec == 1 ? %d : pvec == 2 ? %d : %d;"
+                " po = pvec == 1 ? %d : pvec == 2 ? %d : %d; end"
+                % (i, x["H"] * hd, x["D"], x["F"], x["coff"], x["aoff"], x["moff"])
+                for i, x in enumerate(sh))) + "endmodule\n"
         for name, text in (("qwen_zybo_%s.v" % p, top), ("fpgai_zybo_%s.v" % p, wrap),
                            ("rank_%s.v" % p, tb)):
             with open(os.path.join(work, name), "w") as f:
@@ -366,11 +380,16 @@ def build_boards(im, ids, n_gen, work, ranks=2, clocks=(10.0, 7.9, 12.3), lanes=
     allp = " && ".join("%s.post" % p for p in P)
     nop = " && ".join("!%s.post" % p for p in P)
     copies = []
-    for sr, ps in enumerate(P):
-        for dr, pd in enumerate(P):
-            if sr != dr:
-                copies.append("        for (i = 0; i < a.pn; i = i + 1) %s.vbuf[%d * a.pn + i] = %s.vbuf[%d * a.pn + i];"
-                              % (pd, sr, ps, sr))
+    for vec, n, off in ((1, lambda x: x["H"] * hd, lambda x: x["coff"]),
+                        (2, lambda x: x["D"], lambda x: x["aoff"]),
+                        (3, lambda x: x["F"], lambda x: x["moff"])):
+        body = []
+        for sr, ps in enumerate(P):
+            for dr, pd in enumerate(P):
+                if sr != dr:
+                    body.append("          for (i = %d; i < %d; i = i + 1) %s.vbuf[i] = %s.vbuf[i];"
+                                % (off(sh[sr]), off(sh[sr]) + n(sh[sr]), pd, ps))
+        copies.append("        %d: begin\n%s\n        end" % (vec, "\n".join(body)))
     pick = ["        gbest = a.lbest; gtok = a.ltok;"]
     pick += ["        if (%s.lbest > gbest) begin gbest = %s.lbest; gtok = %s.ltok; end" % (p, p, p)
              for p in P[1:]]
@@ -396,7 +415,10 @@ module tb_tpboards;
     if (a.pvec == 4) begin
 {pick}
     end else begin
+      case (a.pvec)
 {copies}
+        default: ;
+      endcase
     end
     gathers = gathers + 1;
 {acks}
@@ -448,13 +470,9 @@ endmodule
     return want, ["tb_tpboards.v"] + tops + srcs[1:]
 
 
-def run(work, srcs, timeout=3600):
-    r = subprocess.run(["iverilog", "-g2005", "-DSIM", "-o", "t.out"] + srcs, cwd=work,
-                       capture_output=True, text=True)
-    if r.returncode:
-        return r.stdout + r.stderr
-    return subprocess.run(["vvp", "t.out"], cwd=work, capture_output=True,
-                          text=True, timeout=timeout).stdout
+def run(work, srcs, timeout=3600, sim="iverilog"):
+    import vsim
+    return vsim.run(work, srcs, sim, timeout=timeout, tag="t")
 
 
 def main():
