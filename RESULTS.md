@@ -89,7 +89,7 @@ times put within 10%.
 ### The full suite
 
 ```
-python3 tests.py            # 397 tests, or 395 without OpenSTA
+python3 tests.py            # 404 tests, or 402 without OpenSTA
 ```
 
 ### Spec to RTL, across the spec space
@@ -1258,6 +1258,49 @@ it. Resending is safe because running a position twice writes its KV
 cache entries again with the same values. What is not run: real lwIP on
 a Zynq, and a board without an ARM, which cannot yet hold a layer,
 having no DRAM this design reaches.
+
+## Both directions of every link
+
+The fabric models each connection as full duplex, two one-way links
+(`fabric.connect`), but the ring all-reduce the sizing layer charges sent
+one way round: on three boards or more, each link's other direction
+carried only acknowledgements. `ring_allreduce(boards, data, bidir=True)`
+sends half the vector each way at once, the same 2(n-1) steps each
+serializing half as much. On two boards one ring already uses both
+directions of the only link, so it stays one ring and takes the same
+time. The model spec's `ring_bidirectional` turns it on in
+`sizing.predict_config` and `simulate_decode`. It is off by default, so
+every number in this file is unchanged, and the one-way ring's times are
+the same to the nanosecond as before.
+
+An all-reduce on KC705-class boards over 10 Gb/s links, in ns:
+
+| boards | 8 KB one way | both ways | | 512 KB one way | both ways | |
+|---|---|---|---|---|---|---|
+| 2 | 9,335 | 9,335 | 1.00× | 484,669 | 484,669 | 1.00× |
+| 3 | 13,284 | 8,118 | 1.64× | 601,791 | 342,619 | 1.76× |
+| 4 | 16,081 | 10,888 | 1.48× | 681,227 | 378,116 | 1.80× |
+| 8 | 23,612 | 16,982 | 1.39× | 813,952 | 435,963 | 1.87× |
+
+Small vectors gain less: each step still pays the link's latency once.
+Decode on the large class (Alveo U250, the Qwen2.5-0.5B spec at batch 8),
+in tokens/s, predicted and then simulated on the fabric:
+
+| boards | one way | both ways |
+|---|---|---|
+| 4 | 1,368 / 1,250 | 1,881 / 1,735 |
+| 8 | 1,622 / 1,423 | 2,592 / 2,306 |
+| 16 | 1,524 / 1,337 | 2,470 / 2,140 |
+
+The peak stays at eight boards and rises 1.62× on the fabric, and the
+prediction is as close as it was one way, within 13%.
+`test_bidirectional_ring` holds it exact on two to eight boards and a
+mixed three, the same on two boards, 1.6× faster on 512 KB over four,
+and the 8-board decode within 15% of its prediction.
+
+This is the sizing layer's fabric. The Zynq packages' weight split does
+not ring: each rank sends its slice to every other rank over UDP through
+a switch, which already sends and receives on every port at once.
 
 ## Qwen3-0.6B, the model Architect Labs hosted
 

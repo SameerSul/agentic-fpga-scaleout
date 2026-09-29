@@ -76,7 +76,9 @@ def predict_config(ms, fit_result, n):
     read, which always lives in DDR), overlapped with compute by double
     buffering, hence the max; comm is n_layer*2 ring all-reduces of a
     [1, d_model] activation at the synthesized link rate, with ring step =
-    propagation + serialization of the chunk and 2*(n-1) steps per all-reduce."""
+    propagation + serialization of the chunk and 2*(n-1) steps per all-reduce.
+    With ms["ring_bidirectional"], on three boards or more, half the vector
+    goes each way round and each step serializes half the chunk."""
     s = model_summary(ms)
     # Batching is the lever that breaks the memory wall. One decode step
     # reads every weight once and serves B sequences with them, so weight
@@ -103,6 +105,10 @@ def predict_config(ms, fit_result, n):
         # Aurora control words). Small chunks at high board counts pay that
         # latency term repeatedly, which is what caps tensor parallelism.
         chunk = b * s["allreduce_bytes"] / n
+        if ms.get("ring_bidirectional") and n > 2:
+            # half the vector goes each way round, on the links' other
+            # directions, so each step serializes half the chunk
+            chunk /= 2
         frames = max(1, math.ceil(chunk / PAYLOAD))
         wire = chunk + frames * (HDR_BYTES
                                  + fit_result.get("frame_overhead_bytes", 0))
@@ -191,7 +197,8 @@ def simulate_decode(fits, ms, tokens=8, ber=0.0, seed=11):
 
     # Pre-build every collective so all boards agree on op ids: for each of
     # tokens * n_layer * 2 all-reduces there is one generator per board.
-    ars = [ring_allreduce(boards, vecs)
+    bidir = bool(ms.get("ring_bidirectional"))
+    ars = [ring_allreduce(boards, vecs, bidir)
            for _ in range(tokens * L * ms["allreduces_per_token_per_layer"])]
 
     def worker(i):

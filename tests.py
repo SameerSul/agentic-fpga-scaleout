@@ -3912,6 +3912,53 @@ def test_sizing(profile, fp):
           r['vecs_equal_across_boards'])
 
 
+def test_bidirectional_ring(profile, fp):
+    """Every link is full duplex; one ring only sends one way round it.
+    Half the vector each way uses both directions: still exact, and
+    faster wherever the links, not their latency, set the time."""
+    mid = fit('kc705', profile, fp)
+
+    def ring(fits, L, bidir):
+        sim, boards = make_cluster(fits)
+        rng = random.Random(len(fits) * 7 + L)
+        for b in boards:
+            b.mem = [rng.uniform(-1.0, 1.0) for _ in range(L)]
+        exp = [sum(b.mem[k] for b in boards) for k in range(L)]
+        t = run_workers(sim, ring_allreduce(boards, [b.mem for b in boards], bidir))
+        err = max(abs(b.mem[k] - exp[k]) for b in boards for k in range(L))
+        return t, err, all(b.mem == boards[0].mem for b in boards)
+
+    ok = True
+    for n in (2, 3, 5, 8):
+        t, err, same = ring([mid] * n, 1000, True)
+        ok = ok and err < 1e-9 and same
+    check('bidirectional ring allreduce exact, every board the same, n=2,3,5,8', ok)
+    fits = [fit('arty_a7_100t', profile, fp), fit('alveo_u250', profile, fp),
+            fit('kc705', profile, fp)]
+    t, err, same = ring(fits, 777, True)
+    check('bidirectional ring allreduce heterogeneous 3-board exact', err < 1e-9 and same)
+    check('two boards: one ring already uses both directions, same time',
+          ring([mid] * 2, 4096, True)[0] == ring([mid] * 2, 4096, False)[0])
+    t1 = ring([mid] * 4, 65536, False)[0]
+    t2 = ring([mid] * 4, 65536, True)[0]
+    check('bidirectional ring 1.6x faster on a 512 KB all-reduce over 4 boards '
+          '(%.2fx)' % (t1 / t2), t1 / t2 > 1.6)
+
+    ms = load_model_spec()
+    lg = fit('alveo_u250', profile, fp)
+    bi = dict(ms, ring_bidirectional=True)
+    p1, p2 = predict_config(ms, lg, 8), predict_config(bi, lg, 8)
+    check('sizing: both directions lift the 8-board prediction 1.4x',
+          p2['predicted_tok_per_s'] > 1.4 * p1['predicted_tok_per_s'])
+    r1 = simulate_decode([lg] * 8, ms, tokens=2)
+    r2 = simulate_decode([lg] * 8, bi, tokens=2)
+    ratio = r2['tok_per_s'] / p2['predicted_tok_per_s']
+    check('bidirectional decode within 15%% of its prediction (ratio %.2f)' % ratio,
+          0.85 <= ratio <= 1.15)
+    check('bidirectional decode faster on the fabric, activations identical',
+          r2['tok_per_s'] > 1.4 * r1['tok_per_s'] and r2['vecs_equal_across_boards'])
+
+
 def test_link_reliability(profile):
     mid = fit('kc705', profile)
     sim, boards = make_cluster([mid, mid], ber=1e-5)
@@ -4004,5 +4051,6 @@ if __name__ == '__main__':
     test_transports(profile, fp)
     test_batching(profile, fp)
     test_sizing(profile, fp)
+    test_bidirectional_ring(profile, fp)
     test_link_reliability(profile)
     print('all %d tests passed' % PASSED[0])

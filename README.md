@@ -168,7 +168,7 @@ One convenient alignment: Ethernet's frame check sequence is CRC-32 with polynom
 | `_Tx` / `_Rx` in `fabric.py` | seq numbers, CRC32, go-back-N retransmit, cumulative ACKs | the reliable link-layer RTL block: replay buffer in BRAM, ACK sideband |
 | Credit flow control | 64-packet RX buffer, sender stalls at zero credits, overflow impossible by construction | RTL credit counters and credit-return words on the reverse channel |
 | `Board.compute` / `Board.matmul` | instances chiplets in parallel, cycles from the measured profile | the generated chiplet array the fabric feeds |
-| `collectives.py` | ring all-reduce (reduce-scatter + all-gather) for arbitrary N, heterogeneous rings gated by the slowest segment | CCL-style hardware collectives over multi-board topologies |
+| `collectives.py` | ring all-reduce (reduce-scatter + all-gather) for arbitrary N, heterogeneous rings gated by the slowest segment, one way round or half the vector each way on the full-duplex links | CCL-style hardware collectives over multi-board topologies |
 | `sizing.simulate_decode` | full decode loop, n_layer x (attn, all-reduce, MLP, all-reduce) per token, every all-reduce real fabric traffic | tensor-parallel LLM decode across the cluster |
 
 ## How to run

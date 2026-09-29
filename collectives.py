@@ -4,7 +4,8 @@ ring_allreduce: reduce-scatter then all-gather around the ring, the standard
 bandwidth-optimal algorithm (each board moves 2*(n-1)/n of the vector). Works
 for arbitrary N and for heterogeneous boards: the discrete-event simulation
 charges each hop its own link rate, so the slowest ring segment gates each
-step, which is the honest model.
+step, which is the honest model. With bidir it sends half the vector each
+way round, using both directions of every full-duplex link.
 naive_allreduce: gather everything to board 0, reduce, broadcast back.
 Both return one worker generator per board; run them with run_workers."""
 from fabric import start
@@ -38,33 +39,54 @@ def run_workers(sim, gens):
     return max(fin) - t0
 
 
-def ring_allreduce(boards, data):
+def ring_allreduce(boards, data, bidir=False):
     """data: list of equal-length float lists, one per board, reduced in
-    place so every board ends with the elementwise sum."""
+    place so every board ends with the elementwise sum.
+
+    Every link is full duplex, and one ring only sends one way round it:
+    on three boards or more, each link's other direction carries nothing
+    but acknowledgements. bidir sends half the vector each way at once, so
+    each direction of each link carries half the bytes: the same 2*(n-1)
+    steps, each serializing half as much. Two boards gain nothing, since
+    one ring there already uses both directions of the only link, so it
+    stays one ring."""
     n = len(boards)
     if n == 1:
         return [_noop()]
     L = len(data[0])
     assert all(len(d) == L for d in data)
     op = _next_op()
-    bnd = [(k * L) // n for k in range(n + 1)]
+    if bidir and n > 2 and L > 1:
+        rings = [(0, L // 2, 1), (L // 2, L, -1)]
+    else:
+        rings = [(0, L, 1)]
 
-    def worker(i):
+    def one_way(i, lo, hi, d):
+        """The standard ring over vec[lo:hi], in direction d: board i's
+        position round that ring is p, and it sends to position p+1."""
         b = boards[i]
-        nxt = boards[(i + 1) % n].id
-        prv = boards[(i - 1) % n].id
+        nxt = boards[(i + d) % n].id
+        prv = boards[(i - d) % n].id
+        p = i if d == 1 else (-i) % n
+        bnd = [lo + (k * (hi - lo)) // n for k in range(n + 1)]
         vec = data[i]
         for s in range(n - 1):
-            si, ri = (i - s) % n, (i - s - 1) % n
-            start(b.sim, b.send(nxt, vec[bnd[si]:bnd[si + 1]], ('rs', op, s)))
-            got = yield from b.recv(prv, ('rs', op, s))
-            lo, hi = bnd[ri], bnd[ri + 1]
-            vec[lo:hi] = [a + c for a, c in zip(vec[lo:hi], got)]
+            si, ri = (p - s) % n, (p - s - 1) % n
+            start(b.sim, b.send(nxt, vec[bnd[si]:bnd[si + 1]], ('rs', op, d, s)))
+            got = yield from b.recv(prv, ('rs', op, d, s))
+            a, z = bnd[ri], bnd[ri + 1]
+            vec[a:z] = [x + c for x, c in zip(vec[a:z], got)]
         for s in range(n - 1):
-            si, ri = (i + 1 - s) % n, (i - s) % n
-            start(b.sim, b.send(nxt, vec[bnd[si]:bnd[si + 1]], ('ag', op, s)))
-            got = yield from b.recv(prv, ('ag', op, s))
+            si, ri = (p + 1 - s) % n, (p - s) % n
+            start(b.sim, b.send(nxt, vec[bnd[si]:bnd[si + 1]], ('ag', op, d, s)))
+            got = yield from b.recv(prv, ('ag', op, d, s))
             vec[bnd[ri]:bnd[ri + 1]] = got
+
+    def worker(i):
+        others = [start(boards[i].sim, one_way(i, *r)) for r in rings[1:]]
+        yield from one_way(i, *rings[0])
+        for ev in others:
+            yield ev
 
     return [worker(i) for i in range(n)]
 
