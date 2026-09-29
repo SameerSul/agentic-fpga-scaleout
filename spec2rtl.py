@@ -1024,10 +1024,10 @@ def render_report(rep):
                     "%d-%d" % tuple(hk) if hk[1] >= hk[0] else "none",
                     1e3 * tpp["rank_layer_seconds"][r]))
             L += ["", "A layer, gather by gather the slowest rank: %.2f ms, and about %.2f "
-                  "ms of gathers on the ARMs (an estimate: %.2f us a register access); "
-                  "%.3f s a token at a context of 128." % (
-                      1e3 * tpp["layer_seconds"], 1e3 * tpp["gather_seconds"],
-                      1e6 * 0.25e-6, tpp["seconds_per_token"]), ""]
+                  "ms of gathers: the PL's mover at its measured cost a word, and 200 us "
+                  "of Ethernet latency a gather, an estimate; %.3f s a token at a context "
+                  "of 128." % (1e3 * tpp["layer_seconds"], 1e3 * tpp["gather_seconds"],
+                               tpp["seconds_per_token"]), ""]
         L += ["## The weights split %d ways" % d["boards"], "",
               "Every board on every layer with a slice of every matrix, at its own "
               "width (%s lanes) and on its own clock, gathering the others' slices "

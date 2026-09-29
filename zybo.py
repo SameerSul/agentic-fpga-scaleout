@@ -48,7 +48,7 @@ def _bits(v, hi, lo):
     return "%s[%d]" % (v, hi) if hi == lo else "%s[%d:%d]" % (v, hi, lo)
 
 
-def render_top(W, gwords, cb, kb, vb, np_=4, wbase=0, ns=32):
+def render_top(W, gwords, cb, kb, vb, np_=4, wbase=0, ns=32, gb=None):
     """The bridge for a core of N lanes: a weight word is N int8s in DDR
     and a KV word N 16-bit lanes. Weight lines are one 8-beat burst, 64
     bytes, and KV lines one 16-beat burst, 128, so both hold 64 / N
@@ -243,7 +243,128 @@ endmodule
            wports=render_wports(np_, n)[0], wassign=render_wports(np_, n)[1],
            wdata=render_wports(np_, n)[2], lbm=lb - 1, lwm=16 * n - 1,
            lw=16 * n, pad=16 * n - 16, kpm=wpl - 1, wlb=wlb, wlbm=wlb - 1,
-           kvb=2 * n, kbw=_bits("beat", 3, kbb), kbp=_bits("beat", kbb - 1, 0))
+           kvb=2 * n, kbw=_bits("beat", 3, kbb), kbp=_bits("beat", kbb - 1, 0)) \
+        if gb is None else _mover(render_top(W, gwords, cb, kb, vb, np_, wbase, ns), W, gb)
+
+
+def _mover(v, W, gb):
+    """A rank of a weight split: the gather mover. It copies a run of the
+    vector being gathered between the core and DDR at gb, element i at
+    byte gb + 2i, a word a core edge, through the constants' and KV
+    cache's master: out of the core as single 64-bit beats of four words,
+    into it from 16-beat reads of 64 words. The ARM then moves the slices
+    as ordinary memory. Started by dma_go (the run from dma_first, dma_n
+    words, dma_in for into the core); dma_busy until the last word."""
+    gx = W["gx_addr"]
+    def rep(a, b):
+        nonlocal v
+        assert v.count(a) == 1, a
+        v = v.replace(a, b)
+    rep("""  output signed [15:0] gx_rdata,
+""", """  output signed [15:0] gx_rdata,
+  input dma_go, input dma_in, input [{m}:0] dma_first, input [{m1}:0] dma_n,
+  output dma_busy,
+""".format(m=gx - 1, m1=gx))
+    rep("""    .g_req(g_req), .g_vec(g_vec), .g_done(g_done), .gx_we(gx_we),
+    .gx_addr(gx_addr), .gx_wdata(gx_wdata), .gx_rdata(gx_rdata),
+""", """    .g_req(g_req), .g_vec(g_vec), .g_done(g_done), .gx_we(cgx_we),
+    .gx_addr(cgx_addr), .gx_wdata(cgx_wdata), .gx_rdata(gx_rdata),
+""")
+    rep("""  // ---- the core, on a clock held while memory catches up
+""", """  // ---- the gather mover: its hold on the core's gather port
+  reg dm_on, dm_in, dm_wreq, dm_rreq, dm_we, dmw;
+  reg [{m1}:0] dm_e, dm_end;
+  reg [{m}:0] dm_addr;
+  reg signed [15:0] dm_wdata;
+  reg [3:0] dm_st;
+  reg [63:0] dm_word, dl [0:15];
+  reg [7:0] dm_strb;
+  assign dma_busy = dm_on;
+  wire [{m}:0] cgx_addr = dm_on ? dm_addr : gx_addr;
+  wire cgx_we = dm_on ? dm_we : gx_we;
+  wire signed [15:0] cgx_wdata = dm_on ? dm_wdata : gx_wdata;
+  localparam D_IDLE = 4'd0, D_RA = 4'd1, D_RW = 4'd2, D_RC = 4'd3, D_WT = 4'd4,
+             D_IN = 4'd5, D_IW = 4'd6, D_WA = 4'd7, D_WW = 4'd8;
+
+  // ---- the core, on a clock held while memory catches up
+""".format(m=gx - 1, m1=gx))
+    rep("""      d2 <= 1'b0; wq <= 0; curns <= NS; cq <= 0; kq <= 0; vq <= 0; core_cycles <= 0;
+    end else begin""", """      d2 <= 1'b0; wq <= 0; curns <= NS; cq <= 0; kq <= 0; vq <= 0; core_cycles <= 0;
+      dm_on <= 1'b0; dm_wreq <= 1'b0; dm_rreq <= 1'b0; dm_we <= 1'b0; dmw <= 1'b0;
+      dm_st <= D_IDLE; dm_strb <= 0; dm_word <= 0;
+    end else begin
+      // The mover: a word each time the core takes an edge (ce_l), since
+      // the gather port is the core's own registers.
+      case (dm_st)
+        D_IDLE: if (dma_go && !dm_on) begin
+          dm_on <= 1'b1; dm_in <= dma_in; dm_e <= dma_first; dm_end <= dma_first + dma_n;
+          dm_strb <= 0; dm_word <= 0;
+          dm_st <= (dma_n == 0) ? D_WT : dma_in ? D_IN : D_RA;
+        end
+        D_RA: begin dm_addr <= dm_e[{m}:0]; dm_st <= D_RW; end
+        D_RW: if (ce_l) dm_st <= D_RC;
+        D_RC: begin
+          dm_word[dm_e[1:0] * 16 +: 16] <= gx_rdata;
+          dm_strb[dm_e[1:0] * 2 +: 2] <= 2'b11;
+          if (dm_e[1:0] == 2'd3 || dm_e + 1 == dm_end) begin dm_wreq <= 1'b1; dm_st <= D_WT; end
+          else begin dm_e <= dm_e + 1; dm_st <= D_RA; end
+        end
+        D_WT: if (!dm_wreq) begin
+          dm_strb <= 0; dm_word <= 0;
+          if (dm_e + 1 >= dm_end) begin dm_on <= 1'b0; dm_st <= D_IDLE; end
+          else begin dm_e <= dm_e + 1; dm_st <= D_RA; end
+        end
+        D_IN: begin dm_rreq <= 1'b1; dm_st <= D_IW; end
+        D_IW: if (!dm_rreq) dm_st <= D_WA;
+        D_WA: begin
+          dm_addr <= dm_e[{m}:0]; dm_wdata <= dl[dm_e[5:2]][dm_e[1:0] * 16 +: 16];
+          dm_we <= 1'b1; dm_st <= D_WW;
+        end
+        D_WW: if (ce_l) begin
+          dm_we <= 1'b0;
+          if (dm_e + 1 == dm_end) begin dm_on <= 1'b0; dm_st <= D_IDLE; end
+          else begin dm_e <= dm_e + 1; dm_st <= (dm_e[5:0] == 6'd63) ? D_IN : D_WA; end
+        end
+        default: dm_st <= D_IDLE;
+      endcase""".format(m=gx - 1))
+    rep("""          end else if (!hv) begin
+            port <= 2'd3; araddr <= 32'd{vb} + (vq >> {wlb}) * 128; vbl <= vq; vv <= 1'b0;
+            arvalid <= 1'b1; beat <= 0; fs <= F_AR;
+          end
+        end""".replace("{vb}", str(_find(v, r"araddr <= 32'd(\d+) \+ \(vq >>"))).replace(
+            "{wlb}", str(_find(v, r"\(vq >> (\d+)\) \* 128"))), """          end else if (!hv) begin
+            port <= 2'd3; araddr <= 32'd{vb} + (vq >> {wlb}) * 128; vbl <= vq; vv <= 1'b0;
+            arvalid <= 1'b1; beat <= 0; fs <= F_AR;
+          end
+        end else if (dm_wreq && !dmw) begin
+          // The mover's words: one beat, the words it holds strobed.
+          awaddr <= 32'd{gb} + (dm_e >> 2) * 8; dmw <= 1'b1; awvalid <= 1'b1; fs <= F_AW;
+        end else if (dm_rreq) begin
+          port <= 2'd0; araddr <= 32'd{gb} + (dm_e >> 6) * 128; arvalid <= 1'b1;
+          beat <= 0; fs <= F_AR;
+        end""".replace("{vb}", str(_find(v, r"araddr <= 32'd(\d+) \+ \(vq >>"))).replace(
+            "{wlb}", str(_find(v, r"\(vq >> (\d+)\) \* 128"))).replace("{gb}", str(gb)))
+    rep("""          case (port)
+            2'd1: cl[beat] <= rdata;""", """          case (port)
+            2'd0: dl[beat] <= rdata;
+            2'd1: cl[beat] <= rdata;""")
+    rep("""            case (port) 2'd1: cv <= 1'b1; 2'd2: kv <= 1'b1;
+                        2'd3: vv <= 1'b1; endcase""", """            case (port) 2'd0: dm_rreq <= 1'b0; 2'd1: cv <= 1'b1; 2'd2: kv <= 1'b1;
+                        2'd3: vv <= 1'b1; endcase""")
+    i = v.index("          wdata <= {48'd0, wval} << (wlane[1:0] * 16);")
+    rep("""          wdata <= {48'd0, wval} << (wlane[1:0] * 16);
+          wstrb <= 8'b11 << (wlane[1:0] * 2);""", """          wdata <= dmw ? dm_word : {48'd0, wval} << (wlane[1:0] * 16);
+          wstrb <= dmw ? dm_strb : 8'b11 << (wlane[1:0] * 2);""")
+    rep("""          if (!wisv && kv &&""", """          if (!dmw && !wisv && kv &&""")
+    rep("""          if (wisv && vv &&""", """          if (!dmw && wisv && vv &&""")
+    rep("""          case (wsel) 2'd0: d0 <= 1'b1; 2'd1: d1 <= 1'b1; default: d2 <= 1'b1; endcase""",
+        """          if (dmw) begin dmw <= 1'b0; dm_wreq <= 1'b0; end
+          else case (wsel) 2'd0: d0 <= 1'b1; 2'd1: d1 <= 1'b1; default: d2 <= 1'b1; endcase""")
+    return v
+
+
+def _find(v, pat):
+    return int(re.search(pat, v).group(1))
 
 
 def render_streamer(np_, wam, ns=32, wbase=0, n=16):
@@ -642,6 +763,11 @@ def layout(work, base=0):
     L["kb"] = align(L["cb"] + L["cn"] * 8)
     L["vb"] = align(L["kb"] + L["kn"] * 2 * n)
     L["end"] = align(L["vb"] + L["vn"] * 2 * n)
+    if "gx_addr" in L["W"]:
+        # A rank of a weight split: the gather buffer after the KV cache,
+        # a 16-bit word for every element of the widest vector gathered.
+        L["gb"] = L["end"]
+        L["gend"] = align(L["gb"] + 2 * (1 << L["W"]["gx_addr"]))
     L["steps"] = [tuple(int(v) for v in re.findall(r"-?\d+", l))
                   for l in old.splitlines() if l.strip().startswith("step(")]
     return L

@@ -263,13 +263,16 @@ def build(im, ids, n_gen, work, ranks=2, clocks=(10.0, 7.9, 12.3), lanes=None,
 
 
 ARM = """  // ---- the ARM's side of each gather, as the rank's program does it:
-  // read this rank's slice through GADDR and GDATA, post it, and once the
-  // network has brought the others', write them in and let the core go.
-  localparam RANK = {r}, RANKS = {T};
+  // take this rank's slice out, post it, and once the network has brought
+  // the others', put them in and let the core go. With MOVER the PL moves
+  // the words between the core and DDR (GMOVE) and the ARM reads and
+  // writes DDR; without, the ARM moves them a word an access (GDATA).
+  localparam RANK = {r}, RANKS = {T}, MOVER = {mover};
+  integer mcyc = 0, mc0;          // bus cycles spent moving words in and out
   reg signed [15:0] vbuf [0:{vm}];
   reg post = 0, ack = 0, inpos = 0;
   reg [2:0] pvec = 0;
-  integer pn, po, k, s_, gathers = 0;
+  integer pn, po, pt, k, s_, gathers = 0;
   // Rank s_'s slice of vector pvec: pn words from po.
   task slice_of(input integer s);
     case (s)
@@ -295,16 +298,42 @@ ARM = """  // ---- the ARM's side of each gather, as the rank's program does it:
           end else begin
             slice_of(RANK);
             wr(7'h38, po);
-            for (k = 0; k < pn; k = k + 1) begin rd(7'h3c); vbuf[po + k] = rv[15:0]; end
+            if (MOVER) begin
+              mc0 = cyc;
+              wr(7'h48, pn);
+              rv = 1; while (rv[0]) rd(7'h48);
+              mcyc = mcyc + (cyc - mc0);
+              for (k = 0; k < pn; k = k + 1) vbuf[po + k] = gm[po + k];
+            end else begin
+              mc0 = cyc;
+              for (k = 0; k < pn; k = k + 1) begin rd(7'h3c); vbuf[po + k] = rv[15:0]; end
+              mcyc = mcyc + (cyc - mc0);
+            end
           end
           post = 1; wait (ack); post = 0; wait (!ack);
-          if (pvec != 4)
+          if (pvec != 4 && MOVER) begin
+            // The others' slices into DDR, then the whole vector into the
+            // core: its own slice goes back unchanged.
+            pt = 0;
+            for (s_ = 0; s_ < RANKS; s_ = s_ + 1) begin
+              slice_of(s_);
+              pt = pt + pn;
+              if (s_ != RANK) for (k = 0; k < pn; k = k + 1) gm[po + k] = vbuf[po + k];
+            end
+            mc0 = cyc;
+            wr(7'h38, 0); wr(7'h48, pt | (1 << 16));
+            rv = 1; while (rv[0]) rd(7'h48);
+            mcyc = mcyc + (cyc - mc0);
+          end else if (pvec != 4) begin
+            mc0 = cyc;
             for (s_ = 0; s_ < RANKS; s_ = s_ + 1)
               if (s_ != RANK) begin
                 slice_of(s_);
                 wr(7'h38, po);
                 for (k = 0; k < pn; k = k + 1) wr(7'h3c, vbuf[po + k]);
               end
+            mcyc = mcyc + (cyc - mc0);
+          end
           wr(7'h44, 1);
           gathers = gathers + 1;
         end else begin
@@ -325,7 +354,7 @@ def _rename(src, p, mods):
 
 
 def build_boards(im, ids, n_gen, work, ranks=2, clocks=(10.0, 7.9, 12.3), lanes=None,
-                 lat=30, jit=1, log=print, part=None):
+                 lat=30, jit=1, log=print, part=None, mover=True):
     """The same ranks as build, each as its board runs it: the package's
     register block and DDR bridge around the core, a DDR model of its own
     (from the rank's weights8.bin and cparams.hex) that stalls at random
@@ -346,7 +375,8 @@ def build_boards(im, ids, n_gen, work, ranks=2, clocks=(10.0, 7.9, 12.3), lanes=
         L = zybo.layout(d, board_zybo.BASE)
         L["steps"] = []
         L["tp"] = dict(rank=r, ranks=T)
-        top = zybo.render_top(L["W"], L["gn"], L["cb"], L["kb"], L["vb"], 4, L["wb"])
+        top = zybo.render_top(L["W"], L["gn"], L["cb"], L["kb"], L["vb"], 4, L["wb"],
+                              gb=L["gb"])
         top = _rename(top, p, ["qwen_zybo"]).replace(
             "  qwen_full core (", "  qwen_full_%s core (" % p, 1).replace(
             '$readmemh("gains.hex"', '$readmemh("%s/gains.hex"' % p, 1)
@@ -362,10 +392,27 @@ def build_boards(im, ids, n_gen, work, ranks=2, clocks=(10.0, 7.9, 12.3), lanes=
             assert tb.count(x) == 1, x
             tb = tb.replace(x, y)
         tb = tb.replace("input [5:0] a", "input [6:0] a")
+        # The DDR model's gather buffer: 16-bit words from L["gb"].
+        gb, gn = L["gb"], (L["gend"] - L["gb"]) // 2
+        for x, y in (("  reg [63:0] cmem [", "  reg [15:0] gm [0:%d];\n  reg [15:0] gt;\n  reg [63:0] cmem [" % (gn - 1)),
+                     ("      if (a < %d) beat_at = cmem" % L["kb"],
+                      "      if (a >= %d) beat_at = {gm[(a - %d) / 2 + 3], gm[(a - %d) / 2 + 2],"
+                      " gm[(a - %d) / 2 + 1], gm[(a - %d) / 2]};\n      else if (a < %d) beat_at = cmem"
+                      % (gb, gb, gb, gb, gb, L["kb"]))):
+            assert tb.count(x) == 1, x
+            tb = tb.replace(x, y)
+        i = tb.index("      if (wa >= %d) begin tw = vm[" % L["vb"])
+        j = tb.index("\n", tb.index("      if (wa >= %d) vm[" % L["vb"])) + 1
+        tb = tb[:i] + ("      if (wa >= %d) begin\n"
+                       "        for (b = 0; b < 8; b = b + 1) if (wstrb[b]) begin\n"
+                       "          gt = gm[(wa - %d) / 2 + b / 2]; gt[(b %% 2) * 8 +: 8] = wdata[b * 8 +: 8];\n"
+                       "          gm[(wa - %d) / 2 + b / 2] = gt;\n"
+                       "        end\n"
+                       "      end else begin\n" % (gb, gb, gb)) + tb[i:j] + "      end\n" + tb[j:]
         tail = "\n    $finish;\n  end\nendmodule\n"
         assert tb.endswith(tail)
         tb = tb[:-len(tail)] + "\n    up = 1;\n  end\n" + ARM.format(
-            r=r, T=T, vm=max(H * hd, D, F) - 1, twm=L["W"]["tok"] - 1,
+            r=r, T=T, vm=max(H * hd, D, F) - 1, twm=L["W"]["tok"] - 1, mover=int(mover),
             n_of="\n".join(
                 "      %d: begin pn = pvec == 1 ? %d : pvec == 2 ? %d : %d;"
                 " po = pvec == 1 ? %d : pvec == 2 ? %d : %d; end"
@@ -463,8 +510,8 @@ endmodule
            unacks="\n".join("    %s.ack = 0;" % p for p in P),
            starts="\n".join("        %s.run_pos(t, p, he);" % p for p in P),
            up=" && ".join("%s.up" % p for p in P), steps=steps,
-           cycles="\n".join('    $display("RANK %s core_cycles=%%0d clk_cycles=%%0d", %s.core_cycles, %s.cyc);'
-                            % (p, p, p) for p in P))
+           cycles="\n".join('    $display("RANK %s core_cycles=%%0d clk_cycles=%%0d move_cycles=%%0d", '
+                            '%s.core_cycles, %s.cyc, %s.mcyc);' % (p, p, p, p) for p in P))
     with open(os.path.join(work, "tb_tpboards.v"), "w") as f:
         f.write(tb)
     return want, ["tb_tpboards.v"] + tops + srcs[1:]

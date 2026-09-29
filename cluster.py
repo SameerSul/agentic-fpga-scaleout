@@ -172,9 +172,11 @@ def seconds_per_cycle(name):
     return pk.get("bus_per_core", BUS_PER_CORE) / (pk.get("fpgai_mhz", 50) * 1e6)
 
 
-# The ARM's side of a gather: one GADDR/GDATA access through GP0, which
-# waits for the core's edges. An estimate: no board has timed one yet.
-ARM_ACCESS_S = 0.25e-6
+# The gathers' words move in the PL (the mover behind GMOVE): bus cycles a
+# word out of the core to DDR and back in, measured through the registers
+# on Qwen3-0.6B's shape against the stalling DDR model (RESULTS.md).
+MOVE_OUT_CYCLES = 5.9
+MOVE_IN_CYCLES = 2.9
 
 
 def tp_plan(names, m, ctx=128, even=False):
@@ -258,19 +260,19 @@ def tp_plan(names, m, ctx=128, even=False):
     lay, seg = layer_s(kv, f, d)
     hs, ht, hk = head_s(c)
     part = dict(kv=kv, f=[x * unit for x in f], d=[x * unit for x in d], hk=[list(x) for x in hk])
-    # The gathers, four a layer and the head's: each rank reads its slice
-    # through the registers and writes everyone else's, and the slices
-    # cross the Ethernet once.
+    # The gathers, four a layer and the head's: each rank's mover takes its
+    # slice out and the whole vector back in, and the slices cross the
+    # Ethernet once; the latency is an estimate, no board has timed one.
     hd = m["hd"]
     vecs = [[grp * kv[r] * hd for r in range(T)], [x * unit for x in d],
             [x * unit for x in f], [x * unit for x in d]]
+    bus = [1.0 / (boards.PACKAGES[n].get("fpgai_mhz", 50) * 1e6) for n in names]
     g = 0.0
     for sl in vecs:
-        # Every rank reads its own words and writes all the others'.
         tot = sum(sl)
-        g += tot * ARM_ACCESS_S + LINK_LATENCY_S["ethernet"] \
-            + max(2 * (tot - x) for x in sl) / ETH_BYTES_S
-    head_g = 3 * T * ARM_ACCESS_S + LINK_LATENCY_S["ethernet"]
+        g += max((x * MOVE_OUT_CYCLES + tot * MOVE_IN_CYCLES) * b for x, b in zip(sl, bus)) \
+            + LINK_LATENCY_S["ethernet"] + max(2 * (tot - x) for x in sl) / ETH_BYTES_S
+    head_g = LINK_LATENCY_S["ethernet"]
     tok = m["NL"] * (lay + g) + hs + head_g + (m["D"] + 12) * max(spc)
     return dict(part=part, lanes=lanes, layer_seconds=lay, gather_seconds=g,
                 rank_layer_seconds=[sum(x) for x in seg], head_seconds=ht,

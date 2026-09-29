@@ -2202,27 +2202,38 @@ def test_weights_split_through_registers():
     clock, and every gather done by the ARM's side through GADDR, GDATA
     and GATHER. Two ranks at 16 lanes, a Zybo's 16 beside a ZC706's 32,
     and the same two with the ZC706 holding more of d_ff, have to give the
-    one-board integer model's tokens and logits. A register block whose
-    GATHER still reads set once answered lets an ARM serve one gather
-    twice, and has to be caught."""
+    one-board integer model's tokens and logits, the PL's mover carrying
+    the slices between the core and DDR (GMOVE); and again with the ARM
+    moving them a word an access (GDATA). A register block whose GATHER
+    still reads set once answered lets an ARM serve one gather twice, and
+    a mover that packs its words in the wrong lanes corrupts every slice:
+    both have to be caught."""
     import tp, qwen_synth
     ids = [3, 77, 12, 140]
     work = os.path.join(ROOT, 'build_tpregtest')
     u2 = dict(kv=[1, 1], f=[96, 160], d=[32, 32], hk=[[0, 0], [1, 2]])
-    for lanes, mut, part in ((None, False, None), ([16, 32], False, None),
-                             ([16, 32], False, u2), (None, True, None)):
+    for lanes, mut, part, mover in ((None, False, None, True), ([16, 32], False, None, True),
+                                    ([16, 32], False, u2, True), (None, False, None, False),
+                                    (None, True, None, False), (None, 'lanes', None, True)):
         shutil.rmtree(work, ignore_errors=True)
         try:
             im, _ = qwen_synth.model('qwen3', nl=2)
             want, srcs = tp.build_boards(im, ids, 3, work, 2, lanes=lanes, jit=1,
-                                         log=lambda *a: None, part=part)
+                                         log=lambda *a: None, part=part, mover=mover)
             im.reset()
             best = []
             for p in range(len(want) - 1):
                 lg = im.step(want[p], p, logits=p >= len(ids) - 1)
                 if lg is not None:
                     best.append((max(range(len(lg)), key=lg.__getitem__), max(lg)))
-            if mut:
+            if mut == 'lanes':
+                for p in 'ab':
+                    f = os.path.join(work, 'qwen_zybo_%s.v' % p)
+                    src = open(f).read()
+                    a = 'dm_word[dm_e[1:0] * 16 +: 16] <= gx_rdata;'
+                    assert a in src
+                    open(f, 'w').write(src.replace(a, 'dm_word[(2\'d3 - dm_e[1:0]) * 16 +: 16] <= gx_rdata;'))
+            elif mut:
                 for p in 'ab':
                     f = os.path.join(work, 'fpgai_zybo_%s.v' % p)
                     src = open(f).read()
@@ -2231,14 +2242,19 @@ def test_weights_split_through_registers():
             out = tp.run(work, srcs, timeout=1800)
             got = [(int(l.split('tok=')[1].split()[0]), int(l.split('best=')[1].split()[0]))
                    for l in out.splitlines() if l.startswith('TOKEN')]
-            if mut:
+            if mut == 'lanes':
+                check('a gather mover that packs its words in the wrong lanes is caught',
+                      got != best)
+            elif mut:
                 check('a GATHER that reads set once answered is caught serving a gather twice',
                       'TP_FAIL' in out and got != best)
             else:
-                check('the weights split 2 ways through the registers and DDR bridges%s%s: '
-                      'one board\'s tokens and logits'
+                check('the weights split 2 ways through the registers and DDR bridges%s%s, '
+                      '%s: one board\'s tokens and logits'
                       % (', %s lanes' % '/'.join(map(str, lanes)) if lanes else '',
-                         ', shares %s of d_ff' % '/'.join(map(str, part['f'])) if part else ''),
+                         ', shares %s of d_ff' % '/'.join(map(str, part['f'])) if part else '',
+                         'the PL moving the slices' if mover else 'the ARM moving them a word '
+                         'an access'),
                       got == best and len(best) == 3 and 'bad=0' in out)
         finally:
             shutil.rmtree(work, ignore_errors=True)
@@ -2640,6 +2656,9 @@ void Xil_Out32(UINTPTR a, u32 v) {
   else if (o == FPGAI_GADDR) gaddr = v;
   else if (o == FPGAI_GDATA) { if (greq) vec_of()[gaddr] = (s16)v; gaddr++; }
   else if (o == FPGAI_GATHER) { if ((v & 1) && greq) answered(); }
+  else if (o == FPGAI_GMOVE && greq) { u32 n = v & 0xffff; s16 *g = (s16 *)GBUF;
+    for (u32 i = 0; i < n; i++) { if (v >> 16 & 1) vec_of()[gaddr + i] = g[gaddr + i];
+                                  else g[gaddr + i] = vec_of()[gaddr + i]; } }
   else if (o == FPGAI_CTRL && (v & 1)) {
     head = (v >> 1) & 1; done = 0; phase = 0;
     for (int i = 0; i < FPGAI_D; i++) x[i] = wrap((long)r_tok * 31 + i + (long)r_pos * 7);
@@ -2700,8 +2719,8 @@ def test_tp_network_on_host():
     uneven = [(300, 100, 600), (500, 300, 900), (400, 200, 600)]
     for k, (label, mut, slices) in enumerate((
             ('good', None, None), ('uneven', None, uneven),
-            ('off', ('Xil_Out32(REG(FPGAI_GADDR), ra);',
-                     'Xil_Out32(REG(FPGAI_GADDR), ra + 1);'), uneven))):
+            ('off', ('gbuf[ra + i] = cur->v[ra + i];',
+                     'gbuf[ra + i + 1] = cur->v[ra + i];'), uneven))):
         shutil.rmtree(work, ignore_errors=True)
         port0 = 45000 + (os.getpid() + k * 97) % 2000
         procs, outs = [], {}
@@ -2719,12 +2738,14 @@ def test_tp_network_on_host():
                     ips=[(127, 0, 0, 20 + j) for j in range(T)]))
                 for k, v in (('WBASE', '((UINTPTR)host_ddr)'), ('CBASE', '((UINTPTR)host_ddr + 4096)'),
                              ('KBASE', '((UINTPTR)host_ddr + 8192)'), ('KVEND', '((UINTPTR)host_ddr + 16384)'),
+                             ('GBUF', '((UINTPTR)host_ddr + 32768)'),
                              ('VOCAB_BASE', '((UINTPTR)host_ddr + 65536)'), ('WBYTES', '1024U'),
                              ('CBYTES', '512U'), ('FPGAI_REGS', '0x43C00000U')):
                     h = re.sub(r'#define %s\s+\S+' % k, '#define %s %s' % (k, v), h)
                 h = h.replace('#ifndef FPGAI_LAYOUT_H\n#define FPGAI_LAYOUT_H\n',
                               '#ifndef FPGAI_LAYOUT_H\n#define FPGAI_LAYOUT_H\n'
-                              'extern unsigned char host_ddr[];\n#define PORT0 %d\n' % port0)
+                              'extern unsigned char host_ddr[];\n#define PORT0 %d\n'
+                              '#define FPGAI_BARRIER() __sync_synchronize()\n' % port0)
                 open(os.path.join(d, 'fpgai_layout.h'), 'w').write(h)
                 src = bz.TP_C
                 if mut:
@@ -2928,9 +2949,9 @@ def test_arm_programs_on_their_rtl():
             m = os.path.join(work, 'rank%d_mut' % r)
             shutil.copytree(o, m)
             src = open(os.path.join(m, 'sw', 'main.c')).read()
-            a = 'Xil_Out32(REG(FPGAI_GADDR), ra);'
+            a = 'gbuf[ra + i] = cur->v[ra + i];'
             assert a in src
-            open(os.path.join(m, 'sw', 'main.c'), 'w').write(src.replace(a, 'Xil_Out32(REG(FPGAI_GADDR), ra + 1);'))
+            open(os.path.join(m, 'sw', 'main.c'), 'w').write(src.replace(a, 'gbuf[ra + i + 1] = cur->v[ra + i];'))
             bad.append((cosim.build(m, os.path.join(work, 'rank%d_mutsim' % r), log=lambda *a: None),
                         os.path.join(m, 'sd'), {'JITTER': '0'}))
         outs = cosim.run_group(bad)

@@ -102,6 +102,7 @@ int xemacif_input(struct netif *); void netif_set_default(struct netif *); void 
 #include <string.h>
 #include "xil_io.h"
 #define memset(p, v, n) cosim_memset((p), (v), (n))
+#define FPGAI_BARRIER() __sync_synchronize()
 """,
     "shim.c": """#include <arpa/inet.h>
 #include <fcntl.h>
@@ -349,14 +350,17 @@ def build(pkg, work, lat=30, log=print):
         with open(os.path.join(work, name), "w") as f:
             f.write(src)
     h = open(os.path.join(sw, "fpgai_layout.h")).read()
-    wb, end = _header_value(h, "WBASE"), _header_value(h, "KVEND")
+    wb, end = _header_value(h, "WBASE"), _header_value(h, "VOCAB_BASE")
     base = board_zybo.BASE
     size = (end - base) + (48 << 20)        # the vocabulary's text after the KV cache
-    # The vocabulary is read through a pointer, not loaded by address
-    # only: point it into DDR's host array, at the same offset.
+    # The vocabulary and a rank's gather buffer are read through pointers,
+    # not loaded by address only: point them into DDR's host array, at the
+    # same offsets.
     h = h.replace("#define FPGAI_LAYOUT_H\n", "#define FPGAI_LAYOUT_H\n#include \"cosim.h\"\n", 1)
-    h = re.sub(r"#define VOCAB_BASE\s+\S+",
-               "#define VOCAB_BASE      ((UINTPTR)cosim_bus(0x%08XU))" % end, h)
+    for name in ("VOCAB_BASE", "GBUF"):
+        if re.search(r"#define %s\s" % name, h):
+            h = re.sub(r"#define %s\s+\S+" % name, "#define %-15s ((UINTPTR)cosim_bus(0x%08XU))"
+                       % (name, _header_value(h, name)), h)
     with open(os.path.join(work, "fpgai_layout.h"), "w") as f:
         f.write(h)
     shutil.copyfile(os.path.join(sw, "main.c"), os.path.join(work, "main.c"))

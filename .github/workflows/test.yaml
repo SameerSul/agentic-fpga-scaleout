@@ -7,7 +7,9 @@ on:
 jobs:
   test:
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    # The suite took 39 minutes at 392 tests; the weight split's
+    # register-level runs and the ARM programs on their RTL are the long ones.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
 

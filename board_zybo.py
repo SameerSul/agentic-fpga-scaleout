@@ -76,6 +76,10 @@ TP_REGS = [
     (0x44, "GATHER", "bit 0 the core waits on a gather not yet answered, bits 3:1 which "
                      "(1 the attention context, 2 o's or down's output, 3 the gated "
                      "product, 4 the head's best); write 1 once the other ranks' slices are in"),
+    (0x48, "GMOVE", "write n, with bit 16 set for into the core: the PL moves n words from "
+                    "element GADDR of the vector being gathered to DDR at GBUF, or back; "
+                    "bit 0 reads 1 while it moves"),
+    (0x4C, "GBUF", "DDR address of the gather buffer: element i at byte 2i"),
 ]
 
 
@@ -242,6 +246,7 @@ endmodule
     return tp_wrapper(v, L) if "gx_addr" in W else v
 
 
+
 def stage_wrapper(v, L):
     """The register block for one pipeline stage of a multi-board run:
     XADDR and XDATA load the hidden state the stage starts from and read
@@ -288,7 +293,9 @@ def _window(v, L, px):
     else:
         r, T = L["tp"]["rank"], L["tp"]["ranks"]
         ident = ("          5'h10: s_axi_rdata <= 32'h%08X;\n"
-                 "          5'h11: s_axi_rdata <= {28'd0, g_vec, g_req && !g_done};\n" % (r | T << 8))
+                 "          5'h11: s_axi_rdata <= {28'd0, g_vec, g_req && !g_done};\n"
+                 "          5'h12: s_axi_rdata <= {31'd0, dma_busy || dma_go};\n"
+                 "          5'h13: s_axi_rdata <= 32'h%08X;\n" % (r | T << 8, L["gb"]))
     rep("""          default: s_axi_rdata <= 32'd0;""",
         """          5'h0E: s_axi_rdata <= {%d'd0, %s_addr};
 %s          default: s_axi_rdata <= 32'd0;""" % (32 - xa, px, ident))
@@ -300,8 +307,11 @@ def _window(v, L, px):
     rep("""          4'h1: tok <= wd[""", """          5'h01: tok <= wd[""")
     rep("""          4'h2: pos <= wd[""", """          5'h02: pos <= wd[""")
     # A gather's answer is held until the core drops its request.
-    go = "" if stage else "          5'h11: if (wd[0]) g_done <= 1'b1;\n"
-    drop = "" if stage else "      if (g_done && !g_req) g_done <= 1'b0;\n"
+    go = "" if stage else ("          5'h11: if (wd[0]) g_done <= 1'b1;\n"
+                           "          5'h12: begin dma_go <= 1'b1; dma_in <= wd[16]; "
+                           "dma_n <= wd[%d:0]; end\n" % xa)
+    drop = "" if stage else ("      if (g_done && !g_req) g_done <= 1'b0;\n"
+                             "      if (dma_go && dma_busy) dma_go <= 1'b0;\n")
     rep("""          default: ;
         endcase
       end
@@ -340,12 +350,15 @@ def _window(v, L, px):
         conn = "    .emb_en(emb_en), .x_we(x_we), .x_addr(x_addr), .x_wdata(x_wdata), .x_rdata(x_rdata),\n"
     else:
         rst = ("      gx_we <= 1'b0; gx_addr <= 0; gx_wdata <= 0; xop <= 2'd0; xcc <= 0;"
-               " g_done <= 1'b0;")
+               " g_done <= 1'b0; dma_go <= 1'b0; dma_in <= 1'b0; dma_n <= 0;")
         decl = ("  reg gx_we, g_done; reg [%d:0] gx_addr; reg signed [15:0] gx_wdata;\n"
                 "  wire signed [15:0] gx_rdata; wire g_req; wire [2:0] g_vec;\n"
-                "  reg [1:0] xop; reg [31:0] xcc;" % (xa - 1))
+                "  reg [1:0] xop; reg [31:0] xcc;\n"
+                "  reg dma_go, dma_in; reg [%d:0] dma_n; wire dma_busy;" % (xa - 1, xa))
         conn = ("    .g_req(g_req), .g_vec(g_vec), .g_done(g_done), .gx_we(gx_we),\n"
-                "    .gx_addr(gx_addr), .gx_wdata(gx_wdata), .gx_rdata(gx_rdata),\n")
+                "    .gx_addr(gx_addr), .gx_wdata(gx_wdata), .gx_rdata(gx_rdata),\n"
+                "    .dma_go(dma_go), .dma_in(dma_in), .dma_first(gx_addr), .dma_n(dma_n),\n"
+                "    .dma_busy(dma_busy),\n")
     rep("""      tok <= 0; pos <= 0; bus_cycles <= 0;""",
         """      tok <= 0; pos <= 0; bus_cycles <= 0;
 """ + rst)
@@ -758,7 +771,7 @@ def render_header(L, n_gen, title="Zybo Z7-20", stage=None, tp=None):
               "#define CBYTES          %dU" % (L["cn"] * 8),
               "#define KBASE           0x%08XU" % L["kb"],
               "#define KVEND           0x%08XU" % L["end"],
-              "#define VOCAB_BASE      0x%08XU" % L["end"],
+              "#define VOCAB_BASE      0x%08XU" % L.get("gend", L["end"]),
               "#define MAX_POS         %d" % (1 << L["W"]["pos"]),
               "#define N_GEN           %d" % n_gen,
               "#define CORE_MHZ        %d" % MHZ,
@@ -793,6 +806,7 @@ def render_header(L, n_gen, title="Zybo Z7-20", stage=None, tp=None):
                   "#define TP_RANK         %d" % tp["rank"],
                   "#define TP_RANKS        %d" % tp["ranks"],
                   "#define TP_VALUE        0x%08XU" % (tp["rank"] | tp["ranks"] << 8),
+                  "#define GBUF            0x%08XU" % L.get("gb", 0),
                   "#define TP_SLICES       %s" % ", ".join("{%d, %d, %d}" % tuple(x) for x in sl),
                   "#define TP_OFFSETS      %s" % ", ".join("{%d, %d, %d}" % x for x in of),
                   "#define IP_RANKS        %s" % ", ".join(
@@ -1231,9 +1245,12 @@ TP_C = r"""// GENERATED by board_zybo.py. One rank of a tensor-parallel run (tp.
 // fpgai_layout.h, and enable xilffs in the BSP.
 //
 // Every rank runs every position. The core stops at each gather with
-// GATHER bit 0 set and the vector's number in bits 3:1; the ARM reads
-// this rank's slice through GADDR and GDATA, sends it to every other
-// rank, writes theirs in as they arrive and writes 1 to GATHER. At the
+// GATHER bit 0 set and the vector's number in bits 3:1. The PL moves this
+// rank's slice out to the gather buffer in DDR (GMOVE), the ARM sends it
+// to every other rank, writes theirs into the buffer as they arrive, the
+// PL moves the whole vector back into the core, and the ARM writes 1 to
+// GATHER. The buffer is on the PL's cache-coherent port, so the ARM reads
+// and writes it as ordinary memory. At the
 // head each rank offers its best logit and that token, and every rank
 // takes the same winner: the largest logit, the lower rank on a tie,
 // which is the lower token, as the integer model's argmax.
@@ -1266,6 +1283,9 @@ TP_C = r"""// GENERATED by board_zybo.py. One rank of a tensor-parallel run (tp.
 #define REG(o) (FPGAI_REGS + (o))
 #define PART_WORDS 600
 #define MAX2(a, b) ((a) > (b) ? (a) : (b))
+#ifndef FPGAI_BARRIER
+#define FPGAI_BARRIER() __asm__ volatile ("dsb" ::: "memory")
+#endif
 #define VMAX MAX2(MAX2(FPGAI_HHD, FPGAI_D), MAX2(FPGAI_F, 3 * TP_RANKS))
 #define SMAX VMAX
 #define PMAX ((SMAX + PART_WORDS - 1) / PART_WORDS)
@@ -1292,6 +1312,19 @@ static const u16 slices[TP_RANKS][3] = {TP_SLICES}, offsets[TP_RANKS][3] = {TP_O
 // head each rank offers three words: its best logit and that token.
 static int words_of(int r, int vec) { return vec == 4 ? 3 : slices[r][vec - 1]; }
 static int start_of(int r, int vec) { return vec == 4 ? 3 * r : offsets[r][vec - 1]; }
+
+// The PL moves n words from element first of the vector being gathered
+// out to the gather buffer, or with into back into the core.
+#define gbuf ((volatile s16 *)GBUF)
+static void move(int into, int first, int n)
+{
+    FPGAI_BARRIER();                     // the buffer's words before the move
+    Xil_Out32(REG(FPGAI_GADDR), first);
+    Xil_Out32(REG(FPGAI_GMOVE), (u32)n | (into ? 1U << 16 : 0));
+    while (Xil_In32(REG(FPGAI_GMOVE)) & 1)
+        ;
+    FPGAI_BARRIER();
+}
 static ip_addr_t peer[TP_RANKS];
 static struct gather gb[2], *cur = &gb[0], *nxt = &gb[1];
 static s16 mine[SMAX], prev[SMAX];
@@ -1433,9 +1466,9 @@ static void gather(int vec)
         mine[1] = (s16)(tk & 0xFFFF);
         mine[2] = (s16)(tk >> 16);
     } else {
-        Xil_Out32(REG(FPGAI_GADDR), at);
+        move(0, at, n);
         for (int i = 0; i < n; i++)
-            mine[i] = (s16)Xil_In32(REG(FPGAI_GDATA));
+            mine[i] = gbuf[at + i];
     }
     mine_gid = cur->gid; mine_vec = vec; mine_n = n;
     memcpy(cur->v + at, mine, 2 * n);
@@ -1473,14 +1506,17 @@ static void gather(int vec)
                 g_tok = (u16)cur->v[3 * r + 1] | (u32)(u16)cur->v[3 * r + 2] << 16;
             }
     } else {
+        // The others' slices into the buffer, then the whole vector into
+        // the core: this rank's own slice goes back as it came out.
+        int tot = 0;
         for (int r = 0; r < TP_RANKS; r++) {
-            if (r == TP_RANK)
-                continue;
             int rn = words_of(r, vec), ra = start_of(r, vec);
-            Xil_Out32(REG(FPGAI_GADDR), ra);
-            for (int i = 0; i < rn; i++)
-                Xil_Out32(REG(FPGAI_GDATA), (u16)cur->v[ra + i]);
+            tot += rn;
+            if (r != TP_RANK)
+                for (int i = 0; i < rn; i++)
+                    gbuf[ra + i] = cur->v[ra + i];
         }
+        move(1, 0, tot);
     }
     n_gathers++;
     Xil_Out32(REG(FPGAI_GATHER), 1);
@@ -1777,7 +1813,8 @@ def package(work, board="zybo_z7_20", out=None, prompt="The capital of France is
         shutil.copyfile(os.path.join(work, f), os.path.join(rtl, f))
     shutil.copyfile(os.path.join(work, "gains.hex"), os.path.join(rtl, "gains.hex"))
     with open(os.path.join(rtl, "qwen_zybo.v"), "w") as f:
-        f.write(zybo.render_top(L["W"], L["gn"], L["cb"], L["kb"], L["vb"], 4, L["wb"]))
+        f.write(zybo.render_top(L["W"], L["gn"], L["cb"], L["kb"], L["vb"], 4, L["wb"],
+                                gb=L.get("gb")))
     with open(os.path.join(rtl, "fpgai_zybo.v"), "w") as f:
         f.write(render_wrapper(L))
     with open(os.path.join(out, "build.tcl"), "w") as f:

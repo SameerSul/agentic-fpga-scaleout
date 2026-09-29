@@ -67,7 +67,7 @@ The remaining gap is listed at the bottom rather than glossed over.
 ### The full suite
 
 ```
-python3 tests.py            # 392 tests, or 390 without OpenSTA
+python3 tests.py            # 394 tests, or 392 without OpenSTA
 ```
 
 ### Spec to RTL, across the spec space
@@ -798,15 +798,17 @@ writes it into the others' through `gx_wdata`.
 python3 spec2rtl.py examples/tiny_tp4.json --boards zybo_z7_20 zc706 zybo_z7_20 zc706 --split weights --bridge --package
 ```
 
-On a board the gathers are the ARM's. A rank's package adds four
+On a board the network is the ARM's. A rank's package adds six
 registers: GADDR and GDATA read the rank's slice of the vector being
 gathered and write the others' into it, a word an access, each waiting
-for the core's edges as a stage's XDATA does; GATHER says whether the
-core waits on a gather and which; a write of 1 lets it go on; TP says
-which rank of how many the bitstream is. The ARM program
-(`board_zybo.TP_C`) sends the rank's slice to every other rank over UDP
-in parts of at most 600 words, writes theirs in as they arrive, and at
-the head every rank takes the same winner. A rank can be one gather
+for the core's edges as a stage's XDATA does; GMOVE has the PL move a run
+of words between the core and a gather buffer in DDR (GBUF) instead;
+GATHER says whether the core waits on a gather and which, and a write of
+1 lets it go on; TP says which rank of how many the bitstream is. The ARM
+program (`board_zybo.TP_C`) has the PL move the rank's slice out, sends
+it to every other rank over UDP in parts of at most 600 words, writes
+theirs into the buffer as they arrive, has the PL move the whole vector
+back in, and at the head every rank takes the same winner. A rank can be one gather
 ahead of another and never more, so it keeps parts that come early for
 the next gather and its own previous slice for a rank one behind; a rank
 still missing parts after 250 ms asks their sender again, and the answer
@@ -830,9 +832,11 @@ The first register block read GATHER as the core's request itself,
 which stays up until the core's next edge after the answer. An ARM that
 read it again in that window served one gather twice, and the two-rank
 run hung after 33 gathers. GATHER now reads clear once answered;
-`test_weights_split_through_registers` runs the first two rows and
-fails on the old block, which the testbench now stops on at the first
-gather posted out of step.
+`test_weights_split_through_registers` runs the first two rows, and
+uneven shares, with the mover, and again with the ARM moving every word,
+and fails on the old block, which the testbench now stops on at the
+first gather posted out of step, and on a mover that packs its words in
+the wrong lanes.
 
 The program's network half has run on this host
 (`test_tp_network_on_host`): three ranks compiled from the generated
@@ -876,27 +880,29 @@ shares.
 For Qwen3-0.6B at a context of 128, from the cycle model and each
 package's measured bus cycles a core cycle:
 
-| boards | shares, KV heads / d_ff | a layer, computing | gathers on the ARMs, estimated | a token |
+| boards | shares, KV heads / d_ff | a layer, computing | its gathers | a token |
 |---|---|---|---|---|
 | ZC706 alone | | 18.3 ms | | 0.68 s |
-| ZC706 + Zybo, even | 4/4, 1536/1536 | 12.4 ms | 2.7 ms | 0.54 s |
-| ZC706 + Zybo, by speed | 5/3, 1760/1312 | 11.1 ms | 2.7 ms | 0.48 s |
-| ZC706 + 2 Zybos | 3/3/2, 1248/928/896 | 8.2 ms | 2.7 ms | 0.38 s |
-| 4 Zybos | 2 each, 768 each | 6.3 ms | 2.7 ms | 0.31 s |
-| 8 Zybos | 1 each, 384 each | 3.2 ms | 2.7 ms | 0.20 s |
+| ZC706 + Zybo, even | 4/4, 1536/1536 | 12.4 ms | 1.7 ms | 0.51 s |
+| ZC706 + Zybo, by speed | 5/3, 1760/1312 | 11.1 ms | 1.8 ms | 0.46 s |
+| ZC706 + 2 Zybos | 3/3/2, 1248/928/896 | 8.2 ms | 1.7 ms | 0.35 s |
+| 4 Zybos | 2 each, 768 each | 6.3 ms | 1.5 ms | 0.28 s |
+| 8 Zybos | 1 each, 384 each | 3.2 ms | 1.5 ms | 0.16 s |
 
 Eight KV heads do not split three ways evenly, so three boards had no even
-split at all. The gathers are estimated, not measured: 0.25 us an ARM
-register access, every rank reading its slice and writing the others'
-through GADDR and GDATA, 200 us of Ethernet latency a gather and 100 MB/s.
-At eight boards they are nearly as long as the layer, so moving the slices
-in the PL rather than a word an access from the ARM is the next thing that
-would pay.
+split at all. A gather's words move in the PL: GMOVE's mover takes a rank's
+slice out of the core to DDR and the whole vector back in, 5.9 and 2.9 bus
+cycles a word, measured through both ranks' registers on Qwen3-0.6B's
+shares against the stalling DDR model, about 0.9 ms a layer; the ARM
+only copies the buffer. The rest, 200 us of Ethernet latency a gather and
+100 MB/s, is an estimate. The first cut had the ARM move every word
+through GADDR and GDATA, which a guess of 0.25 us a register access put at
+1.8 ms a layer; the mover is measured, and needs no guess.
 
 | run | shares | result |
 |---|---|---|
 | 4 ranks, 16/32/16/32 lanes, direct | d_ff 32/96/32/96, d_model 16/32/16/64, two ranks with no head chunk | tokens and logits exact |
-| 2 ranks, 16/32 lanes, through the registers | d_ff 96/160 | exact |
+| 2 ranks, 16/32 lanes, through the registers | d_ff 96/160 | exact, the mover carrying every slice |
 | ZC706 + 2 Zybos through `spec2rtl.py` | 1/2/1 KV heads, d_ff 96/96/64, d_model 64/32/32 | 30 blocks signed off; exact directly and through the registers; three packages |
 | the ARM program on the host, 3 ranks | slices of 300/500/400, 100/300/200, 600/900/600 words | the reference's tokens after a lost and a corrupt datagram |
 | Qwen3-0.6B's checkpoint over a ZC706 and a Zybo through `spec2rtl.py` | 5/3 KV heads, d_ff 1760/1312, d_model 608/416, head chunks 0-28/29-49 | 30 blocks signed off; exact at 1 of 28 layers; each rank's computing cycles within 0.003% of `cluster.tp_rank_cycles`; both packages from the checkpoint |
@@ -1084,7 +1090,8 @@ tells the team to expect. Qwen3-0.6B split by weights over a ZC706 and a
 Zybo, its shares by speed, runs the same way as two processes, each rank's
 program on its own package's RTL, gathering over UDP: rank 0 prints the
 single board's text, and the logit the ranks agree on at every step is
-the integer model's (2,256 gathers a rank, 222 s).
+the integer model's (2,256 gathers a rank, 222 s; 216 s once the PL
+moves the slices).
 
 `test_arm_programs_on_their_rtl` runs all three programs on small
 checkpoints and checks tokens and logits against the integer model: the
