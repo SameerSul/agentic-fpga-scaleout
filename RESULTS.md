@@ -1132,7 +1132,25 @@ Zybo, its shares by speed, runs the same way as two processes, each rank's
 program on its own package's RTL, gathering over UDP: rank 0 prints the
 single board's text, and the logit the ranks agree on at every step is
 the integer model's (2,256 gathers a rank, 222 s; 216 s once the PL
-moves the slices).
+moves the slices). Split by layers instead, over the same two boards
+(`spec2rtl.py`, every layer in Verilator: the ZC706 layers 0 to 15, the
+Zybo 16 to 27 and the head, stage cycles within 0.011% of the planner's),
+both stages' programs on their RTL print the same text, the last stage's
+logits the integer model's, in 7 minutes.
+
+The harness's clock is the PL's: `XTime` reads simulated nanoseconds,
+the bus cycles so far, so a program's timeouts mean what they mean on a
+board, and the step times it prints are the board's less the ARM's own
+work and the Ethernet's latency, which localhost does not have. The first
+two-stage run kept wall time, and the first stage resent every hidden
+state after five seconds of it while the Zybo's twelve layers were still
+being simulated. For the planner's cycle model, which the proposal holds
+to 15%, these are the closest thing to a measurement this host can make:
+
+| run | the program's last step | the planner, at that context |
+|---|---|---|
+| `board_zc706/`, Qwen2.5-0.5B alone | 25,499,870 bus cycles, 0.51 s | 0.54 s |
+| Qwen3-0.6B split by weights over a ZC706 and a Zybo | 0.465 s | 0.425 s, less the Ethernet's latency |
 
 `test_arm_programs_on_their_rtl` runs all three programs on small
 checkpoints and checks tokens and logits against the integer model: the

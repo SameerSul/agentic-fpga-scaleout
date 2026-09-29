@@ -50,12 +50,14 @@ void cosim_idle(void);
 #endif
 """,
     "xil_cache.h": "static inline void Xil_DCacheFlush(void) {}\n",
+    # The timer is the PL's: simulated nanoseconds, the bus clock's cycles,
+    # so a program's timeouts mean what they mean on the board, and the
+    # step times it prints are the board's, less the ARM's own work.
     "xtime_l.h": """#pragma once
-#include <time.h>
 typedef unsigned long long XTime;
 #define COUNTS_PER_SECOND 1000000000ULL
-static inline void XTime_GetTime(XTime *t) { struct timespec s; clock_gettime(CLOCK_MONOTONIC, &s);
-  *t = (XTime)s.tv_sec * 1000000000ULL + s.tv_nsec; }
+unsigned long long cosim_ns(void);
+static inline void XTime_GetTime(XTime *t) { *t = cosim_ns(); }
 """,
     "ff.h": """#pragma once
 #include <stdio.h>
@@ -186,6 +188,7 @@ static void up();
 // The ARM polling the network with nothing to read: on a board the PL runs
 // on meanwhile, so here it takes a thousand bus cycles.
 extern "C" void cosim_idle(void) { up(); for (int i = 0; i < 1000; i++) tick(); }
+extern "C" unsigned long long cosim_ns(void) { up(); return cyc * %(ns)dULL; }
 
 static uint64_t rd64(uint64_t a) {
   if (a < BASE || a + 8 > BASE + SIZE) { fprintf(stderr, "PL read outside DDR: %%llx\n", (unsigned long long)a); exit(3); }
@@ -264,7 +267,7 @@ static void up() {
   if (pl) return;
   ddr = (uint8_t *)calloc(SIZE, 1);
   const char *j = getenv("JITTER"); jit = j && atoi(j);
-  const char *l = getenv("LIMIT"); limit = l ? strtoull(l, 0, 10) : 2000000000ULL;
+  const char *l = getenv("LIMIT"); limit = l ? strtoull(l, 0, 10) : 20000000000ULL;
   pl = new Vfpgai_zybo;
   pl->aresetn = 0; pl->s_axi_awvalid = 0; pl->s_axi_wvalid = 0; pl->s_axi_arvalid = 0;
   pl->s_axi_bready = 0; pl->s_axi_rready = 0; pl->s_axi_wstrb = 0xf;
@@ -336,9 +339,10 @@ def _header_value(h, name):
     return int(m.group(1), 16)
 
 
-def build(pkg, work, lat=30, log=print):
+def build(pkg, work, lat=30, log=print, defines=None):
     """Compile pkg's RTL (Verilator) with its sw/main.c, unchanged, and the
-    shims into work/cosim. Returns the executable's path."""
+    shims into work/cosim. Returns the executable's path. defines: macros
+    for the program, such as a shorter RESEND_MS for a quick test."""
     import board_zybo
     import vsim
     pkg, work = os.path.abspath(pkg), vsim.spaceless(os.path.abspath(work))
@@ -365,7 +369,8 @@ def build(pkg, work, lat=30, log=print):
         f.write(h)
     shutil.copyfile(os.path.join(sw, "main.c"), os.path.join(work, "main.c"))
     with open(os.path.join(work, "harness.cpp"), "w") as f:
-        f.write(HARNESS % dict(base=base, size=size, regs=board_zybo.REG_BASE, lat=lat))
+        f.write(HARNESS % dict(base=base, size=size, regs=board_zybo.REG_BASE, lat=lat,
+                               ns=1000 // board_zybo.MHZ))
     # The RTL beside the harness, named relative to it: make cannot take
     # a source path with a space in it.
     os.makedirs(os.path.join(work, "rtl"))
@@ -374,9 +379,10 @@ def build(pkg, work, lat=30, log=print):
             shutil.copyfile(os.path.join(rtl, f), os.path.join(work, "rtl", f))
     srcs = sorted(os.path.join("rtl", f) for f in os.listdir(rtl) if f.endswith(".v"))
     cc = shutil.which("cc") or "cc"
+    dflags = ["-D%s=%s" % kv for kv in sorted((defines or {}).items())]
     for c in ("main.c", "shim.c"):
-        r = subprocess.run([cc, "-O1", "-w", "-I.", "-c", c, "-o", c[:-2] + ".o"], cwd=work,
-                           capture_output=True, text=True)
+        r = subprocess.run([cc, "-O1", "-w", "-I."] + dflags + ["-c", c, "-o", c[:-2] + ".o"],
+                           cwd=work, capture_output=True, text=True)
         if r.returncode:
             raise RuntimeError(r.stderr[-3000:])
     r = subprocess.run(["verilator", "--cc", "--exe", "--build", "-j", "8", "-DSIM",

@@ -2965,7 +2965,9 @@ def test_arm_programs_on_their_rtl():
                       ip=ips[i], next_ip=ips[1 - i], first_ip=ips[0])
             o = pkg(im, want, 'stage%d' % i, board, layers=[i], stage=True, table=True, st=st,
                     first=i == 0)
-            runs.append((cosim.build(o, os.path.join(work, 'stage%d_sim' % i), log=lambda *a: None),
+            # The program's clock is the PL's: a 20 ms resend, not its 5 s.
+            runs.append((cosim.build(o, os.path.join(work, 'stage%d_sim' % i), log=lambda *a: None,
+                                     defines={'RESEND_MS': 20}),
                          os.path.join(o, 'sd'), {'JITTER': '1', 'DROP': '1' if i == 0 else '0'}))
         outs = cosim.run_group(runs)
         check('two stages\' programs on their RTL, the first datagram lost: '
@@ -2983,7 +2985,8 @@ def test_arm_programs_on_their_rtl():
                        slices=[(grp * part['kv'][k] * im.hd, part['d'][k], part['f'][k])
                                for k in range(2)])
             o = pkg(im, want, 'rank%d' % r, board, tp=(r, 2, part), tpd=tpd, vocab=r == 0)
-            runs.append((cosim.build(o, os.path.join(work, 'rank%d_sim' % r), log=lambda *a: None),
+            runs.append((cosim.build(o, os.path.join(work, 'rank%d_sim' % r), log=lambda *a: None,
+                                     defines={'RESEND_MS': 20, 'LINGER_MS': 50}),
                          os.path.join(o, 'sd'), {'JITTER': '1', 'DROP': '3' if r == 1 else '0'}))
         outs = cosim.run_group(runs)
         asks = sum(int(m) for o in outs for m in re.findall(r'(\d+) asks', o))
@@ -3002,7 +3005,8 @@ def test_arm_programs_on_their_rtl():
             a = 'gbuf[ra + i] = cur->v[ra + i];'
             assert a in src
             open(os.path.join(m, 'sw', 'main.c'), 'w').write(src.replace(a, 'gbuf[ra + i + 1] = cur->v[ra + i];'))
-            bad.append((cosim.build(m, os.path.join(work, 'rank%d_mutsim' % r), log=lambda *a: None),
+            bad.append((cosim.build(m, os.path.join(work, 'rank%d_mutsim' % r), log=lambda *a: None,
+                                    defines={'RESEND_MS': 20, 'LINGER_MS': 50}),
                         os.path.join(m, 'sd'), {'JITTER': '0'}))
         outs = cosim.run_group(bad)
         check('ranks whose ARM writes the others\' slices one word off are caught',
