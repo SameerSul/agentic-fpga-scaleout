@@ -1108,6 +1108,27 @@ run.
 | `spec2rtl.py` on Qwen3-0.6B split by weights over a ZC706 and a Zybo, `--bridge` | 1 layer | all 28 layers on both ranks, then all 28 through each rank's registers, 37 minutes in all |
 | `spec2rtl.py --weights qwen_weights --bridge`, Qwen2.5-0.5B on the Zybo | 1 layer, then 1 layer through the registers | all 24 layers and the head, every position within 0.01% of the cycle model, then all 24 through the registers against stalling DDR at 1.19 bus cycles a core cycle: " Paris" and "." with the integer model's logits, 19 minutes in all |
 
+## Half the bytes: int4 weights, measured and not taken
+
+At 32 lanes the core waits on its four HP ports, so weights of half the
+width would carry twice as many a beat. Whether the model survives them
+decides it; the integer model with every layer's weights rounded to 4
+bits (the tied table kept at 8), the same teacher-forced check as above:
+
+| weights | Qwen2.5-0.5B | Qwen3-0.6B |
+|---|---|---|
+| int8 per channel (this design) | 14/16, "Paris. Paris is" | 13/16, "Paris. The capital of the" |
+| int4 per channel | 11/16, "18,000." | 5/16, "the capital of the world" |
+| int4, a scale per 64 columns | 14/16, "located in the city of Paris." | 11/16, "12,000," |
+| int4, a scale per 32 columns | | 8/16, "the capital city of the country" |
+| int4, a scale per 16 columns | | 9/16, "Paris, and the capital of England" |
+
+Qwen2.5 keeps its answer at int4 in groups of 64; Qwen3, the proposal's
+model, does not keep it reliably at any group size, as its massive
+activations (above) would suggest. Round-to-nearest is the simplest
+scheme; one calibrated on activations (GPTQ, AWQ) might hold Qwen3, and
+is where halving the bytes would start. The design stays at int8.
+
 ## The ARM programs on their own RTL
 
 ```
