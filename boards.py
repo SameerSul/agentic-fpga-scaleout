@@ -266,12 +266,16 @@ PACKAGES = {
         "board_files": "Digilent's board files (github.com/Digilent/vivado-boards)",
         "led": ("M14", "LVCMOS33", "LD0"), "ps7": True, "ddr": "ps7",
         "ddr_bytes": 1 << 30, "link": "ethernet", "out": "board_zybo",
+        # Projection lanes: one int8 weight each a core cycle. The
+        # XC7Z020's 220 DSPs hold 16; the XC7Z045's 900 hold 32, and its
+        # four HP ports still feed them, 32 bytes a bus cycle between them.
+        "lanes": 16,
         "license": "the free edition covers the XC7Z020",
         "boot": "set the boot jumper (JP5) to JTAG",
         "uart": "the micro-USB port (PROG/UART)",
         # nextpnr-xilinx, post-route core and bus clocks, per model built
         # (RESULTS.md); a package quotes only what was measured for it.
-        "open_flow_mhz": {"qwen2.5": (53.4, 50.9)},
+        "open_flow_mhz": {"qwen2.5": (65.46, 54.51)},
     },
     "zc706": {
         "title": "ZC706", "part": "xc7z045ffg900-2", "chip": "xc7z045",
@@ -282,16 +286,20 @@ PACKAGES = {
         # the same thing over the registers.
         "led": None, "ps7": True, "ddr": "ps7",
         "ddr_bytes": 1 << 30, "link": "ethernet", "out": "board_zc706",
+        "lanes": 32,
+        # Bus cycles a core cycle through its registers, stalling DDR
+        # model (RESULTS.md): 32 lanes want all four HP ports' bandwidth.
+        "bus_per_core": 1.70,
         "license": "the XC7Z045 is not in the free edition: use the ZC706 "
                    "kit's device-locked license, or the open flow in open/",
         "boot": "set the boot-mode switch (SW11) to JTAG, per UG954",
         "uart": "the USB-UART port (J21)",
-        "open_flow_mhz": {"qwen2.5": (68.0, 52.8), "qwen3": (61.0, 51.0)},
+        "open_flow_mhz": {"qwen2.5": (65.45, 50.30), "qwen3": (71.51, 60.26)},
     },
     "arty_a7_100t": {
         "title": "Arty A7-100T", "part": "xc7a100tcsg324-1", "chip": "xc7a100t",
         "led": None, "ps7": False, "ddr": None, "ddr_bytes": 256 << 20,
-        "link": "uart", "out": "board_arty",
+        "link": "uart", "out": "board_arty", "lanes": 16,
     },
 }
 

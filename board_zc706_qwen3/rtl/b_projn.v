@@ -8,8 +8,8 @@ module projn (
   input      [6:0] shift,
   output     [11:0] a_addr,
   input      signed [15:0] a_data,
-  output     [19:0] w_addr,
-  input      [255:0] w_data,
+  output     [18:0] w_addr,
+  input      [511:0] w_data,
   output reg [11:0] c_addr,
   input      [60:0] c_data,
   output reg               o_valid,
@@ -20,7 +20,7 @@ module projn (
   reg issuing;
   reg [11:0] r;
   reg [11:0] g0;          // first column of the group being issued
-  reg [19:0] wbase;        // g * depth
+  reg [18:0] wbase;        // g * depth
   assign a_addr = r;
   assign w_addr = wbase + r;
 
@@ -31,25 +31,25 @@ module projn (
   reg [4:0] lastp;
   reg [11:0] gp [0:4];
   reg mclr;
-  wire signed [35:0] acc [0:15];
+  wire signed [35:0] acc [0:31];
   genvar j;
   generate
-    for (j = 0; j < 16; j = j + 1) begin : lane
+    for (j = 0; j < 32; j = j + 1) begin : lane
       mac mc (.clk(clk), .rst_n(rst_n), .clear(mclr), .a(a_data),
               .b(w_data[16*j +: 16]), .valid_in(v1), .acc(acc[j]), .valid_out());
     end
   endgenerate
 
   // Shadow bank and the drain through one requantizer.
-  reg signed [35:0] shadow [0:15];
+  reg signed [35:0] shadow [0:31];
   reg [11:0] cap0;
-  reg [4:0] dj, dn;
+  reg [5:0] dj, dn;
   reg  rq_vin;
   reg  signed [35:0] rq_acc;
   reg  [11:0] rq_idx;
   wire signed [15:0] rq_q;
   wire rq_sat, rq_vout;
-  reg [3:0] dsel, dselb;
+  reg [4:0] dsel, dselb;
   reg dva, dvb;
   reg [11:0] didx, didxb;
   reg [17:0] rq_scale_r;
@@ -62,7 +62,7 @@ module projn (
   reg pend;                    // a finished group waits for the drain
   integer k;
   wire [11:0] left = cols - cap0;
-  wire [11:0] next0 = g0 + 16;
+  wire [11:0] next0 = g0 + 32;
 
   always @(posedge clk) begin
     if (!rst_n) begin
@@ -75,7 +75,7 @@ module projn (
       rq_scale_r <= 0; rq_shift_r <= 0;
       for (k = 0; k <= 10; k = k + 1) idx_pipe[k] <= 0;
       for (k = 0; k <= 4; k = k + 1) gp[k] <= 0;
-      for (k = 0; k < 16; k = k + 1) shadow[k] <= 0;
+      for (k = 0; k < 32; k = k + 1) shadow[k] <= 0;
     end else begin
       mclr <= 1'b0;
       rq_vin <= 1'b0;
@@ -112,10 +112,10 @@ module projn (
         // drain, parameter read included.
         if (dj == dn && !dva && !dvb) begin
           pend <= 1'b0;
-          for (k = 0; k < 16; k = k + 1) shadow[k] <= acc[k];
+          for (k = 0; k < 32; k = k + 1) shadow[k] <= acc[k];
           cap0 <= gp[4];
           dj <= 0;
-          dn <= (cols - gp[4] < 16) ? cols - gp[4] : 16;
+          dn <= (cols - gp[4] < 32) ? cols - gp[4] : 32;
           mclr <= 1'b1;
           if (next0 < cols) begin
             g0 <= next0; wbase <= wbase + depth; issuing <= 1'b1;
@@ -126,7 +126,7 @@ module projn (
       end
 
       if (dj != dn) begin
-        c_addr <= cap0 + dj; dsel <= dj[3:0]; dva <= 1'b1;
+        c_addr <= cap0 + dj; dsel <= dj[4:0]; dva <= 1'b1;
         didx <= cap0 + dj; dj <= dj + 1;
       end else dva <= 1'b0;
       dvb <= dva; dselb <= dsel; didxb <= didx;
@@ -141,7 +141,7 @@ module projn (
         dj <= 0; dn <= 0; pend <= 1'b0;
       end else if (busy && !issuing && !v1 && lastp == 0 && !pend
                    && dj == dn && outst == 0 && !rq_vin && !mclr && !dva && !dvb
-                   && g0 + 16 >= cols) begin
+                   && g0 + 32 >= cols) begin
         busy <= 1'b0;
       end
     end

@@ -35,15 +35,30 @@ def widths(core_src):
         m = re.search(r"\[(\d+):0\]\s+%s\b" % name, core_src)
         return int(m.group(1)) + 1
     out = {n: w(n) for n in ("tok", "pos", "w_addr", "c_addr", "g_addr",
-                              "k_raddr", "v_raddr", "c_data")}
+                              "k_raddr", "v_raddr", "c_data", "w_data")}
+    out["N"] = out["w_data"] // 16         # lanes
     if "input emb_en" in core_src:
         out["x_addr"] = w("x_addr")          # a pipeline stage's core
     return out
 
 
-def render_top(W, gwords, cb, kb, vb, np_=4, wbase=0):
+def _bits(v, hi, lo):
+    return "%s[%d]" % (v, hi) if hi == lo else "%s[%d:%d]" % (v, hi, lo)
+
+
+def render_top(W, gwords, cb, kb, vb, np_=4, wbase=0, ns=32):
+    """The bridge for a core of N lanes: a weight word is N int8s in DDR
+    and a KV word N 16-bit lanes. Weight lines are one 8-beat burst, 64
+    bytes, and KV lines one 16-beat burst, 128, so both hold 64 / N
+    words."""
     wa, ca, ga, ka, va = (W["w_addr"], W["c_addr"], W["g_addr"],
                           W["k_raddr"], W["v_raddr"])
+    n = W["N"]
+    assert n in (8, 16, 32)
+    lb = (n - 1).bit_length()                # lane index bits
+    wpl = 64 // n                            # words a line
+    wlb = max(1, (wpl - 1).bit_length())
+    kbb = (n // 4 - 1).bit_length()          # beat bits within a KV word
     stage = "x_addr" in W
     sports = ("  // A pipeline stage: the hidden state in and out, on the core's edges.\n"
               "  input emb_en, input x_we, input [%d:0] x_addr, input signed [15:0] x_wdata,\n"
@@ -85,9 +100,9 @@ module qwen_zybo (
   wire [{kam}:0] k_raddr, kw0_addr, kw1_addr;
   wire [{vam}:0] v_raddr, vw_addr;
   wire kw0_en, kw1_en, vw_en;
-  wire [3:0] kw0_lane, kw1_lane, vw_lane;
+  wire [{lbm}:0] kw0_lane, kw1_lane, vw_lane;
   wire signed [15:0] kw0_data, kw1_data, vw_data;
-  wire [255:0] w_data, k_rdata, v_rdata;
+  wire [{lwm}:0] w_data, k_rdata, v_rdata;
   wire [{cdm}:0] c_data;
   reg signed [15:0] g_data;
   qwen_full core (.clk(cclk), .rst_n(rst_n), .start(start), .head_en(head_en),
@@ -106,18 +121,18 @@ module qwen_zybo (
   // ---- line buffers: the address each port was given at the core's
   // last edge, and the line that holds it.
   reg [{wam}:0] wq; reg [{cam}:0] cq; reg [{kam}:0] kq; reg [{vam}:0] vq;
-  reg [255:0] kl [0:3], vl [0:3];
+  reg [{lwm}:0] kl [0:{kpm}], vl [0:{kpm}];
   reg [63:0] cl [0:15];
   reg [{cam}:0] cbase; reg [{kam}:0] kbl; reg [{vam}:0] vbl;
   reg cv, kv, vv;
 
 {streamer}  wire hc = cv && (cq >> 4) == (cbase >> 4);
-  wire hk = kv && (kq >> 2) == (kbl >> 2);
-  wire hv = vv && (vq >> 2) == (vbl >> 2);
+  wire hk = kv && (kq >> {wlb}) == (kbl >> {wlb});
+  wire hv = vv && (vq >> {wlb}) == (vbl >> {wlb});
 {wdata}
   assign c_data = cl[cq[3:0]][{cdm}:0];
-  assign k_rdata = kl[kq[1:0]];
-  assign v_rdata = vl[vq[1:0]];
+  assign k_rdata = kl[kq[{wlbm}:0]];
+  assign v_rdata = vl[vq[{wlbm}:0]];
 
   // Writes the core has issued since its last edge, not yet on the bus.
   reg d0, d1, d2;
@@ -132,10 +147,10 @@ module qwen_zybo (
   reg [3:0] beat;
   reg [1:0] wsel;
   reg [{kam}:0] waddr_w;
-  reg [3:0] wlane;
+  reg [{lbm}:0] wlane;
   reg signed [15:0] wval;
   reg wisv;
-  wire [255:0] lane_mask = 256'hffff << (wlane * 16);
+  wire [{lwm}:0] lane_mask = {lw}'hffff << (wlane * 16);
   always @(posedge clk) begin
     if (!rst_n) begin
       fs <= F_IDLE; arvalid <= 1'b0; awvalid <= 1'b0; wvalid <= 1'b0;
@@ -146,7 +161,7 @@ module qwen_zybo (
       // memory would, and clear the write flags for its new outputs.
       if (ce_l) begin
         wq <= w_addr; cq <= c_addr; kq <= k_raddr; vq <= v_raddr;
-        curns <= (w_addr >> 2) + NS;
+        curns <= (w_addr >> {wlb}) + NS;
         g_data <= gmem[g_addr];
         d0 <= 1'b0; d1 <= 1'b0; d2 <= 1'b0;
         core_cycles <= core_cycles + 1;
@@ -161,17 +176,17 @@ module qwen_zybo (
             wval <= p0 ? kw0_data : p1 ? kw1_data : vw_data;
             wisv <= !(p0 || p1);
             awaddr <= (p0 || p1 ? 32'd{kb} : 32'd{vb})
-                      + (p0 ? kw0_addr : p1 ? kw1_addr : vw_addr) * 32
+                      + (p0 ? kw0_addr : p1 ? kw1_addr : vw_addr) * {kvb}
                       + ((p0 ? kw0_lane : p1 ? kw1_lane : vw_lane) >> 2) * 8;
             awvalid <= 1'b1; fs <= F_AW;
           end else if (!hc) begin
             port <= 2'd1; araddr <= 32'd{cb} + (cq >> 4) * 128; cbase <= cq; cv <= 1'b0;
             arvalid <= 1'b1; beat <= 0; fs <= F_AR;
           end else if (!hk) begin
-            port <= 2'd2; araddr <= 32'd{kb} + (kq >> 2) * 128; kbl <= kq; kv <= 1'b0;
+            port <= 2'd2; araddr <= 32'd{kb} + (kq >> {wlb}) * 128; kbl <= kq; kv <= 1'b0;
             arvalid <= 1'b1; beat <= 0; fs <= F_AR;
           end else if (!hv) begin
-            port <= 2'd3; araddr <= 32'd{vb} + (vq >> 2) * 128; vbl <= vq; vv <= 1'b0;
+            port <= 2'd3; araddr <= 32'd{vb} + (vq >> {wlb}) * 128; vbl <= vq; vv <= 1'b0;
             arvalid <= 1'b1; beat <= 0; fs <= F_AR;
           end
         end
@@ -179,8 +194,8 @@ module qwen_zybo (
         F_R: if (rvalid) begin
           case (port)
             2'd1: cl[beat] <= rdata;
-            2'd2: kl[beat[3:2]][beat[1:0] * 64 +: 64] <= rdata;
-            2'd3: vl[beat[3:2]][beat[1:0] * 64 +: 64] <= rdata;
+            2'd2: kl[{kbw}][{kbp} * 64 +: 64] <= rdata;
+            2'd3: vl[{kbw}][{kbp} * 64 +: 64] <= rdata;
           endcase
           beat <= beat + 1;
           if (rlast) begin
@@ -194,12 +209,12 @@ module qwen_zybo (
           wdata <= {{48'd0, wval}} << (wlane[1:0] * 16);
           wstrb <= 8'b11 << (wlane[1:0] * 2);
           // A line already holding this word takes the write too.
-          if (!wisv && kv && (waddr_w >> 2) == (kbl >> 2))
-            kl[waddr_w[1:0]] <= (kl[waddr_w[1:0]] & ~lane_mask)
-                                | ({{240'd0, wval}} << (wlane * 16));
-          if (wisv && vv && (waddr_w >> 2) == (vbl >> 2))
-            vl[waddr_w[1:0]] <= (vl[waddr_w[1:0]] & ~lane_mask)
-                                | ({{240'd0, wval}} << (wlane * 16));
+          if (!wisv && kv && (waddr_w >> {wlb}) == (kbl >> {wlb}))
+            kl[waddr_w[{wlbm}:0]] <= (kl[waddr_w[{wlbm}:0]] & ~lane_mask)
+                                | ({{{pad}'d0, wval}} << (wlane * 16));
+          if (wisv && vv && (waddr_w >> {wlb}) == (vbl >> {wlb}))
+            vl[waddr_w[{wlbm}:0]] <= (vl[waddr_w[{wlbm}:0]] & ~lane_mask)
+                                | ({{{pad}'d0, wval}} << (wlane * 16));
           fs <= F_W;
         end
         F_W: if (wready) begin wvalid <= 1'b0; fs <= F_B; end
@@ -214,13 +229,15 @@ module qwen_zybo (
 endmodule
 """.format(twm=W["tok"] - 1, pwm=W["pos"] - 1, wam=wa - 1, cam=ca - 1,
            gam=ga - 1, kam=ka - 1, vam=va - 1, gn=gwords - 1, cb=cb, kb=kb,
-           vb=vb, streamer=render_streamer(np_, wa - 1, wbase=wbase),
+           vb=vb, streamer=render_streamer(np_, wa - 1, ns=ns, wbase=wbase, n=n),
            sports=sports, sconn=sconn, cdm=W["c_data"] - 1,
-           wports=render_wports(np_)[0], wassign=render_wports(np_)[1],
-           wdata=render_wports(np_)[2])
+           wports=render_wports(np_, n)[0], wassign=render_wports(np_, n)[1],
+           wdata=render_wports(np_, n)[2], lbm=lb - 1, lwm=16 * n - 1,
+           lw=16 * n, pad=16 * n - 16, kpm=wpl - 1, wlb=wlb, wlbm=wlb - 1,
+           kvb=2 * n, kbw=_bits("beat", 3, kbb), kbp=_bits("beat", kbb - 1, 0))
 
 
-def render_streamer(np_, wam, ns=32, wbase=0):
+def render_streamer(np_, wam, ns=32, wbase=0, n=16):
     """The weight streamer over np_ read masters: line L on master L % np_,
     ns slots, slot s always filled through master s % np_, so each slot's
     requests and responses stay in one in-order stream. Slot memory is
@@ -229,6 +246,9 @@ def render_streamer(np_, wam, ns=32, wbase=0):
     the latency: 2.77 bus cycles a core cycle. 32 gives each eight."""
     per = ns // np_
     sb = (ns - 1).bit_length()
+    wpl = 64 // n                   # weight words a 64-byte line
+    wlb = (wpl - 1).bit_length()
+    bb = (n // 8 - 1).bit_length()  # beat bits within a word
     L = []
     a = L.append
     a("  // ---- the weight streamer: %d line slots, direct mapped, filled up" % ns)
@@ -237,10 +257,17 @@ def render_streamer(np_, wam, ns=32, wbase=0):
     a("  // master only, so a line requested later always lands later.")
     a("  localparam NS = %d, MAXO = 8;" % ns)
     for p in range(np_):
-        a("  reg [127:0] swb%d [0:%d];" % (p, per * 4 - 1))
+        a("  reg [%d:0] swb%d [0:%d];" % (8 * n - 1, p, per * wpl - 1))
     a("  reg [%d:0] stag [0:NS - 1];" % wam)
     a("  reg sval [0:NS - 1];")
-    a("  wire [%d:0] cur = wq >> 2;" % wam)
+    a("  // A slot with a burst still in flight takes no second request: two")
+    a("  // for one slot (X, then Y after the stream moved on, then X again")
+    a("  // after a jump back) let X's first copy mark the slot valid and")
+    a("  // Y's beats then overwrite it, and the core read Y's weights as X's.")
+    a("  // With one burst a slot, the only one that can land in a slot is")
+    a("  // the line its tag names.")
+    a("  reg pend [0:NS - 1];")
+    a("  wire [%d:0] cur = wq >> %d;" % (wam, wlb))
     a("  wire [%d:0] cs = cur[%d:0];" % (sb - 1, sb - 1))
     a("  wire hw = sval[cs] && stag[cs] == cur;")
     a("  reg [%d:0] nreq;" % wam)
@@ -263,7 +290,20 @@ def render_streamer(np_, wam, ns=32, wbase=0):
     a("  reg jl;")
     a("  wire jumped = jl || (cur != pcur && cur != pcur1) || nreq < cur")
     a("               || nreq > curns;")
-    a("  wire have = sval[ns] && stag[ns] == nreq;")
+    a("  // What the stream knows of the slot nreq names, registered: its tag")
+    a("  // is nreq (tm_r), the line is held or on its way (sp_r), a burst is")
+    a("  // still in flight to it (pd_r). Each is computed a cycle ahead for")
+    a("  // the line nreq moves to, the next one or the core's on a restart,")
+    a("  // so the issue decision reads flip-flops rather than a 32-way tag")
+    a("  // mux and compare: that path, into every tag's enable, held the")
+    a("  // 32-lane ZC706 build's bus clock to 47 MHz. tm_r and sp_r are")
+    a("  // exact; pd_r can lag a landing burst by a cycle, which only")
+    a("  // delays an issue, never lets one into a slot still in flight.")
+    a("  reg tm_r, sp_r, pd_r;")
+    a("  wire [%d:0] ns1 = ns + 1'b1;" % (sb - 1))
+    a("  wire [%d:0] cs_ = cur[%d:0];" % (sb - 1, sb - 1))
+    a("  // Held, or on its way: either way the stream moves past it.")
+    a("  wire have = tm_r && sp_r;")
     anyv = " || ".join("w%d_arvalid" % p for p in range(np_))
     a("  wire anyv = %s;" % anyv)
     for p in range(np_):
@@ -278,10 +318,11 @@ def render_streamer(np_, wam, ns=32, wbase=0):
     a("  always @(posedge clk) begin")
     a("    if (!rst_n) begin")
     a("      nreq <= 0; pcur <= 0; pcur1 <= 1; jl <= 1'b0;")
+    a("      tm_r <= 1'b1; sp_r <= 1'b0; pd_r <= 1'b0;")
     for p in range(np_):
         a("      w%d_arvalid <= 1'b0; out%d <= 0; ih%d <= 0; it%d <= 0; wb%d <= 0;"
           % (p, p, p, p, p))
-    a("      for (si = 0; si < NS; si = si + 1) begin sval[si] <= 1'b0; stag[si] <= 0; end")
+    a("      for (si = 0; si < NS; si = si + 1) begin sval[si] <= 1'b0; pend[si] <= 1'b0; stag[si] <= 0; end")
     a("    end else begin")
     for p in range(np_):
         a("      if (w%d_arvalid && w%d_arready) w%d_arvalid <= 1'b0;" % (p, p, p))
@@ -289,27 +330,34 @@ def render_streamer(np_, wam, ns=32, wbase=0):
     a("      // restart the stream at the core's line.")
     a("      pcur <= cur; pcur1 <= cur + 1;")
     a("      jl <= jumped && anyv;")
-    a("      if (jumped && !anyv) nreq <= cur;")
-    a("      else if (in_win && have) nreq <= nreq + 1;")
-    a("      else if (in_win) begin")
+    a("      // nreq held: its slot's flags stand, but a burst may land.")
+    a("      pd_r <= pend[ns];")
+    a("      if (jumped && !anyv) begin")
+    a("        nreq <= cur;")
+    a("        tm_r <= stag[cs_] == cur; sp_r <= sval[cs_] || pend[cs_]; pd_r <= pend[cs_];")
+    a("      end else if (in_win && have) begin")
+    a("        nreq <= nreq + 1;")
+    a("        tm_r <= stag[ns1] == nreq + 1; sp_r <= sval[ns1] || pend[ns1]; pd_r <= pend[ns1];")
+    a("      end else if (in_win) begin")
     a("        case (np_sel)")
     for p in range(np_):
-        a("          %d: if (!w%d_arvalid && out%d < MAXO) begin" % (p, p, p))
+        a("          %d: if (!w%d_arvalid && out%d < MAXO && !pd_r) begin" % (p, p, p))
         a("            w%d_araddr <= 32'd%d + nreq * 64; w%d_arvalid <= 1'b1;" % (p, wbase, p))
-        a("            sval[ns] <= 1'b0; stag[ns] <= nreq;")
+        a("            sval[ns] <= 1'b0; pend[ns] <= 1'b1; stag[ns] <= nreq;")
         a("            inf%d[it%d] <= nreq; it%d <= it%d + 1; nreq <= nreq + 1;" % (p, p, p, p))
+        a("            tm_r <= stag[ns1] == nreq + 1; sp_r <= sval[ns1] || pend[ns1]; pd_r <= pend[ns1];")
         a("          end")
     a("          default: ;")
     a("        endcase")
     a("      end")
     for p in range(np_):
         a("      if (w%d_rvalid) begin" % p)
-        a("        swb%d[(inf%d[ih%d][%d:0] / %d) * 4 + wb%d[2:1]][wb%d[0] * 64 +: 64] <= w%d_rdata;"
-          % (p, p, p, sb - 1, np_, p, p, p))
+        a("        swb%d[(inf%d[ih%d][%d:0] / %d) * %d + %s][%s * 64 +: 64] <= w%d_rdata;"
+          % (p, p, p, sb - 1, np_, wpl, _bits("wb%d" % p, 2, bb), _bits("wb%d" % p, bb - 1, 0), p))
         a("        wb%d <= wb%d + 1;" % (p, p))
         a("        if (w%d_rlast) begin" % p)
-        a("          if (stag[inf%d[ih%d][%d:0]] == inf%d[ih%d]) sval[inf%d[ih%d][%d:0]] <= 1'b1;"
-          % (p, p, sb - 1, p, p, p, p, sb - 1))
+        a("          sval[inf%d[ih%d][%d:0]] <= 1'b1; pend[inf%d[ih%d][%d:0]] <= 1'b0;"
+          % (p, p, sb - 1, p, p, sb - 1))
         a("          ih%d <= ih%d + 1;" % (p, p))
         a("        end")
         a("      end")
@@ -324,7 +372,7 @@ def render_streamer(np_, wam, ns=32, wbase=0):
     return "\n".join(L) + "\n"
 
 
-def render_wports(np_):
+def render_wports(np_, n=16):
     ports = "".join(
         "  output reg [31:0] w%d_araddr, output [3:0] w%d_arlen, output reg w%d_arvalid,\n"
         "  input w%d_arready, input [63:0] w%d_rdata, input w%d_rvalid, input w%d_rlast,\n"
@@ -332,16 +380,18 @@ def render_wports(np_):
     assign = " ".join("assign w%d_arlen = 4'd7; assign w%d_rready = 1'b1;" % (p, p)
                       for p in range(np_))
     sel = "cs %% %d" % np_
-    arms = " : ".join("(%s == %d) ? swb%d[(cs / %d) * 4 + wq[1:0]]" % (sel, p, p, np_)
+    wpl = 64 // n
+    wsel = _bits("wq", (wpl - 1).bit_length() - 1, 0)
+    arms = " : ".join("(%s == %d) ? swb%d[(cs / %d) * %d + %s]" % (sel, p, p, np_, wpl, wsel)
                       for p in range(np_ - 1))
-    last = "swb%d[(cs / %d) * 4 + wq[1:0]]" % (np_ - 1, np_)
-    # DDR holds the weights as int8, 16 to a 128-bit word; the core's
-    # word has them in 16-bit lanes, so each byte is sign-extended here.
-    # Half the memory, and half the bus traffic, of storing the lanes.
+    last = "swb%d[(cs / %d) * %d + %s]" % (np_ - 1, np_, wpl, wsel)
+    # DDR holds the weights as int8, N to a word; the core's word has
+    # them in 16-bit lanes, so each byte is sign-extended here. Half the
+    # memory, and half the bus traffic, of storing the lanes.
     ext = ", ".join("{{8{wpk[%d]}}, wpk[%d:%d]}" % (8 * j + 7, 8 * j + 7, 8 * j)
-                    for j in range(15, -1, -1))
-    wdata = ("  wire [127:0] wpk = %s;\n  assign w_data = {%s};"
-             % ((arms + " : " + last) if np_ > 1 else last, ext))
+                    for j in range(n - 1, -1, -1))
+    wdata = ("  wire [%d:0] wpk = %s;\n  assign w_data = {%s};"
+             % (8 * n - 1, (arms + " : " + last) if np_ > 1 else last, ext))
     return ("  // Weights: their own read masters, streaming ahead of the core.\n"
             + ports), "  " + assign, wdata
 
@@ -369,11 +419,10 @@ module tb_zybo;
   // ---- DDR: weights from the image on disk, the rest in arrays
   reg [63:0] cmem [0:%(cn)d];
   reg [%(cdm)d:0] c62 [0:%(cn)d];
-  reg [255:0] km [0:%(kn)d];
-  reg [255:0] vm [0:%(vn)d];
-  integer fd, fd8, r, i, cyc = 0, t0 = 0, c0 = 0, lat;
-  reg [255:0] wword, t;
-  integer wlast_ = -1;
+  reg [%(LW)d:0] km [0:%(kn)d];
+  reg [%(LW)d:0] vm [0:%(vn)d];
+  integer fd8, r, i, cyc = 0, t0 = 0, c0 = 0, lat;
+  reg [%(LW)d:0] t;
   reg [31:0] ra;
   reg [3:0] rn;
   always @(posedge clk) cyc = cyc + 1;
@@ -382,18 +431,13 @@ module tb_zybo;
     $display("PROGRESS clk=%%0d core=%%0d bus_state=%%0d", cyc, core_cycles, %(fs)s);
     $fflush;
   end
+  // This master reads the constants and the KV cache; the weights
+  // have their own.
   function [63:0] beat_at(input [31:0] a);
-    integer w_;
     begin
-      if (a < %(cb)d) begin
-        w_ = (a - %(wb)d) / 32;
-        if (w_ != wlast_) begin
-          r = $fseek(fd, w_ * 32, 0); r = $fread(wword, fd); wlast_ = w_;
-        end
-        beat_at = wword[(((a - %(wb)d) %% 32) / 8) * 64 +: 64];
-      end else if (a < %(kb)d) beat_at = cmem[(a - %(cb)d) / 8];
-      else if (a < %(vb)d) begin t = km[(a - %(kb)d) / 32]; beat_at = t[((a %% 32) / 8) * 64 +: 64]; end
-      else begin t = vm[(a - %(vb)d) / 32]; beat_at = t[((a %% 32) / 8) * 64 +: 64]; end
+      if (a < %(kb)d) beat_at = cmem[(a - %(cb)d) / 8];
+      else if (a < %(vb)d) begin t = km[(a - %(kb)d) / %(KB)d]; beat_at = t[((a %% %(KB)d) / 8) * 64 +: 64]; end
+      else begin t = vm[(a - %(vb)d) / %(KB)d]; beat_at = t[((a %% %(KB)d) / 8) * 64 +: 64]; end
     end
   endfunction
   // Reads: address accepted, then %(lat)d cycles of latency, then the burst.
@@ -419,7 +463,7 @@ module tb_zybo;
   end
 %(wresp)s  // Writes: one beat, strobed, into the KV arrays.
   reg [31:0] wa;
-  reg [255:0] tw;              // not t: the read process's function uses t
+  reg [%(LW)d:0] tw;              // not t: the read process's function uses t
   integer b, base;
   initial begin
     @(posedge rst_n);
@@ -429,16 +473,15 @@ module tb_zybo;
       awready <= 1; wa = awaddr; @(posedge clk); awready <= 0;
       while (wvalid !== 1'b1) @(posedge clk);
       wready <= 1;
-      if (wa >= %(vb)d) begin tw = vm[(wa - %(vb)d) / 32]; base = ((wa - %(vb)d) %% 32) * 8; end
-      else begin tw = km[(wa - %(kb)d) / 32]; base = ((wa - %(kb)d) %% 32) * 8; end
+      if (wa >= %(vb)d) begin tw = vm[(wa - %(vb)d) / %(KB)d]; base = ((wa - %(vb)d) %% %(KB)d) * 8; end
+      else begin tw = km[(wa - %(kb)d) / %(KB)d]; base = ((wa - %(kb)d) %% %(KB)d) * 8; end
       for (b = 0; b < 8; b = b + 1) if (wstrb[b]) tw[base + b * 8 +: 8] = wdata[b * 8 +: 8];
-      if (wa >= %(vb)d) vm[(wa - %(vb)d) / 32] = tw; else km[(wa - %(kb)d) / 32] = tw;
+      if (wa >= %(vb)d) vm[(wa - %(vb)d) / %(KB)d] = tw; else km[(wa - %(kb)d) / %(KB)d] = tw;
       @(posedge clk); wready <= 0;
       repeat (4) @(posedge clk); bvalid <= 1; @(posedge clk); bvalid <= 0;
     end
   end
 %(step)s  initial begin
-    fd = $fopen("weights.bin", "rb");
     fd8 = $fopen("weights8.bin", "rb");
     // Without it every weight read is X, and the timing, which does
     // not depend on the data, would still look right.
@@ -472,8 +515,7 @@ def render_tb_weights(np_, lat, wbase=0):
         resp.append("""  reg [31:0] qa%(p)d [0:15];
   integer qt%(p)d [0:15];
   integer qh%(p)d = 0, qn%(p)d = 0, j%(p)d;
-  reg [127:0] ww%(p)d;
-  integer wl%(p)d = -1;
+  reg [63:0] ww%(p)d;
   always @(posedge clk) if (JIT) w%(p)d_arready <= {$random} %% 4 != 0;
   always @(posedge clk) if (rst_n && w%(p)d_arvalid && w%(p)d_arready) begin
     qa%(p)d[qn%(p)d %% 16] = w%(p)d_araddr; qt%(p)d[qn%(p)d %% 16] = cyc; qn%(p)d = qn%(p)d + 1;
@@ -487,11 +529,13 @@ def render_tb_weights(np_, lat, wbase=0):
           while (JIT && {$random} %% 4 == 0) begin
             w%(p)d_rvalid <= 0; w%(p)d_rlast <= 0; @(posedge clk);
           end
-          if ((qa%(p)d[qh%(p)d %% 16] - %(wb)d + j%(p)d * 8) / 16 != wl%(p)d) begin
-            wl%(p)d = (qa%(p)d[qh%(p)d %% 16] - %(wb)d + j%(p)d * 8) / 16;
-            r = $fseek(fd8, wl%(p)d * 16, 0); r = $fread(ww%(p)d, fd8);
-          end
-          w%(p)d_rdata <= ww%(p)d[(((qa%(p)d[qh%(p)d %% 16] + j%(p)d * 8) %% 16) / 8) * 64 +: 64];
+          // The eight bytes at this beat's address, the lowest on
+          // rdata[7:0] as AXI has them; $fread puts the first byte high.
+          // Every port shares the file, so every beat seeks.
+          r = $fseek(fd8, qa%(p)d[qh%(p)d %% 16] - %(wb)d + j%(p)d * 8, 0);
+          r = $fread(ww%(p)d, fd8);
+          w%(p)d_rdata <= {ww%(p)d[7:0], ww%(p)d[15:8], ww%(p)d[23:16], ww%(p)d[31:24],
+                        ww%(p)d[39:32], ww%(p)d[47:40], ww%(p)d[55:48], ww%(p)d[63:56]};
           w%(p)d_rvalid <= 1; w%(p)d_rlast <= (j%(p)d == 7);
           @(posedge clk);
         end
@@ -528,20 +572,46 @@ STEP = """  task step(input integer tk, input integer p, input integer he);
 """
 
 
+def lanes(work):
+    """The core's lane count, from the w_data port it declares."""
+    core = open(os.path.join(work, "qwen_full.v")).read()
+    return int(re.search(r"input \[(\d+):0\] w_data", core).group(1)) // 16 + 1
+
+
+def _w8_block(blk, n):
+    """weights.bin words to DDR bytes: lane j's low byte, the int8, at
+    byte j of its word. The ARM copies the file into DDR byte for byte
+    and AXI is little-endian, so byte j reaches the core as w_data lane
+    j. weights.bin is in $fread's order, lane n - 1 first."""
+    out = bytearray(len(blk) // 2)
+    for j in range(n):
+        out[j::n] = blk[(n - 1 - j) * 2 + 1::2 * n]
+    return out
+
+
 def write_w8(work):
-    """The DDR image: each 16-bit lane's low byte, int8, 16 to a word. In
-    weights.bin lane j's low byte is every other byte, so this is a
-    slice, and the byte order $fread reads is kept."""
-    words = os.path.getsize(os.path.join(work, "weights.bin")) // 32
+    """The DDR image of the weights, int8, one N-byte word per core word
+    (see _w8_block). Rewritten when the one on disk is not this build's,
+    by size or by its first megabyte."""
+    n = lanes(work)
+    src = os.path.join(work, "weights.bin")
     w8 = os.path.join(work, "weights8.bin")
-    if not os.path.exists(w8) or os.path.getsize(w8) != words * 16:
-        with open(os.path.join(work, "weights.bin"), "rb") as f, \
-                open(w8, "wb") as g:
-            while True:
-                blk = f.read(32 << 20)
-                if not blk:
-                    break
-                g.write(blk[1::2])
+    with open(src, "rb") as f:
+        head = _w8_block(f.read(2 << 20), n)
+    if os.path.exists(w8) and os.path.getsize(w8) == os.path.getsize(src) // 2:
+        with open(w8, "rb") as g:
+            if g.read(len(head)) == head:
+                return w8
+    tmp = w8 + ".tmp"
+    with open(src, "rb") as f, open(tmp, "wb") as g:
+        while True:
+            blk = f.read(32 << 20)
+            if not blk:
+                break
+            g.write(_w8_block(blk, n))
+    # A new file, not the old one rewritten: an SD card's hard link to
+    # the old image is then seen to be stale.
+    os.replace(tmp, w8)
     return w8
 
 
@@ -552,15 +622,17 @@ def layout(work, base=0):
     core = open(os.path.join(work, "qwen_full.v")).read()
     old = open(os.path.join(work, "tb_qfull.v")).read()
     size = lambda name: int(re.search(r"%s \[0:(\d+)\]" % name, old).group(1)) + 1
+    n = lanes(work)
     L = dict(W=widths(core), cn=size("cmem"), gn=size("gmem"),
-             kn=size("km"), vn=size("vm"),
-             words=os.path.getsize(os.path.join(work, "weights.bin")) // 32)
+             kn=size("km"), vn=size("vm"), N=n,
+             words=os.path.getsize(os.path.join(work, "weights.bin")) // (2 * n))
     align = lambda x: (x + 4095) // 4096 * 4096
+    # A weight word is n int8s in DDR; a KV word n 16-bit lanes.
     L["wb"] = base
-    L["cb"] = align(base + L["words"] * 16)
+    L["cb"] = align(base + L["words"] * n)
     L["kb"] = align(L["cb"] + L["cn"] * 8)
-    L["vb"] = align(L["kb"] + L["kn"] * 32)
-    L["end"] = align(L["vb"] + L["vn"] * 32)
+    L["vb"] = align(L["kb"] + L["kn"] * 2 * n)
+    L["end"] = align(L["vb"] + L["vn"] * 2 * n)
     L["steps"] = [tuple(int(v) for v in re.findall(r"-?\d+", l))
                   for l in old.splitlines() if l.strip().startswith("step(")]
     return L
@@ -571,6 +643,7 @@ def tb_text(L, np_, lat, dut=DUT, step=STEP, fs="dut.fs", jit=0):
     W = L["W"]
     return TB % dict(twm=W["tok"] - 1, pwm=W["pos"] - 1, cn=L["cn"] - 1, cdm=W["c_data"] - 1,
                      kn=L["kn"] - 1, vn=L["vn"] - 1, wb=L["wb"], cb=L["cb"],
+                     LW=16 * L["N"] - 1, KB=2 * L["N"],
                      kb=L["kb"], vb=L["vb"], lat=lat, wdecl=wd, jit=jit,
                      wresp=wr, dut=dut % dict(wconn=wc), step=step, fs=fs,
                      steps="\n".join("    step(%d, %d, %d);" % s

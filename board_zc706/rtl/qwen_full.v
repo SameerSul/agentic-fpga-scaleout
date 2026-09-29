@@ -4,16 +4,16 @@
 module qwen_full (
   input clk, input rst_n, input start, input head_en,
   input [17:0] tok, input [7:0] pos,
-  output [24:0] w_addr, input [255:0] w_data,
+  output [23:0] w_addr, input [511:0] w_data,
   output [19:0] c_addr, input [61:0] c_data,
   output [15:0] g_addr, input signed [15:0] g_data,
-  output [15:0] k_raddr, input [255:0] k_rdata,
-  output [15:0] v_raddr, input [255:0] v_rdata,
-  output reg kw0_en, output reg [15:0] kw0_addr, output reg [3:0] kw0_lane,
+  output [14:0] k_raddr, input [511:0] k_rdata,
+  output [14:0] v_raddr, input [511:0] v_rdata,
+  output reg kw0_en, output reg [14:0] kw0_addr, output reg [4:0] kw0_lane,
   output reg signed [15:0] kw0_data,
-  output reg kw1_en, output reg [15:0] kw1_addr, output reg [3:0] kw1_lane,
+  output reg kw1_en, output reg [14:0] kw1_addr, output reg [4:0] kw1_lane,
   output reg signed [15:0] kw1_data,
-  output reg vw_en, output reg [15:0] vw_addr, output reg [3:0] vw_lane,
+  output reg vw_en, output reg [14:0] vw_addr, output reg [4:0] vw_lane,
   output reg signed [15:0] vw_data,
   output reg [17:0] next_tok, output reg signed [15:0] best,
   output reg done, output reg busy
@@ -42,7 +42,7 @@ module qwen_full (
   reg pj_start;
   reg [12:0] pj_depth, pj_cols;
   wire [12:0] pj_a_addr, pj_c_addr, pj_index;
-  wire [20:0] pj_w_addr;
+  wire [19:0] pj_w_addr;
   reg signed [15:0] pj_a_data;
   wire pj_valid, pj_busy;
   wire signed [15:0] pj_data;
@@ -68,8 +68,8 @@ module qwen_full (
   reg [4:0] at_shs;
   reg [17:0] at_scale;
   reg [6:0] at_shift;
-  wire [9:0] at_k_addr;
-  wire [9:0] at_v_addr;
+  wire [8:0] at_k_addr;
+  wire [8:0] at_v_addr;
   wire at_valid, at_busy;
   wire [5:0] at_index;
   wire signed [15:0] at_data;
@@ -196,9 +196,9 @@ module qwen_full (
     endcase
   end
 
-  wire [24:0] lw = lyr * 931840;
+  wire [23:0] lw = lyr * 465920;
   wire [19:0] lcb = lyr * 12672;
-  reg [24:0] wbase;
+  reg [23:0] wbase;
   reg [19:0] cbase;
   reg [15:0] gbase;
   reg [12:0] expect_n;
@@ -208,18 +208,18 @@ module qwen_full (
     expect_n = 896; rn_scale = 0; rn_shift = 0; ra_sa = 0; ra_sb = 0; ra_sh = 0;
     at_shs = c_shs; at_scale = c_ctxs; at_shift = c_ctxh;
     case (st)
-      S_EMB: begin wbase = 22364160 + (tok_r >> 4) * 896; cbase = 456064 + tok_r; end
+      S_EMB: begin wbase = 11182080 + (tok_r >> 5) * 896; cbase = 456064 + tok_r; end
       S_N1: begin gbase = lyr * 1792; rn_scale = c_n1s; rn_shift = c_n1h; end
       S_N2: begin gbase = lyr * 1792 + 896; rn_scale = c_n2s; rn_shift = c_n2h; end
       S_NF: begin gbase = 43008; rn_scale = 169359; rn_shift = 25; end
       S_Q: begin wbase = lw + 0; cbase = lcb + 0; pj_depth = 896; pj_cols = 896; expect_n = 896; end
-      S_K: begin wbase = lw + 50176; cbase = lcb + 896; pj_depth = 896; pj_cols = 128; expect_n = 128; end
-      S_V: begin wbase = lw + 57344; cbase = lcb + 1024; pj_depth = 896; pj_cols = 128; expect_n = 128; end
-      S_O: begin wbase = lw + 64512; cbase = lcb + 1152; pj_depth = 896; pj_cols = 896; expect_n = 896; end
-      S_G: begin wbase = lw + 114688; cbase = lcb + 2048; pj_depth = 896; pj_cols = 4864; expect_n = 4864; end
-      S_U: begin wbase = lw + 387072; cbase = lcb + 6912; pj_depth = 896; pj_cols = 4864; expect_n = 4864; end
-      S_DN: begin wbase = lw + 659456; cbase = lcb + 11776; pj_depth = 4864; pj_cols = 896; expect_n = 896; end
-      S_HD: begin wbase = 22364160 + hk * 272384; cbase = 304128 + hk * 4864; pj_cols = hcols; expect_n = hcols; end
+      S_K: begin wbase = lw + 25088; cbase = lcb + 896; pj_depth = 896; pj_cols = 128; expect_n = 128; end
+      S_V: begin wbase = lw + 28672; cbase = lcb + 1024; pj_depth = 896; pj_cols = 128; expect_n = 128; end
+      S_O: begin wbase = lw + 32256; cbase = lcb + 1152; pj_depth = 896; pj_cols = 896; expect_n = 896; end
+      S_G: begin wbase = lw + 57344; cbase = lcb + 2048; pj_depth = 896; pj_cols = 4864; expect_n = 4864; end
+      S_U: begin wbase = lw + 193536; cbase = lcb + 6912; pj_depth = 896; pj_cols = 4864; expect_n = 4864; end
+      S_DN: begin wbase = lw + 329728; cbase = lcb + 11776; pj_depth = 4864; pj_cols = 896; expect_n = 896; end
+      S_HD: begin wbase = 11182080 + hk * 136192; cbase = 304128 + hk * 4864; pj_cols = hcols; expect_n = hcols; end
       S_R1: begin ra_sa = c_r1a; ra_sb = c_r1b; ra_sh = c_r1h; end
       S_R2: begin ra_sa = c_r2a; ra_sb = c_r2b; ra_sh = c_r2h; end
       S_ATT: expect_n = 64;
@@ -235,9 +235,9 @@ module qwen_full (
   assign c_addr = cbase + ((st == S_EMB) ? 13'd0 : pj_c_addr);
   assign g_addr = gbase + rn_g_addr;
   // The KV head this query head reads.
-  wire [15:0] kvsel = lyr * 2 + hh / 7;
-  assign k_raddr = kvsel * 1024 + at_k_addr;
-  assign v_raddr = kvsel * 1024 + at_v_addr;
+  wire [14:0] kvsel = lyr * 2 + hh / 7;
+  assign k_raddr = kvsel * 512 + at_k_addr;
+  assign v_raddr = kvsel * 512 + at_v_addr;
   always @(posedge clk) begin
     rn_x_data <= xm[rn_x_addr];
     pj_a_data <= (st == S_O) ? cm[pj_a_addr] : (st == S_DN) ? mm[pj_a_addr] : nm[pj_a_addr];
@@ -250,10 +250,10 @@ module qwen_full (
   wire [12:0] fh = fj >> 5, fp = fj & 31;
   wire [12:0] oh = ocnt >> 5, op = ocnt & 31;
   // KV cache words: keys interleaved by position, values by dimension.
-  wire [15:0] kslot = (lyr * 2 + oh) * 1024 + (pos_r >> 4) * 64;
-  wire [15:0] vslot = ((lyr * 2 + (pj_index >> 6)) * 256 + pos_r) * 4 + ((pj_index & 63) >> 4);
+  wire [14:0] kslot = (lyr * 2 + oh) * 512 + (pos_r >> 5) * 64;
+  wire [14:0] vslot = ((lyr * 2 + (pj_index >> 6)) * 256 + pos_r) * 2 + ((pj_index & 63) >> 5);
   reg ev1;
-  reg [3:0] lane_r;
+  reg [4:0] lane_r;
   wire signed [15:0] ew = w_data[lane_r * 16 +: 16];
   reg [17:0] hbase;
 
@@ -278,7 +278,7 @@ module qwen_full (
         case (st)
           S_Q: if (pj_half) qhi[pj_hadr] <= pj_data; else qlo[pj_hadr] <= pj_data;
           S_K: if (pj_half) khi[pj_hadr] <= pj_data; else klo[pj_hadr] <= pj_data;
-          S_V: begin vw_en <= 1'b1; vw_addr <= vslot; vw_lane <= pj_index[3:0];
+          S_V: begin vw_en <= 1'b1; vw_addr <= vslot; vw_lane <= pj_index[4:0];
                  vw_data <= pj_data; end
           S_O, S_DN: am[pj_index] <= pj_data;
           S_G: gm[pj_index] <= pj_data;
@@ -294,8 +294,8 @@ module qwen_full (
       if ((st == S_R1 || st == S_R2) && ra_vout) begin xm[ocnt] <= ra_y; ocnt <= ocnt + 1; end
       if (st == S_RQ && ro_vout) begin qlo[ocnt] <= ro_y1; qhi[ocnt] <= ro_y2; ocnt <= ocnt + 1; end
       if (st == S_RK && ro_vout) begin
-        kw0_en <= 1'b1; kw0_addr <= kslot + op; kw0_lane <= pos_r[3:0]; kw0_data <= ro_y1;
-        kw1_en <= 1'b1; kw1_addr <= kslot + op + 32; kw1_lane <= pos_r[3:0]; kw1_data <= ro_y2;
+        kw0_en <= 1'b1; kw0_addr <= kslot + op; kw0_lane <= pos_r[4:0]; kw0_data <= ro_y1;
+        kw1_en <= 1'b1; kw1_addr <= kslot + op + 32; kw1_lane <= pos_r[4:0]; kw1_data <= ro_y2;
         ocnt <= ocnt + 1;
       end
       if (st == S_GLU && si_vout) begin
@@ -309,7 +309,7 @@ module qwen_full (
         S_IDLE: if (start) begin
           tok_r <= tok; pos_r <= pos; hen <= head_en; busy <= 1'b1; lyr <= 0;
           hh <= 0; hk <= 0; st <= S_EMB; ed <= 0; ev1 <= 1'b0; ocnt <= 0; ph <= 1'b0;
-          lane_r <= tok[3:0];
+          lane_r <= tok[4:0];
         end
         // The embedding row out of the head's weight words, requantized
         // with this token's own constants.

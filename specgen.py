@@ -4120,6 +4120,10 @@ def derive_projn_spec(ms, board=None, per_column=False):
     lanes = 1
     while lanes < need:
         lanes *= 2
+    # A build may ask for a width of its own: the rule above counts the
+    # activation's bytes, where the DDR carries int8 weights, so on a board
+    # with DSPs to spare twice the lanes still fit its bandwidth.
+    lanes = ms.get("lanes") or lanes
     top = p["max_dim"]
     words = -(-top // lanes) * top
     p.update(per_column=bool(per_column),

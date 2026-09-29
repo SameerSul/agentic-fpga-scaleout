@@ -195,24 +195,24 @@ def _mem_block(p, w, lay, gn, half):
   reg {p}_clk = 0;
   always #{half} {p}_clk = ~{p}_clk;
   reg {p}_rst_n = 0;
-  wire [{WA}:0] {p}_w_addr; reg [255:0] {p}_w_data, {p}_wtmp;
+  wire [{WA}:0] {p}_w_addr; reg [{LW}:0] {p}_w_data, {p}_wtmp;
   wire [{CA}:0] {p}_c_addr; reg [{CW}:0] {p}_c_data;
   wire [{GA}:0] {p}_g_addr; reg signed [15:0] {p}_g_data;
   wire [{KA}:0] {p}_k_raddr, {p}_kw0_addr, {p}_kw1_addr;
   wire [{VA}:0] {p}_v_raddr, {p}_vw_addr;
-  reg [255:0] {p}_k_rdata, {p}_v_rdata, {p}_kt;
+  reg [{LW}:0] {p}_k_rdata, {p}_v_rdata, {p}_kt;
   wire {p}_kw0_en, {p}_kw1_en, {p}_vw_en;
-  wire [3:0] {p}_kw0_lane, {p}_kw1_lane, {p}_vw_lane;
+  wire [{LB}:0] {p}_kw0_lane, {p}_kw1_lane, {p}_vw_lane;
   wire signed [15:0] {p}_kw0_data, {p}_kw1_data, {p}_vw_data;
   reg [{CW}:0] {p}_cmem [0:{cn}];
   reg signed [15:0] {p}_gmem [0:{gn}];
-  reg [255:0] {p}_km [0:{kn}];
-  reg [255:0] {p}_vm [0:{vn}];
+  reg [{LW}:0] {p}_km [0:{kn}];
+  reg [{LW}:0] {p}_vm [0:{vn}];
   integer {p}_fd, {p}_r, {p}_i;
   reg [{WA}:0] {p}_wlast;
   always @(posedge {p}_clk) begin
     if ({p}_w_addr !== {p}_wlast) begin
-      if ({p}_w_addr !== {p}_wlast + 1) {p}_r = $fseek({p}_fd, {p}_w_addr * 32, 0);
+      if ({p}_w_addr !== {p}_wlast + 1) {p}_r = $fseek({p}_fd, {p}_w_addr * {WB}, 0);
       {p}_r = $fread({p}_wtmp, {p}_fd);
       {p}_wlast = {p}_w_addr;
     end
@@ -254,7 +254,8 @@ def _mem_block(p, w, lay, gn, half):
 """.format(p=p, half=half, WA=w["WA"] - 1, WA1=w["WA"], CA=w["CA"] - 1,
            CW=w["CW"] - 1, GA=w["GA"] - 1, KA=w["KA"] - 1, VA=w["VA"] - 1,
            cn=lay.cwords - 1, gn=gn - 1, kn=w["KWN"] - 1, vn=w["VWN"] - 1,
-           twm=w["tw"] - 1, pwm=w["pw"] - 1, xam=w["xa"] - 1)
+           twm=w["tw"] - 1, pwm=w["pw"] - 1, xam=w["xa"] - 1,
+           LW=16 * w["N"] - 1, LB=w["LB"] - 1, WB=2 * w["N"])
 
 
 def render_tb(stages, bit_ns, seq, n_prompt, D):
@@ -344,32 +345,49 @@ endmodule
            last=last, steps=steps, errs=errs)
 
 
-def build(im, ids, n_gen, work, split, clocks=(10.0, 7.9, 12.3), bit_ns=160.0, log=print):
+def build(im, ids, n_gen, work, split, clocks=(10.0, 7.9, 12.3), bit_ns=160.0, log=print,
+          lanes=None):
     """Build a pipeline of len(split) stages; split[i] is stage i's layers.
-    Returns the integer model's tokens and the testbench sources."""
+    lanes[i], if given, is stage i's projection width: boards of different
+    sizes in one pipeline, which only share the hidden state. Returns the
+    integer model's tokens and the testbench sources."""
     want = qr.greedy(im, ids, n_gen)
+    own = im.ms.get("lanes")
     os.makedirs(work, exist_ok=True)
     stages, srcs = [], set()
     for i, layers in enumerate(split):
         p = chr(ord("a") + i)
         d = os.path.join(work, p)
         head = i == len(split) - 1
+        if lanes:
+            im.ms["lanes"] = lanes[i]
         # Only the first and last stage need the tied table.
         _, s, w = qwen_full.build_model(im, ids, n_gen, d, log=lambda *a: None,
                                         layers=layers, stage=True, want=want,
                                         table=i == 0 or head)
+        # The blocks whose width is the stage's own get the stage's name.
         rtl = open(os.path.join(d, "qwen_full.v")).read().replace(
-            "module qwen_full (", "module qwen_full_%s (" % p, 1)
+            "module qwen_full (", "module qwen_full_%s (" % p, 1).replace(
+            "  projn u_proj (", "  projn_%s u_proj (" % p, 1).replace(
+            "  attnn u_attn (", "  attnn_%s u_attn (" % p, 1)
         with open(os.path.join(work, "qwen_full_%s.v" % p), "w") as f:
             f.write(rtl)
         for f in s:
-            if f not in ("tb_qfull.v", "qwen_full.v"):
+            if f in ("b_projn.v", "b_attnn.v"):
+                m = f[2:-2]
+                with open(os.path.join(work, "b_%s_%s.v" % (m, p)), "w") as g:
+                    g.write(open(os.path.join(d, f)).read().replace(
+                        "module %s (" % m, "module %s_%s (" % (m, p), 1))
+                srcs.add("b_%s_%s.v" % (m, p))
+            elif f not in ("tb_qfull.v", "qwen_full.v"):
                 shutil.copyfile(os.path.join(d, f), os.path.join(work, f))
                 srcs.add(f)
         w["xa"] = _clog2(im.D)
         half = clocks[i % len(clocks)] / 2
         div = int(round(bit_ns / clocks[i % len(clocks)]))
         stages.append((p, w, w["lay"], w["gn"], half, div, i == 0, head))
+    if lanes:
+        im.ms["lanes"] = own
     tw, pw = stages[0][1]["tw"], stages[0][1]["pw"]
     with open(os.path.join(work, "stage_ctrl.v"), "w") as f:
         f.write(board.UART + render_ctrl(im.D, tw, pw))

@@ -1780,7 +1780,11 @@ def test_weight_streamer_survives_stalls():
     that runs ahead, jumps back and jumps forward the way projections do.
     Every word the core is shown has to be the right one and the stream
     must never stop: a jump back while a request waited for arready used
-    to be forgotten, and the core then waited forever."""
+    to be forgotten, and the core then waited forever. With 120 jumps it
+    also passed a streamer that let two bursts be in flight for one slot,
+    which after a jump back could mark a slot valid for one line and
+    then fill it with another's beats: 1500 jumps, on two seeds, show
+    that one (4 to 31 wrong words in 88,000 on every seed tried)."""
     import zybo
     wam, base = 15, 0x08000000
     work = os.path.join(ROOT, 'build_strmtest')
@@ -1874,28 +1878,31 @@ module tb;
     else $display("TB_RESULT: PASS, %%0d words", n);
     $finish;
   end
-  initial begin #20000000; $display("TB_RESULT: FAIL, stalled"); $finish; end
+  initial begin #400000000; $display("TB_RESULT: FAIL, stalled"); $finish; end
 endmodule
 """ % (base, mem, wam, conn)
-    rng = random.Random(7)
-    segs = [(0, 900), (8, 300)]
-    for _ in range(120):
-        start = rng.choice([rng.randrange(0, 4000), rng.randrange(0, 64)])
-        segs.append((start, rng.choice([rng.randrange(1, 12), rng.randrange(20, 200)])))
-    tb = tb.replace('@NS@', str(len(segs) - 1)).replace('@SEGS@', '\n'.join(
-        '    from[%d] = %d; len[%d] = %d;' % (k, f, k, l)
-        for k, (f, l) in enumerate(segs)))
+    ok = True
     try:
         open(os.path.join(work, 'strm.v'), 'w').write(top)
-        open(os.path.join(work, 'tb.v'), 'w').write(tb)
-        r = subprocess.run(['iverilog', '-g2005', '-o', 'z.out', 'tb.v', 'strm.v'],
-                           cwd=work, capture_output=True, text=True)
-        out = r.stdout + r.stderr
-        if not r.returncode:
-            out = subprocess.run(['vvp', 'z.out'], cwd=work, capture_output=True,
-                                 text=True, timeout=300).stdout
-        check('the weight streamer never stalls under a stalling bus',
-              'TB_RESULT: PASS' in out)
+        for seed in (7, 11):
+            rng = random.Random(seed)
+            segs = [(0, 900), (8, 300)]
+            for _ in range(1500):
+                start = rng.choice([rng.randrange(0, 4000), rng.randrange(0, 64)])
+                segs.append((start, rng.choice([rng.randrange(1, 12), rng.randrange(20, 200)])))
+            open(os.path.join(work, 'tb.v'), 'w').write(
+                tb.replace('@NS@', str(len(segs) - 1)).replace('@SEGS@', '\n'.join(
+                    '    from[%d] = %d; len[%d] = %d;' % (k, f, k, l)
+                    for k, (f, l) in enumerate(segs))))
+            r = subprocess.run(['iverilog', '-g2005', '-o', 'z.out', 'tb.v', 'strm.v'],
+                               cwd=work, capture_output=True, text=True)
+            out = r.stdout + r.stderr
+            if not r.returncode:
+                out = subprocess.run(['vvp', 'z.out'], cwd=work, capture_output=True,
+                                     text=True, timeout=900).stdout
+            ok &= 'TB_RESULT: PASS' in out
+        check('the weight streamer never stalls, nor shows a wrong word, under a '
+              'stalling bus and 1500 jumps', ok)
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
@@ -1907,15 +1914,20 @@ def test_full_sequencer_both_qwens():
     v biases). Each head step's argmax and its logit have to be the
     integer model's, and a sequencer that skips Qwen3's head norms has to
     be caught, which the token alone would not do: a random tied-head
-    model keeps choosing its input token."""
+    model keeps choosing its input token. Both again at 32 lanes, the
+    ZC706's width: every lane-dependent index in the sequencer, its KV
+    cache and its embedding lookup is derived from the count."""
     import qwen_full, qwen_synth
     ids = [3, 77, 12, 140]
-    for style, mut in (('qwen3', None), ('qwen2.5', None),
-                       ('qwen3', ('S_V: st <= S_QN;', 'S_V: st <= S_RQ;'))):
+    for style, mut, lanes, kw in (
+            ('qwen3', None, None, {}), ('qwen2.5', None, None, {}),
+            ('qwen3', ('S_V: st <= S_QN;', 'S_V: st <= S_RQ;'), None, {}),
+            ('qwen3', None, 32, dict(vocab=608)),
+            ('qwen2.5', None, 32, dict(vocab=608, hidden=128))):
         work = os.path.join(ROOT, 'build_qsynthtest')
         shutil.rmtree(work, ignore_errors=True)
         try:
-            im, _ = qwen_synth.model(style)
+            im, _ = qwen_synth.model(style, lanes=lanes, **kw)
             want, srcs = qwen_full.build_model(im, ids, 3, work, log=lambda *a: None)
             im.reset()
             best = []
@@ -1941,8 +1953,61 @@ def test_full_sequencer_both_qwens():
                 check('a Qwen3 sequencer skipping the head norms is caught',
                       len(got) == len(best) and got != best)
             else:
-                check('the %s-shaped sequencer matches every logit it picks' % style,
-                      got == best and len(best) == 3)
+                check('the %s-shaped sequencer at %d lanes matches every logit it picks'
+                      % (style, qwen_full.lanes_of(im)), got == best and len(best) == 3)
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+
+
+def test_bridge_end_to_end():
+    """The generated sequencer inside the Zybo/ZC706 DDR bridge, on small
+    random checkpoints, with every DDR port stalling and gapping at
+    random: at 16 lanes and at 32 each head step has to pick the integer
+    model's token. The DDR model returns bytes in address order, lowest
+    on rdata[7:0], as the Zynq's HP ports do once the ARM has copied
+    weights8.bin in byte for byte, and byte j of each word has to be lane
+    j's int8: an image written lane N - 1 first, as the first one was,
+    has to be caught."""
+    import qwen_full, qwen_synth, zybo
+    ids = [3, 77, 12, 140]
+    for lanes, kw, mut in ((16, {}, False), (32, dict(vocab=608), False),
+                           (16, {}, True)):
+        work = os.path.join(ROOT, 'build_bridgetest')
+        shutil.rmtree(work, ignore_errors=True)
+        try:
+            im, _ = qwen_synth.model('qwen3', lanes=lanes, **kw)
+            want, _ = qwen_full.build_model(im, ids, 3, work, log=lambda *a: None)
+            w8 = zybo.write_w8(work)
+            img = open(w8, 'rb').read()
+            Q, D = im.Q['model.layers.0.self_attn.q_proj.weight'], im.D
+            order = all((img[(g * D + d) * lanes + j] ^ 0x80) - 0x80
+                        == Q[(g * lanes + j) * D + d]
+                        for g in range(2) for d in (0, 1, D - 1) for j in range(lanes))
+            if mut:
+                with open(w8, 'wb') as f:
+                    for o in range(0, len(img), lanes):
+                        f.write(img[o:o + lanes][::-1])
+            L = zybo.layout(work, 0x08000000)
+            open(os.path.join(work, 'qwen_zybo.v'), 'w').write(zybo.render_top(
+                L['W'], L['gn'], L['cb'], L['kb'], L['vb'], 4, L['wb']))
+            open(os.path.join(work, 'tb_zybo.v'), 'w').write(zybo.tb_text(L, 4, 30, jit=1))
+            srcs = sorted(f for f in os.listdir(work) if f.endswith('.v')
+                          and not f.startswith('tb_') and f != 'qwen_zybo.v')
+            r = subprocess.run(['iverilog', '-g2005', '-DSIM', '-o', 'z.out', 'tb_zybo.v',
+                                'qwen_zybo.v'] + srcs, cwd=work, capture_output=True, text=True)
+            out = r.stdout + r.stderr
+            if not r.returncode:
+                out = subprocess.run(['vvp', 'z.out'], cwd=work, capture_output=True,
+                                     text=True, timeout=900).stdout
+            got = [int(l.split('next=')[1].split()[0]) for l in out.splitlines()
+                   if l.startswith('STEP') and int(l.split('pos=')[1].split()[0]) >= len(ids) - 1]
+            if mut:
+                check('a weight image in the wrong byte order is caught on the bus',
+                      len(got) == 3 and got != want[len(ids):])
+            else:
+                check('the %d-lane core on a stalling DDR bus picks the integer model\'s '
+                      'tokens, from an image in AXI byte order' % lanes,
+                      order and got == want[len(ids):] and len(got) == 3)
         finally:
             shutil.rmtree(work, ignore_errors=True)
 
@@ -1956,19 +2021,21 @@ def test_gals_two_boards():
     host at its own rate. With two boards and with three, every token and
     logit has to be the one-board integer model's, the links must see no
     CRC error, and a link that sends the hidden state's bytes swapped is
-    caught."""
+    caught. Boards need not be alike: a pipeline of 32, 16 and 32 lanes
+    has to give the same tokens, since only the hidden state crosses."""
     import gals, qwen_synth
     ids = [3, 77, 12, 140]
     work = os.path.join(ROOT, 'build_galstest')
-    for nl, split, mut in (
-            (2, [[0], [1]], None),
-            (3, [[0], [1], [2]], None),
+    for nl, split, mut, lanes in (
+            (2, [[0], [1]], None, None),
+            (3, [[0], [1], [2]], None, None),
+            (3, [[0], [1], [2]], None, [32, 16, 32]),
             (2, [[0], [1]], ("tbyte = tx_hid ? (ti[0] ? x_rdata[7:0] : x_rdata[15:8])",
-                             "tbyte = tx_hid ? (ti[0] ? x_rdata[15:8] : x_rdata[7:0])"))):
+                             "tbyte = tx_hid ? (ti[0] ? x_rdata[15:8] : x_rdata[7:0])"), None)):
         shutil.rmtree(work, ignore_errors=True)
         try:
-            im, _ = qwen_synth.model('qwen3', nl=nl)
-            want, srcs = gals.build(im, ids, 3, work, split)
+            im, _ = qwen_synth.model('qwen3', nl=nl, vocab=608 if lanes else 600)
+            want, srcs = gals.build(im, ids, 3, work, split, lanes=lanes)
             im.reset()
             best = []
             for p in range(len(want) - 1):
@@ -1987,7 +2054,8 @@ def test_gals_two_boards():
                 check('a link that swaps the hidden state bytes is caught',
                       len(got) == len(best) and got != best)
             else:
-                check('%d boards on their own clocks give one board\'s tokens' % len(split),
+                check('%d boards on their own clocks%s give one board\'s tokens'
+                      % (len(split), ', of %s lanes,' % '/'.join(map(str, lanes)) if lanes else ''),
                       got == best and len(best) == 3 and 'LINK crc_errors=0 host_bad=0' in out)
         finally:
             shutil.rmtree(work, ignore_errors=True)
@@ -2307,7 +2375,7 @@ def test_stage_network_on_host():
             for name, src in STAGE_SHIM.items():
                 open(os.path.join(d, name), 'w').write(src)
             L = dict(W=dict(tok=18, pos=8, x_addr=10), wb=0, cb=0, cn=64, kb=0, vb=0,
-                     end=0, words=64)
+                     end=0, words=64, N=16)
             st = dict(D=D, index=i, count=2, l0=l0, l1=l1, emb=i == 0, head=i == 1,
                       ip=(127, 0, 0, 10 + i), next_ip=(127, 0, 0, 10 + (i + 1) % 2),
                       first_ip=(127, 0, 0, 10))
@@ -3214,6 +3282,7 @@ if __name__ == '__main__':
     test_zybo_register_block()
     test_weight_streamer_survives_stalls()
     test_full_sequencer_both_qwens()
+    test_bridge_end_to_end()
     test_gals_two_boards()
     test_cluster_plan()
     test_zybo_stage_registers()

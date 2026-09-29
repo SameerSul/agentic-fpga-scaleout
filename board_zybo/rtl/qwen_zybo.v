@@ -83,6 +83,13 @@ module qwen_zybo (
   reg [127:0] swb3 [0:31];
   reg [24:0] stag [0:NS - 1];
   reg sval [0:NS - 1];
+  // A slot with a burst still in flight takes no second request: two
+  // for one slot (X, then Y after the stream moved on, then X again
+  // after a jump back) let X's first copy mark the slot valid and
+  // Y's beats then overwrite it, and the core read Y's weights as X's.
+  // With one burst a slot, the only one that can land in a slot is
+  // the line its tag names.
+  reg pend [0:NS - 1];
   wire [24:0] cur = wq >> 2;
   wire [4:0] cs = cur[4:0];
   wire hw = sval[cs] && stag[cs] == cur;
@@ -106,7 +113,20 @@ module qwen_zybo (
   reg jl;
   wire jumped = jl || (cur != pcur && cur != pcur1) || nreq < cur
                || nreq > curns;
-  wire have = sval[ns] && stag[ns] == nreq;
+  // What the stream knows of the slot nreq names, registered: its tag
+  // is nreq (tm_r), the line is held or on its way (sp_r), a burst is
+  // still in flight to it (pd_r). Each is computed a cycle ahead for
+  // the line nreq moves to, the next one or the core's on a restart,
+  // so the issue decision reads flip-flops rather than a 32-way tag
+  // mux and compare: that path, into every tag's enable, held the
+  // 32-lane ZC706 build's bus clock to 47 MHz. tm_r and sp_r are
+  // exact; pd_r can lag a landing burst by a cycle, which only
+  // delays an issue, never lets one into a slot still in flight.
+  reg tm_r, sp_r, pd_r;
+  wire [4:0] ns1 = ns + 1'b1;
+  wire [4:0] cs_ = cur[4:0];
+  // Held, or on its way: either way the stream moves past it.
+  wire have = tm_r && sp_r;
   wire anyv = w0_arvalid || w1_arvalid || w2_arvalid || w3_arvalid;
   reg [3:0] out0;
   reg [24:0] inf0 [0:MAXO - 1];
@@ -129,11 +149,12 @@ module qwen_zybo (
   always @(posedge clk) begin
     if (!rst_n) begin
       nreq <= 0; pcur <= 0; pcur1 <= 1; jl <= 1'b0;
+      tm_r <= 1'b1; sp_r <= 1'b0; pd_r <= 1'b0;
       w0_arvalid <= 1'b0; out0 <= 0; ih0 <= 0; it0 <= 0; wb0 <= 0;
       w1_arvalid <= 1'b0; out1 <= 0; ih1 <= 0; it1 <= 0; wb1 <= 0;
       w2_arvalid <= 1'b0; out2 <= 0; ih2 <= 0; it2 <= 0; wb2 <= 0;
       w3_arvalid <= 1'b0; out3 <= 0; ih3 <= 0; it3 <= 0; wb3 <= 0;
-      for (si = 0; si < NS; si = si + 1) begin sval[si] <= 1'b0; stag[si] <= 0; end
+      for (si = 0; si < NS; si = si + 1) begin sval[si] <= 1'b0; pend[si] <= 1'b0; stag[si] <= 0; end
     end else begin
       if (w0_arvalid && w0_arready) w0_arvalid <= 1'b0;
       if (w1_arvalid && w1_arready) w1_arvalid <= 1'b0;
@@ -143,29 +164,39 @@ module qwen_zybo (
       // restart the stream at the core's line.
       pcur <= cur; pcur1 <= cur + 1;
       jl <= jumped && anyv;
-      if (jumped && !anyv) nreq <= cur;
-      else if (in_win && have) nreq <= nreq + 1;
-      else if (in_win) begin
+      // nreq held: its slot's flags stand, but a burst may land.
+      pd_r <= pend[ns];
+      if (jumped && !anyv) begin
+        nreq <= cur;
+        tm_r <= stag[cs_] == cur; sp_r <= sval[cs_] || pend[cs_]; pd_r <= pend[cs_];
+      end else if (in_win && have) begin
+        nreq <= nreq + 1;
+        tm_r <= stag[ns1] == nreq + 1; sp_r <= sval[ns1] || pend[ns1]; pd_r <= pend[ns1];
+      end else if (in_win) begin
         case (np_sel)
-          0: if (!w0_arvalid && out0 < MAXO) begin
+          0: if (!w0_arvalid && out0 < MAXO && !pd_r) begin
             w0_araddr <= 32'd134217728 + nreq * 64; w0_arvalid <= 1'b1;
-            sval[ns] <= 1'b0; stag[ns] <= nreq;
+            sval[ns] <= 1'b0; pend[ns] <= 1'b1; stag[ns] <= nreq;
             inf0[it0] <= nreq; it0 <= it0 + 1; nreq <= nreq + 1;
+            tm_r <= stag[ns1] == nreq + 1; sp_r <= sval[ns1] || pend[ns1]; pd_r <= pend[ns1];
           end
-          1: if (!w1_arvalid && out1 < MAXO) begin
+          1: if (!w1_arvalid && out1 < MAXO && !pd_r) begin
             w1_araddr <= 32'd134217728 + nreq * 64; w1_arvalid <= 1'b1;
-            sval[ns] <= 1'b0; stag[ns] <= nreq;
+            sval[ns] <= 1'b0; pend[ns] <= 1'b1; stag[ns] <= nreq;
             inf1[it1] <= nreq; it1 <= it1 + 1; nreq <= nreq + 1;
+            tm_r <= stag[ns1] == nreq + 1; sp_r <= sval[ns1] || pend[ns1]; pd_r <= pend[ns1];
           end
-          2: if (!w2_arvalid && out2 < MAXO) begin
+          2: if (!w2_arvalid && out2 < MAXO && !pd_r) begin
             w2_araddr <= 32'd134217728 + nreq * 64; w2_arvalid <= 1'b1;
-            sval[ns] <= 1'b0; stag[ns] <= nreq;
+            sval[ns] <= 1'b0; pend[ns] <= 1'b1; stag[ns] <= nreq;
             inf2[it2] <= nreq; it2 <= it2 + 1; nreq <= nreq + 1;
+            tm_r <= stag[ns1] == nreq + 1; sp_r <= sval[ns1] || pend[ns1]; pd_r <= pend[ns1];
           end
-          3: if (!w3_arvalid && out3 < MAXO) begin
+          3: if (!w3_arvalid && out3 < MAXO && !pd_r) begin
             w3_araddr <= 32'd134217728 + nreq * 64; w3_arvalid <= 1'b1;
-            sval[ns] <= 1'b0; stag[ns] <= nreq;
+            sval[ns] <= 1'b0; pend[ns] <= 1'b1; stag[ns] <= nreq;
             inf3[it3] <= nreq; it3 <= it3 + 1; nreq <= nreq + 1;
+            tm_r <= stag[ns1] == nreq + 1; sp_r <= sval[ns1] || pend[ns1]; pd_r <= pend[ns1];
           end
           default: ;
         endcase
@@ -174,7 +205,7 @@ module qwen_zybo (
         swb0[(inf0[ih0][4:0] / 4) * 4 + wb0[2:1]][wb0[0] * 64 +: 64] <= w0_rdata;
         wb0 <= wb0 + 1;
         if (w0_rlast) begin
-          if (stag[inf0[ih0][4:0]] == inf0[ih0]) sval[inf0[ih0][4:0]] <= 1'b1;
+          sval[inf0[ih0][4:0]] <= 1'b1; pend[inf0[ih0][4:0]] <= 1'b0;
           ih0 <= ih0 + 1;
         end
       end
@@ -187,7 +218,7 @@ module qwen_zybo (
         swb1[(inf1[ih1][4:0] / 4) * 4 + wb1[2:1]][wb1[0] * 64 +: 64] <= w1_rdata;
         wb1 <= wb1 + 1;
         if (w1_rlast) begin
-          if (stag[inf1[ih1][4:0]] == inf1[ih1]) sval[inf1[ih1][4:0]] <= 1'b1;
+          sval[inf1[ih1][4:0]] <= 1'b1; pend[inf1[ih1][4:0]] <= 1'b0;
           ih1 <= ih1 + 1;
         end
       end
@@ -200,7 +231,7 @@ module qwen_zybo (
         swb2[(inf2[ih2][4:0] / 4) * 4 + wb2[2:1]][wb2[0] * 64 +: 64] <= w2_rdata;
         wb2 <= wb2 + 1;
         if (w2_rlast) begin
-          if (stag[inf2[ih2][4:0]] == inf2[ih2]) sval[inf2[ih2][4:0]] <= 1'b1;
+          sval[inf2[ih2][4:0]] <= 1'b1; pend[inf2[ih2][4:0]] <= 1'b0;
           ih2 <= ih2 + 1;
         end
       end
@@ -213,7 +244,7 @@ module qwen_zybo (
         swb3[(inf3[ih3][4:0] / 4) * 4 + wb3[2:1]][wb3[0] * 64 +: 64] <= w3_rdata;
         wb3 <= wb3 + 1;
         if (w3_rlast) begin
-          if (stag[inf3[ih3][4:0]] == inf3[ih3]) sval[inf3[ih3][4:0]] <= 1'b1;
+          sval[inf3[ih3][4:0]] <= 1'b1; pend[inf3[ih3][4:0]] <= 1'b0;
           ih3 <= ih3 + 1;
         end
       end

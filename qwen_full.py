@@ -8,8 +8,9 @@ residual add, all derived for 8-bit weights and 16-bit activations), and
 simulates it in iverilog on the checkpoint's own weights.
 
 What would be DDR on a board is outside the design, behind ports: a
-256-bit weight word per cycle, served by the testbench from a 1 GB binary
-image with $fread; a constant memory with each projection column's bias,
+weight word per cycle, 16 lanes of 16 bits (32 with --lanes 32, the
+ZC706's width), served by the testbench from a 1 GB binary image with
+$fread; a constant memory with each projection column's bias,
 scale and shift; the norm gains; and the KV cache, read and written a
 lane at a time. The embedding lookup reads the tied head's weight words.
 The head runs as 32 projection chunks with a streaming argmax, so the
@@ -40,7 +41,13 @@ import specgen
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 WORK = os.path.join(ROOT, "build_qfull")
-N = 16                       # projection lanes at 16-bit data
+N = 16                       # projection lanes at 16-bit data, unless the build asks
+
+
+def lanes_of(im):
+    """The build's lane count: the projection's, which the model spec can
+    set (im.ms["lanes"]) and otherwise derives from the board."""
+    return specgen.derive_projn_spec(im.ms, per_column=True)["parameters"]["lanes"]
 
 
 def head_chunk(im):
@@ -49,7 +56,7 @@ def head_chunk(im):
     overflowed Qwen3's 12-bit column port (it sizes for 3072): the block
     ran 768 columns and the sequencer waited for 4864, for good."""
     c = max(im.D, im.F)
-    assert im.H * im.hd <= c and c % N == 0
+    assert im.H * im.hd <= c and c % lanes_of(im) == 0
     return c
 
 
@@ -69,6 +76,7 @@ class Layout:
         D, F, H, KV, hd = im.D, im.F, im.H, im.KV, im.hd
         nl = im.NL if nl is None else nl
         self.table = table
+        self.N = N = lanes_of(im)
         self.shape = {"q": (H * hd, D), "k": (KV * hd, D), "v": (KV * hd, D),
                       "o": (D, H * hd), "g": (F, D), "u": (F, D), "d": (D, F)}
         self.woff, self.coff = {}, {}
@@ -93,18 +101,19 @@ def write_images(im, lay, work, log=print, layers=None):
     reads, most significant byte first: lane 15's high byte leads."""
     s = im.s
     layers = list(range(im.NL)) if layers is None else list(layers)
+    N = lay.N
     t0 = time.time()
     sign = bytes((0xff if b >= 128 else 0) for b in range(256))
     with open(os.path.join(work, "weights.bin"), "wb") as f:
         def put(key, rows, depth):
             Q = im.Q[key]
             for g in range(rows // N):
-                buf = bytearray(depth * 32)
+                buf = bytearray(depth * 2 * N)
                 for j in range(N):
                     c = g * N + j
                     lo = Q[c * depth:(c + 1) * depth].tobytes()
-                    buf[(15 - j) * 2::32] = lo.translate(sign)
-                    buf[(15 - j) * 2 + 1::32] = lo
+                    buf[(N - 1 - j) * 2::2 * N] = lo.translate(sign)
+                    buf[(N - 1 - j) * 2 + 1::2 * N] = lo
                 f.write(buf)
         for li in layers:
             for m, name in lay.MATS:
@@ -208,6 +217,8 @@ def render(im, lay, lc, nf, stage=False):
     embedding lookup."""
     D, F, H, KV, hd, V = im.D, im.F, im.H, im.KV, im.hd, im.V
     NL = len(lc)
+    N = lay.N
+    LB = _clog2(N)                  # lane index bits
     L = im.ms["seq_len"]
     grp, h2 = H // KV, hd // 2
     ps = specgen.derive_projn_spec(im.ms, per_column=True)["parameters"]
@@ -248,11 +259,11 @@ def render(im, lay, lc, nf, stage=False):
     a("  output [%d:0] g_addr, input signed [15:0] g_data," % (GA - 1))
     a("  output [%d:0] k_raddr, input [%d:0] k_rdata," % (KA - 1, N * 16 - 1))
     a("  output [%d:0] v_raddr, input [%d:0] v_rdata," % (VA - 1, N * 16 - 1))
-    a("  output reg kw0_en, output reg [%d:0] kw0_addr, output reg [3:0] kw0_lane," % (KA - 1))
+    a("  output reg kw0_en, output reg [%d:0] kw0_addr, output reg [%d:0] kw0_lane," % (KA - 1, LB - 1))
     a("  output reg signed [15:0] kw0_data,")
-    a("  output reg kw1_en, output reg [%d:0] kw1_addr, output reg [3:0] kw1_lane," % (KA - 1))
+    a("  output reg kw1_en, output reg [%d:0] kw1_addr, output reg [%d:0] kw1_lane," % (KA - 1, LB - 1))
     a("  output reg signed [15:0] kw1_data,")
-    a("  output reg vw_en, output reg [%d:0] vw_addr, output reg [3:0] vw_lane," % (VA - 1))
+    a("  output reg vw_en, output reg [%d:0] vw_addr, output reg [%d:0] vw_lane," % (VA - 1, LB - 1))
     a("  output reg signed [15:0] vw_data,")
     a("  output reg [%d:0] next_tok, output reg signed [15:0] best," % (tw - 1))
     if stage:
@@ -412,8 +423,8 @@ def render(im, lay, lc, nf, stage=False):
     if qkn:
         a("    hn_scale = 0; hn_shift = 0;")
     a("    case (st)")
-    a("      S_EMB: begin wbase = %d + (tok_r >> 4) * %d; cbase = %d + tok_r; end"
-      % (lay.headw, D, lay.embc))
+    a("      S_EMB: begin wbase = %d + (tok_r >> %d) * %d; cbase = %d + tok_r; end"
+      % (lay.headw, LB, D, lay.embc))
     a("      S_N1: begin gbase = lyr * %d; rn_scale = c_n1s; rn_shift = c_n1h; end" % (2 * D))
     a("      S_N2: begin gbase = lyr * %d + %d; rn_scale = c_n2s; rn_shift = c_n2h; end" % (2 * D, D))
     a("      S_NF: begin gbase = %d; rn_scale = %d; rn_shift = %d; end"
@@ -477,12 +488,12 @@ def render(im, lay, lc, nf, stage=False):
     a("  wire [12:0] fh = fj >> %d, fp = fj & %d;" % (_clog2(h2), h2 - 1))
     a("  wire [12:0] oh = ocnt >> %d, op = ocnt & %d;" % (_clog2(h2), h2 - 1))
     a("  // KV cache words: keys interleaved by position, values by dimension.")
-    a("  wire [%d:0] kslot = (lyr * %d + oh) * %d + (pos_r >> 4) * %d;"
-      % (KA - 1, KV, (L // N) * hd, hd))
+    a("  wire [%d:0] kslot = (lyr * %d + oh) * %d + (pos_r >> %d) * %d;"
+      % (KA - 1, KV, (L // N) * hd, LB, hd))
     a("  wire [%d:0] vslot = ((lyr * %d + (pj_index >> %d)) * %d + pos_r) * %d"
-      " + ((pj_index & %d) >> 4);" % (VA - 1, KV, _clog2(hd), L, hd // N, hd - 1))
+      " + ((pj_index & %d) >> %d);" % (VA - 1, KV, _clog2(hd), L, hd // N, hd - 1, LB))
     a("  reg ev1;")
-    a("  reg [3:0] lane_r;")
+    a("  reg [%d:0] lane_r;" % (LB - 1))
     a("  wire signed [15:0] ew = w_data[lane_r * 16 +: 16];")
     a("  reg [%d:0] hbase;" % (tw - 1))
     a("")
@@ -509,7 +520,7 @@ def render(im, lay, lc, nf, stage=False):
     a("        case (st)")
     a("          S_Q: if (pj_half) qhi[pj_hadr] <= pj_data; else qlo[pj_hadr] <= pj_data;")
     a("          S_K: if (pj_half) khi[pj_hadr] <= pj_data; else klo[pj_hadr] <= pj_data;")
-    a("          S_V: begin vw_en <= 1'b1; vw_addr <= vslot; vw_lane <= pj_index[3:0];")
+    a("          S_V: begin vw_en <= 1'b1; vw_addr <= vslot; vw_lane <= pj_index[%d:0];" % (LB - 1))
     a("                 vw_data <= pj_data; end")
     a("          S_O, S_DN: am[pj_index] <= pj_data;")
     a("          S_G: gm[pj_index] <= pj_data;")
@@ -538,8 +549,8 @@ def render(im, lay, lc, nf, stage=False):
     a("      if ((st == S_R1 || st == S_R2) && ra_vout) begin xm[ocnt] <= ra_y; ocnt <= ocnt + 1; end")
     a("      if (st == S_RQ && ro_vout) begin qlo[ocnt] <= ro_y1; qhi[ocnt] <= ro_y2; ocnt <= ocnt + 1; end")
     a("      if (st == S_RK && ro_vout) begin")
-    a("        kw0_en <= 1'b1; kw0_addr <= kslot + op; kw0_lane <= pos_r[3:0]; kw0_data <= ro_y1;")
-    a("        kw1_en <= 1'b1; kw1_addr <= kslot + op + %d; kw1_lane <= pos_r[3:0]; kw1_data <= ro_y2;" % h2)
+    a("        kw0_en <= 1'b1; kw0_addr <= kslot + op; kw0_lane <= pos_r[%d:0]; kw0_data <= ro_y1;" % (LB - 1))
+    a("        kw1_en <= 1'b1; kw1_addr <= kslot + op + %d; kw1_lane <= pos_r[%d:0]; kw1_data <= ro_y2;" % (h2, LB - 1))
     a("        ocnt <= ocnt + 1;")
     a("      end")
     a("      if (st == S_GLU && si_vout) begin")
@@ -554,7 +565,7 @@ def render(im, lay, lc, nf, stage=False):
     a("          tok_r <= tok; pos_r <= pos; hen <= head_en; busy <= 1'b1; lyr <= 0;")
     a("          hh <= 0; hk <= 0; st <= %s; ed <= 0; ev1 <= 1'b0; ocnt <= 0; ph <= 1'b0;"
       % ("emb_en ? S_EMB : S_N1" if stage else "S_EMB"))
-    a("          lane_r <= tok[3:0];")
+    a("          lane_r <= tok[%d:0];" % (LB - 1))
     a("        end")
     a("        // The embedding row out of the head's weight words, requantized")
     a("        // with this token's own constants.")
@@ -641,7 +652,8 @@ def render(im, lay, lc, nf, stage=False):
     a("  end")
     a("endmodule")
     return "\n".join(A) + "\n", dict(WA=WA, CA=CA, GA=GA, KA=KA, VA=VA,
-                                     KWN=KWN, VWN=VWN, CW=CW, tw=tw, pw=pw)
+                                     KWN=KWN, VWN=VWN, CW=CW, tw=tw, pw=pw,
+                                     N=N, LB=LB)
 
 
 TB = """`timescale 1ns/1ps
@@ -650,24 +662,24 @@ module tb_qfull;
   reg [%(tw)d:0] tok = 0;
   reg [%(pw)d:0] pos = 0;
   wire [%(WA)d:0] w_addr;
-  reg [255:0] w_data, wtmp;
+  reg [%(LW)d:0] w_data, wtmp;
   wire [%(CA)d:0] c_addr;
   reg [%(CW)d:0] c_data;
   wire [%(GA)d:0] g_addr;
   reg signed [15:0] g_data;
   wire [%(KA)d:0] k_raddr, kw0_addr, kw1_addr;
   wire [%(VA)d:0] v_raddr, vw_addr;
-  reg [255:0] k_rdata, v_rdata, kt;
+  reg [%(LW)d:0] k_rdata, v_rdata, kt;
   wire kw0_en, kw1_en, vw_en;
-  wire [3:0] kw0_lane, kw1_lane, vw_lane;
+  wire [%(LB)d:0] kw0_lane, kw1_lane, vw_lane;
   wire signed [15:0] kw0_data, kw1_data, vw_data;
   wire [%(tw)d:0] next_tok;
   wire signed [15:0] best;
   wire done, busy;
   reg [%(CW)d:0] cmem [0:%(cn)d];
   reg signed [15:0] gmem [0:%(gn)d];
-  reg [255:0] km [0:%(kn)d];
-  reg [255:0] vm [0:%(vn)d];
+  reg [%(LW)d:0] km [0:%(kn)d];
+  reg [%(LW)d:0] vm [0:%(vn)d];
   integer fd, r, cyc = 0, t0 = 0, i;
   reg [%(WA)d:0] wlast;
   always #5 clk = ~clk;
@@ -680,7 +692,7 @@ module tb_qfull;
   // What would be DDR: one weight word a cycle, from the image on disk.
   always @(posedge clk) begin
     if (w_addr !== wlast) begin
-      if (w_addr !== wlast + 1) r = $fseek(fd, w_addr * 32, 0);
+      if (w_addr !== wlast + 1) r = $fseek(fd, w_addr * %(WB)d, 0);
       r = $fread(wtmp, fd);
       wlast = w_addr;
     end
@@ -725,7 +737,7 @@ endmodule
 """
 
 
-def build(prompt, n_gen, work=WORK, log=print, layers=None):
+def build(prompt, n_gen, work=WORK, log=print, layers=None, lanes=None):
     cfg, W = qr.load()
     tok = qr.Tokenizer()
     cal = qc.calibration(cfg, W, tok)
@@ -735,6 +747,8 @@ def build(prompt, n_gen, work=WORK, log=print, layers=None):
         # model run with the same layers.
         cfg = dict(cfg, num_hidden_layers=layers)
     im = qi.IntQwen(cfg, W, 16, True, cal, exact_io=True)
+    if lanes:
+        im.ms["lanes"] = lanes      # the board's width, not the default rule
     ids = tok.encode(prompt)
     want, srcs = build_model(im, ids, n_gen, work, log, tok.decode)
     return tok, ids, want, srcs
@@ -795,7 +809,8 @@ def build_model(im, ids, n_gen, work, log=print, decode=str, layers=None,
                    WA1=w["WA"], CA=w["CA"] - 1, CW=w["CW"] - 1,
                    GA=w["GA"] - 1, KA=w["KA"] - 1, VA=w["VA"] - 1,
                    cn=lay.cwords - 1, gn=gain_words(im, len(layers)) - 1,
-                   kn=w["KWN"] - 1, vn=w["VWN"] - 1, steps="\n".join(steps))
+                   kn=w["KWN"] - 1, vn=w["VWN"] - 1, LW=16 * w["N"] - 1,
+                   LB=w["LB"] - 1, WB=2 * w["N"], steps="\n".join(steps))
     with open(os.path.join(work, "tb_qfull.v"), "w") as f:
         f.write(tb)
     srcs = ["tb_qfull.v", "qwen_full.v"] + sorted(blocks) + deps
@@ -812,8 +827,11 @@ def main():
     ap.add_argument("--work", default=WORK)
     ap.add_argument("--no-sim", action="store_true",
                     help="write the images and RTL only, e.g. for board_zybo.py")
+    ap.add_argument("--lanes", type=int, default=None,
+                    help="projection lanes (16 by default; 32 for the ZC706)")
     a = ap.parse_args()
-    tok, ids, want, srcs = build(a.prompt, a.tokens, a.work, layers=a.layers)
+    tok, ids, want, srcs = build(a.prompt, a.tokens, a.work, layers=a.layers,
+                                 lanes=a.lanes)
     if a.no_sim:
         print("wrote", a.work)
         return

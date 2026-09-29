@@ -8,10 +8,10 @@ module attnn (
   input      [4:0]  shift_s,
   input      [17:0] scale_o,
   input      [6:0] shift_o,
-  output     [10:0] k_addr,
-  input      [255:0] k_data,
-  output     [10:0] v_addr,
-  input      [255:0] v_data,
+  output     [9:0] k_addr,
+  input      [511:0] k_data,
+  output     [9:0] v_addr,
+  input      [511:0] v_data,
   output reg               o_valid,
   output reg [6:0] o_index,
   output reg signed [15:0] o_data,
@@ -29,7 +29,7 @@ module attnn (
   reg issuing;
   reg [7:0] r;
   reg [8:0] g0;
-  reg [10:0] kbase;
+  reg [9:0] kbase;
   assign k_addr = kbase + r;
   reg signed [15:0] a_data;
   always @(posedge clk) a_data <= qbuf[r[6:0]];
@@ -37,19 +37,19 @@ module attnn (
   reg [4:0] lastp;
   reg [8:0] gp [0:4];
   reg mclr;
-  wire signed [35:0] acc [0:15];
+  wire signed [35:0] acc [0:31];
   genvar l;
   generate
-    for (l = 0; l < 16; l = l + 1) begin : slane
+    for (l = 0; l < 32; l = l + 1) begin : slane
       mac mc (.clk(clk), .rst_n(rst_n), .clear(mclr), .a(a_data),
               .b(k_data[16*l +: 16]), .valid_in(v1), .acc(acc[l]), .valid_out());
     end
   endgenerate
-  reg signed [35:0] shadow [0:15];
+  reg signed [35:0] shadow [0:31];
   reg [8:0] cap0;
-  reg [4:0] dj, dn;
+  reg [5:0] dj, dn;
   reg pend;
-  wire [8:0] next0 = g0 + 16;
+  wire [8:0] next0 = g0 + 32;
 
   // Score quantizer, as the one-lane head's: round, shift, clamp.
   wire signed [40:0] rnd_s = (shift_s == 5'd0) ? 41'sd0
@@ -73,24 +73,24 @@ module attnn (
               .w_index(sm_wi), .w_data(sm_wd), .busy(sm_busy));
   reg  [8:0] pcnt;
 
-  // ---- weighted sum: lane l is dimension dg * 16 + l
+  // ---- weighted sum: lane l is dimension dg * 32 + l
   reg wiss;
   reg [8:0] jj;
-  reg [2:0] dg;
-  reg [10:0] vaddr;
+  reg [1:0] dg;
+  reg [9:0] vaddr;
   assign v_addr = vaddr;
   reg [15:0] p_r;
   always @(posedge clk) p_r <= pbuf[jj[7:0]];
   reg u1, f1, uA, fA;
   reg [3:0] lastw;
-  reg [2:0] dgp [0:3];
-  reg signed [32:0] prod [0:15];
-  reg signed [31:0] accw [0:15];
-  reg signed [31:0] shadow2 [0:15];
-  reg [2:0] capd;
-  reg [4:0] dj2, dn2;
+  reg [1:0] dgp [0:3];
+  reg signed [32:0] prod [0:31];
+  reg signed [31:0] accw [0:31];
+  reg signed [31:0] shadow2 [0:31];
+  reg [1:0] capd;
+  reg [5:0] dj2, dn2;
   reg pend2;
-  wire signed [31:0] x = shadow2[dj2[3:0]];
+  wire signed [31:0] x = shadow2[dj2[4:0]];
 
   reg  rq_vin;
   reg  signed [35:0] rq_acc;
@@ -136,9 +136,9 @@ module attnn (
       if (lastp[4] || pend) begin
         if (dj == dn) begin
           pend <= 1'b0;
-          for (k = 0; k < 16; k = k + 1) shadow[k] <= acc[k];
+          for (k = 0; k < 32; k = k + 1) shadow[k] <= acc[k];
           cap0 <= gp[4]; dj <= 0;
-          dn <= (n_r - gp[4] < 16) ? n_r - gp[4] : 16;
+          dn <= (n_r - gp[4] < 32) ? n_r - gp[4] : 32;
           mclr <= 1'b1;
           if (next0 < n_r) begin
             g0 <= next0; kbase <= kbase + 128; issuing <= 1'b1;
@@ -146,7 +146,7 @@ module attnn (
         end else pend <= 1'b1;
       end
       if (dj != dn) begin
-        st1 <= {shadow[dj[3:0]][35], shadow[dj[3:0]], 4'd0} + rnd_r; si1 <= cap0 + dj; sv1 <= 1'b1; dj <= dj + 1;
+        st1 <= {shadow[dj[4:0]][35], shadow[dj[4:0]], 4'd0} + rnd_r; si1 <= cap0 + dj; sv1 <= 1'b1; dj <= dj + 1;
       end
       if (sv1) begin
         if (shv > 41'sd1048575) sbuf[si1] <= 21'sd1048575;
@@ -164,26 +164,26 @@ module attnn (
       lastw <= {lastw[2:0], wiss && jj == n_r - 1};
       dgp[0] <= dg;
       for (k = 1; k < 4; k = k + 1) dgp[k] <= dgp[k-1];
-      for (k = 0; k < 16; k = k + 1) begin
+      for (k = 0; k < 32; k = k + 1) begin
         if (u1) prod[k] <= $signed({1'b0, p_r}) * $signed(v_data[k*16 +: 16]);
         if (uA) accw[k] <= fA ? prod[k] : accw[k] + prod[k];
       end
       if (wiss) begin
         if (jj == n_r - 1) wiss <= 1'b0;
-        else begin jj <= jj + 1; vaddr <= vaddr + 8; end
+        else begin jj <= jj + 1; vaddr <= vaddr + 4; end
       end
       if (lastw[3] || pend2) begin
         if (dj2 == dn2) begin
           pend2 <= 1'b0;
-          for (k = 0; k < 16; k = k + 1) shadow2[k] <= accw[k];
-          capd <= dgp[3]; dj2 <= 0; dn2 <= 16;
-          if (dg + 1 < 8) begin
+          for (k = 0; k < 32; k = k + 1) shadow2[k] <= accw[k];
+          capd <= dgp[3]; dj2 <= 0; dn2 <= 32;
+          if (dg + 1 < 4) begin
             dg <= dg + 1; jj <= 0; vaddr <= dg + 1; wiss <= 1'b1;
           end
         end else pend2 <= 1'b1;
       end
       if (dj2 != dn2) begin
-        rq_acc <= {{4{x[31]}}, x}; rq_idx <= capd * 16 + dj2; rq_vin <= 1'b1;
+        rq_acc <= {{4{x[31]}}, x}; rq_idx <= capd * 32 + dj2; rq_vin <= 1'b1;
         dj2 <= dj2 + 1;
       end
       idx_pipe[0] <= rq_idx;

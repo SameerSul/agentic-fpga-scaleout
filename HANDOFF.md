@@ -9,9 +9,10 @@ needs the hardware. Nothing below needs this repo's author.
 |---|---|---|
 | package | `board_zybo/` | `board_zc706/` (`python3 board_zybo.py --board zc706`) |
 | part | XC7Z020-1CLG400 | XC7Z045-2FFG900 |
+| core width | 16 lanes | 32 lanes, twice the weights a core cycle |
 | Vivado board preset | Digilent's board files | ships with Vivado |
 | Vivado license | free edition | the ZC706 kit's device-locked license (the XC7Z045 is not in the free edition), or the open flow below |
-| open flow, post-route | core 53.4, bus 50.9 MHz | core 68.0, bus 52.8 MHz |
+| open flow, post-route | core 65.5, bus 54.5 MHz | core 65.5, bus 50.3 MHz (Qwen3: 71.5, 60.3) |
 | boot from JTAG | JP5 to JTAG | SW11 boot mode to JTAG (UG954) |
 | USB-UART | the PROG/UART micro-USB | J21 |
 | busy LED | LD0 | none driven (STATUS register instead) |
@@ -24,9 +25,11 @@ Below, `board_<name>/` is whichever package matches the board.
 |---|---|
 | Qwen2.5-0.5B on the generated blocks' integer arithmetic | 14/16 teacher-forced against float |
 | the generated sequencer, 24 layers + head, in iverilog | chooses " Paris", the integer model's token |
-| the Zybo top level (`board_zybo/rtl/fpgai_zybo.v`) driven only through its AXI-Lite registers, DDR model with random stalls | all 24 layers + head: " Paris", same core cycles, 1.18 bus cycles per core cycle |
-| fits the XC7Z020 (Yosys) | 33169 LUTs + 7380 LUT RAM, 148 DSPs, 36 BRAMs |
-| places and routes in the open flow (nextpnr-xilinx), XC7Z020 and XC7Z045 | both close 50 MHz; the Zybo bitstream round-trips frame for frame |
+| the Zybo top level (`board_zybo/rtl/fpgai_zybo.v`) driven only through its AXI-Lite registers, DDR model with random stalls | all 24 layers + head: " Paris", same core cycles, 1.18 bus cycles per core cycle (rerun on the corrected streamer under way, the same bus cycles so far) |
+| the ZC706 top level at 32 lanes, the same way | one layer of each model: the direct run's token and core cycles, 1.70 bus cycles per core cycle; all 24 layers of Qwen2.5 under way, 1.69 so far |
+| the weight streamer under 1500 jumps and a stalling bus, every word checked | passes; it failed on every seed before a slot was limited to one burst in flight |
+| fits the part (Yosys, nextpnr-xilinx) | Zybo: 28% of LUT sites, 132 of 220 DSPs, 49 BRAMs; ZC706 at 32 lanes: 9%, 196 of 900 DSPs |
+| places and routes in the open flow (nextpnr-xilinx), XC7Z020 and XC7Z045 | all three builds close 50 MHz on both clocks, and every bitstream round-trips frame for frame |
 | several boards on their own clocks, each a stage of layers (`gals.py`, simulated) | two and three stages over fabric UARTs give one board's tokens and logits exactly |
 | the stage ARM program's UDP protocol, run on a host (two processes, lwIP shimmed, one datagram dropped) | resends, reassembles, prints the reference tokens |
 | Vivado block design, Vivado timing, the ARM program | **not run** |
@@ -55,7 +58,14 @@ that the bitstream's layout registers match its header before it runs.
 python3 fetch_qwen.py                      # Qwen2.5-0.5B, ~1 GB, into qwen_weights/
 python3 qwen_full.py --no-sim --work build_qfull   # quantize, write weights.bin, cparams.hex, gains.hex
 python3 board_zybo.py                      # board_zybo/, including board_zybo/sd/
-python3 board_zybo.py --board zc706        # or board_zc706/, for the ZC706
+```
+
+For the ZC706, whose core is 32 lanes wide, build at its width instead
+(`board_zybo.py` refuses a build of the wrong width):
+
+```bash
+python3 qwen_full.py --no-sim --lanes 32 --work build_q25l32
+python3 board_zybo.py --board zc706 --work build_q25l32   # board_zc706/, with sd/
 ```
 
 `board_zybo/sd/` then holds `weights8.bin` (494 MB), `cparams.bin`,
@@ -68,13 +78,13 @@ disagree, and the committed one is what was simulated.
 `board_zc706_qwen3/` is the same package for Qwen3-0.6B, the model
 Architect Labs hosted: 596 MB of int8 weights, which the ZC706's 1 GB
 holds with room to spare. Its open-flow build routes at 50 MHz as well
-(61.0 MHz core, 51.0 MHz bus, post-route), and its bitstream round-trips.
+(71.5 MHz core, 60.3 MHz bus, post-route), and its bitstream round-trips.
 Its SD files come from:
 
 ```bash
 python3 fetch_qwen.py --model qwen3                              # ~1.5 GB
-FPGAI_QWEN=qwen3 python3 qwen_full.py --no-sim --work build_q3full
-FPGAI_QWEN=qwen3 python3 board_zybo.py --work build_q3full --board zc706 --out board_zc706_qwen3
+FPGAI_QWEN=qwen3 python3 qwen_full.py --no-sim --lanes 32 --work build_q3l32
+FPGAI_QWEN=qwen3 python3 board_zybo.py --work build_q3l32 --board zc706 --out board_zc706_qwen3
 ```
 
 Everything below is the same, from inside `board_zc706_qwen3/`.
@@ -148,7 +158,8 @@ RTL is built to match exactly. What simulation has checked: the first
 generated token, " Paris", through all 24 layers and the head, and
 several generated tokens in a row on small test models. So a board that
 prints " Paris" and then differs later is a finding worth reporting. At 50 MHz each
-position should take about 0.5 s and the head step about 0.7 s; the
+position should take about 0.5 s and the head step about 0.7 s (on the
+ZC706, about 0.4 s a position); the
 last line prints the core and bus cycles of the last step.
 
 ## What to send back
@@ -165,6 +176,7 @@ last line prints the core and bus cycles of the last step.
 | hangs after loading, LD0 lit | the core is waiting on memory: an AXI connection in the block design is wrong (check the address map: every master must see DDR at 0x00000000) |
 | hangs, LD0 dark | the start never reached the core: check the GP0 connection and the register base 0x43C00000 |
 | different tokens | send the log: the position where it first differs says which block |
+| wrong from the first token, with an SD card made from an older commit | an old `weights8.bin` holds each word's lanes in reverse (RESULTS.md, "the weight image's byte order"), and the layout check cannot see it, since the sizes are the same. Remake step 1 |
 
 ## Several boards
 

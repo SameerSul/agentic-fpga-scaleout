@@ -28,7 +28,12 @@ Architect Labs hosted, decodes the same way: all 28 layers and the head
 in generated RTL choose " Paris", the integer model's token. The package is generated for any Zynq board in
 `boards.py`, today the Zybo Z7-20 and the ZC706, and without Vivado the
 open 7-series flow places and routes the whole design on both parts at
-50 MHz, with bitstreams that round-trip frame for frame. Several boards
+50 MHz, with bitstreams that round-trip frame for frame. The ZC706's core
+is twice the Zybo's width, 32 lanes, and the work to get there found two
+faults in the DDR bridge that simulation had passed: the weight image's
+byte order, which would have reversed every word's lanes on the board,
+and a streamer that could hand the core another line's weights after a
+jump back. Both are fixed and tested. Several boards
 can share one model as GALS stages on their own clocks, simulated exact
 to one board's tokens over fabric UARTs, with the Zynq's UDP protocol
 run on a host. It still does not host a local LLM the way Architect Labs
@@ -41,7 +46,7 @@ The remaining gap is listed at the bottom rather than glossed over.
 ### The full suite
 
 ```
-python3 tests.py            # 357 tests, or 355 without OpenSTA
+python3 tests.py            # 363 tests, or 361 without OpenSTA
 ```
 
 ### Spec to RTL, across the spec space
@@ -514,7 +519,8 @@ prompt, and is not committed.
 Yosys maps the whole top level, 24 layers, bridge and registers, to
 33169 LUTs, 7380 more as LUT RAM, 15922 flip-flops, 148 DSPs and 36
 block RAMs on 7-series: 76% of a Zynq 7020's LUTs counting the LUT RAM,
-67% of its DSPs.
+67% of its DSPs. (That was before the streamer's later fixes, which add a
+few dozen flip-flops; the routed utilization below is current.)
 
 The testbench drives the design only through AXI-Lite, as the ARM would,
 against the DDR model, and the one-layer build chooses token 70526, the direct testbench's, in
@@ -529,8 +535,10 @@ skipped and forgotten, leaving the stream 255 lines ahead of a core that
 waited for good. The always-ready model could never show it; the board
 would have. The jump is now held until the stream can restart, and a
 stream past its window counts as one. With that fix the jittered run
-chooses 70526 too, in 11,452,288 bus cycles, 1.20 a core cycle. Both
-run the core's 9,510,162 cycles; the core counter they print is a few
+chooses 70526 too, in 11,452,288 bus cycles, 1.20 a core cycle
+(11,452,707 on the streamer as corrected later, in "32 lanes on the
+ZC706"; always ready, its count is unchanged). Both run the core's
+9,510,162 cycles; the core counter they print is a few
 higher because it is read before the AXI-Lite write that starts the
 step, and the idle core ticks through that write.
 
@@ -541,12 +549,17 @@ and the integer model do, each prompt position in the direct run's
 22.81 million core cycles and 26.7 to 27.0 million bus cycles, the head
 step in 31,375,557 core cycles and 37,457,732 bus cycles: 1.18 bus
 cycles a core cycle, 0.54 s a position and 0.75 s for the head at
-50 MHz. Four hours of simulation.
+50 MHz. Four hours of simulation. That run used the streamer before the
+fixes in "32 lanes on the ZC706"; the rerun on the corrected one was
+still going when this was written, its first two positions in
+26,745,870 and 26,895,926 bus cycles, as before.
 
-Two tests keep it: `test_weight_streamer_survives_stalls` runs the
-streamer alone on four stalling ports under an address stream of 122
-runs and jumps, checks every word it hands the core, and fails on the
-old streamer in half a second; `test_zybo_register_block` runs the
+Three tests keep it: `test_weight_streamer_survives_stalls` runs the
+streamer alone on four stalling ports under address streams of 1502
+runs and jumps on two seeds, checks every word it hands the core, and
+fails on both earlier streamers; `test_bridge_end_to_end` runs the
+bridge around generated 16- and 32-lane cores on small checkpoints and
+requires the integer model's tokens; `test_zybo_register_block` runs the
 registers around a stub core whose clock ticks one bus cycle in four,
 and fails if a start is a one-cycle pulse or done is not kept.
 
@@ -568,11 +581,12 @@ routes on the real part:
 
 | clock | post-route Fmax | at 50 MHz |
 |---|---|---|
-| core (gated, through a BUFGCTRL) | 53.4 MHz | passes |
-| bus and registers (FCLK0) | 50.9 MHz | passes |
+| core (gated, through a BUFGCTRL) | 65.5 MHz | passes |
+| bus and registers (FCLK0) | 54.5 MHz | passes |
 
-using 29% of the LUT sites (LUT RAM included), 14% of the flip-flops,
-132 of 220 DSPs and 49 block RAMs. The bitstream is 4,045,667 bytes, the
+using 28% of the LUT sites (LUT RAM included), 132 of 220 DSPs and 49
+block RAMs (first routed at 53.4 and 50.9 MHz, before the streamer's
+issue decision was registered; see "32 lanes on the ZC706"). The bitstream is 4,045,667 bytes, the
 XC7Z020's full size, and it round-trips: Project X-Ray decodes it back
 to features which, encoded again, give the routed design's frames
 exactly, all 7,802 of them.
@@ -611,21 +625,121 @@ chip database, and the whole design routes there too:
 
 | | Zybo Z7-20 (XC7Z020) | ZC706 (XC7Z045) |
 |---|---|---|
-| core clock, post-route | 53.4 MHz | 68.0 MHz |
-| bus clock, post-route | 50.9 MHz | 52.8 MHz |
-| LUT sites / DSPs used | 29% / 132 of 220 | 7% / 132 of 900 |
+| core width | 16 lanes | 32 lanes |
+| core clock, post-route | 65.5 MHz | 65.5 MHz |
+| bus clock, post-route | 54.5 MHz | 50.3 MHz |
+| LUT sites / DSPs used | 28% / 132 of 220 | 9% / 196 of 900 |
 | bitstream | 4.0 MB, 7,802 frames round-trip | 13.3 MB, 30,722 frames round-trip |
 
-The Qwen3-0.6B build (`board_zc706_qwen3/`) routes there too, at 61.0 MHz
-core and 51.0 MHz bus. Its conversion to a bitstream first aborted inside
+The Qwen3-0.6B build (`board_zc706_qwen3/`) routes there too, at 71.5 MHz
+core and 60.3 MHz bus. Its conversion to a bitstream first aborted inside
 Project X-Ray: `fasm2frames` adds a glue bit ten rows above the first
 column-62 ground tie it sees, a rule observed on another part, and here
 that tile, `INT_L_X62Y354`, is off the XC7Z045's grid.
 `prjxray-glue.patch` skips the glue where its tile does not exist. The
-bitstream it then writes round-trips, all 30,722 frames. The ZC706 has room for a far wider core than
-this one; the design is sized for the Zybo. Its LEDs sit in banks of more than one voltage, so
+bitstream it then writes round-trips, all 30,722 frames. The ZC706's
+core is now twice the Zybo's width (next section). Its LEDs sit in banks of more than one voltage, so
 its package drives none rather than guess an IOSTANDARD; STATUS says the
 same thing over the registers.
+
+## 32 lanes on the ZC706
+
+```
+python3 qwen_full.py --lanes 32 --work build_q25l32     # all 24 layers, direct
+python3 board_zybo.py --board zc706 --work build_q25l32 --sim --jitter
+FPGAI_QWEN=qwen3 python3 qwen_full.py --lanes 32 --work build_q3l32
+```
+
+The core's width is now a build option, `qwen_full.py --lanes`, and each
+package in `boards.py` names its own: 16 on the Zybo, whose XC7Z020 has
+220 DSPs, and 32 on the ZC706, whose XC7Z045 has 900. Everything that
+depended on 16 is derived from it: the weight images, the KV cache's
+layout, the embedding lookup, the bridge's lines and bursts, and the
+DDR model. At 16 lanes, rebuilding both real models gives byte-identical
+RTL, blocks, weights, constants and gains. At 32 the DDR layout, the
+ARM's header and the register block are unchanged too, since the same
+bytes sit at the same addresses, grouped into words twice as wide;
+`board_zybo.py` refuses a build whose width is not its board's.
+
+On the direct testbench, all layers and the head, the prompt's five
+positions:
+
+| | 16 lanes | 32 lanes |
+|---|---|---|
+| Qwen2.5-0.5B, a position | 22.81 M core cycles | 11.58 M |
+| Qwen2.5-0.5B, the head step | 31.38 M | 15.87 M |
+| Qwen3-0.6B, a position | 28.3 M | 14.52 M |
+| Qwen3-0.6B, the head step | 38.1 M | 19.42 M |
+| token chosen | " Paris" | " Paris", both models |
+
+Through the ZC706 package's registers, one layer of each model chooses
+the direct testbench's token in its core cycles, against the DDR model
+always ready and stalling at random. The bus is the limit now: 32 lanes
+take 32 bytes a core cycle, all four 64-bit HP ports carry at best,
+where 16 lanes took half. One Qwen2.5 layer, five steps, takes 1.35 bus
+cycles a core cycle with the DDR model always ready and 1.70 with it
+stalling, where 16 lanes take 1.17 and 1.20. Part of the first is the DDR model's
+own: it leaves a cycle idle after every burst, which caps a port at
+8/9 of its beats. With bursts back to back, as a real HP port can
+deliver them, a position takes 1.22 bus cycles a core cycle, and a
+larger streamer window changes nothing (1.22). So 32 lanes buy 1.7
+times the tokens a second on a well-behaved bus and 1.4 times on the
+stalling one, not 2. The whole of Qwen2.5 through the ZC706's registers,
+against the stalling DDR model, was still simulating when this was
+written: its first three positions took 19.57 to 19.68 million bus
+cycles for the direct run's core cycles, 1.69 a core cycle, which is
+0.39 s a position at 50 MHz against the Zybo's 0.54 s.
+
+The routed design uses 196 of the XC7Z045's 900 DSPs (198 for Qwen3) and
+9% of its LUT sites (10%), and closes 50 MHz on both clocks in the open
+flow: 65.5 MHz core and 50.3 MHz bus for Qwen2.5, 71.5 and 60.3 for
+Qwen3. Both bitstreams round-trip, all 30,722 frames.
+
+### Two bridge faults, found on the way
+
+The weight image was in the wrong byte order for the board. The ARM
+copies `weights8.bin` into DDR byte for byte, and AXI is little-endian:
+the byte at a word's lowest address arrives on `rdata[7:0]`, which the
+bridge takes as lane 0. The image held each word lane 15 first, and the
+testbench's DDR model handed bytes back the other way round, so the two
+agreed with each other and not with the board, where every word's
+lanes would have landed reversed. The image now holds lane j at byte j,
+the DDR model returns the bytes at a beat's address lowest first, and
+`test_bridge_end_to_end` checks the image against the model's own
+weights and fails on an image in the old order. An SD card made before
+this has the old image; its sizes are the same, so the layout check
+cannot tell, and `HANDOFF.md` says so.
+
+The weight streamer could hand the core another line's weights. It
+allowed a second request to a slot while the first was still in flight.
+After the stream moved on and then jumped back, one slot could have
+three bursts on their way, X, then Y, then X again; X's first copy
+marked the slot valid for X, and Y's beats then overwrote it while it
+still read as X. The stress test that guards the streamer ran 120 jumps
+and passed; with 1500 it fails on every one of 24 seeds, 4 to 31 wrong
+words in 88,000. A real decode step has only a few jumps, which is why
+every model run above still chose the right tokens, but a board's DDR
+timing could have hit it on any of them. A slot now takes no request
+while a burst is in flight to it: the stream moves past a line that is
+held or on its way, and waits for the slot otherwise. Every seed tried
+since passes at 1500 jumps, the test now runs two, and with the DDR model
+always ready the one-layer runs take exactly the bus cycles they did
+before, on both boards.
+
+The 32-lane build first closed only 47.3 MHz on the bus clock (Qwen3:
+46.4). Its worst path was the stream's issue decision: a 32-way mux of
+line tags and a compare against the next line, then every tag's enable,
+ten LUTs, most of it wire on a die the wider core spreads over. The
+decision now reads three registered flags, computed a cycle ahead for
+the line the stream moves to, which is exact for the tag and the
+held-or-coming flag; the in-flight flag can lag a landing burst by a
+cycle, which delays an issue and never lets one into a busy slot. The
+Zybo's bus clock went from 50.9 to 54.5 MHz with it.
+
+A pipeline need not be one kind of board. `gals.build` takes each
+stage's width, and three boards of 32, 16 and 32 lanes give the one-board
+integer model's tokens and logits exactly, with no CRC error: only the
+hidden state crosses between them.
 
 ## Boards on their own clocks: GALS
 
@@ -662,11 +776,14 @@ which fails on a write that does not wait), and the ARM program carries
 the same messages over lwIP UDP, a hidden state split into datagrams
 under one frame.
 
-For Qwen3-0.6B over the ZC706 and a Zybo, the balanced split is layers
+For Qwen3-0.6B over the ZC706 and a Zybo, the balanced split was layers
 0 to 13 on the ZC706 with the embedding and 14 to 27 on the Zybo with
 the head, both at the 50 MHz bus clock: 0.88 s a token for one stream,
 the same as one board, since a single stream's time is the sum of its
-stages, and 1.8 tokens/s with both stages busy on separate streams.
+stages, and 1.8 tokens/s with both stages busy on separate streams. With
+the ZC706's core at 32 lanes the planner gives it layers 0 to 18: one
+stream then takes 0.78 s, slower than the ZC706 alone (0.63 s), and both
+stages busy give 1.97 tokens/s, which is the split's point.
 `--package` wrote both boards' packages from the real weights, each
 elaborating whole. The network half of the ARM
 program has run too, on this host: `test_stage_network_on_host` compiles
@@ -734,7 +851,7 @@ head on its own weights, the prompt's five positions, choosing token
 the ZC706 package's registers against the stalling DDR model, one layer
 of the same design matches the direct testbench's token and core cycles
 at 1.19 bus cycles a core cycle, so a Qwen3 token is about 0.9 s at the
-50 MHz the design closes. That board-level run first read back a token
+50 MHz the design closes (0.63 s at the ZC706's later 32 lanes). That board-level run first read back a token
 of 0: the DDR model had no weight image to serve, since the package's
 simulation path relied on one a different script writes, and every
 weight read returned X while the data-independent timing still looked
@@ -1466,12 +1583,14 @@ These are the distance between this repo and a local LLM host.
    the stalling DDR model, a Qwen2.5-0.5B position takes 26.9 million bus
    cycles and a step with the head 37.5 million, 0.54 s and 0.75 s at
    the 50 MHz the design closes: a generated token every 0.75 s, about
-   1.3 tokens/s for one stream, and
-   `cluster.py` puts Qwen3-0.6B at 0.88 s a token on one board. The real
+   1.3 tokens/s for one stream. On the ZC706's 32-lane core a position
+   takes 19.6 million bus cycles through the same registers, 0.39 s.
+   `cluster.py`, from the measured
+   bus ratios, puts Qwen3-0.6B at 0.63 s a token on the ZC706. The real
    DDR controller, the interconnect and the ARM have not run it, and
-   the 16-lane core is sized for the Zybo: the ZC706 uses 14% of its
-   DSPs for it. The fabric-level tokens/s of the sizing model remains a
-   model checked against a fabric simulation.
+   the 32-lane core is bound by the four HP ports at the shared 50 MHz
+   clock. The fabric-level tokens/s of the sizing model remains a model
+   checked against a fabric simulation.
 
 5. **Formal coverage is one property of one block.** The accumulator
    proof holds for the int8 targets; with 16-bit operands the MAC splits

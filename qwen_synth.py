@@ -17,9 +17,9 @@ import qwen_int as qi
 import qwen_real as qr
 
 
-def config(style="qwen3", nl=2):
-    c = {"hidden_size": 64, "intermediate_size": 256, "num_attention_heads": 4,
-         "num_key_value_heads": 2, "num_hidden_layers": nl, "vocab_size": 600,
+def config(style="qwen3", nl=2, vocab=600, hidden=64):
+    c = {"hidden_size": hidden, "intermediate_size": 256, "num_attention_heads": 4,
+         "num_key_value_heads": 2, "num_hidden_layers": nl, "vocab_size": vocab,
          "rms_norm_eps": 1e-6, "rope_theta": 1000000.0}
     if style == "qwen3":
         c["head_dim"] = 32
@@ -69,12 +69,15 @@ class _Ids:
         return self.ids
 
 
-def model(style="qwen3", seed=5, nl=2):
-    """(integer model, float model) for a synthetic checkpoint."""
-    cfg = config(style, nl)
+def model(style="qwen3", seed=5, nl=2, lanes=None, vocab=600, hidden=64):
+    """(integer model, float model) for a synthetic checkpoint. lanes
+    sets the projection's width instead of the board's rule."""
+    cfg = config(style, nl, vocab, hidden)
     W = weights(cfg, style, seed)
     rnd = random.Random(seed + 1)
     calib = [rnd.randrange(cfg["vocab_size"]) for _ in range(12)]
     cal = qi.calibrate(cfg, W, _Ids(calib), log=lambda *a: None)
     im = qi.IntQwen(cfg, W, 16, True, cal, log=lambda *a: None, exact_io=True)
+    if lanes:
+        im.ms["lanes"] = lanes
     return im, qr.FloatQwen(cfg, W)

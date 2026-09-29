@@ -8,8 +8,9 @@ boards.py knows about each board:
 
   speed     bytes of weights a second it can stream, the smaller of its
             DDR's sustained rate and what the design consumes at its
-            clock: 16 bytes a core cycle, over the 1.18 bus cycles a core
-            cycle measured through the Zybo's registers
+            clock: a byte a lane each core cycle (16 lanes on the Zybo,
+            32 on the ZC706), over the bus cycles a core cycle measured
+            through that package's registers
   capacity  DDR left for weights once the program, the constants, its
             share of the KV cache and, on the first and last stage, the
             tied embedding and head table are placed
@@ -34,7 +35,6 @@ import os
 import boards
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
-LANE_BYTES = 16          # weight bytes the core takes a cycle
 BUS_PER_CORE = 1.18      # measured, 24 layers through the Zybo's registers
 BASE = 0x08000000        # below it, the ARM's program
 UART_BAUD = 6.25e6       # board to board on two wires: clk/8 at 50 MHz
@@ -64,7 +64,8 @@ def speed(name):
     """Weight bytes a second the board streams through this design."""
     b, pk = boards.BOARDS[name], boards.PACKAGES.get(name, {})
     mhz = pk.get("fpgai_mhz", 50)
-    design = LANE_BYTES * mhz * 1e6 / BUS_PER_CORE
+    design = (pk.get("lanes", 16) * mhz * 1e6
+              / pk.get("bus_per_core", BUS_PER_CORE))
     return min(b["mem_gbytes_per_s"] * 1e9, design)
 
 
@@ -180,6 +181,7 @@ def package(p, out_root, prompt="The capital of France is", tokens=16,
         # every layer, the embedding and the head, no network.
         st = p["stages"][0]
         work = os.path.join(out_root, "build_single")
+        im.ms["lanes"] = boards.PACKAGES[st["board"]]["lanes"]
         qwen_full.build_model(im, ids, 0, work, log=log, want=list(ids) + [0])
         out = os.path.join(out_root, "single_%s" % st["board"])
         board_zybo.package(work, st["board"], out, prompt, tokens)
@@ -193,6 +195,7 @@ def package(p, out_root, prompt="The capital of France is", tokens=16,
                              "over the fabric UART, not a Zynq package" % st["board"])
         layers = list(range(*st["layers"]))
         work = os.path.join(out_root, "build_stage%d" % i)
+        im.ms["lanes"] = pk["lanes"]        # each board its own width
         qwen_full.build_model(im, ids, 0, work, log=log, layers=layers, stage=True,
                               want=list(ids) + [0], table=st["emb"] or st["head"])
         out = os.path.join(out_root, "stage%d_%s" % (i, st["board"]))

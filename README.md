@@ -478,7 +478,7 @@ checked against another model. Read that list before quoting any number here.
 | input | what it holds | where it is used |
 |---|---|---|
 | `model_spec.json` | the model's shape and number formats: layers, hidden size, MLP size, heads and KV heads, head dimension, vocabulary, weight and activation bits, context length, RoPE base, target tokens/s | every derived spec, the sizing model |
-| `boards.py` | each board's resources (LUTs, flip-flops, DSPs, on-chip RAM), DDR bandwidth and size, clock cap, link rates; and for the boards a package can be built for (Zybo Z7-20, ZC706), the part, Vivado preset, pins, and whether it has an ARM | lane counts, fit checks, the sizing model, the board packages, the multi-board split |
+| `boards.py` | each board's resources (LUTs, flip-flops, DSPs, on-chip RAM), DDR bandwidth and size, clock cap, link rates; and for the boards a package can be built for (Zybo Z7-20, ZC706), the part, Vivado preset, pins, the core's lane count (16 and 32), and whether it has an ARM | lane counts, fit checks, the sizing model, the board packages, the multi-board split |
 | a board list, optional | the boards on hand, in chain order, e.g. `zc706 zybo_z7_20` | the multi-board split (`cluster.py`) |
 | a checkpoint, optional | real weights, tokenizer and `config.json` from `fetch_qwen.py` (Qwen2.5-0.5B, or Qwen3-0.6B with `FPGAI_QWEN=qwen3`) | the integer model, the full-size sequencer, the SD image |
 | a prompt | text, tokenized with the checkpoint's own BPE | the decode, in simulation and on the board |
@@ -510,12 +510,15 @@ checked against another model. Read that list before quoting any number here.
 5. **The sequencer** (`qwen_full.py`). One generated RTL module sequences
    the signed-off blocks through a whole decode step, embedding to
    argmax over the full vocabulary, and writes the weight, constant and
-   gain images it reads. Simulated on the real weights, it has to choose
-   the integer model's tokens.
+   gain images it reads. Its width is a build option (`--lanes`): 16
+   weights a cycle for the Zybo, 32 for the ZC706, whose part has the
+   DSPs for it. Simulated on the real weights, it has to choose the
+   integer model's tokens.
 6. **The board** (`zybo.py`, `board_zybo.py --board zybo_z7_20|zc706`).
    A DDR bridge puts the sequencer on the Zynq's memory ports (four
    weight streams, one port for constants and the KV cache, the core
-   clock held while a line is in flight), an AXI-Lite register block
+   clock held while a line is in flight; the weights sit in DDR as int8
+   in the byte order AXI reads them), an AXI-Lite register block
    lets the ARM run it, and the package adds the Vivado block design, an
    open-flow build (`open/`: Yosys, nextpnr-xilinx and Project X-Ray, no
    Vivado), the bare-metal ARM program and the SD card files.
@@ -529,6 +532,8 @@ checked against another model. Read that list before quoting any number here.
    two pins, which any FPGA can build. `cluster.py --package` writes
    every stage's board package; each stage's sequencer gains a port to
    load and read the hidden state, and its ARM program the network.
+   Stages need not match: each board's core has its own width, and only
+   the hidden state crosses between them.
 
 ### Outputs
 
