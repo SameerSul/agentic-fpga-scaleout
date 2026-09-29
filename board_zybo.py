@@ -545,6 +545,22 @@ write_hw_platform -fixed -include_bit -force ./fpgai.xsa
 puts "platform: ./fpgai.xsa"
 """
 
+def _open_synth(pk):
+    """Yosys's synthesis for the open flow. A core that fills the part's
+    DSPs (the Zybo's at 32 lanes, 196 of 220) leaves nextpnr-xilinx no
+    free LUT beside some DSPs to make the constants their unused inputs
+    need, and routing fails; so the first soft_score_lanes of the
+    attention head's score lanes multiply in LUTs instead, retyped before
+    the DSP mapping. Vivado's build keeps every multiplier on a DSP."""
+    n = pk.get("soft_score_lanes", 0)
+    if not n:
+        return "  synth_xilinx -flatten -abc9 -arch xc7 -top fpgai_ps7"
+    lanes = " ".join("c:*slane?%d?.*" % k for k in range(n)) + " %u" * (n - 1)
+    return ("  synth_xilinx -flatten -abc9 -arch xc7 -top fpgai_ps7 -run :map_dsp; \\\n"
+            "  select -set soft t:\\$mul %s %%i; chtype -set \\$__soft_mul @soft; \\\n"
+            "  synth_xilinx -flatten -abc9 -arch xc7 -top fpgai_ps7 -run map_dsp:" % lanes)
+
+
 def render_xdc(pk, open_flow=False):
     """The one pin the PL drives: an LED that shows the core busy, where
     the board has one whose bank voltage is known."""
@@ -722,7 +738,7 @@ cd "$(dirname "$0")"
 : "${{NEXTPNR_XILINX:?set NEXTPNR_XILINX}}" "${{XRAY_DIR:?set XRAY_DIR}}"
 cp ../rtl/gains.hex .
 yosys -q -l yosys.log -p "read_verilog fpgai_ps7.v $(ls ../rtl/*.v | tr '\\n' ' '); \\
-  synth_xilinx -flatten -abc9 -arch xc7 -top fpgai_ps7; write_json fpgai.json"
+{synth}; write_json fpgai.json"
 "$NEXTPNR_XILINX/build/nextpnr-xilinx" --chipdb "$NEXTPNR_XILINX/xilinx/{chip}.bin" \\
   --xdc open.xdc --json fpgai.json --fasm fpgai.fasm --freq {mhz} \\
   --report report.json --log nextpnr.log
@@ -744,17 +760,19 @@ CHECKED = {
                 "cycles of latency on every port: one layer matching the direct "
                 "testbench's token and core cycles, with every port always ready "
                 "and with every port stalling and gapping its beats at random "
-                "(`--jitter`); and all 24 layers and the head of the Zybo's 16-lane "
-                "build the same way, choosing \" Paris\". The attention head's wider "
-                "score lanes came after that run; with them, all 24 layers and the "
-                "head on the direct testbench take the same cycles and choose "
-                "\" Paris\" again."),
+                "(`--jitter`); all 24 layers and the head the same way, on the "
+                "16-lane build and on the 32-lane one, choosing \" Paris\"; and this "
+                "package's own ARM program, compiled unchanged, driving this RTL "
+                "from its own SD card's files (`cosim.py --jitter`), printing the "
+                "integer model's 16 tokens with its logits."),
     "qwen3": ("Qwen3-0.6B",
               "this design with one layer run only through AXI-Lite against the "
               "stalling DDR model, matching the direct testbench's token and core "
-              "cycles, and the sequencer itself through all 28 layers and the head "
-              "on the direct testbench, choosing \" Paris\" as the integer model "
-              "does."),
+              "cycles; the sequencer itself through all 28 layers and the head on "
+              "the direct testbench, choosing \" Paris\" as the integer model does; "
+              "and this package's own ARM program, compiled unchanged, driving this "
+              "RTL from its own SD card's files (`cosim.py --jitter`), printing the "
+              "integer model's 16 tokens with its logits."),
 }
 
 
@@ -1826,7 +1844,7 @@ def package(work, board="zybo_z7_20", out=None, prompt="The capital of France is
     with open(os.path.join(od, "fpgai_ps7.v"), "w") as f:
         f.write(render_ps7_top(led=bool(pk.get("led"))))
     with open(os.path.join(od, "build_open.sh"), "w") as f:
-        f.write(OPEN_SH.format(mhz=MHZ, part=pk["part"], chip=pk["chip"],
+        f.write(OPEN_SH.format(mhz=MHZ, part=pk["part"], chip=pk["chip"], synth=_open_synth(pk),
                                title=pk["title"]))
     os.chmod(os.path.join(od, "build_open.sh"), 0o755)
     with open(os.path.join(od, "open.xdc"), "w") as f:

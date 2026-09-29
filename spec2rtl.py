@@ -250,16 +250,28 @@ def _sign_off(im, gates, agent_kind, log, dv=False):
         with open(job["tb_file"], "w") as f:
             f.write(tbf(spec))
         t0 = time.time()
-        attempts, prev = [], None
+        attempts, prev, report, err = [], None, None, None
         for label, make, iters in agent_chain(agent_kind):
             ag = make()
             if getattr(prev, "last_rtl", None) and hasattr(ag, "last_rtl"):
                 ag.last_rtl = prev.last_rtl     # edit the last attempt, not restart
-            report, profile = cf.run_flow(job, verbose=False, agent=ag, max_iters=iters)
+            try:
+                report, profile = cf.run_flow(job, verbose=False, agent=ag, max_iters=iters)
+            except RuntimeError as e:
+                # An agent that gives no answer (a model's CLI timing out) has
+                # failed its attempt: the next in the chain takes the block.
+                err = e
+                attempts.append([label, 0, False, str(e)[:200]])
+                log("  %-26s %s gave no answer (%s); the next agent takes it"
+                    % (what, label, str(e)[:60]))
+                prev = ag
+                continue
             attempts.append([label, report["iterations_used"], report["converged"]])
             prev = ag
             if report["converged"]:
                 break
+        if report is None:
+            raise err
         last = report["history"][-1] if report["history"] else {}
         timing = (last.get("timing") or {})
         fpga = (last.get("fpga") or {})

@@ -108,6 +108,20 @@ register access an AXI-Lite transaction and every DDR port stalling at
 random. It prints what the UART should print, in under ten minutes; if
 it does not, the fault is in the files or the RTL, not the board.
 
+### A faster Zybo: 32 lanes
+
+`board_zybo_32/` is the same Zybo at the ZC706's width: the ZC706 package's
+RTL, about a third faster a token. It places and routes on the XC7Z020 in
+the open flow (57.8 MHz core, 58.5 MHz bus), with 24 of the attention
+head's score multipliers in LUTs; Vivado may keep them all on DSPs. Make
+its SD card from the 32-lane build and run it the same way:
+
+```bash
+python3 qwen_full.py --lanes 32 --work build_q25l32
+python3 board_zybo.py --board zybo_z7_20_32 --work build_q25l32
+python3 cosim.py board_zybo_32 --jitter
+```
+
 ## 2. Build the bitstream and the platform
 
 ```bash

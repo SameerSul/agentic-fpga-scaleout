@@ -1,0 +1,16 @@
+diff --git a/utils/fasm2frames.py b/utils/fasm2frames.py
+index 0e76d3f..d46341b 100755
+--- a/utils/fasm2frames.py
++++ b/utils/fasm2frames.py
+@@ -515,7 +515,10 @@ def run(
+                     x62_gfan_tile = 'INT_L_X{}Y{}'.format(m.group(2), int(m.group(3)) + 10)
+                 break
+ 
+-        if x62_gfan_tile:
++        # The rule was observed on one part's column 62; on a part whose
++        # grid has no tile ten rows up (the XC7Z045 at Y354) there is no
++        # glue bit to set, and looking one up would abort the conversion.
++        if x62_gfan_tile and x62_gfan_tile in assembler.grid.tileinfo:
+             feature = '{}.GFAN_TIE_ROOT_GLUE'.format(x62_gfan_tile)
+             for line in fasm.parse_fasm_string(feature):
+                 assembler.add_fasm_line(line, glue_missing)

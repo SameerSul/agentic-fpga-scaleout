@@ -522,7 +522,7 @@ the gathers over UDP.
 | input | what it holds | where it is used |
 |---|---|---|
 | `model_spec.json` | the model's shape and number formats: layers, hidden size, MLP size, heads and KV heads, head dimension, vocabulary, weight and activation bits, context length, RoPE base, target tokens/s | every derived spec, the sizing model |
-| `boards.py` | each board's resources (LUTs, flip-flops, DSPs, on-chip RAM), DDR bandwidth and size, clock cap, link rates; and for the boards a package can be built for (Zybo Z7-20, ZC706), the part, Vivado preset, pins, the core's lane count (16 and 32), and whether it has an ARM | lane counts, fit checks, the sizing model, the board packages, the multi-board split |
+| `boards.py` | each board's resources (LUTs, flip-flops, DSPs, on-chip RAM), DDR bandwidth and size, clock cap, link rates; and for the boards a package can be built for (Zybo Z7-20, ZC706, and the Zybo at the ZC706's width, `zybo_z7_20_32`), the part, Vivado preset, pins, the core's lane count (16 and 32), and whether it has an ARM | lane counts, fit checks, the sizing model, the board packages, the multi-board split |
 | a board list, optional | the boards on hand, in chain order, e.g. `zc706 zybo_z7_20` | the multi-board split (`cluster.py`) |
 | a checkpoint, optional | real weights, tokenizer and `config.json` from `fetch_qwen.py` (Qwen2.5-0.5B, or Qwen3-0.6B with `FPGAI_QWEN=qwen3`) | the integer model, the full-size sequencer, the SD image |
 | a prompt | text, tokenized with the checkpoint's own BPE | the decode, in simulation and on the board |
@@ -592,6 +592,6 @@ the gathers over UDP.
 |---|---|
 | `build*/`, `chiplet_profile.json`, `fabric_profile.json` | per-block RTL that passed every gate, with measured cycles, timing and resources |
 | `build_qfull/qwen_full.v` and its images | the full decode step as one RTL design, with `weights.bin`, `cparams.hex` and `gains.hex` |
-| `board_zybo/`, `board_zc706/`, `board_zc706_qwen3/` | one board's package: RTL, `build.tcl`, `open/build_open.sh` (a bitstream without Vivado), `sw/main.c`, and `sd/` (the model: 494 MB for Qwen2.5-0.5B, 596 MB for Qwen3-0.6B) |
+| `board_zybo/`, `board_zybo_32/`, `board_zc706/`, `board_zc706_qwen3/` | one board's package: RTL, `build.tcl`, `open/build_open.sh` (a bitstream without Vivado), `sw/main.c`, and `sd/` (the model: 494 MB for Qwen2.5-0.5B, 596 MB for Qwen3-0.6B) |
 | `cluster.py --package DIR` | one package a stage, `DIR/stage<i>_<board>/`, each with its layers, its images, and an ARM program that knows its neighbours' addresses; `plan.json` records the split |
 | on the board | generated text over the USB-UART: `The capital of France is Paris. Paris is the capital of France. ...`, the integer model's tokens; RTL simulation has checked the first one, " Paris", through all 24 layers and the head |

@@ -2049,6 +2049,38 @@ def test_spec_to_verified_rtl():
         shutil.rmtree(out, ignore_errors=True)
 
 
+def test_sign_off_survives_a_silent_agent():
+    """An LLM agent whose model never answers (its CLI timing out, as
+    Sonnet's did on the attention head for 75 minutes) has failed its
+    attempt, and the next agent in the chain has to take the block; it
+    used to abort the whole spec2rtl.py run."""
+    import spec2rtl, qwen_synth
+    import chiplet_flow as cf
+
+    class Silent:
+        last_rtl = None
+
+        def propose(self, spec, history):
+            raise RuntimeError("claude CLI failed after 3 attempt(s): timed out after 1500s")
+    gates = os.path.join(ROOT, 'build_silenttest')
+    shutil.rmtree(gates, ignore_errors=True)
+    chain, plan, build = spec2rtl.agent_chain, spec2rtl.block_plan, cf.BUILD
+    try:
+        spec2rtl.agent_chain = lambda kind: [('silent', Silent, 2),
+                                             ('rules (fallback)', RuleBasedAgent, 5)]
+        spec2rtl.block_plan = lambda im: (plan(im)[0][:1], plan(im)[1])
+        im, _ = qwen_synth.model('qwen3', nl=1)
+        rows, _ = spec2rtl.sign_off(im, gates, 'llm', lambda *a: None)
+        r = rows[0]
+        check('a model that never answers hands its block to the next agent, which signs it off',
+              r['converged'] and r['agent'] == 'rules (fallback)'
+              and [a[0] for a in r['attempts']] == ['silent', 'rules (fallback)']
+              and not r['attempts'][0][2])
+    finally:
+        spec2rtl.agent_chain, spec2rtl.block_plan, cf.BUILD = chain, plan, build
+        shutil.rmtree(gates, ignore_errors=True)
+
+
 def test_attention_scores_cannot_overflow():
     """A score is q times k, both 16-bit activations at a16, over head_dim;
     the model's MAC is sized for an int8 weight times an activation. At a
@@ -2143,6 +2175,24 @@ def test_weights_split_over_boards():
                       got == best and len(best) == 3 and 'bad=0' in out)
         finally:
             shutil.rmtree(work, ignore_errors=True)
+
+
+def test_zybo_at_32_lanes():
+    """The Zybo package at the ZC706's width (boards.zybo_z7_20_32): the
+    same core, the planner's speed for it the ZC706's, and an open flow
+    that multiplies 24 of the attention head's score lanes in LUTs, so
+    nextpnr-xilinx has LUTs to make the constants the DSPs left need; the
+    16-lane Zybo's synthesis is unchanged."""
+    import board_zybo as bz, cluster
+    z32, z16 = boards_mod.PACKAGES['zybo_z7_20_32'], boards_mod.PACKAGES['zybo_z7_20']
+    soft = bz._open_synth(z32)
+    check('a 32-lane Zybo runs the ZC706\'s core at its speed, 24 score lanes in LUTs in '
+          'the open flow',
+          z32['lanes'] == 32 and boards_mod.base('zybo_z7_20_32') == 'zybo_z7_20'
+          and cluster.speed('zybo_z7_20_32') == cluster.speed('zc706')
+          and soft.count('slane?') == 24 and '-run :map_dsp' in soft
+          and '$__soft_mul' in soft and 'slane' not in bz._open_synth(z16)
+          and cluster.speed('zybo_z7_20_32') > cluster.speed('zybo_z7_20'))
 
 
 def test_tp_plan():
@@ -3895,11 +3945,13 @@ if __name__ == '__main__':
     test_weight_streamer_survives_stalls()
     test_full_sequencer_both_qwens()
     test_bridge_end_to_end()
+    test_sign_off_survives_a_silent_agent()
     test_attention_scores_cannot_overflow()
     test_spec_to_verified_rtl()
     test_weights_split_over_boards()
     test_weights_split_through_registers()
     test_tp_plan()
+    test_zybo_at_32_lanes()
     test_gals_two_boards()
     test_cluster_plan()
     test_zybo_stage_registers()

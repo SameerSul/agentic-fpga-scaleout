@@ -289,12 +289,12 @@ def stage_seconds(name, m, n_layers, n, emb, head):
         * pk.get("bus_per_core", BUS_PER_CORE) / (mhz * 1e6)
     sb = shape_bytes(m)
     byts = n_layers * sb["layer_weights"] + (m["V"] * m["D"] if head else 0)
-    return max(t, byts / (boards.BOARDS[name]["mem_gbytes_per_s"] * 1e9))
+    return max(t, byts / (boards.BOARDS[boards.base(name)]["mem_gbytes_per_s"] * 1e9))
 
 
 def speed(name):
     """Weight bytes a second the board streams through this design."""
-    b, pk = boards.BOARDS[name], boards.PACKAGES.get(name, {})
+    b, pk = boards.BOARDS[boards.base(name)], boards.PACKAGES.get(name, {})
     mhz = pk.get("fpgai_mhz", 50)
     design = (pk.get("lanes", 16) * mhz * 1e6
               / pk.get("bus_per_core", BUS_PER_CORE))
@@ -447,7 +447,7 @@ def package(p, out_root, prompt="The capital of France is", tokens=16,
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("boards", nargs="+", choices=sorted(boards.BOARDS))
+    ap.add_argument("boards", nargs="+", choices=sorted(set(boards.BOARDS) | set(boards.PACKAGES)))
     ap.add_argument("--model", default="qwen3", choices=sorted(MODELS))
     ap.add_argument("--mode", default="balanced", choices=("balanced", "fast"))
     ap.add_argument("--json", action="store_true")

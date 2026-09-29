@@ -304,6 +304,23 @@ PACKAGES = {
 }
 
 
+# The Zybo at the ZC706's width: the XC7Z020's 220 DSPs hold a 32-lane
+# core when 24 of the attention head's 32 score lanes multiply in LUTs,
+# which the open flow needs to deliver its constants to the DSPs left (see
+# open/build_open.sh); then its four HP ports feed it as the ZC706's do.
+PACKAGES["zybo_z7_20_32"] = dict(
+    PACKAGES["zybo_z7_20"], title="Zybo Z7-20, 32 lanes", out="board_zybo_32",
+    board="zybo_z7_20", lanes=32, soft_score_lanes=24,
+    # As the ZC706's: the same 32-lane bridge on the same four HP ports.
+    bus_per_core=1.70,
+    open_flow_mhz={"qwen2.5": (57.77, 58.53)})
+
+
+def base(name):
+    """The board a package is built for: a package can be a width of one."""
+    return PACKAGES.get(name, {}).get("board", name)
+
+
 def link_between(a, b):
     """How two boards talk: Ethernet when both have an ARM to run it,
     otherwise the fabric UART, which both ends can always build."""

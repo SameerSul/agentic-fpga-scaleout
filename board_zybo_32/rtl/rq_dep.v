@@ -1,0 +1,270 @@
+module requant (
+  input                     clk,
+  input                     rst_n,
+  input      signed [36:0] acc_in,
+  input             [17:0] scale,
+  input             [6:0] shift,
+  input                     valid_in,
+  output reg signed [15:0] q_out,
+  output reg                sat,
+  output reg                valid_out
+);
+  // scale is unsigned, so it is zero-extended before the signed multiply:
+  // mixing a signed and an unsigned operand makes the whole expression
+  // unsigned in Verilog and silently breaks every negative accumulator.
+  // half depends only on shift, so it is built before the tree and never
+  // sits on the rounding path.
+  reg  signed [54:0] pp0_0;
+  reg  signed [54:0] pp0_1;
+  reg  signed [54:0] pp0_2;
+  reg  signed [54:0] pp0_3;
+  reg  signed [54:0] pp0_4;
+  reg  signed [54:0] pp1_0;
+  reg  signed [54:0] pp1_1;
+  reg  signed [54:0] pp1_2;
+  reg  signed [54:0] pp1_3;
+  reg  signed [54:0] pp1_4;
+  reg  [27:0] s1_0_lo;
+  reg  signed [54:0] s1_0_xh;
+  reg  signed [54:0] s1_0_yh;
+  reg  signed [54:0] s1_0;
+  reg  [27:0] s1_1_lo;
+  reg  signed [54:0] s1_1_xh;
+  reg  signed [54:0] s1_1_yh;
+  reg  signed [54:0] s1_1;
+  reg  [27:0] s1_2_lo;
+  reg  signed [54:0] s1_2_xh;
+  reg  signed [54:0] s1_2_yh;
+  reg  signed [54:0] s1_2;
+  reg  [27:0] s1_3_lo;
+  reg  signed [54:0] s1_3_xh;
+  reg  signed [54:0] s1_3_yh;
+  reg  signed [54:0] s1_3;
+  reg  [27:0] s1_4_lo;
+  reg  signed [54:0] s1_4_xh;
+  reg  signed [54:0] s1_4_yh;
+  reg  signed [54:0] s1_4;
+  reg  [27:0] s2_0_lo;
+  reg  signed [54:0] s2_0_xh;
+  reg  signed [54:0] s2_0_yh;
+  reg  signed [54:0] s2_0;
+  reg  [27:0] s2_1_lo;
+  reg  signed [54:0] s2_1_xh;
+  reg  signed [54:0] s2_1_yh;
+  reg  signed [54:0] s2_1;
+  reg  signed [54:0] s2_2_d0;
+  reg  signed [54:0] s2_2;
+  reg  [27:0] s3_0_lo;
+  reg  signed [54:0] s3_0_xh;
+  reg  signed [54:0] s3_0_yh;
+  reg  signed [54:0] s3_0;
+  reg  signed [54:0] s3_1_d0;
+  reg  signed [54:0] s3_1;
+  reg  [27:0] s4_0_lo;
+  reg  signed [54:0] s4_0_xh;
+  reg  signed [54:0] s4_0_yh;
+  reg  signed [54:0] s4_0;
+  reg  [27:0] summed_lo;
+  reg  signed [54:0] summed_xh;
+  reg  signed [54:0] summed_yh;
+  reg  signed [54:0] summed;
+  reg  signed [54:0] shifted;
+  reg  signed [54:0] hf0, hf1, hf2, hf3, hf4, hf5, hf6, hf7, hf8;
+  reg  [6:0] sh0, sh1, sh2, sh3, sh4, sh5, sh6, sh7, sh8, sh9, sh10;
+  reg  v0, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11;
+  wire signed [54:0] half_w = (shift == 0)
+        ? 55'sd0 : (55'sd1 <<< (shift - 1));
+  always @(posedge clk) begin
+    if (!rst_n) begin
+      pp0_0      <= 0;
+      pp0_1      <= 0;
+      pp0_2      <= 0;
+      pp0_3      <= 0;
+      pp0_4      <= 0;
+      pp1_0      <= 0;
+      pp1_1      <= 0;
+      pp1_2      <= 0;
+      pp1_3      <= 0;
+      pp1_4      <= 0;
+      s1_0_lo    <= 0;
+      s1_0_xh    <= 0;
+      s1_0_yh    <= 0;
+      s1_0       <= 0;
+      s1_1_lo    <= 0;
+      s1_1_xh    <= 0;
+      s1_1_yh    <= 0;
+      s1_1       <= 0;
+      s1_2_lo    <= 0;
+      s1_2_xh    <= 0;
+      s1_2_yh    <= 0;
+      s1_2       <= 0;
+      s1_3_lo    <= 0;
+      s1_3_xh    <= 0;
+      s1_3_yh    <= 0;
+      s1_3       <= 0;
+      s1_4_lo    <= 0;
+      s1_4_xh    <= 0;
+      s1_4_yh    <= 0;
+      s1_4       <= 0;
+      s2_0_lo    <= 0;
+      s2_0_xh    <= 0;
+      s2_0_yh    <= 0;
+      s2_0       <= 0;
+      s2_1_lo    <= 0;
+      s2_1_xh    <= 0;
+      s2_1_yh    <= 0;
+      s2_1       <= 0;
+      s2_2_d0    <= 0;
+      s2_2       <= 0;
+      s3_0_lo    <= 0;
+      s3_0_xh    <= 0;
+      s3_0_yh    <= 0;
+      s3_0       <= 0;
+      s3_1_d0    <= 0;
+      s3_1       <= 0;
+      s4_0_lo    <= 0;
+      s4_0_xh    <= 0;
+      s4_0_yh    <= 0;
+      s4_0       <= 0;
+      summed_lo  <= 0;
+      summed_xh  <= 0;
+      summed_yh  <= 0;
+      summed     <= 0;
+      shifted    <= 0;
+      hf0        <= 0;
+      hf1        <= 0;
+      hf2        <= 0;
+      hf3        <= 0;
+      hf4        <= 0;
+      hf5        <= 0;
+      hf6        <= 0;
+      hf7        <= 0;
+      hf8        <= 0;
+      sh0        <= 0;
+      sh1        <= 0;
+      sh2        <= 0;
+      sh3        <= 0;
+      sh4        <= 0;
+      sh5        <= 0;
+      sh6        <= 0;
+      sh7        <= 0;
+      sh8        <= 0;
+      sh9        <= 0;
+      sh10       <= 0;
+      v0         <= 1'b0;
+      v1         <= 1'b0;
+      v2         <= 1'b0;
+      v3         <= 1'b0;
+      v4         <= 1'b0;
+      v5         <= 1'b0;
+      v6         <= 1'b0;
+      v7         <= 1'b0;
+      v8         <= 1'b0;
+      v9         <= 1'b0;
+      v10        <= 1'b0;
+      v11        <= 1'b0;
+      q_out      <= 0;
+      sat        <= 1'b0;
+      valid_out  <= 1'b0;
+    end else begin
+      pp0_0      <= $signed({1'b0, acc_in[17:0]}) * $signed({1'b0, scale[2:0]});
+      pp0_1      <= ($signed({1'b0, acc_in[17:0]}) * $signed({1'b0, scale[6:3]})) <<< 3;
+      pp0_2      <= ($signed({1'b0, acc_in[17:0]}) * $signed({1'b0, scale[9:7]})) <<< 7;
+      pp0_3      <= ($signed({1'b0, acc_in[17:0]}) * $signed({1'b0, scale[13:10]})) <<< 10;
+      pp0_4      <= ($signed({1'b0, acc_in[17:0]}) * $signed({1'b0, scale[17:14]})) <<< 14;
+      pp1_0      <= ($signed(acc_in[36:18]) * $signed({1'b0, scale[2:0]})) <<< 18;
+      pp1_1      <= ($signed(acc_in[36:18]) * $signed({1'b0, scale[6:3]})) <<< 21;
+      pp1_2      <= ($signed(acc_in[36:18]) * $signed({1'b0, scale[9:7]})) <<< 25;
+      pp1_3      <= ($signed(acc_in[36:18]) * $signed({1'b0, scale[13:10]})) <<< 28;
+      pp1_4      <= ($signed(acc_in[36:18]) * $signed({1'b0, scale[17:14]})) <<< 32;
+      hf0        <= half_w;
+      sh0        <= shift;
+      s1_0_lo    <= {1'b0, pp0_0[26:0]} + {1'b0, pp0_1[26:0]};
+      s1_0_xh    <= pp0_0;
+      s1_0_yh    <= pp0_1;
+      s1_1_lo    <= {1'b0, pp0_2[26:0]} + {1'b0, pp0_3[26:0]};
+      s1_1_xh    <= pp0_2;
+      s1_1_yh    <= pp0_3;
+      s1_2_lo    <= {1'b0, pp0_4[26:0]} + {1'b0, pp1_0[26:0]};
+      s1_2_xh    <= pp0_4;
+      s1_2_yh    <= pp1_0;
+      s1_3_lo    <= {1'b0, pp1_1[26:0]} + {1'b0, pp1_2[26:0]};
+      s1_3_xh    <= pp1_1;
+      s1_3_yh    <= pp1_2;
+      s1_4_lo    <= {1'b0, pp1_3[26:0]} + {1'b0, pp1_4[26:0]};
+      s1_4_xh    <= pp1_3;
+      s1_4_yh    <= pp1_4;
+      hf1        <= hf0;
+      sh1        <= sh0;
+      s1_0       <= {s1_0_xh[54:27] + s1_0_yh[54:27] + s1_0_lo[27], s1_0_lo[26:0]};
+      s1_1       <= {s1_1_xh[54:27] + s1_1_yh[54:27] + s1_1_lo[27], s1_1_lo[26:0]};
+      s1_2       <= {s1_2_xh[54:27] + s1_2_yh[54:27] + s1_2_lo[27], s1_2_lo[26:0]};
+      s1_3       <= {s1_3_xh[54:27] + s1_3_yh[54:27] + s1_3_lo[27], s1_3_lo[26:0]};
+      s1_4       <= {s1_4_xh[54:27] + s1_4_yh[54:27] + s1_4_lo[27], s1_4_lo[26:0]};
+      hf2        <= hf1;
+      sh2        <= sh1;
+      s2_0_lo    <= {1'b0, s1_0[26:0]} + {1'b0, s1_1[26:0]};
+      s2_0_xh    <= s1_0;
+      s2_0_yh    <= s1_1;
+      s2_1_lo    <= {1'b0, s1_2[26:0]} + {1'b0, s1_3[26:0]};
+      s2_1_xh    <= s1_2;
+      s2_1_yh    <= s1_3;
+      s2_2_d0    <= s1_4;
+      hf3        <= hf2;
+      sh3        <= sh2;
+      s2_0       <= {s2_0_xh[54:27] + s2_0_yh[54:27] + s2_0_lo[27], s2_0_lo[26:0]};
+      s2_1       <= {s2_1_xh[54:27] + s2_1_yh[54:27] + s2_1_lo[27], s2_1_lo[26:0]};
+      s2_2       <= s2_2_d0;
+      hf4        <= hf3;
+      sh4        <= sh3;
+      s3_0_lo    <= {1'b0, s2_0[26:0]} + {1'b0, s2_1[26:0]};
+      s3_0_xh    <= s2_0;
+      s3_0_yh    <= s2_1;
+      s3_1_d0    <= s2_2;
+      hf5        <= hf4;
+      sh5        <= sh4;
+      s3_0       <= {s3_0_xh[54:27] + s3_0_yh[54:27] + s3_0_lo[27], s3_0_lo[26:0]};
+      s3_1       <= s3_1_d0;
+      hf6        <= hf5;
+      sh6        <= sh5;
+      s4_0_lo    <= {1'b0, s3_0[26:0]} + {1'b0, s3_1[26:0]};
+      s4_0_xh    <= s3_0;
+      s4_0_yh    <= s3_1;
+      hf7        <= hf6;
+      sh7        <= sh6;
+      s4_0       <= {s4_0_xh[54:27] + s4_0_yh[54:27] + s4_0_lo[27], s4_0_lo[26:0]};
+      hf8        <= hf7;
+      sh8        <= sh7;
+      summed_lo  <= {1'b0, s4_0[26:0]} + {1'b0, hf8[26:0]};
+      summed_xh  <= s4_0;
+      summed_yh  <= hf8;
+      sh9        <= sh8;
+      summed     <= {summed_xh[54:27] + summed_yh[54:27] + summed_lo[27], summed_lo[26:0]};
+      sh10       <= sh9;
+      shifted    <= summed >>> sh10;
+      v0         <= valid_in;
+      v1         <= v0;
+      v2         <= v1;
+      v3         <= v2;
+      v4         <= v3;
+      v5         <= v4;
+      v6         <= v5;
+      v7         <= v6;
+      v8         <= v7;
+      v9         <= v8;
+      v10        <= v9;
+      v11        <= v10;
+      if (shifted > 55'sd32767) begin
+        q_out <= 16'sd32767;
+        sat   <= 1'b1;
+      end else if (shifted < -55'sd32768) begin
+        q_out <= -16'sd32768;
+        sat   <= 1'b1;
+      end else begin
+        q_out <= shifted[15:0];
+        sat   <= 1'b0;
+      end
+      valid_out  <= v11;
+    end
+  end
+endmodule

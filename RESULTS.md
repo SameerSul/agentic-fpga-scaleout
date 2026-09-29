@@ -28,7 +28,9 @@ Architect Labs hosted, decodes the same way: all 28 layers and the head
 in generated RTL choose " Paris", the integer model's token. The package is generated for any Zynq board in
 `boards.py`, today the Zybo Z7-20 and the ZC706, and without Vivado the
 open 7-series flow places and routes the whole design on both parts at
-50 MHz, with bitstreams that round-trip frame for frame. The ZC706's core
+50 MHz, with bitstreams that round-trip frame for frame. The Zybo takes the
+ZC706's 32-lane core as well, 24 of its score multipliers in LUTs so the
+open router can finish, and is then about a third faster a token. The ZC706's core
 is twice the Zybo's width, 32 lanes, and the work to get there found two
 faults in the DDR bridge that simulation had passed: the weight image's
 byte order, which would have reversed every word's lanes on the board,
@@ -67,7 +69,7 @@ The remaining gap is listed at the bottom rather than glossed over.
 ### The full suite
 
 ```
-python3 tests.py            # 394 tests, or 392 without OpenSTA
+python3 tests.py            # 396 tests, or 394 without OpenSTA
 ```
 
 ### Spec to RTL, across the spec space
@@ -1021,6 +1023,45 @@ A pipeline need not be one kind of board. `gals.build` takes each
 stage's width, and three boards of 32, 16 and 32 lanes give the one-board
 integer model's tokens and logits exactly, with no CRC error: only the
 hidden state crosses between them.
+
+## The Zybo at 32 lanes
+
+```
+python3 board_zybo.py --board zybo_z7_20_32 --work build_q25l32
+board_zybo_32/open/build_open.sh
+python3 cosim.py board_zybo_32 --jitter
+```
+
+The Zybo's XC7Z020 holds the ZC706's 32-lane core too: 38% of its LUT
+sites and 196 of its 220 DSPs. In the open flow it placed and did not
+route. With 89% of the DSPs used, nextpnr-xilinx found no free LUT beside
+eleven of them to make the constant zeros their unused C inputs need,
+all on the attention head's score multipliers. With 16 of the 32 score
+lanes multiplying in LUTs, three were left, all in the DSP column beside
+the PS; with 24, none. The package's open flow (`board_zybo_32/`, board
+`zybo_z7_20_32`) retypes those 48 multipliers just before Yosys's DSP
+mapping; Vivado's build keeps every multiplier on a DSP.
+
+| | 32 lanes on the XC7Z020 |
+|---|---|
+| LUT sites / DSPs / block RAM | 50% / 148 of 220 / 26 RAMB36 and 23 RAMB18 |
+| core, post-route | 57.8 MHz, passes 50 |
+| bus and registers, post-route | 58.5 MHz, passes 50 |
+| bitstream | 4,045,667 bytes, all 7,802 frames round-trip |
+| its own ARM program on its RTL, its own SD card, every port stalling (`cosim.py`) | "The capital of France is Paris. Paris is the capital of France. Paris is the capital of France.", every logit the integer model's |
+
+Its RTL is the ZC706 package's byte for byte, so it is verified as that
+one is. On the same four HP ports at the same 50 MHz it runs at the
+ZC706's 1.70 bus cycles a core cycle, and the planner (board
+`zybo_z7_20_32`) puts it at the ZC706's speed: Qwen3-0.6B 0.68 s a token
+against 0.92 s at 16 lanes, Qwen2.5-0.5B 0.55 s against 0.75 s. Two of
+them split by weights come to 0.39 s a token, 2.55 tokens/s, for about
+\$600; eight to 0.13 s. Against Redwood's 12.1 tokens/s on a \$17,995
+board, one 32-lane Zybo is about 7 times the tokens a second per dollar
+and two about 6, from the cycle model, the measured bus ratio and the
+mover, with the Ethernet's latency estimated; the proposal's 40 tokens/s
+on two boards is out of reach at int8, where two Zybos' DDR3 streams the
+model's 600 MB about 10 times a second at most.
 
 ## Every layer of a real model, in minutes
 
