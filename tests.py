@@ -1159,9 +1159,14 @@ def test_rmsnorm():
         with open(os.path.join(work, 'tb.v'), 'w') as f:
             f.write(specgen_mod.render_rmsnorm_testbench(spec))
         res = {}
-        for label, fx_ in (('first', set()), ('fixed', {agent_mod.FIX_EPS})):
+        fixed = rr.render_rmsnorm(spec, {agent_mod.FIX_EPS})
+        early = fixed.replace("if (v1) begin\n        sqr <= x_data * x_data;",
+                              "if (v0) begin\n        sqr <= x_data * x_data;")
+        assert early != fixed
+        for label, src in (('first', rr.render_rmsnorm(spec, set())),
+                           ('fixed', fixed), ('early', early)):
             with open(os.path.join(work, 'rms.v'), 'w') as f:
-                f.write(rr.render_rmsnorm(spec, fx_))
+                f.write(src)
             r = subprocess.run(['iverilog', '-g2005', '-o', 's.out', 'tb.v',
                                 'rms.v'] + list(cf.RMSNORM_DEPS), cwd=work,
                                capture_output=True, text=True)
@@ -1174,6 +1179,23 @@ def test_rmsnorm():
         check('a sum of squares that leaves out epsilon is caught',
               'TB_RESULT: PASS' not in res['first']
               and 'expected_ssq' in res['first'])
+        check('a norm that reads its data a cycle early is caught, its '
+              'outputs named as their neighbours\' expected values',
+              'TB_RESULT: PASS' not in res['early']
+              and 'got_norm_is_the_expected_value_for_out=' in res['early'])
+        # A read one cycle off counts one end element twice and the other
+        # never; the testbench carries both sums for each row to name it.
+        rnd2 = random.Random(83)
+        top = (1 << (p['data_width'] - 1)) - 1
+        xt = [rnd2.randrange(-top // 2, top // 2) for _ in range(D)]
+        s0 = sum(v * v for v in xt) + D
+        mask = (1 << p['rsqrt_in_width']) - 1
+        tbtext = specgen_mod.render_rmsnorm_testbench(spec)
+        check('the testbench carries each row\'s sum with x0 twice and with '
+              'the last element twice',
+              ', %d, %d);' % ((s0 - xt[-1] ** 2 + xt[0] ** 2) & mask,
+                              (s0 - xt[0] ** 2 + xt[-1] ** 2) & mask) in tbtext
+              and 'got_ssq_counts_x0_twice_and_never_the_last_element=1' in tbtext)
     finally:
         shutil.rmtree(work, ignore_errors=True)
 

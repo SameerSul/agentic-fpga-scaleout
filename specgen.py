@@ -2605,8 +2605,15 @@ def render_rmsnorm_testbench(spec):
             body.append("    xmem[%d] = %s; gmem[%d] = %s; expect_o[%d] = %s;"
                         % (i, _slit(x[i], dw), i, _slit(g[i], dw), i,
                            _slit(o[i], dw)))
-        body.append("    run_row(%d, %d, %d, %d, %d, %d);"
-                    % (eps, sc, so, ssq, m, e))
+        # A read one cycle off counts an end element twice and the other
+        # never. Traced on Sonnet's RMSNorm: the sum was exactly x[0]
+        # twice and x[63] not at all, and it read only "expected_ssq got
+        # 6275206260" for three drafts.
+        sq = [v * v for v in x]
+        mask = (1 << p["rsqrt_in_width"]) - 1
+        body.append("    run_row(%d, %d, %d, %d, %d, %d, %d, %d);"
+                    % (eps, sc, so, ssq, m, e, (ssq - sq[-1] + sq[0]) & mask,
+                       (ssq - sq[0] + sq[-1]) & mask))
     return RMSNORM_TB.format(
         dwm=dw - 1, D=D, awm=p["addr_width"] - 1,
         iwm=p["rsqrt_in_width"] - 1, owm=p["rsqrt_out_width"] - 1,
@@ -2676,7 +2683,8 @@ module tb_rmsnorm;
 
   task run_row(input integer ep, input integer sc, input integer so,
                input [{iwm}:0] want_ssq, input [{owm}:0] want_m,
-               input [{ewm}:0] want_e);
+               input [{ewm}:0] want_e, input [{iwm}:0] ssq_first_twice,
+               input [{iwm}:0] ssq_last_twice);
     begin
       seen = 0; nbad = 0; bad = 0;
       eps = ep; scale_o = sc; shift_o = so;
@@ -2688,8 +2696,15 @@ module tb_rmsnorm;
       repeat (8) @(negedge clk);
       checks = checks + 3;
       if (dut.ssq !== want_ssq) begin
-        $display("TB_FAIL test=%0s expected_ssq=%0d got_ssq=%0d",
-                 testname, want_ssq, dut.ssq);
+        if (dut.ssq == ssq_first_twice && ssq_first_twice != want_ssq)
+          $display("TB_FAIL test=%0s expected_ssq=%0d got_ssq=%0d got_ssq_counts_x0_twice_and_never_the_last_element=1",
+                   testname, want_ssq, dut.ssq);
+        else if (dut.ssq == ssq_last_twice && ssq_last_twice != want_ssq)
+          $display("TB_FAIL test=%0s expected_ssq=%0d got_ssq=%0d got_ssq_counts_the_last_element_twice_and_never_x0=1",
+                   testname, want_ssq, dut.ssq);
+        else
+          $display("TB_FAIL test=%0s expected_ssq=%0d got_ssq=%0d",
+                   testname, want_ssq, dut.ssq);
         bad = bad + 1;
       end
       if (dut.rs_m !== want_m || dut.rs_e !== want_e) begin
@@ -2697,9 +2712,19 @@ module tb_rmsnorm;
                  testname, want_m, dut.rs_m, want_e, dut.rs_e);
         bad = bad + 1;
       end
+      // An output that is its neighbour's expected value is a pipeline
+      // alignment fault, not an arithmetic one; traced, Sonnet's outputs
+      // were each the next index's for two drafts.
       for (i = 0; i < nbad && i < 8; i = i + 1)
-        $display("TB_FAIL test=%0s out=%0d expected_norm=%0d got_norm=%0d",
-                 testname, bad_idx[i], bad_exp[i], bad_got[i]);
+        if (bad_idx[i] + 1 < {D} && bad_got[i] == expect_o[bad_idx[i] + 1])
+          $display("TB_FAIL test=%0s out=%0d expected_norm=%0d got_norm=%0d got_norm_is_the_expected_value_for_out=%0d",
+                   testname, bad_idx[i], bad_exp[i], bad_got[i], bad_idx[i] + 1);
+        else if (bad_idx[i] > 0 && bad_got[i] == expect_o[bad_idx[i] - 1])
+          $display("TB_FAIL test=%0s out=%0d expected_norm=%0d got_norm=%0d got_norm_is_the_expected_value_for_out=%0d",
+                   testname, bad_idx[i], bad_exp[i], bad_got[i], bad_idx[i] - 1);
+        else
+          $display("TB_FAIL test=%0s out=%0d expected_norm=%0d got_norm=%0d",
+                   testname, bad_idx[i], bad_exp[i], bad_got[i]);
       if (!bad && !nbad && seen !== {D})
         $display("TB_FAIL test=%0s out=0 expected_count={D} got_count=%0d",
                  testname, seen);

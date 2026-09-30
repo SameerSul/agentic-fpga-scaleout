@@ -91,7 +91,7 @@ times put within 10%.
 ### The full suite
 
 ```
-python3 tests.py            # 417 tests, or 415 without OpenSTA
+python3 tests.py            # 419 tests, or 417 without OpenSTA
 ```
 
 ### Spec to RTL, across the spec space
@@ -1836,6 +1836,14 @@ explained with the rule. Sonnet's gave 16383 for a two-score row, the
 weight of a row whose scores are all equal, five drafts running, and
 read only "expected 14668 got 16383"; the testbench now says when a
 weight is exactly that.
+
+RMSNorm's kept attempts showed a registered read one cycle off, both
+ways round. Sonnet's sum of squares was exactly x[0] twice and x[63]
+not at all, and in other drafts each output was the next index's
+expected value; the testbench said only "expected_ssq got 6275206260"
+and "expected_norm -264 got_norm 2234". It now says when the sum counts
+one end element twice and the other never, and when an output is its
+neighbour's expected value.
 
 A block's own testbench is where a model's reading of the spec is
 checked, and a gap there lets a wrong block through every gate. The
