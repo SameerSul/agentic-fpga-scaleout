@@ -2119,6 +2119,35 @@ def test_sign_off_survives_a_silent_agent():
         shutil.rmtree(gates, ignore_errors=True)
 
 
+def test_failed_attempts_are_kept():
+    """The next agent in the chain writes over a block's report and draft,
+    so a run that fell back to the rules agent kept no record of why the
+    models had failed. Each attempt that does not converge now leaves both
+    under its own name."""
+    import spec2rtl, qwen_synth
+    import chiplet_flow as cf
+    gates = os.path.join(ROOT, 'build_attempttest')
+    shutil.rmtree(gates, ignore_errors=True)
+    chain, plan, build = spec2rtl.agent_chain, spec2rtl.block_plan, cf.BUILD
+    try:
+        spec2rtl.agent_chain = lambda kind: [('first try', RuleBasedAgent, 1),
+                                             ('rules (fallback)', RuleBasedAgent, 5)]
+        spec2rtl.block_plan = lambda im: (plan(im)[0][:1], plan(im)[1])
+        im, _ = qwen_synth.model('qwen3', nl=1)
+        rows, _ = spec2rtl.sign_off(im, gates, 'llm', lambda *a: None)
+        tag = rows[0]['file'][:-2]
+        kept = os.path.join(gates, 'report_%s.first_try.json' % tag)
+        draft = os.path.join(gates, 'rtl_%s.first_try.v' % tag)
+        rep = json.load(open(kept)) if os.path.exists(kept) else {}
+        check('an attempt that does not converge keeps its report and draft; the fallback signs off',
+              rows[0]['converged'] and rows[0]['agent'] == 'rules (fallback)'
+              and rep.get('converged') is False and rep.get('iterations_used') == 1
+              and os.path.exists(draft))
+    finally:
+        spec2rtl.agent_chain, spec2rtl.block_plan, cf.BUILD = chain, plan, build
+        shutil.rmtree(gates, ignore_errors=True)
+
+
 def test_attention_scores_cannot_overflow():
     """A score is q times k, both 16-bit activations at a16, over head_dim;
     the model's MAC is sized for an int8 weight times an activation. At a
@@ -3153,6 +3182,15 @@ def test_multi_lane_attention():
     ms = load_model_spec()
     one, wide = (specgen_mod.derive_attn_spec(ms),
                  specgen_mod.derive_attnn_spec(ms))
+    # The lanes' spec once kept the one-lane head's sentences beside its
+    # own: row-major caches, and matvec with cols = n giving the key
+    # address. Sonnet spent its whole answer on the contradiction.
+    La = wide['parameters']['lanes']
+    text = ' '.join(wide['behavior'])
+    check('the lanes spec says one layout and one column count, its own',
+          'row-major' not in text and 'cols = n,' not in text
+          and 'cols = ceil(n / %d)' % La in text
+          and 'write only j < n into sbuf' in text)
     work = os.path.join(ROOT, 'build_attnntest')
     shutil.rmtree(work, ignore_errors=True)
     try:
@@ -3365,14 +3403,11 @@ def test_llm_transport_is_retried():
     import llm_agent
 
     calls = []
-
-    class Result:
-        def __init__(self, rc, out, err=''):
-            self.returncode, self.stdout, self.stderr = rc, out, err
+    Result = llm_agent.CliResult
 
     def fake_run(seq):
         it = iter(seq)
-        def run(cmd, **kw):
+        def run(cmd, prompt, cap, silence=None, cwd=None):
             calls.append(cmd)
             nxt = next(it)
             if isinstance(nxt, Exception):
@@ -3380,27 +3415,40 @@ def test_llm_transport_is_retried():
             return nxt
         return run
 
-    real_run, real_sleep = llm_agent.subprocess.run, llm_agent.time.sleep
+    real_run, real_sleep = llm_agent.run_cli, llm_agent.time.sleep
     llm_agent.time.sleep = lambda *_: None
     try:
-        # A timeout, then success: the loop should see the success.
+        # A call that went silent, then success: the loop should see the success.
         calls[:] = []
-        llm_agent.subprocess.run = fake_run([
-            subprocess.TimeoutExpired('claude', 600),
+        llm_agent.run_cli = fake_run([
+            subprocess.TimeoutExpired('claude', 180),
             Result(0, 'module m(); endmodule'),
         ])
         out = llm_agent.call_claude_cli('p', 'm')
-        check('a timed out call is retried rather than ending the block',
+        check('a call that goes silent is retried rather than ending the block',
               'module m' in out and len(calls) == 2)
         check('the writer call runs with tools disabled',
               calls[-1][calls[-1].index('--tools') + 1] == '')
         check('larger models get bounded effort, haiku keeps its default',
               '--effort' in llm_agent.cli_command('sonnet')
               and '--effort' not in llm_agent.cli_command('haiku'))
+        check('the CLI streams its events, so thinking can be told from hung',
+              'stream-json' in llm_agent.cli_command('sonnet'))
+
+        # A model still thinking at its cap is not asked the same thing again.
+        calls[:] = []
+        llm_agent.run_cli = fake_run([llm_agent.StillThinking('still thinking after 1500s, no answer')] * 3)
+        msg = ''
+        try:
+            llm_agent.call_claude_cli('p', 'm')
+        except RuntimeError as e:
+            msg = str(e)
+        check('a model still thinking at its cap fails its attempt at once',
+              len(calls) == 1 and 'still thinking' in msg)
 
         # Rate limiting is transport too.
         calls[:] = []
-        llm_agent.subprocess.run = fake_run([
+        llm_agent.run_cli = fake_run([
             Result(1, 'rate limit exceeded'),
             Result(0, 'module m(); endmodule'),
         ])
@@ -3409,7 +3457,7 @@ def test_llm_transport_is_retried():
 
         # An auth fault is not, because the next attempt cannot differ.
         calls[:] = []
-        llm_agent.subprocess.run = fake_run([
+        llm_agent.run_cli = fake_run([
             Result(1, 'Invalid API key'), Result(1, 'Invalid API key'),
             Result(1, 'Invalid API key'),
         ])
@@ -3423,8 +3471,8 @@ def test_llm_transport_is_retried():
 
         # Exhausting the attempts still raises, and says how many it tried.
         calls[:] = []
-        llm_agent.subprocess.run = fake_run(
-            [subprocess.TimeoutExpired('claude', 600)] * 3)
+        llm_agent.run_cli = fake_run(
+            [subprocess.TimeoutExpired('claude', 180)] * 3)
         msg = ''
         try:
             llm_agent.call_claude_cli('p', 'm')
@@ -3433,8 +3481,47 @@ def test_llm_transport_is_retried():
         check('exhausted retries report the attempt count and the cause',
               len(calls) == 3 and 'attempt' in msg and 'timed out' in msg)
     finally:
-        llm_agent.subprocess.run = real_run
+        llm_agent.run_cli = real_run
         llm_agent.time.sleep = real_sleep
+
+    # The stream itself: a stand-in CLI that writes events, then the answer.
+    work = os.path.join(ROOT, 'build_clitest')
+    shutil.rmtree(work, ignore_errors=True)
+    os.makedirs(work)
+    try:
+        fake = os.path.join(work, 'fake_cli.py')
+        with open(fake, 'w') as f:
+            f.write("import json, sys, time\n"
+                    "sys.stdin.read()\n"
+                    "mode = sys.argv[1]\n"
+                    "ev = lambda d: print(json.dumps(d), flush=True)\n"
+                    "for _ in range(4):\n"
+                    "    ev({'type': 'stream_event', 'event': {'delta': {'type': 'thinking_delta', 'thinking': 'x'}}})\n"
+                    "    time.sleep(0.3)\n"
+                    "if mode == 'answer':\n"
+                    "    ev({'type': 'result', 'is_error': False, 'result': 'module m(); endmodule'})\n"
+                    "elif mode == 'think':\n"
+                    "    while True:\n"
+                    "        ev({'type': 'stream_event', 'event': {'delta': {'type': 'thinking_delta', 'thinking': 'x'}}})\n"
+                    "        time.sleep(0.3)\n"
+                    "else:\n"
+                    "    time.sleep(60)\n")
+        r = llm_agent.run_cli([sys.executable, fake, 'answer'], 'p', cap=30, silence=10)
+        check('the answer is the stream\'s result event', r.returncode == 0
+              and r.stdout == 'module m(); endmodule')
+        kinds = []
+        for mode, cap, silence in (('think', 3, 10), ('hang', 30, 2)):
+            try:
+                llm_agent.run_cli([sys.executable, fake, mode], 'p', cap=cap, silence=silence)
+                kinds.append('answered')
+            except llm_agent.StillThinking:
+                kinds.append('thinking')
+            except subprocess.TimeoutExpired:
+                kinds.append('hung')
+        check('a streaming call at its cap is thinking, a silent one is hung',
+              kinds == ['thinking', 'hung'])
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
 
 
 def test_sequencer_specs_are_implementable():
@@ -4036,6 +4123,7 @@ if __name__ == '__main__':
     test_bridge_end_to_end()
     test_signed_off_modules_are_renamed_however_written()
     test_sign_off_survives_a_silent_agent()
+    test_failed_attempts_are_kept()
     test_attention_scores_cannot_overflow()
     test_spec_to_verified_rtl()
     test_weights_split_over_boards()

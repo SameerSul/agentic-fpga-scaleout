@@ -361,11 +361,25 @@ def call_ollama(prompt, model):
 # This is not hypothetical: the exponential was recorded as a convergence
 # failure once when what actually happened was one call sitting at zero
 # CPU until it hit the timeout, which aborted the whole run.
+#
+# A call that is still thinking is not hung, though. On the attention head
+# Sonnet at low effort streamed thinking from the second second on, 13 kB
+# of it in three minutes and not a character of answer, and a flat 25
+# minute timeout killed it three times running, 75 minutes a block spent
+# asking the same question again. So the CLI's events are read as they
+# come: a call that goes silent has hung and is retried, and a call still
+# streaming at the cap is a model that has not answered in the time it is
+# given, which another attempt at the same prompt will not change.
 CLI_TIMEOUT_S = 600
 # Measured: one Sonnet softmax call at low effort took 852 s and returned a
 # complete module. The larger models get room for that; haiku keeps 600.
 CLI_TIMEOUT_LARGE_S = 1500
+CLI_SILENCE_S = 180
 CLI_ATTEMPTS = 3
+
+
+class StillThinking(RuntimeError):
+    """The model was still producing events when its time ran out."""
 
 
 def cli_timeout(model):
@@ -384,13 +398,73 @@ def cli_command(model):
     minutes, and that first draft passed all 209 checks. Haiku keeps its
     default so its results stay comparable with every earlier run.
     CHIPLET_LLM_EFFORT overrides either way.
+    The output is the CLI's event stream, so a thinking model can be told
+    from a hung one; the answer is its final result event.
     """
     cmd = ["claude", "-p", "--model", model, "--tools", ""]
     effort = os.environ.get("CHIPLET_LLM_EFFORT") or \
         (None if "haiku" in model else "low")
     if effort:
         cmd += ["--effort", effort]
-    return cmd
+    return cmd + ["--output-format", "stream-json", "--verbose",
+                  "--include-partial-messages"]
+
+
+class CliResult:
+    def __init__(self, returncode, stdout, stderr=""):
+        self.returncode, self.stdout, self.stderr = returncode, stdout, stderr
+
+
+def run_cli(cmd, prompt, cap, silence=None, cwd=None):
+    """One CLI call. Returns a CliResult whose stdout is the answer.
+    Raises subprocess.TimeoutExpired when no event arrives for silence
+    seconds (hung), and StillThinking when events are still arriving at
+    cap seconds (not hung, but no answer in the time given)."""
+    import select
+    silence = silence or CLI_SILENCE_S
+    err = tempfile.TemporaryFile(mode="w+")
+    p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                         stderr=err, text=True, cwd=cwd)
+    try:
+        p.stdin.write(prompt)
+        p.stdin.close()
+        t0 = last = time.time()
+        result, text, is_error = None, [], False
+        while True:
+            now = time.time()
+            if now - t0 > cap:
+                raise StillThinking("still thinking after %ds, no answer" % cap)
+            if now - last > silence:
+                raise subprocess.TimeoutExpired(cmd, silence)
+            ready, _, _ = select.select([p.stdout], [], [], 5)
+            if not ready:
+                continue
+            line = p.stdout.readline()
+            if not line:
+                break
+            last = time.time()
+            try:
+                ev = json.loads(line)
+            except ValueError:
+                continue
+            if ev.get("type") == "stream_event":
+                d = (ev.get("event") or {}).get("delta") or {}
+                if d.get("type") == "text_delta":
+                    text.append(d.get("text", ""))
+            elif ev.get("type") == "result":
+                result = ev.get("result")
+                is_error = bool(ev.get("is_error"))
+        rc = p.wait(timeout=30)
+        err.seek(0)
+        out = result if result is not None else "".join(text)
+        if is_error and rc == 0:
+            rc = 1
+        return CliResult(rc, out or "", err.read())
+    finally:
+        if p.poll() is None:
+            p.kill()
+            p.wait()
+        err.close()
 
 
 def call_claude_cli(prompt, model, attempts=CLI_ATTEMPTS):
@@ -399,12 +473,15 @@ def call_claude_cli(prompt, model, attempts=CLI_ATTEMPTS):
         try:
             # A neutral directory, so the CLI does not load this repo's
             # project context into what should be a self-contained prompt.
-            r = subprocess.run(cli_command(model), input=prompt,
-                               capture_output=True, text=True,
-                               timeout=cli_timeout(model),
-                               cwd=tempfile.gettempdir())
+            r = run_cli(cli_command(model), prompt, cli_timeout(model),
+                        cwd=tempfile.gettempdir())
         except subprocess.TimeoutExpired:
-            last = "timed out after %ds" % cli_timeout(model)
+            last = "timed out: no output for %ds" % CLI_SILENCE_S
+        except StillThinking as e:
+            # The same prompt again would think the same way: this model's
+            # attempt at the block is over, and the next agent takes it.
+            raise RuntimeError("claude CLI failed after %d attempt(s): %s"
+                               % (attempt, e))
         else:
             if r.returncode == 0:
                 return r.stdout

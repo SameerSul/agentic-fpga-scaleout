@@ -91,7 +91,7 @@ times put within 10%.
 ### The full suite
 
 ```
-python3 tests.py            # 406 tests, or 404 without OpenSTA
+python3 tests.py            # 412 tests, or 410 without OpenSTA
 ```
 
 ### Spec to RTL, across the spec space
@@ -1788,6 +1788,33 @@ checks three times and missed timing at 100 MHz, by 0.4 ns at best;
 Sonnet signed the block off in five. With it in place of Haiku's first
 one and the other nine model-written blocks as they were, the decode
 step matches the integer model: tokens 49 and 49, logits 14065 and 14504.
+
+### Why Sonnet ran out of time on the attention head
+
+Sonnet's "timed out" on the attention head was not a hung call. Streamed,
+the CLI shows it thinking from the second second on, at low effort:
+13 kB of thinking in three minutes and not a character of answer, 128 kB
+after 36 minutes, when the call ended on the CLI's 32,000 output token
+limit, which its thinking counts against. It could not have answered at
+any timeout. Read, the thinking is about the spec: the multi-lane head's
+spec had been built by appending its lane sentences to the one-lane
+head's, so it said the caches were row-major and, a few sentences on,
+that each key word holds one dimension of sixteen positions; and that
+matvec with cols = n gives the key address, which is true of one lane
+only. Sonnet kept returning to "cols must actually be n_groups". The
+rules agent, which reads no prose, never noticed.
+
+The lanes' spec now rewrites those sentences instead: the word layout,
+matvec as optional, and if it runs the score pass, cols = ceil(n / 16),
+with lane l holding position g*16 + l and only positions below n written
+to sbuf; a test holds it to one layout and one column count. The CLI is
+now read as a stream of events, so a call that goes silent for three
+minutes is retried as hung, and a call still streaming at its cap fails
+that model's attempt at once instead of asking the same question twice
+more, 75 minutes a block. And each agent that does not converge now
+keeps its report and last draft under its own name: the rules agent
+used to write over both, and run 4 kept no record of why the models had
+failed softmax, the projection and the two RMSNorms.
 
 A block's own testbench is where a model's reading of the spec is
 checked, and a gap there lets a wrong block through every gate. The

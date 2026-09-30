@@ -228,6 +228,17 @@ def rename_module(src, old, new):
     return out
 
 
+def keep_attempt(gates, tag, job, label):
+    """An agent that did not converge leaves its report and its last draft
+    under its own name, since the next agent in the chain writes over both:
+    without them, why a model failed a block cannot be read back."""
+    name = re.sub(r"[^A-Za-z0-9]+", "_", label).strip("_")
+    for src, dst in ((job["report_file"], "report_%s.%s.json" % (tag, name)),
+                     (os.path.join(gates, job["rtl_file"]), "rtl_%s.%s.v" % (tag, name))):
+        if os.path.exists(src):
+            shutil.copy(src, os.path.join(gates, dst))
+
+
 def sign_off(im, gates, agent_kind, log, dv=False):
     """Each block through the signoff loop, into gates/: its signed-off
     RTL under its design name. Returns one row per block. The flow's
@@ -282,6 +293,7 @@ def _sign_off(im, gates, agent_kind, log, dv=False):
             prev = ag
             if report["converged"]:
                 break
+            keep_attempt(gates, tag, job, label)
         if report is None:
             raise err
         last = report["history"][-1] if report["history"] else {}

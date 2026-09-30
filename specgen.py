@@ -2299,10 +2299,52 @@ def derive_attnn_spec(ms, board=None):
                           % (dw, dw - 1, dw))
         ports.append(q)
     spec["ports"] = ports
-    spec["behavior"] = list(base["behavior"]) + [
-        "Key words: word g*%d + d holds element d of positions g*%d + l "
-        "in lane l. Value words: word j*%d + dg holds V[j][dg*%d + l] in "
-        "lane l." % (hd, La, hd // La, La)]
+    # The one-lane head's prose, rewritten where lanes change it. It was
+    # appended to instead, so the spec said the caches were row-major and
+    # then that they were laid out by lane, and that matvec with cols = n
+    # gave the key address, which is true of one lane only. Sonnet spent
+    # its whole 32,000 token answer reconciling the two and never wrote a
+    # line; the rules agent, which reads no prose, never noticed.
+    ngr = "ceil(n / %d)" % La
+    beh = []
+    for b_ in base["behavior"]:
+        if b_.startswith("The key and value caches are row-major"):
+            b_ = ("The key and value caches are read a word at a time, %d "
+                  "lanes of %d bits. Key words: word g*%d + d holds element "
+                  "d of positions g*%d + l in lane l, so one word gives "
+                  "dimension d of %d consecutive positions. Value words: "
+                  "word j*%d + dg holds V[j][dg*%d + l] in lane l, so one "
+                  "word gives %d dimensions of position j. k_data and v_data "
+                  "are registered reads: each carries the word at address a "
+                  "on the cycle after k_addr or v_addr = a. If the address is "
+                  "itself a register, that is two clock edges after the edge "
+                  "that loads a into it."
+                  % (La, dw, hd, La, La, hd // La, La, La))
+        elif b_.startswith("matvec, mac, softmax and requant are separate"):
+            b_ = b_.replace(
+                "matvec, mac, softmax and requant are separate modules "
+                "supplied as source files, not something to write. "
+                "Instantiate them",
+                "mac, softmax and requant are separate modules supplied as "
+                "source files, not something to write, and matvec is "
+                "supplied too, for the score pass if you want it. "
+                "Instantiate the ones you use")
+            assert "Instantiate the ones you use" in b_
+        elif b_.startswith("matvec walks a_addr"):
+            old = ("Wire mac_valid to the MAC's valid_in and mac_clear to its "
+                   "clear. With depth = %d and cols = n, matvec's w_addr is "
+                   "exactly the key address." % hd)
+            assert old in b_
+            b_ = b_.replace(old, (
+                "If it runs the score pass, it does so with depth = %d and "
+                "cols = %s, the number of %d-position groups: its w_addr is "
+                "then exactly the key word address g*%d + d, col_index is the "
+                "group g, and mac_valid and mac_clear go to every score "
+                "lane. At col_valid, score lane l holds t_j for j = g*%d + l. "
+                "In the last group, lanes with j >= n are not scores: write "
+                "only j < n into sbuf." % (hd, ngr, La, hd, La)))
+        beh.append(b_)
+    spec["behavior"] = beh
     if p["score_acc_width"] != p["acc_width"]:
         spec["behavior"].append(
             "Each score lane is an instance of mac_s (smac_dep.v), the MAC "
