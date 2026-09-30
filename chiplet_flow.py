@@ -937,7 +937,25 @@ def run_flow(job=None, verbose=True, agent=None, max_iters=None):
     converged = False
 
     for it in range(1, max_iters + 1):
-        rtl, fixes = agent.propose(spec, history)
+        try:
+            rtl, fixes = agent.propose(spec, history)
+        except RuntimeError as e:
+            # A model that stops answering part-way (its CLI still thinking
+            # at the cap) ends this agent's attempt; the drafts it did give
+            # are still the record of how it failed, so they are written
+            # before the error goes on to the next agent in the chain.
+            last = iterations[-1] if iterations else None
+            with open(os.path.join(ROOT, job["report_file"]), "w") as f:
+                json.dump({"spec": spec, "tools": tools,
+                           "agent": type(agent).__name__, "converged": False,
+                           "aborted": str(e)[:300],
+                           "iterations_used": len(iterations),
+                           "history": iterations,
+                           "final_metrics": {
+                               "sim_pass": bool(last and last["sim"]["status"] == "pass"),
+                               "sim_checks": last["sim"].get("checks") if last else None}},
+                          f, indent=2)
+            raise
         rtl_path = os.path.join(BUILD, job["rtl_file"])
         with open(rtl_path, "w") as f:
             f.write(rtl)

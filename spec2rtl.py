@@ -287,6 +287,7 @@ def _sign_off(im, gates, agent_kind, log, dv=False):
                 attempts.append([label, 0, False, str(e)[:200]])
                 log("  %-26s %s gave no answer (%s); the next agent takes it"
                     % (what, label, str(e)[:60]))
+                keep_attempt(gates, tag, job, label)
                 prev = ag
                 continue
             attempts.append([label, report["iterations_used"], report["converged"]])

@@ -2120,6 +2120,12 @@ def test_sign_off_survives_a_silent_agent():
               r['converged'] and r['agent'] == 'rules (fallback)'
               and [a[0] for a in r['attempts']] == ['silent', 'rules (fallback)']
               and not r['attempts'][0][2])
+        tag = r['file'][:-2]
+        kept = os.path.join(gates, 'report_%s.silent.json' % tag)
+        rep = json.load(open(kept)) if os.path.exists(kept) else {}
+        check('the silent agent\'s attempt is kept, marked with why it stopped',
+              rep.get('converged') is False and 'timed out' in rep.get('aborted', '')
+              and rep.get('iterations_used') == 0)
     finally:
         spec2rtl.agent_chain, spec2rtl.block_plan, cf.BUILD = chain, plan, build
         shutil.rmtree(gates, ignore_errors=True)
