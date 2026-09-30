@@ -2154,6 +2154,28 @@ def test_failed_attempts_are_kept():
         shutil.rmtree(gates, ignore_errors=True)
 
 
+def test_composites_give_their_parts_ports():
+    """A composite that instantiates supplied modules has to give their
+    ports: told only "the supplied mac module", two models guessed port
+    names for thirteen drafts on the projection and never compiled."""
+    import spec2rtl, qwen_synth
+    im, _ = qwen_synth.model('qwen3', nl=1)
+    plan, _ = spec2rtl.block_plan(im)
+    missing = []
+    for fn, what, spec, tbf, deps in plan:
+        text = ' '.join(spec.get('behavior', []))
+        uses = [d for d in deps if d.endswith('_dep.v')]
+        if uses and 'supplied' in text and not ('exactly these ports' in text
+                                                or 'has ports' in text):
+            missing.append(fn)
+    check('every composite built from supplied modules gives their ports',
+          not missing)
+    pj = next(s for fn, _, s, _, _ in plan if fn == 'b_projn.v')
+    check('the projection gives its mac and requant ports and latencies',
+          'mac (input clk' in ' '.join(pj['behavior'])
+          and 'requant (input clk' in ' '.join(pj['behavior']))
+
+
 def test_attention_scores_cannot_overflow():
     """A score is q times k, both 16-bit activations at a16, over head_dim;
     the model's MAC is sized for an int8 weight times an activation. At a
@@ -4140,6 +4162,7 @@ if __name__ == '__main__':
     test_signed_off_modules_are_renamed_however_written()
     test_sign_off_survives_a_silent_agent()
     test_failed_attempts_are_kept()
+    test_composites_give_their_parts_ports()
     test_attention_scores_cannot_overflow()
     test_spec_to_verified_rtl()
     test_weights_split_over_boards()

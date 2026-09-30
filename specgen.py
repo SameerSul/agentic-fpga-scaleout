@@ -2361,8 +2361,10 @@ def derive_attnn_spec(ms, board=None):
             "Each score lane is an instance of mac_s (smac_dep.v), the MAC "
             "derived for q times k over head_dim, whose acc output is %d "
             "bits: the model's mac, at %d, can overflow on a score. The "
-            "score path runs at %d bits up to the score quantizer."
-            % (p["score_acc_width"], p["acc_width"], p["score_acc_width"]))
+            "score path runs at %d bits up to the score quantizer. Its "
+            "ports, connected by name: %s."
+            % (p["score_acc_width"], p["acc_width"], p["score_acc_width"],
+               port_signature(dict(derive_score_mac_spec(ms), top_module="mac_s"))))
     return spec
 
 
@@ -4317,6 +4319,19 @@ def derive_projn_spec(ms, board=None, per_column=False):
         "busy is high from start until the last output has been emitted.",
         "All state resets to zero.",
     ]
+    # Traced, run 5: told only "the supplied mac module", Haiku and Sonnet
+    # guessed its ports (enable, p, result, o, q; acc, sum, in for the
+    # requantizer) in all thirteen drafts, and none compiled.
+    mac_, rq_ = derive_chiplet_spec(ms), derive_requant_spec(ms)
+    spec["behavior"].append(
+        "mac and requant are separate modules supplied as source files, "
+        "not something to write. Instantiate them with exactly these ports, "
+        "connected by name: %s; %s. mac's valid_out follows its valid_in by "
+        "%d cycles, with acc then holding the running sum, and clear zeroes "
+        "it; requant has a latency of exactly %d cycles."
+        % (port_signature(mac_), port_signature(rq_),
+           mac_["parameters"]["pipeline_stages"],
+           rq_["parameters"]["pipeline_stages"]))
     return spec
 
 

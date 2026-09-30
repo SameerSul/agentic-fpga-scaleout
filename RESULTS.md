@@ -91,7 +91,7 @@ times put within 10%.
 ### The full suite
 
 ```
-python3 tests.py            # 414 tests, or 412 without OpenSTA
+python3 tests.py            # 416 tests, or 414 without OpenSTA
 ```
 
 ### Spec to RTL, across the spec space
@@ -1815,6 +1815,27 @@ more, 75 minutes a block. And each agent that does not converge now
 keeps its report and last draft under its own name: the rules agent
 used to write over both, and run 4 kept no record of why the models had
 failed softmax, the projection and the two RMSNorms.
+
+### What the kept attempts showed
+
+Run 5 put the five fallback blocks through the chain again with the
+attempts kept. The projection's thirteen drafts, eight from Haiku and
+five from Sonnet, none compiled, and every one for the same reason:
+the spec said "the supplied mac module" and "the supplied requant
+module" and never gave their ports, so each draft guessed them
+(enable, p, result, o, q; acc, sum, in). The attention head's spec had
+been given its sub-blocks' exact port lists after the same trace; the
+projection's had not. It now gives both, with the MAC's and the
+requantizer's latencies, and a test requires every composite built from
+supplied modules to give their ports.
+
+Softmax's showed two gaps in the feedback. Haiku's drafts failed to
+compile on a select taken of an expression, (s_buf[i] - mx)[12:0], and
+on a variable declared inside an unnamed begin ... end; both are now
+explained with the rule. Sonnet's gave 16383 for a two-score row, the
+weight of a row whose scores are all equal, five drafts running, and
+read only "expected 14668 got 16383"; the testbench now says when a
+weight is exactly that.
 
 A block's own testbench is where a model's reading of the spec is
 checked, and a gap there lets a wrong block through every gate. The
