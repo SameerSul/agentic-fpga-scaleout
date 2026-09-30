@@ -1319,9 +1319,18 @@ def test_residual_add():
         with open(os.path.join(work, 'tb.v'), 'w') as f:
             f.write(specgen_mod.render_resadd_testbench(spec))
         res = {}
-        for label, fx in (('first', set()), ('fixed', {agent_mod.FIX_RRND})):
+        fixed = RuleBasedAgent().render_resadd(spec, {agent_mod.FIX_RRND})
+        # An LLM signed off a residual add that read its scales as signed:
+        # right for every scale the one stream then used, wrong for every
+        # scale with its top bit set, and the decode step it sat in gave
+        # the wrong tokens.
+        signed_scales = fixed.replace("$signed({1'b0, scale_a})", "$signed(scale_a)") \
+                             .replace("$signed({1'b0, scale_b})", "$signed(scale_b)")
+        assert signed_scales != fixed
+        for label, src in (('first', RuleBasedAgent().render_resadd(spec, set())),
+                           ('fixed', fixed), ('signed', signed_scales)):
             with open(os.path.join(work, 'r.v'), 'w') as f:
-                f.write(RuleBasedAgent().render_resadd(spec, fx))
+                f.write(src)
             r = subprocess.run(['iverilog', '-g2005', '-o', 's.out', 'tb.v',
                                 'r.v'], cwd=work, capture_output=True,
                                text=True)
@@ -1334,6 +1343,15 @@ def test_residual_add():
         check('a residual add that truncates is caught',
               'TB_RESULT: PASS' not in res['first']
               and 'expected_res' in res['first'])
+        check('a residual add that reads its scales as signed is caught, '
+              'at a scale with its top bit set',
+              'TB_RESULT: PASS' not in res['signed']
+              and 'scale_a=%d' % ((1 << spec['parameters']['scale_width']) - 1)
+              in res['signed'])
+        prof = re.search(r'TB_PROFILE elements=(\d+) span_cycles=(\d+) latency_cycles=(\d+)',
+                         res['fixed'])
+        check('the profile is the first stream alone: 214 elements in 225 '
+              'cycles, 4 of latency', prof and prof.groups() == ('214', '225', '4'))
         check('ties round toward plus infinity, as the requantizer does',
               specgen_mod.resadd_golden(1, 0, 1 << 11, 1, 12, 8) == 1
               and specgen_mod.resadd_golden(-1, 0, 1 << 11, 1, 12, 8) == 0)

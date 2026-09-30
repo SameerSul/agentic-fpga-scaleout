@@ -17,7 +17,9 @@ with every token of its output chosen by the hardware. A second
 checkpoint trained with Qwen's structure, RoPE, two query heads over one
 KV head, the gated SiLU MLP, two layers and a final norm, decodes in RTL
 the same way, bit-exact on every logit. An LLM has written
-and signed off ten of the nineteen blocks through the same gates, the rotary embedding the newest of them, and the multiply-accumulate unit's accumulator is formally proved
+and signed off ten of the nineteen blocks through the same gates, the rotary embedding the newest of them, and a
+decode step whose fifteen blocks the agents wrote, ten of them the models' own, matches the integer model; the
+multiply-accumulate unit's accumulator is formally proved
 never to overflow, for any input sequence, on the int8 targets. A trained
 language model decodes through the blocks' exact arithmetic and emits
 text, and a generated RTL sequencer decodes the real Qwen2.5-0.5B, all
@@ -89,7 +91,7 @@ times put within 10%.
 ### The full suite
 
 ```
-python3 tests.py            # 404 tests, or 402 without OpenSTA
+python3 tests.py            # 406 tests, or 404 without OpenSTA
 ```
 
 ### Spec to RTL, across the spec space
@@ -1731,6 +1733,68 @@ The deterministic agent is still what generated the committed RTL, and
 it is still the right default for anyone who wants hardware reproducibly
 and offline. The LLM path is no longer only a demonstration of the loop.
 
+## Every block of a decoder by the LLM agents
+
+`spec2rtl.py --agent llm` on a two-layer checkpoint of Qwen3's shape
+(`examples/tiny_qwen3.json`) takes all fifteen blocks through the agent
+chain, Haiku with eight drafts, then Sonnet, then the rules agent, and
+then simulates the decode step they make against the integer model. The
+fourth such run, the first after the rename fix, took about ten hours:
+
+| block | signed off by | iterations | checks | OpenSTA |
+|---|---|---|---|---|
+| multiply-accumulate | Haiku | 4 | 613 | 139 MHz |
+| requantizer | Sonnet | 5 | 220 | 112 MHz |
+| exponential | Haiku | 2 | 153 | 169 MHz |
+| reciprocal | Haiku | 1 | 200 | 228 MHz |
+| inverse square root | Haiku | 2 | 248 | 249 MHz |
+| matrix-vector sequencer | Haiku | 1 | 11 | 167 MHz |
+| softmax | rules, after both models | 2 | 132 | 124 MHz |
+| score multiply-accumulate | Haiku | 5 | 613 | 107 MHz |
+| projection | rules, Sonnet timed out | 2 | 252 | 113 MHz |
+| attention head | rules, Sonnet timed out | 2 | 236 | 107 MHz |
+| RMSNorm | rules, after both models | 2 | 268 | 106 MHz |
+| RMSNorm over a head | rules, after both models | 2 | 140 | 106 MHz |
+| rotary embedding | Sonnet | 4 | 1004 | 115 MHz |
+| SiLU | Haiku | 6 | 318 | 110 MHz |
+| residual add | Haiku | 5 | 218 | 102 MHz |
+
+Ten of the fifteen are the models' own. The attention head is the block
+the third run lost: an agent that wrote `module mac(` left two modules
+named mac, and nothing could compile the head, the rules agent included.
+It now signs off. Sonnet ran into the 25 minute limit three times on the
+projection and three times on the attention head; on softmax and the two
+RMSNorms both models answered and ran out of drafts.
+
+Every block passed its gates, and the decode step they made did not
+match: tokens 504 and 336 where the integer model has 49 and 49.
+Swapping each of the ten model-written blocks alone into the rules
+agent's design, which matches, found one: Haiku's residual add. It held
+scale_a and scale_b in signed registers. They are unsigned 18-bit
+magnitudes, and a scale with its top bit set, as the real design's
+scales have, became negative. The testbench ran one stream, at scales
+from 512 to 2047, so it passed all 218 checks.
+
+The residual add's testbench now runs three more streams after the
+profiled one, each at its own held scales: the largest scale beside one
+with only its top bit set, both at the largest with the sum saturating,
+and a shift of zero. Haiku's block fails at the first of them, the scales
+in the message, and so does a rules design mutated to read its scales as
+signed; the profile, from the first stream alone, is unchanged, and the
+spec now says the scales' top bit is magnitude.
+
+Signed off again against that testbench, Haiku's drafts passed all 305
+checks three times and missed timing at 100 MHz, by 0.4 ns at best;
+Sonnet signed the block off in five. With it in place of Haiku's first
+one and the other nine model-written blocks as they were, the decode
+step matches the integer model: tokens 49 and 49, logits 14065 and 14504.
+
+A block's own testbench is where a model's reading of the spec is
+checked, and a gap there lets a wrong block through every gate. The
+decode step against the integer model is what caught this one, which is
+why `spec2rtl.py` runs it after the blocks and fails the run when it
+differs.
+
 ## An attention head
 
 The last block a transformer layer was missing. One head, one decode
@@ -1850,6 +1914,12 @@ scale_a + b * scale_b) >> shift)), one pair per cycle at 136 MHz. The
 testbench plants exact rounding ties, negative ones among them, so the
 direction a tie rounds is checked and not only that it rounds, and the
 seeded first cut that truncates is caught.
+
+The testbench first ran one stream, at scales from 512 to 2047. An LLM's
+residual add that read the scales as signed passed it and broke the
+decode step it sat in (see "Every block of a decoder by the LLM
+agents"); three more streams now follow, at the largest scales and a
+shift of zero.
 
 Mutation testing found a reset hole here that the deeper SiLU pipeline
 had been hiding. Both streaming testbenches checked valid_out once,

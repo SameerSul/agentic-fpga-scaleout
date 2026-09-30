@@ -3669,8 +3669,10 @@ def derive_resadd_spec(ms):
             "scale_a, scale_b and shift are held stable while a stream "
             "runs.",
             "v = a * scale_a + b * scale_b. scale_a and scale_b are "
-            "non-negative magnitudes, so each product has the sign of its "
-            "operand, and v is a signed %d-bit value." % sw,
+            "unsigned magnitudes: every one of their %d bits, the top one "
+            "included, is magnitude, so they run up to %d. Each product "
+            "has the sign of its operand, and v is a signed %d-bit value."
+            % (mw, (1 << mw) - 1, sw),
             "If shift > 0, r = (v + 2**(shift-1)) >>> shift, an arithmetic "
             "shift, which rounds to nearest with ties toward plus infinity. "
             "If shift is 0, r = v with no rounding term.",
@@ -3688,7 +3690,8 @@ def resadd_golden(a, b, sa, sb, sh, dw):
 
 
 def render_resadd_testbench(spec):
-    """Streams with gaps, checked in order off valid_out. Includes both
+    """Streams with gaps, checked in order off valid_out, at several held
+    scales, the largest and a zero shift among them. Includes both
     saturation rails and exact rounding ties. Truncation is caught by any
     value whose dropped fraction is at least a half; the ties are there
     for the direction a tie rounds, toward plus infinity, which a design
@@ -3717,14 +3720,50 @@ def render_resadd_testbench(spec):
     ties = sum(1 for a, b in pairs
                if (a * sa + b * sb) % (1 << sh) == 1 << (sh - 1))
     assert ties >= 3, "no rounding ties in the residual testbench"
-    body = []
-    for i, (a, b) in enumerate(pairs):
-        body.append("    as_[%d] = %s; bs_[%d] = %s; ys[%d] = %s;"
-                    % (i, _slit(a, dw), i, _slit(b, dw), i,
-                       _slit(resadd_golden(a, b, sa, sb, sh, dw), dw)))
+    n1 = len(pairs)
+    # The first stream is the profiled one, and its scales sit well inside
+    # the scale range. The real design's do not: a scale with its top bit
+    # set is large, not negative, and a design that read it as signed
+    # passed the first stream alone and got every such add wrong in the
+    # decode step. So more streams follow, each at its own held scales:
+    # the largest scale and one with only the top bit set, both scales at
+    # the largest with the sum saturating, and a shift of zero.
+    hi = (1 << mw) - 1
+    extra = random.Random(114)
+    edge = [(0, 0), (top, top), (-top - 1, -top - 1), (top, -top - 1),
+            (-top - 1, top), (1, 0), (-1, 0), (0, 1), (0, -1)]
+    streams = [(sa, sb, sh, pairs)]
+    for esa, esb, esh, k in ((hi, 1 << (mw - 1), 20, 32), (hi, hi, 16, 12),
+                             (1, 2, 0, 16)):
+        streams.append((esa, esb, esh, edge + [
+            (extra.randrange(-top - 1, top + 1), extra.randrange(-top - 1, top + 1))
+            for _ in range(k)]))
+    body, segs, i = [], [], 0
+    for k, (ssa, ssb, ssh, ps) in enumerate(streams):
+        start = i
+        for a, b in ps:
+            body.append("    as_[%d] = %s; bs_[%d] = %s; ys[%d] = %s;"
+                        % (i, _slit(a, dw), i, _slit(b, dw), i,
+                           _slit(resadd_golden(a, b, ssa, ssb, ssh, dw), dw)))
+            i += 1
+        if k:
+            segs.append(RESADD_STREAM.format(sa=ssa, sb=ssb, sh=ssh, lo=start, hi=i))
     return RESADD_TB.format(dwm=dw - 1, mwm=mw - 1,
-                            swm=p["shift_width"] - 1, n=len(pairs),
-                            sa=sa, sb=sb, sh=sh, cases="\n".join(body))
+                            swm=p["shift_width"] - 1, n=i, n1=n1,
+                            sa=sa, sb=sb, sh=sh, cases="\n".join(body),
+                            streams="".join(segs))
+
+
+# One more stream at its own held scales, started once the last has drained.
+RESADD_STREAM = """    scale_a = {sa}; scale_b = {sb}; shift = {sh};
+    repeat (3) @(negedge clk);
+    for (i = {lo}; i < {hi}; i = i + 1) begin
+      @(negedge clk);
+      a = as_[i]; b = bs_[i]; valid_in = 1;
+    end
+    @(negedge clk); valid_in = 0;
+    repeat (20) @(negedge clk);
+"""
 
 
 RESADD_TB = """`timescale 1ns/1ps
@@ -3761,14 +3800,15 @@ module tb_resadd;
         $finish;
       end
       if (y !== ys[got]) begin
-        $display("TB_FAIL test=resadd idx=%0d a=%0d b=%0d expected_res=%0d got_res=%0d",
-                 got, as_[got], bs_[got], ys[got], y);
+        $display("TB_FAIL test=resadd idx=%0d a=%0d b=%0d scale_a=%0d scale_b=%0d shift=%0d expected_res=%0d got_res=%0d",
+                 got, as_[got], bs_[got], scale_a, scale_b, shift, ys[got], y);
         $display("TB_RESULT: FAIL");
         $finish;
       end
       if (got == 0) lat = cyc - t0;
+      // the profile is the first stream's alone
+      if (got < {n1}) span = cyc - t0 + 1;
       got = got + 1;
-      span = cyc - t0 + 1;
     end
   end
 
@@ -3789,7 +3829,7 @@ module tb_resadd;
     end
     rst_n = 1;
     t0 = cyc + 1;
-    for (i = 0; i < {n}; i = i + 1) begin
+    for (i = 0; i < {n1}; i = i + 1) begin
       @(negedge clk);
       a = as_[i]; b = bs_[i]; valid_in = 1;
       if (i % 29 == 28) begin
@@ -3798,14 +3838,14 @@ module tb_resadd;
     end
     @(negedge clk); valid_in = 0;
     repeat (20) @(negedge clk);
-    checks = checks + 1;
+{streams}    checks = checks + 1;
     if (got !== {n}) begin
       $display("TB_FAIL test=resadd idx=0 expected_count={n} got_count=%0d", got);
       $display("TB_RESULT: FAIL");
       $finish;
     end
     $display("TB_PROFILE elements=%0d span_cycles=%0d latency_cycles=%0d",
-             {n}, span, lat);
+             {n1}, span, lat);
     $display("TB_PASS checks=%0d", checks);
     $display("TB_RESULT: PASS");
     $finish;
