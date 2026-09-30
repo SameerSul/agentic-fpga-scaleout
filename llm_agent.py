@@ -83,6 +83,7 @@ def pick_backend(choice=None):
 
 
 _BAD_LITERAL = re.compile(r"\d+\s*'\s*[sS]?[dDhHbBoO]\s*[-(]")
+_EXPR_SELECT = re.compile(r"[)}]\s*\[[^\]]*\]")
 _ERR_LOC = re.compile(r"^(?P<path>[^\s:]+(?: [^\s:]+)*\.s?v):(?P<line>\d+):\s*(?P<msg>.*)$")
 
 
@@ -122,6 +123,16 @@ def annotate_errors(errors, rtl):
                          "or parentheses after the base. Put the minus in "
                          "front of the whole literal: -8'sd128, not "
                          "8'sd-128 or 8'sd(-128).")
+            # A select taken of an expression, not a name. Traced on
+            # softmax, Haiku wrote (s_buf[i] - mx)[12:0] in every one of
+            # eight drafts, each quoted back to it as a syntax error.
+            if _EXPR_SELECT.search(src):
+                text += ("  | meaning: Verilog-2005 cannot take a bit or part "
+                         "select of an expression, a concatenation or a "
+                         "function result: (a - b)[12:0] is illegal. Assign "
+                         "the expression to a wire of its full width and "
+                         "select bits from that wire, or assign it straight "
+                         "to a narrower reg, which keeps the low bits.")
         out.append(text)
     return out
 
@@ -139,6 +150,11 @@ def _explain(err, lines):
         err += ("  | meaning: the testbench checks an internal memory named "
                 "%s that the spec requires. Declare it with exactly that "
                 "name and layout." % m.group(1))
+    if "declaration in unnamed block requires SystemVerilog" in err:
+        err += ("  | meaning: Verilog-2005 allows a reg, wire or integer to "
+                "be declared only at module level or in a named block. Move "
+                "the declaration out of the begin ... end, to the top of the "
+                "module.")
     if "async set or reset are not supported" in err:
         where = ["line %d: %s" % (i + 1, l.strip())
                  for i, l in enumerate(lines)

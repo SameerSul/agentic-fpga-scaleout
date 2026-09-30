@@ -1679,7 +1679,9 @@ def render_softmax_testbench(spec):
     body = []
     for ri, sc in enumerate(rows):
         w, _, _ = softmax_golden(sc, p)
+        flat = softmax_golden([0] * len(sc), p)[0][0]
         body.append("    // row %d, n=%d" % (ri, len(sc)))
+        body.append("    flat_w = %d'd%d;" % (ww, flat))
         for i, v in enumerate(sc):
             body.append("    smem[%d] = %s;" % (i, _slit(v, swi)))
         for i, v in enumerate(w):
@@ -1706,6 +1708,8 @@ module tb_softmax;
 
   reg signed [{swm}:0] smem [0:{cap}-1];
   reg        [{wwm}:0] expect_w [0:{cap}-1];
+  // The weight every index gets when a row's scores are all equal.
+  reg        [{wwm}:0] flat_w = 0;
   reg signed [{swm}:0] s_data;
   integer checks = 0, seen = 0, i, j, other, best, dist, own;
   reg [255:0] testname;
@@ -1753,7 +1757,14 @@ module tb_softmax;
         end
         own = (expect_w[w_index] > w_data) ? expect_w[w_index] - w_data
                                            : w_data - expect_w[w_index];
-        if (other >= 0 && best < own && best <= expect_w[other] / 64 + 2)
+        // Every score read as one value makes every weight the same.
+        // Traced, Sonnet's softmax gave 16383 for a two-score row in five
+        // drafts running, the weight of a row of equal scores, and read
+        // only "expected 14668 got 16383".
+        if (n > 1 && w_data == flat_w && expect_w[w_index] != flat_w)
+          $display("TB_FAIL test=%0s idx=%0d n=%0d expected_w=%0d got_w=%0d got_w_is_the_weight_of_a_row_whose_scores_are_all_equal=1",
+                   testname, w_index, n, expect_w[w_index], w_data);
+        else if (other >= 0 && best < own && best <= expect_w[other] / 64 + 2)
           $display("TB_FAIL test=%0s idx=%0d expected_w=%0d got_w=%0d got_w_is_closest_to_the_expected_value_for_idx=%0d",
                    testname, w_index, expect_w[w_index], w_data, other);
         else

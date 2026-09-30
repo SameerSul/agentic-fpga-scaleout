@@ -972,11 +972,13 @@ def test_softmax_sequencer():
             RuleBasedAgent().render_recip(rcs, {agent_mod.FIX_NORM}))
         open(os.path.join(work, 'roms.v'), 'w').write(
             specgen_mod.exp_rom(e) + specgen_mod.recip_rom(rcs))
-        res = {}
-        for label, fx in (('raw_scores', set()),
-                          ('fixed', {agent_mod.FIX_SUBMAX})):
-            open(os.path.join(work, 'sm.v'), 'w').write(
-                RuleBasedAgent().render_softmax(spec, fx))
+        res, outs = {}, {}
+        fixed = RuleBasedAgent().render_softmax(spec, {agent_mod.FIX_SUBMAX})
+        flat = fixed.replace("dfull = s_data - mx", "dfull = mx - mx")
+        assert flat != fixed
+        for label, src in (('raw_scores', RuleBasedAgent().render_softmax(spec, set())),
+                           ('fixed', fixed), ('flat', flat)):
+            open(os.path.join(work, 'sm.v'), 'w').write(src)
             r = subprocess.run(['iverilog', '-g2005', '-o', 's.out',
                                 'tb.v', 'sm.v', 'expu.v', 'recip.v', 'roms.v'],
                                cwd=work, capture_output=True, text=True)
@@ -984,6 +986,10 @@ def test_softmax_sequencer():
             r = subprocess.run(['vvp', 's.out'], cwd=work,
                                capture_output=True, text=True, timeout=900)
             res[label] = 'TB_RESULT: PASS' in r.stdout
+            outs[label] = r.stdout
+        check('a softmax that reads every score as one value is named for it',
+              not res['flat'] and
+              'got_w_is_the_weight_of_a_row_whose_scores_are_all_equal=1' in outs['flat'])
         check('the sequencer and both units compute softmax', res['fixed'])
         # The exponential is only defined for non-positive arguments, so
         # skipping the max subtraction feeds it positive ones.
@@ -3628,6 +3634,16 @@ def test_compile_errors_quote_the_source_line():
           and out[2] == "exp_rom.v line 3: warning")
     check('an error without a location passes through unchanged',
           out[3] == "no location here")
+    rtl2 = "a;\nexpu_x <= (s_buf[i] - mx)[12:0];\nc;"
+    out2 = llm_agent.annotate_errors(["/b/sm.v:2: syntax error",
+                                      "/b/sm.v:3: error: Variable declaration in "
+                                      "unnamed block requires SystemVerilog."], rtl2)
+    check('a select taken of an expression is explained, and so is a '
+          'declaration inside an unnamed block',
+          'cannot take a bit or part select of an expression' in out2[0]
+          and 'named block' in out2[1]
+          and 'select of an expression' not in llm_agent.annotate_errors(
+              ["/b/sm.v:1: syntax error"], "y <= mem[(i)][3:0];")[0])
     hist = [{"iteration": 1, "stage": "sim", "status": "fail",
              "errors": [path + ":2: syntax error"]},
             {"iteration": 2, "stage": "sim", "status": "fail",
