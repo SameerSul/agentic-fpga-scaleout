@@ -2202,6 +2202,13 @@ def test_composites_give_their_parts_ports():
     check('the projection gives its mac and requant ports and latencies',
           'mac (input clk' in ' '.join(pj['behavior'])
           and 'requant (input clk' in ' '.join(pj['behavior']))
+    pp = pj['parameters']
+    text = ' '.join(pj['behavior'])
+    check('the per-column projection says what its column word holds and '
+          'how the bias is used',
+          'requant(acc + bias)' in text
+          and 'bias the top %d bits' % pp['acc_width'] in text
+          and 'scale the low %d bits' % pp['scale_width'] in text)
 
 
 def test_attention_scores_cannot_overflow():
@@ -3490,6 +3497,8 @@ def test_llm_transport_is_retried():
               and '--effort' not in llm_agent.cli_command('haiku'))
         check('the CLI streams its events, so thinking can be told from hung',
               'stream-json' in llm_agent.cli_command('sonnet'))
+        check('with hangs caught by silence, every model gets the same cap',
+              llm_agent.cli_timeout('haiku') == llm_agent.cli_timeout('sonnet'))
 
         # A model still thinking at its cap is not asked the same thing again.
         calls[:] = []

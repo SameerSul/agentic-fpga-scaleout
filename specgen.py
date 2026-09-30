@@ -4344,6 +4344,24 @@ def derive_projn_spec(ms, board=None, per_column=False):
         "busy is high from start until the last output has been emitted.",
         "All state resets to zero.",
     ]
+    if per_column:
+        # Traced, run 6: the spec had the c_data port and nothing on what
+        # was in it or how it was used, and Haiku and Sonnet, guessing,
+        # both gave 14918 for a column whose answer is 12375.
+        aw, mw_, sw_ = p["acc_width"], p["scale_width"], p["shift_width"]
+        spec["behavior"][3] = (
+            "Each column's sum acc is requantized by the supplied requant "
+            "module, as requant(acc + bias) with that column's own scale "
+            "and shift, and emitted with o_valid high for one cycle and "
+            "o_index its column. Each column exactly once, in order.")
+        spec["behavior"].append(
+            "Each column's bias, scale and shift are in one word at c_addr = "
+            "its column index, a registered read like the others: c_data = "
+            "{bias, shift, scale}, with bias the top %d bits, a signed value "
+            "at the accumulator's scale, shift the next %d bits and scale the "
+            "low %d bits. The bias is added to the column's sum before the "
+            "requantizer. The scale and shift inputs are not used."
+            % (aw, sw_, mw_))
     # Traced, run 5: told only "the supplied mac module", Haiku and Sonnet
     # guessed its ports (enable, p, result, o, q; acc, sum, in for the
     # requantizer) in all thirteen drafts, and none compiled.

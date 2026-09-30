@@ -399,7 +399,13 @@ class StillThinking(RuntimeError):
 
 
 def cli_timeout(model):
-    return CLI_TIMEOUT_S if "haiku" in model else CLI_TIMEOUT_LARGE_S
+    """The cap on one call. A hung call is caught by silence now, so the
+    cap bounds only how long a model may take over an answer, and every
+    model gets the same. Haiku's used to be 600 s, from when a flat
+    timeout was the only way to catch a hang; in run 6 it cut off
+    Haiku's softmax while it was still streaming, a draft after one had
+    passed all 132 checks and failed only on its reset."""
+    return CLI_TIMEOUT_LARGE_S
 
 
 def cli_command(model):

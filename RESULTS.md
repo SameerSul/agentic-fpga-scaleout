@@ -91,7 +91,7 @@ times put within 10%.
 ### The full suite
 
 ```
-python3 tests.py            # 419 tests, or 417 without OpenSTA
+python3 tests.py            # 421 tests, or 419 without OpenSTA
 ```
 
 ### Spec to RTL, across the spec space
@@ -1844,6 +1844,16 @@ expected value; the testbench said only "expected_ssq got 6275206260"
 and "expected_norm -264 got_norm 2234". It now says when the sum counts
 one end element twice and the other never, and when an output is its
 neighbour's expected value.
+
+Run 6, with those fixes, showed the next layer. The projection's drafts
+now compiled, and Haiku and Sonnet both gave 14918 for a column whose
+answer is 12375: the per-column spec had a c_data port holding {bias,
+shift, scale} and not a word on the fields' widths or on how the bias is
+used. It now gives the layout and requant(acc + bias) with each column's
+own scale and shift. And Haiku's softmax passed all 132 checks for the
+first time, failed only on an asynchronous reset, and was then cut off
+still streaming at its 600 s cap; with hangs caught by silence, every
+model now gets the same cap.
 
 A block's own testbench is where a model's reading of the spec is
 checked, and a gap there lets a wrong block through every gate. The
