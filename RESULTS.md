@@ -91,7 +91,7 @@ times put within 10%.
 ### The full suite
 
 ```
-python3 tests.py            # 421 tests, or 419 without OpenSTA
+python3 tests.py            # 423 tests, or 421 without OpenSTA
 ```
 
 ### Spec to RTL, across the spec space
@@ -1854,6 +1854,27 @@ own scale and shift. And Haiku's softmax passed all 132 checks for the
 first time, failed only on an asynchronous reset, and was then cut off
 still streaming at its 600 s cap; with hangs caught by silence, every
 model now gets the same cap.
+
+### Run 6, and the blocks one at a time
+
+Run 6, a full `--agent llm` run on the fixes so far, verified: the
+decode step matches the integer model, tokens 49 and 49, and ten of the
+fifteen blocks are the models' own, Haiku eight and Sonnet two, the
+residual add among them against its stronger testbench. Sonnet's
+RMSNorm, reading the new messages, went from "x0 counted twice" to
+"each output is its neighbour's" to passing all 268 checks and
+synthesis, and ran out of drafts on timing.
+
+Two findings changed the chain. Sonnet on the attention head, given a
+64,000 token budget and an hour, thought for 200 kB and never answered;
+with thinking turned off (`--settings alwaysThinkingEnabled=false`) it
+streamed a whole module from the third second and compiled it in 105 s.
+An agent whose model is still thinking at the cap now asks again with
+thinking off, and keeps it off for the block. And Opus now follows
+Sonnet before the rules agent, with Sonnet given eight drafts: run
+block by block on these fixes, Haiku signed off the projection in seven
+and Opus signed off softmax in two, each with the decode step still
+matching.
 
 A block's own testbench is where a model's reading of the spec is
 checked, and a gap there lets a wrong block through every gate. The

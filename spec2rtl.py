@@ -202,17 +202,20 @@ def block_plan(im):
 def agent_chain(kind):
     """Who writes a block, in order of escalation: (label, factory, the
     iterations it gets). The LLM agent starts with the model in CHIPLET_LLM
-    (claude-cli:haiku by default), escalates to Sonnet, and only then falls
-    back to the rule-based agent; the report says which one signed each
-    block off."""
+    (claude-cli:haiku by default), escalates to Sonnet and then Opus, and
+    only then falls back to the rule-based agent; the report says which one
+    signed each block off."""
     if kind != "llm":
         return [(kind, lambda: cf.make_agent(kind), None)]
     from llm_agent import LLMAgent
     from agent import RuleBasedAgent
     first = os.environ.get("CHIPLET_LLM") or "claude-cli:haiku"
     chain = [(first, lambda: LLMAgent(first), 8)]
-    if first != "claude-cli:sonnet":
-        chain.append(("claude-cli:sonnet", lambda: LLMAgent("claude-cli:sonnet"), 5))
+    # Escalation by size: Haiku, then Sonnet, then Opus, and the rules
+    # agent only once all three have failed a block.
+    for m, n in (("claude-cli:sonnet", 8), ("claude-cli:opus", 5)):
+        if first != m:
+            chain.append((m, (lambda m=m: LLMAgent(m)), n))
     chain.append(("rules (fallback)", RuleBasedAgent, 5))
     return chain
 

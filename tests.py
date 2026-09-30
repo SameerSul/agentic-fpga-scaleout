@@ -3549,6 +3549,32 @@ def test_llm_transport_is_retried():
         llm_agent.run_cli = real_run
         llm_agent.time.sleep = real_sleep
 
+    # An agent whose model is still thinking at the cap asks again with
+    # thinking off, and keeps it off for the rest of the block.
+    seen = []
+
+    def fake_cli(p, model, attempts=3, thinking=True):
+        seen.append(thinking)
+        if thinking:
+            raise llm_agent.StillThinking('still thinking after 1500s')
+        return 'module m(); endmodule'
+    real_cli, real_pick = llm_agent.call_claude_cli, llm_agent.pick_backend
+    try:
+        llm_agent.call_claude_cli = fake_cli
+        llm_agent.pick_backend = lambda choice=None: ('claude-cli', 'sonnet')
+        ag = llm_agent.LLMAgent('claude-cli:sonnet')
+        spec = {'top_module': 'm', 'ports': [], 'behavior': [], 'parameters': {},
+                'name': 'm', 'description': 'm'}
+        r1, _ = ag.propose(spec, [])
+        r2, _ = ag.propose(spec, [])
+        check('a model still thinking at its cap is asked again with thinking '
+              'off, and stays off for the block',
+              'module m' in r1 and 'module m' in r2 and seen == [True, False, False]
+              and '--settings' in llm_agent.cli_command('sonnet', thinking=False)
+              and '--settings' not in llm_agent.cli_command('sonnet'))
+    finally:
+        llm_agent.call_claude_cli, llm_agent.pick_backend = real_cli, real_pick
+
     # The stream itself: a stand-in CLI that writes events, then the answer.
     work = os.path.join(ROOT, 'build_clitest')
     shutil.rmtree(work, ignore_errors=True)
@@ -3697,6 +3723,12 @@ def test_compile_errors_quote_the_source_line():
     out2 = llm_agent.annotate_errors(["/b/sm.v:2: syntax error",
                                       "/b/sm.v:3: error: Variable declaration in "
                                       "unnamed block requires SystemVerilog."], rtl2)
+    out3 = llm_agent.annotate_errors(
+        ["/b/h.v:3: error: Signing cast requires SystemVerilog.",
+         "/b/h.v:4: error: A reference to a net or variable (`i') is not "
+         "allowed in a constant expression."], "a;\nb;\nx = signed'(y);\nz = w[i*16+15:i*16];")
+    check('a SystemVerilog cast and a variable part-select are explained',
+          '$signed(x)' in out3[0] and '+: width' in out3[1])
     check('a select taken of an expression is explained, and so is a '
           'declaration inside an unnamed block',
           'cannot take a bit or part select of an expression' in out2[0]

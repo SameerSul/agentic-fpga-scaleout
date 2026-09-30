@@ -150,6 +150,14 @@ def _explain(err, lines):
         err += ("  | meaning: the testbench checks an internal memory named "
                 "%s that the spec requires. Declare it with exactly that "
                 "name and layout." % m.group(1))
+    if "Signing cast requires SystemVerilog" in err:
+        err += ("  | meaning: signed'(x) is a SystemVerilog cast. In "
+                "Verilog-2005 write $signed(x), or $unsigned(x).")
+    if "is not allowed in a constant expression" in err:
+        err += ("  | meaning: a part-select x[msb:lsb] needs constant bounds. "
+                "For a slice at a variable offset use the indexed form "
+                "x[base +: width], whose width is constant: x[i*16 +: 16], "
+                "not x[i*16+15:i*16].")
     if "declaration in unnamed block requires SystemVerilog" in err:
         err += ("  | meaning: Verilog-2005 allows a reg, wire or integer to "
                 "be declared only at module level or in a named block. Move "
@@ -408,7 +416,7 @@ def cli_timeout(model):
     return CLI_TIMEOUT_LARGE_S
 
 
-def cli_command(model):
+def cli_command(model, thinking=True):
     """The CLI invocation for one writer call.
 
     --tools "": the model writes text and the flow runs the tools. Left
@@ -428,6 +436,11 @@ def cli_command(model):
         (None if "haiku" in model else "low")
     if effort:
         cmd += ["--effort", effort]
+    if not thinking:
+        # Measured on the attention head: with thinking off Sonnet streams
+        # its answer from the third second, a whole module in 105 s, where
+        # with it on an hour of thinking gave nothing.
+        cmd += ["--settings", json.dumps({"alwaysThinkingEnabled": False})]
     return cmd + ["--output-format", "stream-json", "--verbose",
                   "--include-partial-messages"]
 
@@ -489,21 +502,22 @@ def run_cli(cmd, prompt, cap, silence=None, cwd=None):
         err.close()
 
 
-def call_claude_cli(prompt, model, attempts=CLI_ATTEMPTS):
+def call_claude_cli(prompt, model, attempts=CLI_ATTEMPTS, thinking=True):
     last = None
     for attempt in range(1, attempts + 1):
         try:
             # A neutral directory, so the CLI does not load this repo's
             # project context into what should be a self-contained prompt.
-            r = run_cli(cli_command(model), prompt, cli_timeout(model),
+            r = run_cli(cli_command(model, thinking), prompt, cli_timeout(model),
                         cwd=tempfile.gettempdir())
         except subprocess.TimeoutExpired:
             last = "timed out: no output for %ds" % CLI_SILENCE_S
         except StillThinking as e:
-            # The same prompt again would think the same way: this model's
-            # attempt at the block is over, and the next agent takes it.
-            raise RuntimeError("claude CLI failed after %d attempt(s): %s"
-                               % (attempt, e))
+            # The same prompt again would think the same way. The agent may
+            # ask again with thinking off; otherwise this model's attempt
+            # at the block is over, and the next agent takes it.
+            raise StillThinking("claude CLI failed after %d attempt(s): %s"
+                                % (attempt, e))
         else:
             if r.returncode == 0:
                 return r.stdout
@@ -542,12 +556,25 @@ class LLMAgent:
         self.backend, self.model = pick_backend(choice)
         self.last_rtl = None
         self.calls = 0
+        self.thinking = True
+
+    def _ask(self, p):
+        if self.backend != "claude-cli":
+            return CALLERS[self.backend](p, self.model)
+        try:
+            return call_claude_cli(p, self.model, thinking=self.thinking)
+        except StillThinking:
+            # Still thinking at the cap: ask the same thing with thinking
+            # off, and keep it off for the rest of this block, so no later
+            # draft spends the cap again before it answers.
+            if not self.thinking:
+                raise
+            self.thinking = False
+            return call_claude_cli(p, self.model, thinking=False)
 
     def propose(self, spec, feedback_history):
         prompt = build_prompt(spec, feedback_history, self.last_rtl)
-        rtl, n = ask_for_module(
-            lambda p: CALLERS[self.backend](p, self.model), prompt,
-            spec["top_module"])
+        rtl, n = ask_for_module(self._ask, prompt, spec["top_module"])
         self.last_rtl = rtl
         self.calls += n
         return rtl, ["llm:%s@%s#%d" % (self.model, self.backend, self.calls)]
