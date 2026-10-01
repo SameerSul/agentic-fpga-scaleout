@@ -3477,7 +3477,9 @@ def test_per_column_projection():
               'TB_RESULT: PASS' not in out['norow']
               and 'got_lane_is_this_columns_sum_without_its_last_row=1' in out['norow'])
         check('the spec says when a column word arrives with c_addr a register',
-              'two clock edges after the edge that loads c' in ' '.join(spec['behavior']))
+              'two clock edges after the edge that loads c' in ' '.join(spec['behavior'])
+              and 'two clock edges after the edge that loads r' in ' '.join(spec['behavior'])
+              and "requantizer's scale and shift inputs take" in ' '.join(spec['behavior']))
     finally:
         shutil.rmtree(work, ignore_errors=True)
 

@@ -4405,8 +4405,10 @@ def derive_projn_spec(ms, board=None, per_column=False):
         "nothing." % (lanes, lanes, lanes, lanes - 1),
         "For each group, rows r = 0..depth-1 are read: a_addr = r and "
         "w_addr = g*depth + r, both registered reads whose data arrives "
-        "the cycle after the address. Lane j of the word is the weight of "
-        "column g*%d + j at row r." % lanes,
+        "the cycle after the address; with the address a register, that is "
+        "two clock edges after the edge that loads r into it. Every row "
+        "r = 0..depth-1 is summed exactly once. Lane j of the word is the "
+        "weight of column g*%d + j at row r." % lanes,
         "Each lane accumulates a[r] * w_j over the rows in its own MAC, "
         "the supplied mac module, one instance per lane, cleared between "
         "groups.",
@@ -4435,7 +4437,10 @@ def derive_projn_spec(ms, board=None, per_column=False):
             "{bias, shift, scale}, with bias the top %d bits, a signed value "
             "at the accumulator's scale, shift the next %d bits and scale the "
             "low %d bits. The bias is added to the column's sum before the "
-            "requantizer. The scale and shift inputs are not used."
+            "requantizer, and the requantizer's scale and shift inputs take "
+            "that column's scale and shift from the word. This block's own "
+            "scale and shift ports are not used; tied to 0, the "
+            "requantizer's would make every output 0."
             % (aw, sw_, mw_))
     # Traced, run 5: told only "the supplied mac module", Haiku and Sonnet
     # guessed its ports (enable, p, result, o, q; acc, sum, in for the
