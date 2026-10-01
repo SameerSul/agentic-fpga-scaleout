@@ -91,7 +91,7 @@ times put within 10%.
 ### The full suite
 
 ```
-python3 tests.py            # 437 tests, or 435 without OpenSTA
+python3 tests.py            # 440 tests, or 438 without OpenSTA
 ```
 
 ### Spec to RTL, across the spec space
@@ -1897,8 +1897,8 @@ synthesis at -5.98, -1.7 and -1.02 ns, and 6 to 8 broke the simulation.
 Four changes follow. An agent whose latest draft fails simulation or
 synthesis after an earlier one passed both goes back to that earlier
 draft, told why. The next agent in the chain is handed the draft with
-the least negative slack and that draft's failure records, or, when no
-draft got past simulation, the last draft with how it failed. A timing
+the least negative slack and that draft's failure records; when no
+draft got past simulation it starts from the spec (see below for why). A timing
 failure now quotes the lines of the draft the path runs through: for
 Opus's fifth, an address subtract, a 256 entry buffer read, a 17 by 16
 multiply and a 32 bit add, all in one cycle, on four of its lines. And
@@ -1993,6 +1993,19 @@ a registered read behind a register address arrives two edges after the
 edge that loads it; the projection's said only "a registered read like
 the others". It now says it, and the testbench names a lane computed with
 the previous column's word.
+
+The run after that, on the fix, lost softmax, and three things came out
+of it. Sonnet's and Opus's softmax took s_data[20:8], the top 13 of the
+score's 21 bits, so scores less than 256 apart became equal; the
+testbench said only that the row looked like one of equal scores, and
+now says when the weights are the ones with each score's low 8 bits
+dropped. Sonnet's turn ended after four drafts on three silent calls
+inside ten minutes, retried five and ten seconds apart; silent calls are
+now retried over about twenty minutes. And a model handed a draft that
+never passed simulation kept its bug: Sonnet's and Opus's projections gave
+Haiku's wrong -20614 in five of their thirteen drafts, so the next model
+now starts from the spec unless a draft passed simulation and synthesis.
+Opus, last before the rules agent, gets eight drafts like the others.
 
 ## An attention head
 

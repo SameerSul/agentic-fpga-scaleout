@@ -1680,16 +1680,24 @@ def render_softmax_testbench(spec):
     for ri, sc in enumerate(rows):
         w, _, _ = softmax_golden(sc, p)
         flat = softmax_golden([0] * len(sc), p)[0][0]
+        # The weights from scores with their low bits dropped, as a
+        # design that takes s_data's top score_width bits gives. Traced
+        # on the end-to-end run: Sonnet's and Opus's softmax took
+        # s_data[20:8], two close scores became equal, and the only
+        # message was that the row looked like one of equal scores.
+        narrow = softmax_golden([v >> (swi - sw) for v in sc], p)[0] \
+            if swi > sw else w
         body.append("    // row %d, n=%d" % (ri, len(sc)))
         body.append("    flat_w = %d'd%d;" % (ww, flat))
         for i, v in enumerate(sc):
             body.append("    smem[%d] = %s;" % (i, _slit(v, swi)))
         for i, v in enumerate(w):
             body.append("    expect_w[%d] = %d'd%d;" % (i, ww, v))
+            body.append("    expect_n[%d] = %d'd%d;" % (i, ww, narrow[i]))
         body.append("    run_row(%d'd%d);" % (nw + 1, len(sc)))
     return SOFTMAX_TB.format(
         swm=swi - 1, wwm=ww - 1, nwm=nw - 1, nw=nw + 1, cap=p["capacity"],
-        rows="\n".join(body), nrows=len(rows))
+        rows="\n".join(body), nrows=len(rows), drop=swi - sw)
 
 
 SOFTMAX_TB = """`timescale 1ns/1ps
@@ -1708,6 +1716,7 @@ module tb_softmax;
 
   reg signed [{swm}:0] smem [0:{cap}-1];
   reg        [{wwm}:0] expect_w [0:{cap}-1];
+  reg        [{wwm}:0] expect_n [0:{cap}-1];
   // The weight every index gets when a row's scores are all equal.
   reg        [{wwm}:0] flat_w = 0;
   reg signed [{swm}:0] s_data;
@@ -1762,8 +1771,15 @@ module tb_softmax;
         // drafts running, the weight of a row of equal scores, and read
         // only "expected 14668 got 16383".
         if (n > 1 && w_data == flat_w && expect_w[w_index] != flat_w)
-          $display("TB_FAIL test=%0s idx=%0d n=%0d expected_w=%0d got_w=%0d got_w_is_the_weight_of_a_row_whose_scores_are_all_equal=1",
-                   testname, w_index, n, expect_w[w_index], w_data);
+          if (w_data == expect_n[w_index] && expect_n[w_index] != expect_w[w_index])
+            $display("TB_FAIL test=%0s idx=%0d n=%0d expected_w=%0d got_w=%0d got_w_is_the_weight_of_a_row_whose_scores_are_all_equal=1 got_w_is_the_weight_with_the_low_{drop}_bits_of_each_score_dropped=1",
+                     testname, w_index, n, expect_w[w_index], w_data);
+          else
+            $display("TB_FAIL test=%0s idx=%0d n=%0d expected_w=%0d got_w=%0d got_w_is_the_weight_of_a_row_whose_scores_are_all_equal=1",
+                     testname, w_index, n, expect_w[w_index], w_data);
+        else if (w_data == expect_n[w_index] && expect_n[w_index] != expect_w[w_index])
+          $display("TB_FAIL test=%0s idx=%0d expected_w=%0d got_w=%0d got_w_is_the_weight_with_the_low_{drop}_bits_of_each_score_dropped=1",
+                   testname, w_index, expect_w[w_index], w_data);
         else if (other >= 0 && best < own && best <= expect_w[other] / 64 + 2)
           $display("TB_FAIL test=%0s idx=%0d expected_w=%0d got_w=%0d got_w_is_closest_to_the_expected_value_for_idx=%0d",
                    testname, w_index, expect_w[w_index], w_data, other);

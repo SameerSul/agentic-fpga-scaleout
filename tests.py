@@ -976,8 +976,10 @@ def test_softmax_sequencer():
         fixed = RuleBasedAgent().render_softmax(spec, {agent_mod.FIX_SUBMAX})
         flat = fixed.replace("dfull = s_data - mx", "dfull = mx - mx")
         assert flat != fixed
+        narrow = fixed.replace("dfull = s_data - mx",
+                               "dfull = (s_data >>> 8) - (mx >>> 8)")
         for label, src in (('raw_scores', RuleBasedAgent().render_softmax(spec, set())),
-                           ('fixed', fixed), ('flat', flat)):
+                           ('fixed', fixed), ('flat', flat), ('narrow', narrow)):
             open(os.path.join(work, 'sm.v'), 'w').write(src)
             r = subprocess.run(['iverilog', '-g2005', '-o', 's.out',
                                 'tb.v', 'sm.v', 'expu.v', 'recip.v', 'roms.v'],
@@ -990,6 +992,9 @@ def test_softmax_sequencer():
         check('a softmax that reads every score as one value is named for it',
               not res['flat'] and
               'got_w_is_the_weight_of_a_row_whose_scores_are_all_equal=1' in outs['flat'])
+        check('a softmax that drops the scores\' low bits is named for it',
+              not res['narrow'] and 'got_w_is_the_weight_with_the_low_8_bits_'
+              'of_each_score_dropped=1' in outs['narrow'])
         check('the sequencer and both units compute softmax', res['fixed'])
         # The exponential is only defined for non-positive arguments, so
         # skipping the max subtraction feeds it positive ones.
@@ -2188,6 +2193,53 @@ def test_failed_attempts_are_kept():
               rows[0]['converged'] and rows[0]['agent'] == 'rules (fallback)'
               and rep.get('converged') is False and rep.get('iterations_used') == 1
               and os.path.exists(draft))
+    finally:
+        spec2rtl.agent_chain, spec2rtl.block_plan, cf.BUILD = chain, plan, build
+        shutil.rmtree(gates, ignore_errors=True)
+
+
+def test_a_draft_that_never_passed_is_not_handed_on():
+    """Handed a draft that never passed simulation, the next model kept its
+    bug: Sonnet's and then Opus's projections gave Haiku's wrong -20614 in
+    five of their thirteen drafts. With no draft past simulation and
+    synthesis, the next model starts from the spec."""
+    import spec2rtl, qwen_synth, llm_agent
+    import chiplet_flow as cf
+    gates = os.path.join(ROOT, 'build_handofftest')
+    shutil.rmtree(gates, ignore_errors=True)
+    seen = []
+
+    class Broken:
+        best_of = llm_agent.LLMAgent.best_of
+
+        def __init__(self):
+            self.drafts, self.seed, self.last_rtl = [], None, None
+
+        def propose(self, spec, history):
+            rtl = 'module broken(); endmodule\n'
+            self.drafts.append(rtl)
+            self.last_rtl = rtl
+            return rtl, ['broken']
+
+    class Next(Broken):
+        def __init__(self):
+            Broken.__init__(self)
+            self.rules = RuleBasedAgent()
+
+        def propose(self, spec, history):
+            seen.append((self.seed, self.last_rtl))
+            return self.rules.propose(spec, history)
+
+    chain, plan, build = spec2rtl.agent_chain, spec2rtl.block_plan, cf.BUILD
+    try:
+        spec2rtl.agent_chain = lambda kind: [('broken', Broken, 2),
+                                             ('next', Next, 5)]
+        spec2rtl.block_plan = lambda im: (plan(im)[0][:1], plan(im)[1])
+        im, _ = qwen_synth.model('qwen3', nl=1)
+        rows, _ = spec2rtl.sign_off(im, gates, 'llm', lambda *a: None)
+        check('with no draft past simulation, the next model starts from the spec',
+              rows[0]['converged'] and rows[0]['agent'] == 'next'
+              and seen and seen[0] == (None, None))
     finally:
         spec2rtl.agent_chain, spec2rtl.block_plan, cf.BUILD = chain, plan, build
         shutil.rmtree(gates, ignore_errors=True)
@@ -3561,7 +3613,8 @@ def test_llm_transport_is_retried():
         return run
 
     real_run, real_sleep = llm_agent.run_cli, llm_agent.time.sleep
-    llm_agent.time.sleep = lambda *_: None
+    waits = []
+    llm_agent.time.sleep = lambda t, *_: waits.append(t)
     try:
         # A call that went silent, then success: the loop should see the success.
         calls[:] = []
@@ -3619,14 +3672,19 @@ def test_llm_transport_is_retried():
         # Exhausting the attempts still raises, and says how many it tried.
         calls[:] = []
         llm_agent.run_cli = fake_run(
-            [subprocess.TimeoutExpired('claude', 180)] * 3)
+            [subprocess.TimeoutExpired('claude', 180)] * llm_agent.CLI_ATTEMPTS)
         msg = ''
+        waits[:] = []
         try:
             llm_agent.call_claude_cli('p', 'm')
         except RuntimeError as e:
             msg = str(e)
         check('exhausted retries report the attempt count and the cause',
-              len(calls) == 3 and 'attempt' in msg and 'timed out' in msg)
+              len(calls) == llm_agent.CLI_ATTEMPTS and 'attempt' in msg
+              and 'timed out' in msg)
+        check('silent calls are retried over minutes, not seconds',
+              llm_agent.CLI_ATTEMPTS >= 5 and sum(waits) >= 600
+              and max(waits) <= 300)
     finally:
         llm_agent.run_cli = real_run
         llm_agent.time.sleep = real_sleep
@@ -4458,6 +4516,7 @@ if __name__ == '__main__':
     test_signed_off_modules_are_renamed_however_written()
     test_sign_off_survives_a_silent_agent()
     test_failed_attempts_are_kept()
+    test_a_draft_that_never_passed_is_not_handed_on()
     test_composites_give_their_parts_ports()
     test_llm_blocks_decode()
     test_attention_scores_cannot_overflow()

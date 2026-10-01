@@ -563,7 +563,11 @@ CLI_TIMEOUT_S = 600
 # complete module. The larger models get room for that; haiku keeps 600.
 CLI_TIMEOUT_LARGE_S = 1500
 CLI_SILENCE_S = 180
-CLI_ATTEMPTS = 3
+# Silent calls are retried over about twenty minutes before a model's turn
+# at a block ends: traced, three silent calls inside ten minutes, with five
+# and ten seconds between them, handed softmax on from Sonnet after four
+# drafts in the end-to-end run.
+CLI_ATTEMPTS = 6
 
 
 class StillThinking(RuntimeError):
@@ -704,7 +708,7 @@ def call_claude_cli(prompt, model, attempts=CLI_ATTEMPTS, thinking=True):
             if not _is_retryable(last):
                 break
         if attempt < attempts:
-            time.sleep(min(30, 5 * 2 ** (attempt - 1)))
+            time.sleep(min(300, 30 * 2 ** (attempt - 1)))
     raise RuntimeError("claude CLI failed after %d attempt(s): %s"
                        % (attempt, last))
 

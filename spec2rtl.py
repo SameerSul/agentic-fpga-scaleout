@@ -212,8 +212,10 @@ def agent_chain(kind):
     first = os.environ.get("CHIPLET_LLM") or "claude-cli:haiku"
     chain = [(first, lambda: LLMAgent(first), 8)]
     # Escalation by size: Haiku, then Sonnet, then Opus, and the rules
-    # agent only once all three have failed a block.
-    for m, n in (("claude-cli:sonnet", 8), ("claude-cli:opus", 5)):
+    # agent only once all three have failed a block. Opus gets as many
+    # drafts as the others: twice it ended a block with a draft through
+    # simulation and synthesis and timing still closing, at five.
+    for m, n in (("claude-cli:sonnet", 8), ("claude-cli:opus", 8)):
         if first != m:
             chain.append((m, (lambda m=m: LLMAgent(m)), n))
     chain.append(("rules (fallback)", RuleBasedAgent, 5))
@@ -335,12 +337,16 @@ def _sign_off(im, gates, agent_kind, log, dv=False):
         for label, make, iters in agent_chain(agent_kind):
             ag = make()
             if getattr(prev, "last_rtl", None) and hasattr(ag, "last_rtl"):
-                # Edit an attempt, not restart: the one that got furthest,
-                # with its feedback, when one passed simulation and
-                # synthesis, else the last, with its feedback.
+                # A model edits the draft that got furthest, with its
+                # feedback, when one passed simulation and synthesis, and
+                # otherwise starts from the spec. Handed a draft that never
+                # passed, the next model kept its bug: Sonnet's and then
+                # Opus's projections gave Haiku's wrong -20614 in five of
+                # their thirteen drafts.
                 seed = prev.best_of(prev_iters) if hasattr(prev, "best_of") else None
-                if seed and hasattr(ag, "seed"):
-                    ag.seed = seed
+                if hasattr(ag, "seed"):
+                    if seed and seed[2]:
+                        ag.seed = seed
                 else:
                     ag.last_rtl = prev.last_rtl
             try:
