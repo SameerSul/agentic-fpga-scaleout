@@ -408,6 +408,7 @@ def render_exp_testbench(spec):
         body.append("    drive(%s, %d'd%d);"
                     % (_slit(x, iw), p["out_width"], exp_golden(x, p)))
     return EXP_TB.format(iwm=iw - 1, owm=p["out_width"] - 1,
+                         one=1 << p["out_frac"],
                          settle=p["pipeline_stages"] - 1,
                          cases="\n".join(body), n=len(xs))
 
@@ -449,8 +450,16 @@ module tb_expu;
       repeat ({settle}) @(negedge clk);
       checks = checks + 1;
       if (y !== want || valid_out !== 1'b1) begin
-        $display("TB_FAIL test=%0s x=%0d expected_y=%0d got_y=%0d vout=%b",
-                 testname, xi, want, y, valid_out);
+        // e**x is below one for every negative x. Traced on the fourth
+        // end-to-end run: Haiku's exponential gave 32857 for x = -1, five
+        // drafts running, the table's entry 1 with no shift, and read only
+        // "expected 32591 got 32857".
+        if (xi < 0 && y >= {one})
+          $display("TB_FAIL test=%0s x=%0d expected_y=%0d got_y=%0d vout=%b got_y_is_not_below_one_for_a_negative_x=1",
+                   testname, xi, want, y, valid_out);
+        else
+          $display("TB_FAIL test=%0s x=%0d expected_y=%0d got_y=%0d vout=%b",
+                   testname, xi, want, y, valid_out);
         $display("TB_RESULT: FAIL");
         $finish;
       end

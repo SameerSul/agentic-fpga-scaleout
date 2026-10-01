@@ -150,6 +150,14 @@ def _explain(err, lines):
         err += ("  | meaning: the testbench checks an internal memory named "
                 "%s that the spec requires. Declare it with exactly that "
                 "name and layout." % m.group(1))
+    if "arg->is_signed == sig.as_wire()->is_signed" in err:
+        # Traced on the fourth end-to-end run: .a($signed(a_data)) with
+        # a_data a plain input, in a draft that passed all 252 checks.
+        err += ("  | meaning: Yosys's front end crashes on $signed(x) of a "
+                "whole unsigned signal used directly as a module port "
+                "connection, as in .a($signed(a_data)). The design can be "
+                "right; the tool cannot read it. Declare a signed wire, "
+                "wire signed [15:0] a_s = a_data;, and connect .a(a_s).")
     if "Signing cast requires SystemVerilog" in err:
         err += ("  | meaning: signed'(x) is a SystemVerilog cast. In "
                 "Verilog-2005 write $signed(x), or $unsigned(x).")
@@ -438,6 +446,21 @@ def code_findings(rtl, history):
                 "as a large positive number. Write $signed(%s) * %s."
                 % (n, cat, name, name, name, name, cat, name))
             break
+    portcast = {}
+    for n, line in enumerate(rtl.splitlines(), 1):
+        code = line.split("//")[0]
+        for m in re.finditer(r"\.(\w+)\s*\(\s*\$signed\s*\(\s*([A-Za-z_]\w*)\s*\)\s*\)", code):
+            if sig.get(m.group(2)) is False:
+                portcast.setdefault(m.group(2), []).append((n, m.group(1)))
+    for name, uses in portcast.items():
+        (n, port), more = uses[0], len(uses) - 1
+        out.append(
+            "line %d%s: .%s($signed(%s)) connects a $signed() of the unsigned "
+            "%s straight to a port, which crashes Yosys's front end with an "
+            "assertion although the design is right. Declare wire signed "
+            "[..] %s_s = %s; and connect .%s(%s_s)."
+            % (n, " and %d more" % more if more else "", port, name, name,
+               name, name, port, name))
     out += handshake_findings(rtl)
     last = history[-1] if history else {}
     ends = last.get("stage") == "timing" and _ENDS.search(
@@ -805,7 +828,9 @@ class LLMAgent:
                         [h for h in history if h.get("iteration") == it],
                         "Your draft %d" % it)
         if self.seed and self.seed[2]:
-            return self.seed[0], self.seed[1], "The draft you were handed"
+            return (self.seed[0], self.seed[1], "The draft you were handed"
+                    if self.seed[2] == "synth" else
+                    "The draft you were handed, which passed simulation")
         return None
 
     def best_of(self, iterations):
@@ -829,13 +854,22 @@ class LLMAgent:
             key = slack if slack is not None else float("-inf")
             if best is None or key >= best[0]:
                 best = (key, i, rec)
-        passed = best is not None
+        passed = "synth" if best is not None else False
+        done = [r for r in iterations
+                if 1 <= (r.get("iteration") or 0) <= len(self.drafts)]
         if not passed:
-            done = [r for r in iterations
-                    if 1 <= (r.get("iteration") or 0) <= len(self.drafts)]
-            if not done:
+            # Else the latest draft that passed simulation: traced on the
+            # fourth end-to-end run, Sonnet's projection passed all 252
+            # checks and only Yosys's front end crashed on it, and Opus,
+            # handed nothing, started again from the spec.
+            sim_ok = [r for r in done
+                      if (r.get("sim") or {}).get("status") == "pass"]
+            if sim_ok:
+                rec, passed = sim_ok[-1], "sim"
+            elif not done:
                 return None
-            rec = done[-1]
+            else:
+                rec = done[-1]
             i = rec["iteration"]
         else:
             _, i, rec = best
@@ -849,18 +883,24 @@ class LLMAgent:
         best = self._best_draft(feedback_history)
         if best:
             base, hist, who = best
-            note = ("%s, shown above, passed every simulation check and "
-                    "synthesis, and failed only what the feedback below "
-                    "says. The drafts after it broke the simulation, so you "
-                    "are revising it again: change only what that failure "
-                    "needs, and keep its behaviour exactly as it is." % who)
+            note = ("%s, shown above, passed every simulation check%s, and "
+                    "failed only what the feedback below says. The drafts "
+                    "after it broke the simulation, so you are revising it "
+                    "again: change only what that failure needs, and keep its "
+                    "behaviour exactly as it is."
+                    % (who, "" if "passed simulation" in who else " and synthesis"))
         elif not self.drafts and self.seed:
             base, hist = self.seed[0], self.seed[1]
             note = ("The draft shown above was written by another model. It "
                     "passed every simulation check and synthesis, and failed "
                     "only what the feedback below says. Start from it: change "
                     "only what that failure needs, and keep its behaviour "
-                    "exactly as it is." if self.seed[2] else
+                    "exactly as it is." if self.seed[2] == "synth" else
+                    "The draft shown above was written by another model. It "
+                    "passed every simulation check, and synthesis failed as "
+                    "the feedback below says. Start from it: change only what "
+                    "synthesis needs, and keep its behaviour exactly as it "
+                    "is." if self.seed[2] == "sim" else
                     "The draft shown above was written by another model, and "
                     "the feedback below is how it failed. Revise it.")
         prompt = build_prompt(spec, hist, base, note)

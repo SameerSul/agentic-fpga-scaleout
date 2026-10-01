@@ -706,6 +706,31 @@ def test_exp_block():
           specgen_mod.exp_golden(-(1 << (p['in_width'] - 1)), p) == 0)
 
     rtl = RuleBasedAgent().render_exp(spec, {agent_mod.FIX_LUT})
+    # The table entry without its shift: e**x at or above one for a
+    # negative x, which the testbench names.
+    work = os.path.join(ROOT, 'build_exptbtest')
+    shutil.rmtree(work, ignore_errors=True)
+    os.makedirs(work)
+    try:
+        open(os.path.join(work, 'tb.v'), 'w').write(
+            specgen_mod.render_exp_testbench(spec))
+        open(os.path.join(work, 'rom.v'), 'w').write(specgen_mod.exp_rom(spec))
+        res = {}
+        noshift = rtl.replace('y         <= m >> sh;', 'y         <= m;')
+        assert noshift != rtl
+        for label, src in (('good', rtl), ('noshift', noshift)):
+            open(os.path.join(work, 'e.v'), 'w').write(src)
+            r = subprocess.run(['iverilog', '-g2005', '-o', 's.out', 'tb.v', 'e.v',
+                                'rom.v'], cwd=work, capture_output=True, text=True)
+            assert r.returncode == 0, r.stdout + r.stderr
+            res[label] = subprocess.run(['vvp', 's.out'], cwd=work,
+                                        capture_output=True, text=True,
+                                        timeout=600).stdout
+        check('an exponential at or above one for a negative input is named',
+              'TB_RESULT: PASS' in res['good']
+              and 'got_y_is_not_below_one_for_a_negative_x=1' in res['noshift'])
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
     xs = [0, -1, -(1 << p['in_frac']), -(3 << p['in_frac']),
           -(1 << (p['in_width'] - 1))]
     got = inference.run_exp_cosim(spec, xs, rtl)
@@ -3778,7 +3803,18 @@ def test_llm_transport_is_retried():
               and 'written by another model' in prompts[3]
               and '/*one*/' in prompts[4] and '/*four*/' not in prompts[4]
               and 'The draft you were handed' in prompts[4]
-              and seed[2] is True)
+              and seed[2] == "synth")
+        # A draft through simulation but not synthesis still goes on,
+        # with its synthesis failure, ahead of the spec.
+        simonly = ag.best_of([
+            {'iteration': 1, 'sim': {'status': 'fail', 'stage': 'sim'}},
+            {'iteration': 2, 'sim': {'status': 'pass'},
+             'synth': {'stage': 'synth', 'status': 'fail', 'errors': ['crash']}},
+            {'iteration': 3, 'sim': {'status': 'fail', 'stage': 'sim'}}])
+        check('a draft through simulation but not synthesis is handed on '
+              'with its synthesis failure',
+              simonly[2] == "sim" and '/*two*/' in simonly[0]
+              and simonly[1][0]['stage'] == 'synth')
         # With no draft past simulation, the last one goes on with its
         # failures: handed over bare, Sonnet saw Haiku's RMSNorm with no
         # word of how it failed.
@@ -4066,6 +4102,16 @@ def test_compile_errors_quote_the_source_line():
           '$signed one is not',
           [f.split(":")[0] for f in cf_] == ["line 3", "line 4"]
           and "Write $signed(" in cf_[0])
+    ys = ("module t(input clk, input [15:0] a_data, input signed [15:0] s_in);\n"
+          "  sub u (.clk(clk), .a($signed(a_data)));\n"
+          "  sub v (.clk(clk), .a($signed(s_in)));\nendmodule")
+    yf = [f for f in llm_agent.code_findings(ys, []) if "Yosys" in f]
+    ye = llm_agent.annotate_errors(
+        ["ERROR: Assert `arg->is_signed == sig.as_wire()->is_signed' failed in genrtlil.cc:2214."], None)
+    check('$signed() of an unsigned signal in a port connection is reported '
+          'and the Yosys assertion it causes is explained',
+          len(yf) == 1 and yf[0].startswith("line 2: .a($signed(a_data))")
+          and "Declare a signed wire" in ye[0])
     hf = llm_agent.code_findings(hs, [])
     check('an output wired from an instance beside a valid registered from '
           'it is reported, and the same output driven alongside its valid is not',
