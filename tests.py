@@ -3449,8 +3449,13 @@ def test_per_column_projection():
                              'if (dva) begin\n        rq_acc <= shadow[dsel] +'
                              ).replace('rq_idx <= didxb;', 'rq_idx <= didx;')
         assert early.count('shadow[dsel] +') == 1
+        # The last row never reaches the MACs: each column's sum without it.
+        norow = good.replace('      v1 <= issuing;\n',
+                             '      v1 <= issuing && r != depth - 1;\n')
+        assert norow != good
         out = {}
-        for label, src in (('good', good), ('nobias', nobias), ('early', early)):
+        for label, src in (('good', good), ('nobias', nobias), ('early', early),
+                           ('norow', norow)):
             with open(os.path.join(work, 'p.v'), 'w') as f:
                 f.write(src)
             r = subprocess.run(['iverilog', '-g2005', '-o', 's.out', 'tb.v',
@@ -3468,6 +3473,9 @@ def test_per_column_projection():
               'TB_RESULT: PASS' not in out['early']
               and 'got_lane_is_this_columns_sum_with_the_previous_columns_word=1'
               in out['early'])
+        check('a column sum that misses its last row is caught and named',
+              'TB_RESULT: PASS' not in out['norow']
+              and 'got_lane_is_this_columns_sum_without_its_last_row=1' in out['norow'])
         check('the spec says when a column word arrives with c_addr a register',
               'two clock edges after the edge that loads c' in ' '.join(spec['behavior']))
     finally:
@@ -4045,6 +4053,17 @@ def test_compile_errors_quote_the_source_line():
           "      o_valid <= 1'b1;\n"
           "    end\n"
           "  end\nendmodule")
+    cm = ("module mac(input clk, input signed [15:0] a, input signed [15:0] b);\n"
+          "  reg signed [24:0] ph, pl, ok;\n"
+          "  always @(posedge clk) ph <= {{a[15]}, a[15:8]} * b;\n"
+          "  always @(posedge clk) pl <= {1'b0, a[7:0]} * b;\n"
+          "  always @(posedge clk) ok <= $signed({1'b0, a[7:0]}) * b;\n"
+          "endmodule")
+    cf_ = llm_agent.code_findings(cm, [])
+    check('a concatenation multiplied by a signed operand is reported, and the '
+          '$signed one is not',
+          [f.split(":")[0] for f in cf_] == ["line 3", "line 4"]
+          and "Write $signed(" in cf_[0])
     hf = llm_agent.code_findings(hs, [])
     check('an output wired from an instance beside a valid registered from '
           'it is reported, and the same output driven alongside its valid is not',

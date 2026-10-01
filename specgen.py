@@ -4192,6 +4192,13 @@ def render_proj_testbench(spec, cases=None, colfn=None):
                 pb, psc, psh = words[c - 1] if c else (b, csc, csh)
                 body.append("    expect_p[%d] = %s;" % (c, _slit(
                     requant_golden(acc[c] + pb, psc, psh, dw)[0], dw)))
+                # The sum without its last row: the rows fed to the MACs
+                # one cycle early, as Haiku's projection did for eight
+                # drafts of the end-to-end run, 12414 for 12375.
+                last = proj_x(depth - 1, seed, dw) * proj_w(
+                    c * depth + depth - 1, seed, dw, wb)
+                body.append("    expect_l[%d] = %s;" % (c, _slit(
+                    requant_golden(acc[c] - last + b, csc, csh, dw)[0], dw)))
                 word = (((b & ((1 << p["acc_width"]) - 1)) << (sw_o + mw))
                         | (csh << mw) | csc)
                 body.append("    cmem[%d] = %d'h%x;"
@@ -4473,6 +4480,10 @@ FAIL_LANE_PREV = (
     '          $display("TB_FAIL test=%0s out=%0d expected_lane=%0d got_lane=%0d '
     'got_lane_is_this_columns_sum_with_the_previous_columns_word=1",\n'
     '                   testname, o_index, expect_y[o_index], o_data);\n'
+    '        else if (o_data === expect_l[o_index] && expect_l[o_index] !== expect_y[o_index])\n'
+    '          $display("TB_FAIL test=%0s out=%0d expected_lane=%0d got_lane=%0d '
+    'got_lane_is_this_columns_sum_without_its_last_row=1",\n'
+    '                   testname, o_index, expect_y[o_index], o_data);\n'
     '        else\n'
     '          $display("TB_FAIL test=%0s out=%0d expected_lane=%0d got_lane=%0d",\n'
     '                   testname, o_index, expect_y[o_index], o_data);')
@@ -4520,8 +4531,9 @@ def render_projn_testbench(spec, cases=None):
                 if cases else (1 << p["col_width"]) - 1, cw - 1)),
             (".w_data(w_data),", ".w_data(w_data), .c_addr(c_addr), .c_data(c_data),"),
             ("  reg [%d-1:0] seen_bits;" % maxc,
-             "  reg [%d-1:0] seen_bits;\n  reg signed [%d:0] expect_p [0:%d];"
-             % (maxc, dw - 1, maxc - 1)),
+             "  reg [%d-1:0] seen_bits;\n  reg signed [%d:0] expect_p [0:%d];\n"
+             "  reg signed [%d:0] expect_l [0:%d];"
+             % (maxc, dw - 1, maxc - 1, dw - 1, maxc - 1)),
             (FAIL_LANE, FAIL_LANE_PREV),
         ]
     for a_, b_ in rep:

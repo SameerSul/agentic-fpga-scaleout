@@ -269,6 +269,14 @@ def timing_path(rtl, start, end, depth=10):
     return []
 
 
+# A concatenation, unwrapped, on either side of a multiply by a whole name.
+_CAT_MUL = re.compile(
+    r"(\$signed\s*\(\s*)?(\{[^{};]*(?:\{[^{};]*\}[^{};]*)*\})\s*\*\s*"
+    r"(\$signed\s*\(\s*)?([A-Za-z_]\w*)\b(?!\s*\[)"
+    r"|\b([A-Za-z_]\w*)\b(?!\s*\[)\s*\*\s*(\$signed\s*\(\s*)?"
+    r"(\{[^{};]*(?:\{[^{};]*\}[^{};]*)*\})")
+
+
 def _decl_names(code, kind):
     return {m.group(2) for m in re.finditer(
         r"\b%s\b([^;,)]*?)\b([A-Za-z_]\w*)\s*(?=[,;)])" % kind, code)}
@@ -411,6 +419,25 @@ def code_findings(rtl, history):
                     "write x <<< n, or wrap it as $signed(%s)."
                     % (n, m.group(2), m.group(2)))
                 break
+    # Traced on the end-to-end run: Haiku's score MAC split its multiply
+    # as {a[15], a[15:8]} * b and {1'b0, a[7:0]} * b for eight drafts, so
+    # each product was unsigned and every negative b came out 65536 high.
+    for n, line in enumerate(rtl.splitlines(), 1):
+        code = line.split("//")[0]
+        for m in _CAT_MUL.finditer(code):
+            if m.group(2):
+                wrapped, cat, name = m.group(1), m.group(2), m.group(4)
+            else:
+                name, wrapped, cat = m.group(5), m.group(6), m.group(7)
+            if wrapped or not sig.get(name):
+                continue
+            out.append(
+                "line %d: %s * %s multiplies a concatenation, which Verilog "
+                "always treats as unsigned, by the signed %s, so the product "
+                "is unsigned and %s is zero-extended: a negative %s multiplies "
+                "as a large positive number. Write $signed(%s) * %s."
+                % (n, cat, name, name, name, name, cat, name))
+            break
     out += handshake_findings(rtl)
     last = history[-1] if history else {}
     ends = last.get("stage") == "timing" and _ENDS.search(
