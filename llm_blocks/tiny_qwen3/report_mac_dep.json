@@ -1,0 +1,256 @@
+{
+  "spec": {
+    "name": "mac16_qwen2_5_0p5b_a16",
+    "description": "16-bit pipelined multiply-accumulate unit derived from qwen2_5_0p5b_a16: datapath from the model quantization, accumulator sized for its longest reduction",
+    "top_module": "mac",
+    "parameters": {
+      "data_width": 16,
+      "acc_width": 32,
+      "signed": true,
+      "pipeline_stages": 3,
+      "target_clock_mhz": 100
+    },
+    "derivation": {
+      "model": "qwen2_5_0p5b_a16",
+      "weight_bits": 8,
+      "activation_bits": 16,
+      "reduction_depth": 256,
+      "guard_bits": 8,
+      "signed": true,
+      "rule": "acc_width = weight_bits + activation_bits + ceil(log2(max(d_model, d_ff)))",
+      "signedness_rule": "symmetric quantization is two's complement signed, so operands, product and accumulator are all signed",
+      "pipeline_stages": 3,
+      "pipeline_rule": "2 stages up to an 8-bit datapath, 3 above it: the signed multiply is the critical path and splitting it into half-width partial products buys the clock back for one cycle of latency"
+    },
+    "ports": [
+      {
+        "name": "clk",
+        "dir": "input",
+        "width": 1,
+        "desc": "clock, rising edge"
+      },
+      {
+        "name": "rst_n",
+        "dir": "input",
+        "width": 1,
+        "desc": "active-low synchronous reset"
+      },
+      {
+        "name": "clear",
+        "dir": "input",
+        "width": 1,
+        "desc": "synchronous accumulator clear"
+      },
+      {
+        "name": "a",
+        "dir": "input",
+        "width": 16,
+        "signed": true,
+        "desc": "multiplicand (activation), signed two's complement"
+      },
+      {
+        "name": "b",
+        "dir": "input",
+        "width": 16,
+        "signed": true,
+        "desc": "multiplier (weight), signed two's complement"
+      },
+      {
+        "name": "valid_in",
+        "dir": "input",
+        "width": 1,
+        "desc": "input operands valid"
+      },
+      {
+        "name": "acc",
+        "dir": "output",
+        "width": 32,
+        "signed": true,
+        "desc": "accumulator value, signed two's complement"
+      },
+      {
+        "name": "valid_out",
+        "dir": "output",
+        "width": 1,
+        "desc": "acc updated this cycle"
+      }
+    ],
+    "behavior": [
+      "Stage 1 registers two half-width partial products of a*b and the valid flag; stage 2 combines them into the full 32-bit product.",
+      "The final stage adds the registered product into the 32-bit accumulator when the piped valid is set.",
+      "clear synchronously zeroes acc and valid_out, taking priority over accumulation.",
+      "Latency from valid_in to valid_out is 3 cycles.",
+      "32 accumulator bits = 24 product bits + 8 guard bits, enough for a 256-deep dot product with no overflow.",
+      "Operands, product and accumulator are signed two's complement. The multiply must be a signed multiply and the product must be sign-extended into the accumulator.",
+      "a carries 16-bit activations and b carries 8-bit weights, sign-extended to the 16-bit ports. The accumulator width depends on those ranges: a wider value on either port can overflow it."
+    ]
+  },
+  "tools": {
+    "iverilog": "iverilog",
+    "vvp": "vvp",
+    "yosys": "yosys",
+    "sta": "sta"
+  },
+  "agent": "LLMAgent",
+  "converged": true,
+  "iterations_used": 5,
+  "history": [
+    {
+      "iteration": 1,
+      "fixes_applied": [
+        "llm:haiku@claude-cli#1"
+      ],
+      "sim": {
+        "stage": "sim",
+        "status": "fail",
+        "checks": null,
+        "mismatches": [
+          {
+            "test": "signed_operands",
+            "expected_acc": "302",
+            "got_acc": "46",
+            "expected_vout": "1",
+            "got_vout": "1"
+          }
+        ]
+      },
+      "synth": null,
+      "timing": null,
+      "fpga": null
+    },
+    {
+      "iteration": 2,
+      "fixes_applied": [
+        "llm:haiku@claude-cli#2"
+      ],
+      "sim": {
+        "stage": "sim",
+        "status": "fail",
+        "checks": null,
+        "mismatches": [
+          {
+            "test": "signed_operands",
+            "expected_acc": "302",
+            "got_acc": "46",
+            "expected_vout": "1",
+            "got_vout": "1"
+          }
+        ]
+      },
+      "synth": null,
+      "timing": null,
+      "fpga": null
+    },
+    {
+      "iteration": 3,
+      "fixes_applied": [
+        "llm:haiku@claude-cli#4"
+      ],
+      "sim": {
+        "stage": "sim",
+        "status": "fail",
+        "checks": null,
+        "mismatches": [
+          {
+            "test": "signed_operands",
+            "expected_acc": "301",
+            "got_acc": "65837",
+            "expected_vout": "1",
+            "got_vout": "1"
+          }
+        ]
+      },
+      "synth": null,
+      "timing": null,
+      "fpga": null
+    },
+    {
+      "iteration": 4,
+      "fixes_applied": [
+        "llm:haiku@claude-cli#5"
+      ],
+      "sim": {
+        "stage": "sim",
+        "status": "pass",
+        "checks": 613,
+        "mismatches": [],
+        "throughput": {
+          "macs": 256,
+          "span_cycles": 256,
+          "latency_cycles": 5,
+          "units": 256,
+          "cycles_per_unit": 1.0
+        }
+      },
+      "synth": {
+        "stage": "synth",
+        "status": "fail",
+        "errors": [
+          "ERROR: FF mac.$auto$ff.cc:337:slice$375 (type $_DFF_PN0_) cannot be legalized: dffs with async set or reset are not supported"
+        ]
+      },
+      "timing": null,
+      "fpga": null
+    },
+    {
+      "iteration": 5,
+      "fixes_applied": [
+        "llm:haiku@claude-cli#6"
+      ],
+      "sim": {
+        "stage": "sim",
+        "status": "pass",
+        "checks": 613,
+        "mismatches": [],
+        "throughput": {
+          "macs": 256,
+          "span_cycles": 256,
+          "latency_cycles": 5,
+          "units": 256,
+          "cycles_per_unit": 1.0
+        }
+      },
+      "synth": {
+        "stage": "synth",
+        "status": "pass",
+        "cell_count": 4145,
+        "area": 8091.0
+      },
+      "timing": {
+        "stage": "timing",
+        "status": "pass",
+        "method": "opensta",
+        "clock_period_ns": 10.0,
+        "worst_slack_ns": 2.78
+      },
+      "fpga": {
+        "luts": 139,
+        "ffs": 115,
+        "dsps": 2,
+        "brams": 0,
+        "urams": 0,
+        "carry": 14,
+        "muxf": 0,
+        "lutram": 0,
+        "status": "pass",
+        "family": "xcup",
+        "top": "mac",
+        "lint": [],
+        "stage": "fpga"
+      }
+    }
+  ],
+  "final_metrics": {
+    "sim_pass": true,
+    "sim_checks": 613,
+    "cell_count": 4145,
+    "area": 8091.0,
+    "timing": {
+      "stage": "timing",
+      "status": "pass",
+      "method": "opensta",
+      "clock_period_ns": 10.0,
+      "worst_slack_ns": 2.78
+    }
+  }
+}

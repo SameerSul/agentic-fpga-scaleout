@@ -1179,9 +1179,14 @@ def test_rmsnorm():
             res[label] = r.stdout
         check('the norm computes the sum of squares, rsqrt and the products',
               'TB_RESULT: PASS' in res['fixed'])
-        check('a sum of squares that leaves out epsilon is caught',
+        check('a sum of squares that leaves out epsilon is caught, with what '
+              'the design saw on its first cycles and its last',
               'TB_RESULT: PASS' not in res['first']
-              and 'expected_ssq' in res['first'])
+              and 'expected_ssq' in res['first']
+              and re.search(r'cycles_after_start_as_cycle_x_addr_x_data_ssq='
+                            r'(\d+:-?\d+,-?\d+,\d+;){8} four_cycles_to_the_last_'
+                            r'change_of_ssq_as_x_addr_x_data_ssq=(-?\d+,-?\d+,\d+;){4}$',
+                            res['first'], re.M))
         check('a norm that reads its data a cycle early is caught, its '
               'outputs named as their neighbours\' expected values',
               'TB_RESULT: PASS' not in res['early']
@@ -2186,6 +2191,43 @@ def test_failed_attempts_are_kept():
     finally:
         spec2rtl.agent_chain, spec2rtl.block_plan, cf.BUILD = chain, plan, build
         shutil.rmtree(gates, ignore_errors=True)
+
+
+def test_llm_blocks_decode():
+    """The fifteen blocks the models signed off, Haiku nine, Sonnet three
+    and Opus three, in one design: the decode step matches the integer
+    model. Each was signed off in a run of its own with the generator's
+    blocks around it; all of them together is the check that matters."""
+    import spec2rtl, qwen_synth
+    src = os.path.join(ROOT, 'llm_blocks', 'tiny_qwen3')
+    out = os.path.join(ROOT, 'build_llmblocks')
+    shutil.rmtree(out, ignore_errors=True)
+    try:
+        spec = json.load(open(os.path.join(ROOT, 'examples', 'tiny_qwen3.json')))
+        rep = spec2rtl.run(spec, out=out, blocks=src, log=lambda *a: None)
+        rows = rep['stages']['blocks']['rows']
+        used = all(open(os.path.join(out, 'design', r['file'])).read()
+                   == open(os.path.join(src, r['file'])).read() for r in rows)
+        models = sorted(r['agent'] for r in rows)
+        check('the fifteen blocks the models signed off decode as the integer '
+              'model does, and the design is built from those files',
+              rep['ok'] and len(rows) == 15 and used
+              and all(r['converged'] and r['agent'].startswith('llm:') for r in rows)
+              and [m.split('@')[0] for m in models].count('llm:haiku') == 9)
+        # A block signed off for other parameters is not this design's.
+        alt = os.path.join(out, 'alt')
+        shutil.copytree(src, alt)
+        p = os.path.join(alt, 'report_b_rmsnorm.json')
+        r = json.load(open(p))
+        r['spec']['parameters']['d_model'] = 128
+        json.dump(r, open(p, 'w'))
+        im, _ = qwen_synth.model('qwen3', nl=1)
+        other, _ = spec2rtl.load_signed_off(im, os.path.join(out, 'other'), alt,
+                                            lambda *a: None)
+        check('a block signed off for other parameters is refused, the rest kept',
+              [r['file'] for r in other if not r['converged']] == ['b_rmsnorm.v'])
+    finally:
+        shutil.rmtree(out, ignore_errors=True)
 
 
 def test_composites_give_their_parts_ports():
@@ -3948,6 +3990,17 @@ def test_compile_errors_quote_the_source_line():
           and 'line 7: if (j <= a) acc <= acc + p' in tf[0]
           and llm_agent.timing_path(pipe, 'acc', 'r2') == [(8, 'r2 <= acc;')]
           and llm_agent.timing_path(pipe, 'a', 'r2') == [])
+    inst = ("module m(input clk, input signed [15:0] g);\n"
+            "  reg signed [15:0] gs; reg [16:0] m_;\n"
+            "  wire signed [31:0] t = gs * $signed({1'b0, m_});\n"
+            "  requant rq (.clk(clk),\n"
+            "              .acc_in(t), .q_out());\n"
+            "  always @(posedge clk) gs <= g;\nendmodule")
+    check('a path that ends inside a module instance is traced to the signal '
+          'wired into it',
+          llm_agent.timing_path(inst, 'gs', 'rq') == [
+              (3, "wire signed [31:0] t = gs * $signed({1'b0, m_});"),
+              (5, ".acc_in(t), into rq")])
     sq = ("module m(input signed [15:0] x, input [39:0] eps);\n"
           "  reg [39:0] ssq; reg [39:0] t; wire signed [31:0] p = x * x;\n"
           "  always @(*) ssq = ssq + (x * x);\n"
@@ -4394,6 +4447,7 @@ if __name__ == '__main__':
     test_sign_off_survives_a_silent_agent()
     test_failed_attempts_are_kept()
     test_composites_give_their_parts_ports()
+    test_llm_blocks_decode()
     test_attention_scores_cannot_overflow()
     test_spec_to_verified_rtl()
     test_weights_split_over_boards()

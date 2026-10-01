@@ -2657,6 +2657,32 @@ module tb_rmsnorm;
     g_data <= gmem[g_addr];
   end
 
+  // What the design saw, cycle by cycle, for a failing sum: the first
+  // cycles after start and the four up to the sum's last change. Traced:
+  // "x0 counted twice" for five drafts running named the fault but not
+  // the cycle it was on, which is what an engineer reads off a waveform.
+  integer trk = 99, q;
+  reg [{awm}:0] tr_a [0:7], ha [0:3], ea [0:3];
+  reg signed [{dwm}:0] tr_d [0:7], hd [0:3], ed [0:3];
+  reg [{iwm}:0] tr_s [0:7], hs [0:3], es [0:3], prev_ssq;
+  always @(posedge clk) begin
+    if (trk < 8) begin
+      tr_a[trk] = x_addr; tr_d[trk] = x_data; tr_s[trk] = dut.ssq;
+      trk = trk + 1;
+    end
+    if (busy) begin
+      for (q = 0; q < 3; q = q + 1) begin
+        ha[q] = ha[q + 1]; hd[q] = hd[q + 1]; hs[q] = hs[q + 1];
+      end
+      ha[3] = x_addr; hd[3] = x_data; hs[3] = dut.ssq;
+      if (dut.ssq !== prev_ssq)
+        for (q = 0; q < 4; q = q + 1) begin
+          ea[q] = ha[q]; ed[q] = hd[q]; es[q] = hs[q];
+        end
+      prev_ssq = dut.ssq;
+    end
+  end
+
   rmsnorm dut (.clk(clk), .rst_n(rst_n), .start(start), .eps(eps),
                .scale_o(scale_o), .shift_o(shift_o), .x_addr(x_addr),
                .x_data(x_data), .g_addr(g_addr), .g_data(g_data),
@@ -2693,7 +2719,7 @@ module tb_rmsnorm;
     begin
       seen = 0; nbad = 0; bad = 0;
       eps = ep; scale_o = sc; shift_o = so;
-      @(negedge clk); start = 1;
+      @(negedge clk); start = 1; trk = 0;
       t0 = cyc; first_out = -1;
       @(negedge clk); start = 0;
       while (busy) @(negedge clk);
@@ -2702,17 +2728,24 @@ module tb_rmsnorm;
       checks = checks + 3;
       if (dut.ssq !== want_ssq) begin
         if (dut.ssq == ssq_first_twice && ssq_first_twice != want_ssq)
-          $display("TB_FAIL test=%0s expected_ssq=%0d got_ssq=%0d got_ssq_counts_x0_twice_and_never_the_last_element=1",
+          $write("TB_FAIL test=%0s expected_ssq=%0d got_ssq=%0d got_ssq_counts_x0_twice_and_never_the_last_element=1",
                    testname, want_ssq, dut.ssq);
         else if (dut.ssq == ssq_last_twice && ssq_last_twice != want_ssq)
-          $display("TB_FAIL test=%0s expected_ssq=%0d got_ssq=%0d got_ssq_counts_the_last_element_twice_and_never_x0=1",
+          $write("TB_FAIL test=%0s expected_ssq=%0d got_ssq=%0d got_ssq_counts_the_last_element_twice_and_never_x0=1",
                    testname, want_ssq, dut.ssq);
         else if (dut.ssq == ssq_unsigned && ssq_unsigned != want_ssq)
-          $display("TB_FAIL test=%0s expected_ssq=%0d got_ssq=%0d got_ssq_is_the_sum_with_x_read_as_unsigned=1",
+          $write("TB_FAIL test=%0s expected_ssq=%0d got_ssq=%0d got_ssq_is_the_sum_with_x_read_as_unsigned=1",
                    testname, want_ssq, dut.ssq);
         else
-          $display("TB_FAIL test=%0s expected_ssq=%0d got_ssq=%0d",
+          $write("TB_FAIL test=%0s expected_ssq=%0d got_ssq=%0d",
                    testname, want_ssq, dut.ssq);
+        $write(" cycles_after_start_as_cycle_x_addr_x_data_ssq=");
+        for (i = 0; i < 8; i = i + 1)
+          $write("%0d:%0d,%0d,%0d;", i, tr_a[i], tr_d[i], tr_s[i]);
+        $write(" four_cycles_to_the_last_change_of_ssq_as_x_addr_x_data_ssq=");
+        for (i = 0; i < 4; i = i + 1)
+          $write("%0d,%0d,%0d;", ea[i], ed[i], es[i]);
+        $display("");
         bad = bad + 1;
       end
       if (dut.rs_m !== want_m || dut.rs_e !== want_e) begin

@@ -1,0 +1,458 @@
+{
+  "spec": {
+    "name": "requant16_qwen2_5_0p5b_a16",
+    "description": "Requantization unit derived from qwen2_5_0p5b_a16: scales a 32-bit signed accumulator back to a 16-bit signed operand by a fixed-point multiply, arithmetic shift with round to nearest, and saturation",
+    "top_module": "requant",
+    "unit": "activation",
+    "parameters": {
+      "acc_width": 32,
+      "out_width": 16,
+      "scale_width": 18,
+      "shift_width": 7,
+      "scale_splits": 4,
+      "signed": true,
+      "pipeline_stages": 9,
+      "target_clock_mhz": 100
+    },
+    "derivation": {
+      "model": "qwen2_5_0p5b_a16",
+      "weight_bits": 8,
+      "activation_bits": 16,
+      "reduction_depth": 256,
+      "rule": "in_width = acc_width from the chiplet derivation; out_width = max(weight_bits, activation_bits); the scale is a 18-bit fixed-point multiplier with a run-time arithmetic shift"
+    },
+    "ports": [
+      {
+        "name": "clk",
+        "dir": "input",
+        "width": 1,
+        "desc": "clock, rising edge"
+      },
+      {
+        "name": "rst_n",
+        "dir": "input",
+        "width": 1,
+        "desc": "active-low synchronous reset"
+      },
+      {
+        "name": "acc_in",
+        "dir": "input",
+        "width": 32,
+        "signed": true,
+        "desc": "accumulator from the MAC, signed two's complement"
+      },
+      {
+        "name": "scale",
+        "dir": "input",
+        "width": 18,
+        "signed": false,
+        "desc": "fixed-point multiplier, unsigned"
+      },
+      {
+        "name": "shift",
+        "dir": "input",
+        "width": 7,
+        "desc": "arithmetic right shift applied after the multiply"
+      },
+      {
+        "name": "valid_in",
+        "dir": "input",
+        "width": 1,
+        "desc": "acc_in valid"
+      },
+      {
+        "name": "q_out",
+        "dir": "output",
+        "width": 16,
+        "signed": true,
+        "desc": "requantized activation, saturated not wrapped"
+      },
+      {
+        "name": "sat",
+        "dir": "output",
+        "width": 1,
+        "desc": "high when this output saturated"
+      },
+      {
+        "name": "valid_out",
+        "dir": "output",
+        "width": 1,
+        "desc": "q_out updated this cycle"
+      }
+    ],
+    "behavior": [
+      "Let p = acc_in * scale. scale is a non-negative magnitude, so p is a signed 50-bit product with the sign of acc_in.",
+      "If shift is greater than zero, r = (p + 2**(shift-1)) >>> shift, an arithmetic right shift. That rounds to nearest with ties toward plus infinity: 2.5 becomes 3 and -2.5 becomes -2. If shift is zero, r = p and no rounding term is added. shift is always less than 50.",
+      "q_out is r clamped to the signed 16-bit range [-32768, 32767]. sat is 1 exactly when the clamp changed the value, and 0 otherwise.",
+      "Latency from valid_in to valid_out is exactly 9 cycles, and q_out, sat and valid_out are sampled at exactly that cycle. If a design needs fewer register stages it must add delay registers to reach 9; more is also a failure.",
+      "The multiply is too wide for one cycle at the target clock. The reference splits scale into 4 slices, registers the 4 partial products, sums them in a registered adder tree, then registers the rounding add, the shift and the saturate. Any structure that meets both timing and the exact latency is acceptable.",
+      "Every pipeline register resets to zero, so valid_out, q_out and sat all read 0 during reset and on the first cycle after it.",
+      "Saturating, not wrapping, is required: a wrapped overflow flips the sign of a large activation and corrupts every later layer."
+    ]
+  },
+  "tools": {
+    "iverilog": "iverilog",
+    "vvp": "vvp",
+    "yosys": "yosys",
+    "sta": "sta"
+  },
+  "agent": "LLMAgent",
+  "converged": true,
+  "iterations_used": 8,
+  "history": [
+    {
+      "iteration": 1,
+      "fixes_applied": [
+        "llm:haiku@claude-cli#1"
+      ],
+      "sim": {
+        "stage": "sim",
+        "status": "fail",
+        "checks": null,
+        "mismatches": [
+          {
+            "test": "directed",
+            "acc": "-32768",
+            "scale": "4096",
+            "shift": "12",
+            "expected_q": "-32768",
+            "got_q": "32767",
+            "expected_sat": "0",
+            "got_sat": "1",
+            "vout": "1"
+          }
+        ]
+      },
+      "synth": null,
+      "timing": null,
+      "fpga": null
+    },
+    {
+      "iteration": 2,
+      "fixes_applied": [
+        "llm:haiku@claude-cli#2"
+      ],
+      "sim": {
+        "stage": "sim",
+        "status": "pass",
+        "checks": 220,
+        "mismatches": [],
+        "throughput": {
+          "activations": 218,
+          "span_cycles": 2180,
+          "latency_cycles": 9,
+          "units": 218,
+          "cycles_per_unit": 10.0
+        }
+      },
+      "synth": {
+        "stage": "synth",
+        "status": "pass",
+        "cell_count": 9928,
+        "area": 20176.0
+      },
+      "timing": {
+        "stage": "timing",
+        "status": "fail",
+        "method": "opensta",
+        "clock_period_ns": 10.0,
+        "worst_slack_ns": -1.86,
+        "critical_path": "from register shift_s3 to register rounded_s4. This path takes longer than one clock period: add a pipeline register on it or split the logic between them."
+      },
+      "fpga": {
+        "luts": 981,
+        "ffs": 488,
+        "dsps": 8,
+        "brams": 0,
+        "urams": 0,
+        "carry": 73,
+        "muxf": 50,
+        "lutram": 0,
+        "status": "pass",
+        "family": "xcup",
+        "top": "requant",
+        "lint": [],
+        "stage": "fpga"
+      }
+    },
+    {
+      "iteration": 3,
+      "fixes_applied": [
+        "llm:haiku@claude-cli#3"
+      ],
+      "sim": {
+        "stage": "sim",
+        "status": "fail",
+        "checks": null,
+        "mismatches": [
+          {
+            "test": "directed",
+            "acc": "0",
+            "scale": "4096",
+            "shift": "12",
+            "expected_q": "0",
+            "got_q": "0",
+            "expected_sat": "0",
+            "got_sat": "0",
+            "vout": "0"
+          }
+        ]
+      },
+      "synth": null,
+      "timing": null,
+      "fpga": null
+    },
+    {
+      "iteration": 4,
+      "fixes_applied": [
+        "llm:haiku@claude-cli#4"
+      ],
+      "sim": {
+        "stage": "sim",
+        "status": "pass",
+        "checks": 220,
+        "mismatches": [],
+        "throughput": {
+          "activations": 218,
+          "span_cycles": 2180,
+          "latency_cycles": 9,
+          "units": 218,
+          "cycles_per_unit": 10.0
+        }
+      },
+      "synth": {
+        "stage": "synth",
+        "status": "pass",
+        "cell_count": 9883,
+        "area": 20282.0
+      },
+      "timing": {
+        "stage": "timing",
+        "status": "fail",
+        "method": "opensta",
+        "clock_period_ns": 10.0,
+        "worst_slack_ns": -0.54,
+        "critical_path": "from register rounding_shift_s3 to register rounded_s4. This path takes longer than one clock period: add a pipeline register on it or split the logic between them."
+      },
+      "fpga": {
+        "luts": 987,
+        "ffs": 538,
+        "dsps": 8,
+        "brams": 0,
+        "urams": 0,
+        "carry": 73,
+        "muxf": 48,
+        "lutram": 0,
+        "status": "pass",
+        "family": "xcup",
+        "top": "requant",
+        "lint": [],
+        "stage": "fpga"
+      }
+    },
+    {
+      "iteration": 5,
+      "fixes_applied": [
+        "llm:haiku@claude-cli#5"
+      ],
+      "sim": {
+        "stage": "sim",
+        "status": "pass",
+        "checks": 220,
+        "mismatches": [],
+        "throughput": {
+          "activations": 218,
+          "span_cycles": 2180,
+          "latency_cycles": 9,
+          "units": 218,
+          "cycles_per_unit": 10.0
+        }
+      },
+      "synth": {
+        "stage": "synth",
+        "status": "pass",
+        "cell_count": 10248,
+        "area": 21307.0
+      },
+      "timing": {
+        "stage": "timing",
+        "status": "fail",
+        "method": "opensta",
+        "clock_period_ns": 10.0,
+        "worst_slack_ns": -0.66,
+        "critical_path": "from register rounding_shift_s3 to register rounded_s4. This path takes longer than one clock period: add a pipeline register on it or split the logic between them."
+      },
+      "fpga": {
+        "luts": 1080,
+        "ffs": 638,
+        "dsps": 8,
+        "brams": 0,
+        "urams": 0,
+        "carry": 73,
+        "muxf": 42,
+        "lutram": 0,
+        "status": "pass",
+        "family": "xcup",
+        "top": "requant",
+        "lint": [],
+        "stage": "fpga"
+      }
+    },
+    {
+      "iteration": 6,
+      "fixes_applied": [
+        "llm:haiku@claude-cli#6"
+      ],
+      "sim": {
+        "stage": "sim",
+        "status": "pass",
+        "checks": 220,
+        "mismatches": [],
+        "throughput": {
+          "activations": 218,
+          "span_cycles": 2180,
+          "latency_cycles": 9,
+          "units": 218,
+          "cycles_per_unit": 10.0
+        }
+      },
+      "synth": {
+        "stage": "synth",
+        "status": "pass",
+        "cell_count": 10025,
+        "area": 20671.0
+      },
+      "timing": {
+        "stage": "timing",
+        "status": "fail",
+        "method": "opensta",
+        "clock_period_ns": 10.0,
+        "worst_slack_ns": -0.62,
+        "critical_path": "from register rounding_shift_s4 to register rounded_s5. This path takes longer than one clock period: add a pipeline register on it or split the logic between them."
+      },
+      "fpga": {
+        "luts": 1022,
+        "ffs": 578,
+        "dsps": 8,
+        "brams": 0,
+        "urams": 0,
+        "carry": 73,
+        "muxf": 44,
+        "lutram": 0,
+        "status": "pass",
+        "family": "xcup",
+        "top": "requant",
+        "lint": [],
+        "stage": "fpga"
+      }
+    },
+    {
+      "iteration": 7,
+      "fixes_applied": [
+        "llm:haiku@claude-cli#7"
+      ],
+      "sim": {
+        "stage": "sim",
+        "status": "pass",
+        "checks": 220,
+        "mismatches": [],
+        "throughput": {
+          "activations": 218,
+          "span_cycles": 2180,
+          "latency_cycles": 9,
+          "units": 218,
+          "cycles_per_unit": 10.0
+        }
+      },
+      "synth": {
+        "stage": "synth",
+        "status": "pass",
+        "cell_count": 10128,
+        "area": 21053.0
+      },
+      "timing": {
+        "stage": "timing",
+        "status": "fail",
+        "method": "opensta",
+        "clock_period_ns": 10.0,
+        "worst_slack_ns": -0.54,
+        "critical_path": "from register product_s5 to register rounded_s6. This path takes longer than one clock period: add a pipeline register on it or split the logic between them."
+      },
+      "fpga": {
+        "luts": 1096,
+        "ffs": 634,
+        "dsps": 8,
+        "brams": 0,
+        "urams": 0,
+        "carry": 73,
+        "muxf": 47,
+        "lutram": 0,
+        "status": "pass",
+        "family": "xcup",
+        "top": "requant",
+        "lint": [],
+        "stage": "fpga"
+      }
+    },
+    {
+      "iteration": 8,
+      "fixes_applied": [
+        "llm:haiku@claude-cli#8"
+      ],
+      "sim": {
+        "stage": "sim",
+        "status": "pass",
+        "checks": 220,
+        "mismatches": [],
+        "throughput": {
+          "activations": 218,
+          "span_cycles": 2180,
+          "latency_cycles": 9,
+          "units": 218,
+          "cycles_per_unit": 10.0
+        }
+      },
+      "synth": {
+        "stage": "synth",
+        "status": "pass",
+        "cell_count": 9649,
+        "area": 19629.0
+      },
+      "timing": {
+        "stage": "timing",
+        "status": "pass",
+        "method": "opensta",
+        "clock_period_ns": 10.0,
+        "worst_slack_ns": 0.64
+      },
+      "fpga": {
+        "luts": 927,
+        "ffs": 482,
+        "dsps": 8,
+        "brams": 0,
+        "urams": 0,
+        "carry": 73,
+        "muxf": 58,
+        "lutram": 0,
+        "status": "pass",
+        "family": "xcup",
+        "top": "requant",
+        "lint": [],
+        "stage": "fpga"
+      }
+    }
+  ],
+  "final_metrics": {
+    "sim_pass": true,
+    "sim_checks": 220,
+    "cell_count": 9649,
+    "area": 19629.0,
+    "timing": {
+      "stage": "timing",
+      "status": "pass",
+      "method": "opensta",
+      "clock_period_ns": 10.0,
+      "worst_slack_ns": 0.64
+    }
+  }
+}

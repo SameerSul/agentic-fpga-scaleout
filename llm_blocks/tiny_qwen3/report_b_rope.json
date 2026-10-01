@@ -1,0 +1,264 @@
+{
+  "spec": {
+    "name": "rope_qwen2_5_0p5b_a16",
+    "description": "Streaming rotary position embedding for a 32-wide head: one (x[i], x[i+16]) pair per cycle, rotated by pos * theta_i, theta base 1e+06",
+    "top_module": "rope",
+    "unit": "pair",
+    "parameters": {
+      "data_width": 16,
+      "head_dim": 32,
+      "pairs": 16,
+      "index_width": 4,
+      "pos_width": 8,
+      "lut_bits": 12,
+      "phase_bits": 22,
+      "freq_width": 20,
+      "coef_frac": 22,
+      "coef_width": 24,
+      "rope_theta": 1000000.0,
+      "signed": true,
+      "pipeline_stages": 1,
+      "target_clock_mhz": 100
+    },
+    "derivation": {
+      "model": "qwen2_5_0p5b_a16",
+      "freqs": [
+        667544,
+        281501,
+        118708,
+        50059,
+        21110,
+        8902,
+        3754,
+        1583,
+        668,
+        282,
+        119,
+        50,
+        21,
+        9,
+        4,
+        2
+      ],
+      "rule": "pairs from head_dim; phase bits from the table index plus the position width plus two guard bits; table fraction bits from the activation width"
+    },
+    "ports": [
+      {
+        "name": "clk",
+        "dir": "input",
+        "width": 1,
+        "desc": "clock, rising edge"
+      },
+      {
+        "name": "rst_n",
+        "dir": "input",
+        "width": 1,
+        "desc": "active-low synchronous reset"
+      },
+      {
+        "name": "x1",
+        "dir": "input",
+        "width": 16,
+        "signed": true,
+        "desc": "x[i]"
+      },
+      {
+        "name": "x2",
+        "dir": "input",
+        "width": 16,
+        "signed": true,
+        "desc": "x[i + 16]"
+      },
+      {
+        "name": "idx",
+        "dir": "input",
+        "width": 4,
+        "desc": "the pair index i"
+      },
+      {
+        "name": "pos",
+        "dir": "input",
+        "width": 8,
+        "desc": "the token's position"
+      },
+      {
+        "name": "valid_in",
+        "dir": "input",
+        "width": 1,
+        "desc": "x1, x2, idx, pos valid"
+      },
+      {
+        "name": "y1",
+        "dir": "output",
+        "width": 16,
+        "signed": true,
+        "desc": "x1 cos - x2 sin"
+      },
+      {
+        "name": "y2",
+        "dir": "output",
+        "width": 16,
+        "signed": true,
+        "desc": "x2 cos + x1 sin"
+      },
+      {
+        "name": "valid_out",
+        "dir": "output",
+        "width": 1,
+        "desc": "y1, y2 valid"
+      }
+    ],
+    "behavior": [
+      "Fully pipelined: a new pair may arrive on every cycle, and each valid_in produces exactly one valid_out, in the same order. The latency is fixed but is the design's choice.",
+      "phase = (pos * F[idx]) mod 2**22, where F comes from the supplied rope_freq table: rope_freq (input [3:0] idx, output [19:0] val), combinational.",
+      "t = ((phase + 2**9) >> 10) mod 2**12, the nearest table entry; s = SIN[t] and c = SIN[(t + 1024) mod 2**12], from the supplied rope_sin table: rope_sin (input [11:0] idx, output [23:0] val), combinational, val a 24-bit two's complement value with 22 fraction bits. Instantiate it twice.",
+      "y1 = sat((x1 * c - x2 * s + 2**21) >>> 22) and y2 = sat((x2 * c + x1 * s + 2**21) >>> 22): signed products, round half up, an arithmetic shift, saturate to 16 bits.",
+      "All state resets to zero: valid_out is 0 during reset."
+    ]
+  },
+  "tools": {
+    "iverilog": "iverilog",
+    "vvp": "vvp",
+    "yosys": "yosys",
+    "sta": "sta"
+  },
+  "agent": "LLMAgent",
+  "converged": true,
+  "iterations_used": 3,
+  "history": [
+    {
+      "iteration": 1,
+      "fixes_applied": [
+        "llm:sonnet@claude-cli#1"
+      ],
+      "sim": {
+        "stage": "sim",
+        "status": "pass",
+        "checks": 1004,
+        "mismatches": [],
+        "throughput": {
+          "pairs": 500,
+          "span_cycles": 517,
+          "latency_cycles": 6,
+          "units": 500,
+          "cycles_per_unit": 1.034
+        }
+      },
+      "synth": {
+        "stage": "synth",
+        "status": "pass",
+        "cell_count": 45857,
+        "area": 88484.0
+      },
+      "timing": {
+        "stage": "timing",
+        "status": "fail",
+        "method": "opensta",
+        "clock_period_ns": 10.0,
+        "worst_slack_ns": -0.82,
+        "critical_path": "from register sin_p2 to register p_x1s_p3. This path takes longer than one clock period: add a pipeline register on it or split the logic between them."
+      },
+      "fpga": {
+        "luts": 2883,
+        "ffs": 361,
+        "dsps": 5,
+        "brams": 0,
+        "urams": 0,
+        "carry": 26,
+        "muxf": 2016,
+        "lutram": 0,
+        "status": "pass",
+        "family": "xcup",
+        "top": "rope",
+        "lint": [],
+        "stage": "fpga"
+      }
+    },
+    {
+      "iteration": 2,
+      "fixes_applied": [
+        "llm:sonnet@claude-cli#2"
+      ],
+      "sim": {
+        "stage": "sim",
+        "status": "fail",
+        "checks": null,
+        "mismatches": [
+          {
+            "test": "rope",
+            "n": "16",
+            "pair": "0",
+            "pos": "1",
+            "x1": "16383",
+            "x2": "0",
+            "expected_rope": "8850,13787",
+            "got_rope": "8849,13787"
+          }
+        ]
+      },
+      "synth": null,
+      "timing": null,
+      "fpga": null
+    },
+    {
+      "iteration": 3,
+      "fixes_applied": [
+        "llm:sonnet@claude-cli#3"
+      ],
+      "sim": {
+        "stage": "sim",
+        "status": "pass",
+        "checks": 1004,
+        "mismatches": [],
+        "throughput": {
+          "pairs": 500,
+          "span_cycles": 517,
+          "latency_cycles": 4,
+          "units": 500,
+          "cycles_per_unit": 1.034
+        }
+      },
+      "synth": {
+        "stage": "synth",
+        "status": "pass",
+        "cell_count": 45895,
+        "area": 88516.0
+      },
+      "timing": {
+        "stage": "timing",
+        "status": "pass",
+        "method": "opensta",
+        "clock_period_ns": 10.0,
+        "worst_slack_ns": 1.64
+      },
+      "fpga": {
+        "luts": 3058,
+        "ffs": 390,
+        "dsps": 9,
+        "brams": 0,
+        "urams": 0,
+        "carry": 58,
+        "muxf": 2016,
+        "lutram": 0,
+        "status": "pass",
+        "family": "xcup",
+        "top": "rope",
+        "lint": [],
+        "stage": "fpga"
+      }
+    }
+  ],
+  "final_metrics": {
+    "sim_pass": true,
+    "sim_checks": 1004,
+    "cell_count": 45895,
+    "area": 88516.0,
+    "timing": {
+      "stage": "timing",
+      "status": "pass",
+      "method": "opensta",
+      "clock_period_ns": 10.0,
+      "worst_slack_ns": 1.64
+    }
+  }
+}

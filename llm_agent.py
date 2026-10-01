@@ -235,6 +235,24 @@ def timing_path(rtl, start, end, depth=10):
             assigns.setdefault(m.group(1), []).append(
                 (n, code.strip(), m.group(2), names))
     reg = {k for k, v in assigns.items() if any(a[2] == "<=" for a in v)}
+    # An endpoint inside a module instance (requant_inst/_21444_ in the
+    # report) is reached through the signals wired into that instance:
+    # traced on Haiku's RMSNorm, whose -7.12 ns path ran into requant.
+    if end not in assigns:
+        lines = rtl.splitlines()
+        for n, line in enumerate(lines, 1):
+            if not re.search(r"\b[A-Za-z_]\w*\s+(?:#\s*\(.*\)\s*)?%s\s*\("
+                             % re.escape(end), line.split("//")[0]):
+                continue
+            for k in range(n - 1, min(n + 40, len(lines))):
+                code = lines[k].split("//")[0]
+                for m in re.finditer(r"\.(\w+)\s*\(\s*([^()]*?)\s*\)", code):
+                    names = set(re.findall(r"(?<!['$\w])([A-Za-z_]\w*)", m.group(2)))
+                    assigns.setdefault(end, []).append(
+                        (k + 1, "%s, into %s" % (m.group(0), end), "=", names))
+                if ");" in code:
+                    break
+            break
     frontier, seen = [(end, [])], {end}
     for _ in range(depth):
         nxt = []

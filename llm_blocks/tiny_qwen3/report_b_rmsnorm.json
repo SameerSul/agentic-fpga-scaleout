@@ -1,0 +1,554 @@
+{
+  "spec": {
+    "name": "rmsnorm_qwen2_5_0p5b_a16",
+    "description": "RMSNorm over a row of 64 activations: sum of squares, one inverse square root, and a scaled product per element, requantized to int8",
+    "top_module": "rmsnorm",
+    "unit": "norm",
+    "parameters": {
+      "data_width": 16,
+      "acc_width": 32,
+      "d_model": 64,
+      "addr_width": 6,
+      "rsqrt_in_width": 40,
+      "rsqrt_out_width": 17,
+      "rsqrt_e_width": 6,
+      "norm_shift": 2,
+      "scale_width": 18,
+      "shift_width": 7,
+      "requant_stages": 9,
+      "rsqrt_stages": 3,
+      "signed": true,
+      "pipeline_stages": 1,
+      "target_clock_mhz": 100
+    },
+    "derivation": {
+      "model": "qwen2_5_0p5b_a16",
+      "rsqrt": {
+        "in_width": 40,
+        "out_width": 17,
+        "lut_bits": 8,
+        "signed": false,
+        "pipeline_stages": 3,
+        "target_clock_mhz": 100
+      },
+      "rule": "row length from d_model; the rsqrt input and shift widths from that block's ports; the extra shift k from the bound |t| < 2**(data_width+ow-k) against the requantizer input"
+    },
+    "ports": [
+      {
+        "name": "clk",
+        "dir": "input",
+        "width": 1,
+        "desc": "clock, rising edge"
+      },
+      {
+        "name": "rst_n",
+        "dir": "input",
+        "width": 1,
+        "desc": "active-low synchronous reset"
+      },
+      {
+        "name": "start",
+        "dir": "input",
+        "width": 1,
+        "desc": "normalise the row"
+      },
+      {
+        "name": "eps",
+        "dir": "input",
+        "width": 40,
+        "desc": "epsilon, in units of the sum of squares"
+      },
+      {
+        "name": "scale_o",
+        "dir": "input",
+        "width": 18,
+        "desc": "output requantizer scale"
+      },
+      {
+        "name": "shift_o",
+        "dir": "input",
+        "width": 7,
+        "desc": "output requantizer shift"
+      },
+      {
+        "name": "x_addr",
+        "dir": "output",
+        "width": 6,
+        "desc": "activation address"
+      },
+      {
+        "name": "x_data",
+        "dir": "input",
+        "width": 16,
+        "signed": true,
+        "desc": "activation, registered read"
+      },
+      {
+        "name": "g_addr",
+        "dir": "output",
+        "width": 6,
+        "desc": "gain (gamma) address"
+      },
+      {
+        "name": "g_data",
+        "dir": "input",
+        "width": 16,
+        "signed": true,
+        "desc": "gain, registered read"
+      },
+      {
+        "name": "o_valid",
+        "dir": "output",
+        "width": 1,
+        "desc": "a normalised element is on o_data"
+      },
+      {
+        "name": "o_index",
+        "dir": "output",
+        "width": 6,
+        "desc": "which element"
+      },
+      {
+        "name": "o_data",
+        "dir": "output",
+        "width": 16,
+        "signed": true,
+        "desc": "normalised element, int8"
+      },
+      {
+        "name": "busy",
+        "dir": "output",
+        "width": 1,
+        "desc": "a row is being normalised"
+      }
+    ],
+    "behavior": [
+      "start is a one-cycle pulse, with eps, scale_o and shift_o held stable for the whole row. busy must be high on the clock edge that samples start, so it already reads 1 one cycle later, and it stays high until the last output is emitted.",
+      "x_data and g_data are registered reads: each carries the element at address a on the cycle after x_addr or g_addr = a. If the address is itself a register, that is two clock edges after the edge that loads a into it.",
+      "Pass 1: ssq = eps + sum over i in 0..63 of x_i * x_i, an unsigned 40-bit value held in a register named ssq. Start the sum from eps, not from zero.",
+      "Then (m, e) = rsqrt(ssq) from the supplied rsqrt block, held in registers named rs_m ([16:0]) and rs_e ([5:0]).",
+      "Pass 2: for i in 0..63, t_i = (x_i * g_i * m) >>> (e + 2), an arithmetic shift of the signed product, which floors. Then o_i = requant(t_i, scale_o, shift_o): multiply by scale_o, add 2**(shift_o-1) when shift_o > 0, arithmetic shift right by shift_o, saturate to [-32768, 32767]. |t_i| stays under 2**31, so it fits the requantizer's 32-bit input.",
+      "Emit each o_i with o_index = i and o_valid high for exactly that one cycle. Outputs may come in any order, but each index exactly once, and o_valid must be low at every other time.",
+      "The testbench reads ssq, rs_m and rs_e directly to check pass 1 and the inverse square root, so those names and widths are part of the interface.",
+      "rsqrt and requant are separate modules supplied as source files, not something to write. Instantiate them with exactly these ports, connected by name: rsqrt (input clk, input rst_n, input [39:0] x, input valid_in, output [16:0] y, output [5:0] e, output valid_out); requant (input clk, input rst_n, input signed [31:0] acc_in, input [17:0] scale, input [6:0] shift, input valid_in, output signed [15:0] q_out, output sat, output valid_out). rsqrt has a latency of 3 cycles and requant of exactly 9.",
+      "All state resets to zero: busy and o_valid are 0 during reset."
+    ]
+  },
+  "tools": {
+    "iverilog": "iverilog",
+    "vvp": "vvp",
+    "yosys": "yosys",
+    "sta": "sta"
+  },
+  "agent": "LLMAgent",
+  "converged": true,
+  "iterations_used": 7,
+  "history": [
+    {
+      "iteration": 1,
+      "fixes_applied": [
+        "llm:sonnet@claude-cli#1"
+      ],
+      "sim": {
+        "stage": "sim",
+        "status": "pass",
+        "checks": 268,
+        "mismatches": [],
+        "throughput": {
+          "rows": 4,
+          "span_cycles": 584,
+          "latency_cycles": 83,
+          "units": 4,
+          "cycles_per_unit": 146.0
+        }
+      },
+      "synth": {
+        "stage": "synth",
+        "status": "pass",
+        "cell_count": 47023,
+        "area": 102289.0
+      },
+      "timing": {
+        "stage": "timing",
+        "status": "fail",
+        "method": "opensta",
+        "clock_period_ns": 10.0,
+        "worst_slack_ns": -1.46,
+        "critical_path": "from register xg_prod_reg to register requant_inst/_21444_. This path takes longer than one clock period: add a pipeline register on it or split the logic between them."
+      },
+      "fpga": {
+        "luts": 2156,
+        "ffs": 1200,
+        "dsps": 12,
+        "brams": 0,
+        "urams": 0,
+        "carry": 63,
+        "muxf": 594,
+        "lutram": 48,
+        "status": "pass",
+        "family": "xcup",
+        "top": "rmsnorm",
+        "lint": [],
+        "stage": "fpga"
+      }
+    },
+    {
+      "iteration": 2,
+      "fixes_applied": [
+        "llm:sonnet@claude-cli#2"
+      ],
+      "sim": {
+        "stage": "sim",
+        "status": "pass",
+        "checks": 268,
+        "mismatches": [],
+        "throughput": {
+          "rows": 4,
+          "span_cycles": 588,
+          "latency_cycles": 83,
+          "units": 4,
+          "cycles_per_unit": 147.0
+        }
+      },
+      "synth": {
+        "stage": "synth",
+        "status": "pass",
+        "cell_count": 47258,
+        "area": 102931.0
+      },
+      "timing": {
+        "stage": "timing",
+        "status": "fail",
+        "method": "opensta",
+        "clock_period_ns": 10.0,
+        "worst_slack_ns": -1.54,
+        "critical_path": "from register xg_prod_reg to register t_val_reg. This path takes longer than one clock period: add a pipeline register on it or split the logic between them."
+      },
+      "fpga": {
+        "luts": 2161,
+        "ffs": 1239,
+        "dsps": 12,
+        "brams": 0,
+        "urams": 0,
+        "carry": 63,
+        "muxf": 592,
+        "lutram": 48,
+        "status": "pass",
+        "family": "xcup",
+        "top": "rmsnorm",
+        "lint": [],
+        "stage": "fpga"
+      }
+    },
+    {
+      "iteration": 3,
+      "fixes_applied": [
+        "llm:sonnet@claude-cli#3"
+      ],
+      "sim": {
+        "stage": "sim",
+        "status": "pass",
+        "checks": 268,
+        "mismatches": [],
+        "throughput": {
+          "rows": 4,
+          "span_cycles": 592,
+          "latency_cycles": 85,
+          "units": 4,
+          "cycles_per_unit": 148.0
+        }
+      },
+      "synth": {
+        "stage": "synth",
+        "status": "pass",
+        "cell_count": 46903,
+        "area": 102543.0
+      },
+      "timing": {
+        "stage": "timing",
+        "status": "fail",
+        "method": "opensta",
+        "clock_period_ns": 10.0,
+        "worst_slack_ns": -1.02,
+        "critical_path": "from port x_data to register ssq. This path takes longer than one clock period: add a pipeline register on it or split the logic between them."
+      },
+      "fpga": {
+        "luts": 2169,
+        "ffs": 1295,
+        "dsps": 12,
+        "brams": 0,
+        "urams": 0,
+        "carry": 63,
+        "muxf": 588,
+        "lutram": 48,
+        "status": "pass",
+        "family": "xcup",
+        "top": "rmsnorm",
+        "lint": [],
+        "stage": "fpga"
+      }
+    },
+    {
+      "iteration": 4,
+      "fixes_applied": [
+        "llm:sonnet@claude-cli#4"
+      ],
+      "sim": {
+        "stage": "sim",
+        "status": "fail",
+        "checks": null,
+        "mismatches": [
+          {
+            "test": "typical",
+            "expected_ssq": "6417467568",
+            "got_ssq": "6275206260",
+            "got_ssq_counts_x0_twice_and_never_the_last_element": "1"
+          },
+          {
+            "test": "typical",
+            "expected_rsm": "107582",
+            "got_rsm": "108732",
+            "expected_rse": "16",
+            "got_rse": "16"
+          },
+          {
+            "test": "typical",
+            "out": "0",
+            "expected_norm": "-264",
+            "got_norm": "-267"
+          },
+          {
+            "test": "typical",
+            "out": "1",
+            "expected_norm": "2234",
+            "got_norm": "-267"
+          },
+          {
+            "test": "typical",
+            "out": "2",
+            "expected_norm": "18148",
+            "got_norm": "2258"
+          },
+          {
+            "test": "typical",
+            "out": "3",
+            "expected_norm": "-1089",
+            "got_norm": "18342"
+          },
+          {
+            "test": "typical",
+            "out": "4",
+            "expected_norm": "-14808",
+            "got_norm": "-1101"
+          },
+          {
+            "test": "typical",
+            "out": "5",
+            "expected_norm": "14107",
+            "got_norm": "-14966"
+          },
+          {
+            "test": "typical",
+            "out": "6",
+            "expected_norm": "-4734",
+            "got_norm": "14257"
+          },
+          {
+            "test": "typical",
+            "out": "7",
+            "expected_norm": "23114",
+            "got_norm": "-4785"
+          }
+        ]
+      },
+      "synth": null,
+      "timing": null,
+      "fpga": null
+    },
+    {
+      "iteration": 5,
+      "fixes_applied": [
+        "llm:sonnet@claude-cli#5"
+      ],
+      "sim": {
+        "stage": "sim",
+        "status": "pass",
+        "checks": 268,
+        "mismatches": [],
+        "throughput": {
+          "rows": 4,
+          "span_cycles": 596,
+          "latency_cycles": 85,
+          "units": 4,
+          "cycles_per_unit": 149.0
+        }
+      },
+      "synth": {
+        "stage": "synth",
+        "status": "pass",
+        "cell_count": 46574,
+        "area": 101879.0
+      },
+      "timing": {
+        "stage": "timing",
+        "status": "fail",
+        "method": "opensta",
+        "clock_period_ns": 10.0,
+        "worst_slack_ns": -0.42,
+        "critical_path": "from register x_store to register xg_prod_reg. This path takes longer than one clock period: add a pipeline register on it or split the logic between them."
+      },
+      "fpga": {
+        "luts": 2178,
+        "ffs": 1328,
+        "dsps": 12,
+        "brams": 0,
+        "urams": 0,
+        "carry": 63,
+        "muxf": 605,
+        "lutram": 48,
+        "status": "pass",
+        "family": "xcup",
+        "top": "rmsnorm",
+        "lint": [],
+        "stage": "fpga"
+      }
+    },
+    {
+      "iteration": 6,
+      "fixes_applied": [
+        "llm:sonnet@claude-cli#6"
+      ],
+      "sim": {
+        "stage": "sim",
+        "status": "fail",
+        "checks": null,
+        "mismatches": [
+          {
+            "test": "typical",
+            "expected_ssq": "6417467568",
+            "got_ssq": "6275206260",
+            "got_ssq_counts_x0_twice_and_never_the_last_element": "1"
+          },
+          {
+            "test": "typical",
+            "expected_rsm": "107582",
+            "got_rsm": "108732",
+            "expected_rse": "16",
+            "got_rse": "16"
+          },
+          {
+            "test": "typical",
+            "out": "0",
+            "expected_norm": "-264",
+            "got_norm": "-267"
+          },
+          {
+            "test": "typical",
+            "out": "1",
+            "expected_norm": "2234",
+            "got_norm": "2258"
+          },
+          {
+            "test": "typical",
+            "out": "2",
+            "expected_norm": "18148",
+            "got_norm": "18342"
+          },
+          {
+            "test": "typical",
+            "out": "3",
+            "expected_norm": "-1089",
+            "got_norm": "-1101"
+          },
+          {
+            "test": "typical",
+            "out": "4",
+            "expected_norm": "-14808",
+            "got_norm": "-14966"
+          },
+          {
+            "test": "typical",
+            "out": "5",
+            "expected_norm": "14107",
+            "got_norm": "14257"
+          },
+          {
+            "test": "typical",
+            "out": "6",
+            "expected_norm": "-4734",
+            "got_norm": "-4785"
+          },
+          {
+            "test": "typical",
+            "out": "7",
+            "expected_norm": "23114",
+            "got_norm": "23361"
+          }
+        ]
+      },
+      "synth": null,
+      "timing": null,
+      "fpga": null
+    },
+    {
+      "iteration": 7,
+      "fixes_applied": [
+        "llm:sonnet@claude-cli#7"
+      ],
+      "sim": {
+        "stage": "sim",
+        "status": "pass",
+        "checks": 268,
+        "mismatches": [],
+        "throughput": {
+          "rows": 4,
+          "span_cycles": 600,
+          "latency_cycles": 87,
+          "units": 4,
+          "cycles_per_unit": 150.0
+        }
+      },
+      "synth": {
+        "stage": "synth",
+        "status": "pass",
+        "cell_count": 45399,
+        "area": 99239.0
+      },
+      "timing": {
+        "stage": "timing",
+        "status": "pass",
+        "method": "opensta",
+        "clock_period_ns": 10.0,
+        "worst_slack_ns": 0.56
+      },
+      "fpga": {
+        "luts": 2170,
+        "ffs": 1361,
+        "dsps": 12,
+        "brams": 0,
+        "urams": 0,
+        "carry": 63,
+        "muxf": 603,
+        "lutram": 48,
+        "status": "pass",
+        "family": "xcup",
+        "top": "rmsnorm",
+        "lint": [],
+        "stage": "fpga"
+      }
+    }
+  ],
+  "final_metrics": {
+    "sim_pass": true,
+    "sim_checks": 268,
+    "cell_count": 45399,
+    "area": 99239.0,
+    "timing": {
+      "stage": "timing",
+      "status": "pass",
+      "method": "opensta",
+      "clock_period_ns": 10.0,
+      "worst_slack_ns": 0.56
+    }
+  }
+}

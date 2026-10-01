@@ -469,7 +469,7 @@ checked against another model. Read that list before quoting any number here.
 - Activations travel as 8-byte IEEE doubles end to end so every all-reduce check is exact; a real deployment would use fp16 or fp32 and halve or quarter the fabric traffic.
 - ACK/credit control packets share link bandwidth but are assumed error-free (in RTL they are short, heavily protected control words); topology is a full mesh of point-to-point links; payloads are fixed 1024 B with a 20 B header.
 - The compute cycle model charges cycles per unit from the profile; it ignores on-board operand distribution to the chiplet array and memory bandwidth limits.
-- The committed RTL and profiles come from the rule-based agent, so they are reproducible offline. The LLM agent is measured separately in `RESULTS.md`: it has signed off nine of the ten layer blocks, eight with Haiku and the requantizer with Sonnet, once the specs stated their arithmetic and timing exactly and the tool feedback named what an engineer would look at.
+- The committed RTL and profiles come from the rule-based agent, so they are reproducible offline. The LLM agent is measured separately in `RESULTS.md`: it has signed off all fifteen blocks of a Qwen3-shaped decoder, nine with Haiku, three with Sonnet and three with Opus, and the decode step built from those files (`llm_blocks/tiny_qwen3`) matches the integer model. That took specs that state their arithmetic and timing exactly, tool feedback that names what an engineer would look at, and a chain that hands each model the draft that got furthest.
 
 ## End to end: what goes in, what happens, what comes out
 
@@ -477,6 +477,7 @@ checked against another model. Read that list before quoting any number here.
 
 ```bash
 python3 spec2rtl.py examples/tiny_qwen3.json                      # any shape, random weights, minutes
+python3 spec2rtl.py examples/tiny_qwen3.json --blocks llm_blocks/tiny_qwen3   # the 15 blocks the LLMs signed off
 python3 spec2rtl.py --weights qwen_weights --package --bridge     # Qwen2.5-0.5B for the Zybo
 FPGAI_QWEN=qwen3 python3 spec2rtl.py --weights qwen_weights/qwen3-0.6b --board zc706 --package
 ```

@@ -242,6 +242,60 @@ def keep_attempt(gates, tag, job, label):
             shutil.copy(src, os.path.join(gates, dst))
 
 
+def load_signed_off(im, gates, src, log):
+    """Blocks signed off before, from src (each design file and its
+    report_<tag>.json, as sign_off leaves them), into gates/ in place of
+    running an agent: the rows come from the reports. A block missing from
+    src, or whose report did not converge, is a row that did not sign off.
+    llm_blocks/tiny_qwen3 holds the fifteen the models signed off."""
+    plan, tables = block_plan(im)
+    os.makedirs(gates, exist_ok=True)
+    for fn, text in tables.items():
+        with open(os.path.join(gates, fn), "w") as f:
+            f.write(text)
+    rows = []
+    for fn, what, spec, *_ in plan:
+        tag = fn[:-2]
+        try:
+            r = json.load(open(os.path.join(src, "report_%s.json" % tag)))
+            shutil.copy(os.path.join(src, fn), os.path.join(gates, fn))
+        except (OSError, ValueError) as e:
+            log("  %-26s not in %s (%s)" % (what, src, e))
+            rows.append({"file": fn, "block": what, "converged": False,
+                         "agent": "none", "iterations": 0, "fixes": []})
+            continue
+        if r.get("spec", {}).get("parameters") != spec.get("parameters"):
+            # Signed off for another shape or lane count: its bits are not
+            # this design's, whatever its report says.
+            log("  %-26s in %s, but signed off for other parameters" % (what, src))
+            rows.append({"file": fn, "block": what, "converged": False,
+                         "agent": "none", "iterations": 0, "fixes": []})
+            continue
+        last = r["history"][-1] if r["history"] else {}
+        fixes = [x for h in r["history"] for x in h["fixes_applied"]]
+        who = fixes[-1].split("#")[0] if fixes and fixes[-1].startswith("llm:") \
+            else "rules"
+        tim, fp = last.get("timing") or {}, last.get("fpga") or {}
+        per = tim.get("clock_period_ns")
+        slack = tim.get("worst_slack_ns")
+        fmax = round(1000.0 / (per - slack), 1) if per and slack is not None \
+            and per > slack else None
+        rows.append({"file": fn, "block": what, "converged": r["converged"],
+                     "agent": who, "attempts": [[who, len(r["history"]),
+                                                 r["converged"]]],
+                     "iterations": len(r["history"]),
+                     "fixes": sorted(set(fixes)),
+                     "checks": r["final_metrics"].get("sim_checks"),
+                     "cells": r["final_metrics"].get("cell_count"),
+                     "timing": tim.get("method"), "fmax": fmax,
+                     "target": spec["parameters"].get("target_clock_mhz"),
+                     "luts": fp.get("luts"), "dsps": fp.get("dsps"),
+                     "seconds": 0})
+        log("  %-26s signed off before by %s, %d iterations, %s checks"
+            % (what, who, len(r["history"]), rows[-1]["checks"]))
+    return rows, [fn for fn, *_ in plan] + sorted(tables)
+
+
 def sign_off(im, gates, agent_kind, log, dv=False):
     """Each block through the signoff loop, into gates/: its signed-off
     RTL under its design name. Returns one row per block. The flow's
@@ -407,7 +461,8 @@ def reference(im, want, n_prompt):
 def run(spec=None, board="zybo_z7_20", out=None, weights=None, lanes=None,
         sim_layers=None, gen=2, agent="rules", package=False, bridge=False,
         dv=False, prompt="The capital of France is", seed=5, log=print,
-        cluster=None, mode="balanced", split="layers", sim="fast"):
+        cluster=None, mode="balanced", split="layers", sim="fast",
+        blocks=None):
     """One board, or with cluster (a list of boards, any mix) the whole
     heterogeneous pipeline: see run_cluster. sim: the simulator (vsim.py);
     "fast", the default, is Verilator where it is installed, and then a
@@ -460,6 +515,9 @@ def run(spec=None, board="zybo_z7_20", out=None, weights=None, lanes=None,
         cal = qi.calibrate(cfg, W, qwen_synth._Ids(
             [rnd.randrange(s["vocab"]) for _ in range(12)]), log=lambda *a: None)
     log("  calibrated in %.0f s" % (time.time() - t0))
+    if blocks and cluster and len(cluster) > 1:
+        raise ValueError("--blocks holds one board's blocks; a cluster signs "
+                         "off its own at each lane count")
     if cluster and len(cluster) > 1:
         if split == "weights":
             return run_tp(s, cfg, W, cal, tok, cluster, out, rep, t_all, sim_layers,
@@ -494,9 +552,13 @@ def run(spec=None, board="zybo_z7_20", out=None, weights=None, lanes=None,
     rep["stages"]["spec"] = {"ok": True, "seq_len": SEQ_LEN}
 
     # ---- 2. blocks
-    log("2. blocks, through the signoff gates (%s agent)" % agent)
     gates = os.path.join(out, "gates")
-    rows, files = sign_off(im, gates, agent, log, dv)
+    if blocks:
+        log("2. blocks, signed off before, from %s" % blocks)
+        rows, files = load_signed_off(im, gates, blocks, log)
+    else:
+        log("2. blocks, through the signoff gates (%s agent)" % agent)
+        rows, files = sign_off(im, gates, agent, log, dv)
     ok_blocks = all(r["converged"] for r in rows) and \
         len(rows) == len(block_plan(im)[0])
     rep["stages"]["blocks"] = {"ok": ok_blocks, "rows": rows}
@@ -1208,13 +1270,16 @@ def main():
                     help="simulate through the board's registers and DDR bridge")
     ap.add_argument("--prompt", default="The capital of France is")
     ap.add_argument("--out", default=None)
+    ap.add_argument("--blocks", default=None,
+                    help="use blocks signed off before, from this directory, "
+                         "instead of running an agent (llm_blocks/tiny_qwen3)")
     a = ap.parse_args()
     if not (a.spec or a.weights):
         ap.error("give a spec, or --weights")
     spec = json.load(open(a.spec)) if a.spec else None
     rep = run(spec, a.board, a.out, a.weights, a.lanes, a.sim_layers, a.gen,
               a.agent, a.package, a.bridge, a.dv, a.prompt, cluster=a.boards,
-              mode=a.mode, split=a.split, sim=a.sim)
+              mode=a.mode, split=a.split, sim=a.sim, blocks=a.blocks)
     sys.exit(0 if rep["ok"] else 1)
 
 

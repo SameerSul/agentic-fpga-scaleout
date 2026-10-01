@@ -91,7 +91,7 @@ times put within 10%.
 ### The full suite
 
 ```
-python3 tests.py            # 432 tests, or 430 without OpenSTA
+python3 tests.py            # 435 tests, or 433 without OpenSTA
 ```
 
 ### Spec to RTL, across the spec space
@@ -1932,6 +1932,56 @@ head norm and Opus on the attention head still streamed for the whole
 1500 s, with nothing saying whether it was text or thinking. An answer
 that already holds a whole module at the cap is now kept, and one that
 does not says how much of each it was.
+
+### All fifteen blocks by the models
+
+Run block by block on those changes, the last three were signed off by
+the models. Sonnet took RMSNorm from Haiku's draft that had passed
+simulation, and its slack went -1.46, -1.54, -1.02, -0.42 and then
++0.56 ns; drafts 4 and 6 broke the simulation, and each time the next
+went back to the best. Opus, first in the chain for the attention head,
+went -1.28, -0.8, -0.28 and then +0.36 ns, the same way round two broken
+drafts. Opus took the head norm from Sonnet's best draft, -1.42 ns, and
+signed it off in two: -1.04, then +0.24.
+
+| block | signed off by | drafts | checks |
+|---|---|---|---|
+| multiply-accumulate | Haiku | 5 | 613 |
+| requantizer | Haiku | 8 | 220 |
+| exponential | Haiku | 8 | 153 |
+| reciprocal | Haiku | 2 | 200 |
+| inverse square root | Haiku | 2 | 248 |
+| matrix-vector sequencer | Haiku | 1 | 11 |
+| softmax | Opus | 2 | 132 |
+| score multiply-accumulate | Sonnet | 2 | 613 |
+| projection, per column | Haiku | 7 | 252 |
+| attention head | Opus | 7 | 236 |
+| RMSNorm | Sonnet | 7 | 268 |
+| RMSNorm over a head | Opus | 2 | 140 |
+| rotary embedding | Sonnet | 3 | 1004 |
+| SiLU | Haiku | 6 | 318 |
+| residual add | Haiku | 6 | 305 |
+
+Every block of the decoder is a model's, none the rules agent's: Haiku
+nine, Sonnet three, Opus three, each through simulation against its
+golden model, synthesis, OpenSTA at 100 MHz and 7-series mapping. They
+were signed off across run 6 and four runs of single blocks, so no
+earlier decode step had all fifteen in it. Put together, the fifteen
+files in `llm_blocks/tiny_qwen3` make one design, and its decode step at
+2 of 2 layers matches the integer model: tokens 49 and 49, logits 14065
+and 14504.
+
+```
+python3 spec2rtl.py examples/tiny_qwen3.json --blocks llm_blocks/tiny_qwen3
+```
+
+builds that design from those files, in about eight seconds, and
+`test_llm_blocks_decode` checks that it matches and that every file in
+the design is the signed-off one. That last part is there because the
+first version of this check, never committed, matched with the
+generator's blocks: given no blocks to run, the design had taken only
+the ROM tables from the signed-off directory. A block whose report was
+signed off for other parameters is refused.
 
 ## An attention head
 
