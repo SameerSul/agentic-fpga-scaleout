@@ -1163,8 +1163,11 @@ def test_rmsnorm():
         early = fixed.replace("if (v1) begin\n        sqr <= x_data * x_data;",
                               "if (v0) begin\n        sqr <= x_data * x_data;")
         assert early != fixed
+        uns = fixed.replace("sqr <= x_data * x_data;",
+                            "sqr <= $unsigned(x_data) * $unsigned(x_data);")
+        assert uns != fixed
         for label, src in (('first', rr.render_rmsnorm(spec, set())),
-                           ('fixed', fixed), ('early', early)):
+                           ('fixed', fixed), ('early', early), ('uns', uns)):
             with open(os.path.join(work, 'rms.v'), 'w') as f:
                 f.write(src)
             r = subprocess.run(['iverilog', '-g2005', '-o', 's.out', 'tb.v',
@@ -1183,6 +1186,9 @@ def test_rmsnorm():
               'outputs named as their neighbours\' expected values',
               'TB_RESULT: PASS' not in res['early']
               and 'got_norm_is_the_expected_value_for_out=' in res['early'])
+        check('a sum of squares that reads x as unsigned is caught and named',
+              'TB_RESULT: PASS' not in res['uns']
+              and 'got_ssq_is_the_sum_with_x_read_as_unsigned=1' in res['uns'])
         # A read one cycle off counts one end element twice and the other
         # never; the testbench carries both sums for each row to name it.
         rnd2 = random.Random(83)
@@ -1193,7 +1199,7 @@ def test_rmsnorm():
         tbtext = specgen_mod.render_rmsnorm_testbench(spec)
         check('the testbench carries each row\'s sum with x0 twice and with '
               'the last element twice',
-              ', %d, %d);' % ((s0 - xt[-1] ** 2 + xt[0] ** 2) & mask,
+              ', %d, %d, ' % ((s0 - xt[-1] ** 2 + xt[0] ** 2) & mask,
                               (s0 - xt[0] ** 2 + xt[-1] ** 2) & mask) in tbtext
               and 'got_ssq_counts_x0_twice_and_never_the_last_element=1' in tbtext)
     finally:
@@ -2198,6 +2204,28 @@ def test_composites_give_their_parts_ports():
             missing.append(fn)
     check('every composite built from supplied modules gives their ports',
           not missing)
+    # A spec whose text and ports say one row length and whose parameters
+    # say another: the head norm was the hidden-size norm's spec with two
+    # parameters changed, "sum over i in 0..63" and 6-bit addresses over a
+    # 32-element row, and Sonnet summed 64 elements for eight drafts.
+    bad = []
+    for fn, what, spec, tbf, deps in plan:
+        pr = spec.get('parameters', {})
+        if 'd_model' not in pr or 'addr_width' not in pr:
+            continue
+        n, aw = pr['d_model'], pr['addr_width']
+        rows = [int(v) for v in re.findall(r'row of (\d+)', spec.get('description', ''))]
+        spans = [int(v) for v in re.findall(r'\b0\.\.(\d+)\b', ' '.join(spec.get('behavior', [])))]
+        widths = [q['width'] for q in spec['ports']
+                  if q['name'].endswith('_addr') or q['name'] == 'o_index']
+        if any(r != n for r in rows) or (spans and n - 1 not in spans) \
+                or any(w != aw for w in widths):
+            bad.append(fn)
+    hd = next(s for fn, _, s, _, _ in plan if fn == 'b_rmsnorm_hd.v')
+    check('every block\'s text and address ports agree with its row length, '
+          'the head norm\'s with the head size',
+          not bad and hd['parameters']['d_model'] == im.hd
+          and 'over i in 0..%d ' % (im.hd - 1) in ' '.join(hd['behavior']))
     pj = next(s for fn, _, s, _, _ in plan if fn == 'b_projn.v')
     check('the projection gives its mac and requant ports and latencies',
           'mac (input clk' in ' '.join(pj['behavior'])
@@ -3575,6 +3603,79 @@ def test_llm_transport_is_retried():
     finally:
         llm_agent.call_claude_cli, llm_agent.pick_backend = real_cli, real_pick
 
+    # A draft that passed simulation and synthesis and failed only timing
+    # is where the next draft starts again once a later one breaks the
+    # simulation, told so.
+    prompts = []
+    replies = iter(['module m(); /*one*/ endmodule', 'module m(); /*two*/ endmodule',
+                    'module m(); /*three*/ endmodule'])
+
+    def fake_cli2(p, model, attempts=3, thinking=True):
+        prompts.append(p)
+        return next(replies)
+    try:
+        llm_agent.call_claude_cli = fake_cli2
+        llm_agent.pick_backend = lambda choice=None: ('claude-cli', 'sonnet')
+        ag = llm_agent.LLMAgent('claude-cli:sonnet')
+        spec = {'top_module': 'm', 'ports': [], 'behavior': [], 'parameters': {},
+                'name': 'm', 'description': 'm'}
+        ag.propose(spec, [])
+        hist = [{'iteration': 1, 'stage': 'timing', 'status': 'fail', 'worst_slack_ns': -1.18}]
+        ag.propose(spec, hist)
+        hist.append({'iteration': 2, 'stage': 'sim', 'status': 'fail',
+                     'mismatches': [{'test': 't', 'out': '0'}]})
+        ag.propose(spec, hist)
+        check('a draft that broke the simulation after one that passed it and '
+              'synthesis goes back to that one, told why',
+              '/*one*/' in prompts[2] and '/*two*/' not in prompts[2]
+              and 'Your draft 1, shown above' in prompts[2]
+              and '/*one*/' in prompts[1])
+        # The next agent in the chain starts from the draft that got
+        # furthest, with that draft's feedback, not from the last draft.
+        iters = [{'iteration': 1, 'sim': {'status': 'pass'},
+                  'synth': {'status': 'pass'},
+                  'timing': {'stage': 'timing', 'status': 'fail',
+                             'worst_slack_ns': -1.18}},
+                 {'iteration': 2, 'sim': {'status': 'pass'},
+                  'synth': {'status': 'pass'},
+                  'timing': {'stage': 'timing', 'status': 'fail',
+                             'worst_slack_ns': -3.5}},
+                 {'iteration': 3, 'sim': {'stage': 'sim', 'status': 'fail'}}]
+        seed = ag.best_of(iters)
+        replies = iter(['module m(); /*four*/ endmodule',
+                        'module m(); /*five*/ endmodule'])
+        nx = llm_agent.LLMAgent('claude-cli:opus')
+        nx.seed = seed
+        nx.propose(spec, [])
+        nx.propose(spec, [{'iteration': 1, 'stage': 'sim', 'status': 'fail'}])
+        check('the next agent is handed the draft with the best slack and its '
+              'timing record, and goes back to it after breaking the simulation',
+              seed[0].strip() == 'module m(); /*one*/ endmodule'
+              and seed[1][0]['worst_slack_ns'] == -1.18
+              and '/*one*/' in prompts[3] and '-1.18' in prompts[3]
+              and 'written by another model' in prompts[3]
+              and '/*one*/' in prompts[4] and '/*four*/' not in prompts[4]
+              and 'The draft you were handed' in prompts[4]
+              and seed[2] is True)
+        # With no draft past simulation, the last one goes on with its
+        # failures: handed over bare, Sonnet saw Haiku's RMSNorm with no
+        # word of how it failed.
+        last = ag.best_of(iters[2:])
+        replies = iter(['module m(); /*six*/ endmodule'])
+        n2 = llm_agent.LLMAgent('claude-cli:opus')
+        n2.seed = ag.best_of([{'iteration': 3, 'sim': {
+            'stage': 'sim', 'status': 'fail',
+            'mismatches': [{'test': 't', 'got_norm_is_the_expected_value_for_out': '1'}]}}])
+        n2.propose(spec, [])
+        check('with no draft past simulation, the last goes on with how it failed',
+              last[0].strip() == 'module m(); /*three*/ endmodule' and last[2] is False
+              and '/*three*/' in prompts[5]
+              and 'got_norm_is_the_expected_value_for_out' in prompts[5]
+              and 'the feedback below is how it failed' in prompts[5]
+              and ag.best_of([]) is None)
+    finally:
+        llm_agent.call_claude_cli, llm_agent.pick_backend = real_cli, real_pick
+
     # The stream itself: a stand-in CLI that writes events, then the answer.
     work = os.path.join(ROOT, 'build_clitest')
     shutil.rmtree(work, ignore_errors=True)
@@ -3782,7 +3883,8 @@ def test_compile_errors_quote_the_source_line():
         for d, r in (("derive_requant_spec", "render_requant"),
                      ("derive_softmax_spec", "render_softmax"),
                      ("derive_mlp_spec", "render_mlp"),
-                     ("derive_exp_spec", "render_exp")))
+                     ("derive_exp_spec", "render_exp"),
+                     ("derive_rmsnorm_spec", "render_rmsnorm")))
     check('the lint raises nothing on the reference designs', clean)
     cat = ("module m(input signed [47:0] a, input signed [47:0] b,\n"
            "         input signed [31:0] c);\n"
@@ -3798,6 +3900,35 @@ def test_compile_errors_quote_the_source_line():
            "  wire signed [49:0] t = {{3{x[46]}}, x} + r;\nendmodule")
     check('sign extension by hand is not reported, since its bits are right',
           llm_agent.code_findings(ext, []) == [])
+    pipe = ("module m(input clk, input [7:0] a, input signed [15:0] v);\n"
+            "  reg [7:0] j; reg [7:0] buf_ [0:255]; reg signed [31:0] acc, r2;\n"
+            "  always @(posedge clk) begin : b\n"
+            "    reg [7:0] jm; reg signed [31:0] p;\n"
+            "    jm = j - 8'd1;\n"
+            "    p = $signed({1'b0, buf_[jm]}) * v;\n"
+            "    if (j <= a) acc <= acc + p;\n"
+            "    r2 <= acc;\n"
+            "    j <= j + 8'd1;\n"
+            "  end\nendmodule")
+    tf = llm_agent.code_findings(pipe, [{'stage': 'timing', 'status': 'fail',
+        'critical_path': 'from register j to register acc. This path takes longer'}])
+    check('a failing timing path is traced to the lines of code it runs through',
+          len(tf) == 1 and 'line 5: jm = j - 8\'d1; line 6: p =' in tf[0]
+          and 'line 7: if (j <= a) acc <= acc + p' in tf[0]
+          and llm_agent.timing_path(pipe, 'acc', 'r2') == [(8, 'r2 <= acc;')]
+          and llm_agent.timing_path(pipe, 'a', 'r2') == [])
+    sq = ("module m(input signed [15:0] x, input [39:0] eps);\n"
+          "  reg [39:0] ssq; reg [39:0] t; wire signed [31:0] p = x * x;\n"
+          "  always @(*) ssq = ssq + (x * x);\n"
+          "  always @(*) t = {8'b0, x * x};\n"
+          "  always @(*) t = ssq + p;\n"
+          "  always @(*) t = $signed({1'b0, ssq}) + x * x;\nendmodule")
+    sf = llm_agent.code_findings(sq, [])
+    check('a signed product added to an unsigned value, and a product inside '
+          'a concatenation, are reported; the product in its own wire and the '
+          'zero-extended sum are not',
+          len(sf) == 2 and sf[0].startswith("line 3: x * x multiplies two signed")
+          and sf[1].startswith("line 4: x * x is inside a concatenation"))
     sta = ("Startpoint: _109349_ (rising edge-triggered flip-flop clocked by clk)\n"
            "Endpoint: w_data[0] (output port clocked by clk)\n")
     net = os.path.join(ROOT, 'build_cptest.v')

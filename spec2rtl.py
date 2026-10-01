@@ -277,10 +277,18 @@ def _sign_off(im, gates, agent_kind, log, dv=False):
             f.write(tbf(spec))
         t0 = time.time()
         attempts, prev, report, err = [], None, None, None
+        prev_iters = []
         for label, make, iters in agent_chain(agent_kind):
             ag = make()
             if getattr(prev, "last_rtl", None) and hasattr(ag, "last_rtl"):
-                ag.last_rtl = prev.last_rtl     # edit the last attempt, not restart
+                # Edit an attempt, not restart: the one that got furthest,
+                # with its feedback, when one passed simulation and
+                # synthesis, else the last, with its feedback.
+                seed = prev.best_of(prev_iters) if hasattr(prev, "best_of") else None
+                if seed and hasattr(ag, "seed"):
+                    ag.seed = seed
+                else:
+                    ag.last_rtl = prev.last_rtl
             try:
                 report, profile = cf.run_flow(job, verbose=False, agent=ag, max_iters=iters)
             except RuntimeError as e:
@@ -292,9 +300,14 @@ def _sign_off(im, gates, agent_kind, log, dv=False):
                     % (what, label, str(e)[:60]))
                 keep_attempt(gates, tag, job, label)
                 prev = ag
+                try:
+                    with open(os.path.join(cf.ROOT, job["report_file"])) as f:
+                        prev_iters = json.load(f).get("history") or []
+                except (OSError, ValueError):
+                    prev_iters = []
                 continue
             attempts.append([label, report["iterations_used"], report["converged"]])
-            prev = ag
+            prev, prev_iters = ag, report["history"]
             if report["converged"]:
                 break
             keep_attempt(gates, tag, job, label)

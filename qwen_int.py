@@ -110,11 +110,12 @@ class IntQwen:
         if self.qkn:
             # The same norm over a row of head_dim: only the row length and
             # its address change, so the rsqrt and requantizer inside are the
-            # hidden-size norm's, shared by both instances in the RTL.
-            hn = json.loads(json.dumps(self.sp["rmsnorm"]))
+            # hidden-size norm's, shared by both instances in the RTL. Derived
+            # again, not copied with two parameters changed: the copy kept
+            # "sum over i in 0..63" and 6-bit addresses for a 32-element row,
+            # and Sonnet summed 64 elements through the wrapping address.
+            hn = specgen.derive_rmsnorm_spec(ms, row=self.hd)
             hn["top_module"] = "rmsnorm_hd"
-            hn["parameters"]["d_model"] = self.hd
-            hn["parameters"]["addr_width"] = max(1, (self.hd - 1).bit_length())
             self.sp["headnorm"] = hn
         rq = self.sp["requant"]["parameters"]
         self.mw, self.sw = rq["scale_width"], rq["shift_width"]

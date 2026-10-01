@@ -91,7 +91,7 @@ times put within 10%.
 ### The full suite
 
 ```
-python3 tests.py            # 423 tests, or 421 without OpenSTA
+python3 tests.py            # 430 tests, or 428 without OpenSTA
 ```
 
 ### Spec to RTL, across the spec space
@@ -1881,6 +1881,45 @@ checked, and a gap there lets a wrong block through every gate. The
 decode step against the integer model is what caught this one, which is
 why `spec2rtl.py` runs it after the blocks and fails the run when it
 differs.
+
+### Drafts that got furthest
+
+Run block by block, the three blocks still left to the rules agent
+showed where drafts were being lost. On the attention head, Sonnet's
+fourth draft passed all 236 checks and synthesis and missed the 10 ns
+clock by 1.18 ns, and each of its next four, an edit of the one before,
+broke the simulation. Opus, next in the chain, was handed Sonnet's last
+draft, the broken one, with none of its feedback, spent three drafts
+getting back to the same point, and missed by 1.36 and 1.52 ns. Sonnet
+on RMSNorm did the same: drafts 1, 4 and 5 passed all 268 checks and
+synthesis at -5.98, -1.7 and -1.02 ns, and 6 to 8 broke the simulation.
+
+Four changes follow. An agent whose latest draft fails simulation or
+synthesis after an earlier one passed both goes back to that earlier
+draft, told why. The next agent in the chain is handed the draft with
+the least negative slack and that draft's failure records, or, when no
+draft got past simulation, the last draft with how it failed. A timing
+failure now quotes the lines of the draft the path runs through: for
+Opus's fifth, an address subtract, a 256 entry buffer read, a 17 by 16
+multiply and a 32 bit add, all in one cycle, on four of its lines. And
+two sign faults are reported as facts about the draft. Haiku's RMSNorm,
+all eight drafts, wrote ssq <= ssq + (x_data * x_data) with ssq
+unsigned, which makes Verilog treat the product as unsigned, so each
+negative x squared as (x + 2**16)**2 and the sum came out 19 times too
+large; its RMSNorm over a head put x * x inside a concatenation, where
+the product keeps only its operands' 16 bits. Neither finding fires on
+any of the 320 signed-off designs, and the testbench now says when the
+sum is the one with x read as unsigned.
+
+The head norm's own spec was wrong. It was the hidden-size norm's spec
+with two parameters changed, d_model 32 and addr_width 5, and its text
+and ports still said "a row of 64 activations", "sum over i in 0..63"
+and 6-bit addresses. Sonnet followed the text for eight drafts, summing
+64 elements through the wrapping 5-bit address, which counts each one
+twice; the rules agent reads only the parameters and passed. It is now
+derived for the head size, with the same parameters, and a test
+requires every block's text and address ports to agree with its row
+length.
 
 ## An attention head
 

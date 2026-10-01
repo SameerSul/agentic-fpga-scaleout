@@ -2423,8 +2423,9 @@ def generate_attn(ms=None, spec_file="spec_attn.json", tb_file="tb_attn.v"):
 # RMSNorm: sum of squares, one inverse square root, a scaled product each.
 # --------------------------------------------------------------------------
 
-def derive_rmsnorm_spec(ms):
-    """model spec -> RMSNorm spec for one d_model activation row.
+def derive_rmsnorm_spec(ms, row=None):
+    """model spec -> RMSNorm spec for one d_model activation row, or for a
+    row of the given length (Qwen3's q and k norms, over one head).
 
     Qwen normalises before attention and before the MLP. The inverse
     square root has been generated for this since it was added; this is
@@ -2438,7 +2439,7 @@ def derive_rmsnorm_spec(ms):
     rq = derive_requant_spec(ms)
     dw, aw = c["parameters"]["data_width"], c["parameters"]["acc_width"]
     wb = ms["weight_bits"]
-    D = ms["d_model"]
+    D = row or ms["d_model"]
     iw, ow = rs["parameters"]["in_width"], rs["parameters"]["out_width"]
     xaw = max(1, (D - 1).bit_length())
     # |x_i| <= sqrt(ssq) and 2**e > sqrt(ssq)/2, and the gain is a
@@ -2611,9 +2612,13 @@ def render_rmsnorm_testbench(spec):
         # 6275206260" for three drafts.
         sq = [v * v for v in x]
         mask = (1 << p["rsqrt_in_width"]) - 1
-        body.append("    run_row(%d, %d, %d, %d, %d, %d, %d, %d);"
+        # And a sum that reads x as unsigned: traced on Haiku's RMSNorm,
+        # ssq <= ssq + x * x with ssq unsigned, 19 times the sum for
+        # eight drafts, each read as only "expected_ssq got_ssq".
+        uns = eps + sum((v & ((1 << dw) - 1)) ** 2 for v in x)
+        body.append("    run_row(%d, %d, %d, %d, %d, %d, %d, %d, %d);"
                     % (eps, sc, so, ssq, m, e, (ssq - sq[-1] + sq[0]) & mask,
-                       (ssq - sq[0] + sq[-1]) & mask))
+                       (ssq - sq[0] + sq[-1]) & mask, uns & mask))
     return RMSNORM_TB.format(
         dwm=dw - 1, D=D, awm=p["addr_width"] - 1,
         iwm=p["rsqrt_in_width"] - 1, owm=p["rsqrt_out_width"] - 1,
@@ -2684,7 +2689,7 @@ module tb_rmsnorm;
   task run_row(input integer ep, input integer sc, input integer so,
                input [{iwm}:0] want_ssq, input [{owm}:0] want_m,
                input [{ewm}:0] want_e, input [{iwm}:0] ssq_first_twice,
-               input [{iwm}:0] ssq_last_twice);
+               input [{iwm}:0] ssq_last_twice, input [{iwm}:0] ssq_unsigned);
     begin
       seen = 0; nbad = 0; bad = 0;
       eps = ep; scale_o = sc; shift_o = so;
@@ -2701,6 +2706,9 @@ module tb_rmsnorm;
                    testname, want_ssq, dut.ssq);
         else if (dut.ssq == ssq_last_twice && ssq_last_twice != want_ssq)
           $display("TB_FAIL test=%0s expected_ssq=%0d got_ssq=%0d got_ssq_counts_the_last_element_twice_and_never_x0=1",
+                   testname, want_ssq, dut.ssq);
+        else if (dut.ssq == ssq_unsigned && ssq_unsigned != want_ssq)
+          $display("TB_FAIL test=%0s expected_ssq=%0d got_ssq=%0d got_ssq_is_the_sum_with_x_read_as_unsigned=1",
                    testname, want_ssq, dut.ssq);
         else
           $display("TB_FAIL test=%0s expected_ssq=%0d got_ssq=%0d",

@@ -181,6 +181,11 @@ _DECL = re.compile(r"\b(input|output|inout|wire|reg)\b"
                    r"((?:(?!\b(?:input|output|inout)\b)[^;])*)")
 _MUL = re.compile(r"(\$signed\s*\(\s*)?\b([A-Za-z_]\w*)\b\s*\*\s*"
                   r"(\$signed\s*\(\s*)?\b([A-Za-z_]\w*)\b")
+# A product of two whole names with a whole name added to it or subtracted
+# from it, either side: acc + a * b, acc + (a * b), a * b - acc.
+_ADD_MUL = re.compile(
+    r"\b([A-Za-z_]\w*)\s*[-+]\s*\(?\s*([A-Za-z_]\w*)\s*\*\s*([A-Za-z_]\w*)\b(?!\s*[\[(])"
+    r"|\b([A-Za-z_]\w*)\s*\*\s*([A-Za-z_]\w*)\s*\)?\s*[-+]\s*([A-Za-z_]\w*)\b(?!\s*[\[(])")
 
 
 def _signedness(rtl):
@@ -197,6 +202,53 @@ def _signedness(rtl):
             for name in re.findall(r"[A-Za-z_]\w*", body):
                 sig.setdefault(name, signed)
     return sig
+
+
+_ASSIGN = re.compile(r"\b([A-Za-z_]\w*)\s*(?:\[[^\]]*\]\s*)*(<=|=)(?!=)\s*([^;]*);")
+_ENDS = re.compile(r"from (?:register|port) ([A-Za-z_]\w*)\S* "
+                   r"to (?:register|port) ([A-Za-z_]\w*)")
+
+
+def timing_path(rtl, start, end, depth=10):
+    """The lines of rtl a failing path runs through, from start to end: the
+    endpoint's assignment back through wires and blocking temporaries to
+    one that reads start. [] when no such chain is found.
+
+    Traced on the attention head: two models each got a draft through all
+    236 checks and synthesis, then missed timing on "from register j_issue
+    to register out_acc" and spent their last drafts elsewhere. The path
+    was an address subtract, a 256-entry buffer read, a 17 by 16 multiply
+    and a 32-bit add, all in one cycle, on four lines of their own code."""
+    assigns = {}
+    for n, line in enumerate(rtl.splitlines(), 1):
+        code, pos = line.split("//")[0], 0
+        while True:
+            m = _ASSIGN.search(code, pos)
+            if not m:
+                break
+            before = code[:m.start()]
+            if before.count("(") > before.count(")"):
+                pos = m.end(1)  # a comparison inside if ( ... ), not a write
+                continue
+            pos = m.end()
+            names = set(re.findall(r"(?<!['$\w])([A-Za-z_]\w*)", m.group(3)))
+            assigns.setdefault(m.group(1), []).append(
+                (n, code.strip(), m.group(2), names))
+    reg = {k for k, v in assigns.items() if any(a[2] == "<=" for a in v)}
+    frontier, seen = [(end, [])], {end}
+    for _ in range(depth):
+        nxt = []
+        for name, path in frontier:
+            for n, text, op, names in assigns.get(name, []):
+                here = [(n, text)] + path
+                if start in names:
+                    return sorted(set(here))
+                for r in names - seen:
+                    if r in assigns and r not in reg:
+                        seen.add(r)
+                        nxt.append((r, here))
+        frontier = nxt
+    return []
 
 
 def code_findings(rtl, history):
@@ -229,6 +281,36 @@ def code_findings(rtl, history):
                     "a large positive number. For a signed value times a "
                     "non-negative unsigned one, write %s * $signed({1'b0, %s})."
                     % (n, a, b, s_, u_, s_, s_, u_))
+        # Traced on Haiku's RMSNorm: ssq <= ssq + (x_data * x_data), with
+        # x_data signed and ssq unsigned, for eight drafts. The unsigned
+        # sum makes the product unsigned too, so each negative x squared
+        # as (x + 2**16)**2 and the sum came out 19 times too large.
+        for m in _ADD_MUL.finditer(code):
+            acc, a, b = m.group(1, 2, 3) if m.group(1) else m.group(6, 4, 5)
+            if sig.get(a) and sig.get(b) and sig.get(acc) is False \
+                    and not re.search(r"\$signed\s*\(\s*$", code[:m.start()]):
+                out.append(
+                    "line %d: %s * %s multiplies two signed values, but %s, "
+                    "added on the same line, is unsigned, and Verilog makes "
+                    "an expression unsigned when any operand is. %s and %s "
+                    "are then zero-extended before the multiply, so a "
+                    "negative value multiplies as a large positive one. "
+                    "Write $signed({1'b0, %s}) for the unsigned operand, or "
+                    "compute the product into its own signed wire first."
+                    % (n, a, b, acc, a, b, acc))
+        # Traced on Haiku's RMSNorm over a head: {8'b0, x * x}, where each
+        # part of a concatenation keeps its own width, so a 16-bit x times
+        # itself kept 16 bits and the sum of squares came out tiny.
+        for m in re.finditer(r"\{([^{}]*)\}", code):
+            pm = re.search(r"([A-Za-z_]\w*)\s*\*\s*([A-Za-z_]\w*)", m.group(1))
+            if pm and "," in m.group(1):
+                out.append(
+                    "line %d: %s is inside a concatenation, where each part "
+                    "is sized by itself: a product there is only as wide as "
+                    "its wider operand, so its high bits are lost. Compute "
+                    "the product into a wire as wide as the result first, "
+                    "then use that wire." % (n, pm.group(0)))
+                break
         for m in re.finditer(r"(\$signed\s*\(\s*)?(\{[^{}]*\})", code):
             if m.group(1):
                 continue
@@ -262,6 +344,17 @@ def code_findings(rtl, history):
                     % (n, m.group(2), m.group(2)))
                 break
     last = history[-1] if history else {}
+    ends = last.get("stage") == "timing" and _ENDS.search(
+        last.get("critical_path") or "")
+    lines = ends and timing_path(rtl, ends.group(1), ends.group(2))
+    if lines:
+        out.append(
+            "the failing timing path, from %s to %s, runs through these lines "
+            "of your code, all in one clock cycle: %s. Register a value part "
+            "way along it and use it a cycle later, adjusting the control so "
+            "the result still lines up with the rest."
+            % (ends.group(1), ends.group(2),
+               "; ".join("line %d: %s" % (n, t.rstrip(";")) for n, t in lines)))
     for mm in last.get("mismatches") or []:
         if any(k.startswith("got") and re.fullmatch(r"[xXzZ]+", str(v))
                for k, v in mm.items()):
@@ -302,12 +395,14 @@ def condense_feedback(history, rtl=None):
     return out
 
 
-def build_prompt(spec, history, last_rtl):
+def build_prompt(spec, history, last_rtl, note=None):
     parts = [RULES.format(top=spec["top_module"]),
              "", "SPEC:", json.dumps(spec, indent=2)]
     if last_rtl:
         parts += ["", "YOUR PREVIOUS ATTEMPT (it failed, revise it):",
                   last_rtl]
+    if note:
+        parts += ["", "NOTE: " + note]
     if history:
         parts += ["", "TOOL FEEDBACK, most recent last (make these pass):",
                   json.dumps(condense_feedback(history, last_rtl), indent=2)]
@@ -557,6 +652,8 @@ class LLMAgent:
         self.last_rtl = None
         self.calls = 0
         self.thinking = True
+        self.drafts = []       # this agent's drafts, in the order proposed
+        self.seed = None       # (rtl, failures) handed on by the last agent
 
     def _ask(self, p):
         if self.backend != "claude-cli":
@@ -572,9 +669,91 @@ class LLMAgent:
             self.thinking = False
             return call_claude_cli(p, self.model, thinking=False)
 
+    def _best_draft(self, history):
+        """The draft to go back to when the most recent one failed
+        simulation or synthesis after an earlier one had passed both: the
+        latest such draft of this agent's, else the one it was handed.
+        Returns (rtl, that draft's failure records, what to call it).
+
+        Traced on the attention head: Sonnet's fourth draft passed all 236
+        checks and synthesis and missed timing by 1.18 ns, and every draft
+        after it, each an edit of the one before, broke the simulation."""
+        if not self.drafts:
+            return None
+        fails = {}
+        for h in history:
+            fails.setdefault(h.get("iteration"), set()).add(h.get("stage"))
+        last = len(self.drafts)
+        if not fails.get(last, set()) & {"sim", "synth"}:
+            return None
+        for it in range(last - 1, 0, -1):
+            st = fails.get(it, set())
+            if st and not st & {"sim", "synth"}:
+                return (self.drafts[it - 1],
+                        [h for h in history if h.get("iteration") == it],
+                        "Your draft %d" % it)
+        if self.seed and self.seed[2]:
+            return self.seed[0], self.seed[1], "The draft you were handed"
+        return None
+
+    def best_of(self, iterations):
+        """What to hand the next agent in the chain, from the flow's
+        per-iteration records: (rtl, its failure records, whether it passed
+        simulation and synthesis). The draft that passed both with the least
+        negative slack, else the last draft; None with no drafts.
+
+        Traced on the attention head: Opus was handed Sonnet's last draft,
+        which broke the simulation, with none of its feedback, and spent
+        three drafts getting back to where Sonnet's fourth had been."""
+        best = None
+        for rec in iterations:
+            i = rec.get("iteration") or 0
+            if not 1 <= i <= len(self.drafts):
+                continue
+            if (rec.get("sim") or {}).get("status") != "pass" or \
+                    (rec.get("synth") or {}).get("status") != "pass":
+                continue
+            slack = (rec.get("timing") or {}).get("worst_slack_ns")
+            key = slack if slack is not None else float("-inf")
+            if best is None or key >= best[0]:
+                best = (key, i, rec)
+        passed = best is not None
+        if not passed:
+            done = [r for r in iterations
+                    if 1 <= (r.get("iteration") or 0) <= len(self.drafts)]
+            if not done:
+                return None
+            rec = done[-1]
+            i = rec["iteration"]
+        else:
+            _, i, rec = best
+        fails = [dict(r, iteration=0) for r in
+                 (rec.get(k) for k in ("sim", "synth", "timing", "fpga"))
+                 if r and r.get("status") == "fail"]
+        return self.drafts[i - 1], fails, passed
+
     def propose(self, spec, feedback_history):
-        prompt = build_prompt(spec, feedback_history, self.last_rtl)
+        base, hist, note = self.last_rtl, feedback_history, None
+        best = self._best_draft(feedback_history)
+        if best:
+            base, hist, who = best
+            note = ("%s, shown above, passed every simulation check and "
+                    "synthesis, and failed only what the feedback below "
+                    "says. The drafts after it broke the simulation, so you "
+                    "are revising it again: change only what that failure "
+                    "needs, and keep its behaviour exactly as it is." % who)
+        elif not self.drafts and self.seed:
+            base, hist = self.seed[0], self.seed[1]
+            note = ("The draft shown above was written by another model. It "
+                    "passed every simulation check and synthesis, and failed "
+                    "only what the feedback below says. Start from it: change "
+                    "only what that failure needs, and keep its behaviour "
+                    "exactly as it is." if self.seed[2] else
+                    "The draft shown above was written by another model, and "
+                    "the feedback below is how it failed. Revise it.")
+        prompt = build_prompt(spec, hist, base, note)
         rtl, n = ask_for_module(self._ask, prompt, spec["top_module"])
+        self.drafts.append(rtl)
         self.last_rtl = rtl
         self.calls += n
         return rtl, ["llm:%s@%s#%d" % (self.model, self.backend, self.calls)]
