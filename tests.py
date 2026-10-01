@@ -3692,6 +3692,11 @@ def test_llm_transport_is_retried():
                     "    time.sleep(0.3)\n"
                     "if mode == 'answer':\n"
                     "    ev({'type': 'result', 'is_error': False, 'result': 'module m(); endmodule'})\n"
+                    "elif mode == 'ramble':\n"
+                    "    ev({'type': 'stream_event', 'event': {'delta': {'type': 'text_delta', 'text': 'module m(); endmodule'}}})\n"
+                    "    while True:\n"
+                    "        ev({'type': 'stream_event', 'event': {'delta': {'type': 'text_delta', 'text': ' and so on'}}})\n"
+                    "        time.sleep(0.3)\n"
                     "elif mode == 'think':\n"
                     "    while True:\n"
                     "        ev({'type': 'stream_event', 'event': {'delta': {'type': 'thinking_delta', 'thinking': 'x'}}})\n"
@@ -3701,17 +3706,23 @@ def test_llm_transport_is_retried():
         r = llm_agent.run_cli([sys.executable, fake, 'answer'], 'p', cap=30, silence=10)
         check('the answer is the stream\'s result event', r.returncode == 0
               and r.stdout == 'module m(); endmodule')
-        kinds = []
+        kinds, said = [], ''
         for mode, cap, silence in (('think', 3, 10), ('hang', 30, 2)):
             try:
                 llm_agent.run_cli([sys.executable, fake, mode], 'p', cap=cap, silence=silence)
                 kinds.append('answered')
-            except llm_agent.StillThinking:
+            except llm_agent.StillThinking as e:
                 kinds.append('thinking')
+                said = str(e)
             except subprocess.TimeoutExpired:
                 kinds.append('hung')
         check('a streaming call at its cap is thinking, a silent one is hung',
               kinds == ['thinking', 'hung'])
+        r = llm_agent.run_cli([sys.executable, fake, 'ramble'], 'p', cap=3, silence=10)
+        check('at the cap, an answer that already holds a whole module is kept, '
+              'and one without says how much was thinking and how much text',
+              r.returncode == 0 and r.stdout.startswith('module m(); endmodule')
+              and 'chars of thinking, 0 of text' in said)
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
@@ -3910,6 +3921,26 @@ def test_compile_errors_quote_the_source_line():
             "    r2 <= acc;\n"
             "    j <= j + 8'd1;\n"
             "  end\nendmodule")
+    hs = ("module m(input clk, input rst_n, output reg o_valid,\n"
+          "         output signed [15:0] o_data);\n"
+          "  wire signed [15:0] q; wire v; reg signed [15:0] a; reg vi;\n"
+          "  requant r (.clk(clk), .acc_in(a), .valid_in(vi), .q_out(q),\n"
+          "             .valid_out(v));\n"
+          "  assign o_data = q;\n"
+          "  always @(posedge clk) begin\n"
+          "    o_valid <= 1'b0;\n"
+          "    if (v) begin\n"
+          "      o_valid <= 1'b1;\n"
+          "    end\n"
+          "  end\nendmodule")
+    hf = llm_agent.code_findings(hs, [])
+    check('an output wired from an instance beside a valid registered from '
+          'it is reported, and the same output driven alongside its valid is not',
+          len(hf) == 1 and hf[0].startswith('line 6: o_data is driven straight from q')
+          and 'o_valid (line 10)' in hf[0]
+          and llm_agent.code_findings(hs.replace(
+              "      o_valid <= 1'b1;", "      o_valid <= v;").replace(
+              "    if (v) begin", "    begin"), []) == [])
     tf = llm_agent.code_findings(pipe, [{'stage': 'timing', 'status': 'fail',
         'critical_path': 'from register j to register acc. This path takes longer'}])
     check('a failing timing path is traced to the lines of code it runs through',

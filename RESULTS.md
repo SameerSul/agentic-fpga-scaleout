@@ -91,7 +91,7 @@ times put within 10%.
 ### The full suite
 
 ```
-python3 tests.py            # 430 tests, or 428 without OpenSTA
+python3 tests.py            # 432 tests, or 430 without OpenSTA
 ```
 
 ### Spec to RTL, across the spec space
@@ -1920,6 +1920,18 @@ twice; the rules agent reads only the parameters and passed. It is now
 derived for the head size, with the same parameters, and a test
 requires every block's text and address ports to agree with its row
 length.
+
+Two more came from the runs on those changes. Haiku's and Sonnet's RMSNorm
+drafts wrote assign o_data = requant's q_out and set o_valid and o_index a
+cycle after requant's valid_out, so each output was its neighbour's,
+which the testbench cannot tell from reading x a cycle early.
+Registering o_data beside o_valid made Sonnet's draft pass all 268
+checks; the agent now reports the pattern, and it fires on none of the
+379 signed-off designs. And with thinking off, Sonnet and Opus on the
+head norm and Opus on the attention head still streamed for the whole
+1500 s, with nothing saying whether it was text or thinking. An answer
+that already holds a whole module at the cap is now kept, and one that
+does not says how much of each it was.
 
 ## An attention head
 

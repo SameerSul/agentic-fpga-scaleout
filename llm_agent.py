@@ -251,6 +251,56 @@ def timing_path(rtl, start, end, depth=10):
     return []
 
 
+def _decl_names(code, kind):
+    return {m.group(2) for m in re.finditer(
+        r"\b%s\b([^;,)]*?)\b([A-Za-z_]\w*)\s*(?=[,;)])" % kind, code)}
+
+
+def handshake_findings(rtl):
+    """An output driven straight from a module instance's output while the
+    valid beside it is a register set from that instance's valid, so the
+    two reach the ports a clock edge apart.
+
+    Traced on RMSNorm: Haiku's and Sonnet's drafts both wrote assign
+    o_data = requant's q_out and set o_valid and o_index a cycle after
+    requant's valid_out, so every output was its neighbour's, and the
+    testbench, which cannot tell that from reading x a cycle early, said
+    only that. Registering o_data beside o_valid passed all 268 checks."""
+    code = "\n".join(l.split("//")[0] for l in rtl.splitlines())
+    ins, outs = _decl_names(code, "input"), _decl_names(code, "output")
+    conn = set(re.findall(r"\.\w+\s*\(\s*([A-Za-z_]\w*)\s*\)", code))
+    driven = set(re.findall(r"\bassign\s+([A-Za-z_]\w*)", code))
+    driven |= set(re.findall(
+        r"\b([A-Za-z_]\w*)\s*(?:\[[^\]]*\]\s*)*(?:<=|=)(?!=)", code))
+    inst = conn - driven - ins          # driven only by an instance
+    lines = code.splitlines()
+    data = []
+    for n, l in enumerate(lines, 1):
+        m = re.match(r"\s*assign\s+([A-Za-z_]\w*)\s*=\s*([A-Za-z_]\w*)"
+                     r"\s*(?:\[[^\]]*\])?\s*;", l)
+        if m and m.group(1) in outs and m.group(2) in inst:
+            data.append((n, m.group(1), m.group(2)))
+    for n, l in enumerate(lines, 1):
+        m = re.search(r"\bif\s*\(\s*([A-Za-z_]\w*)\s*\)", l)
+        if not (data and m and m.group(1) in inst):
+            continue
+        for k in range(n - 1, min(n + 4, len(lines))):
+            v = re.search(r"\b([A-Za-z_]\w*)\s*<=", lines[k])
+            if v and v.group(1) in outs and v.group(1) not in [d[1] for d in data]:
+                dn, dp, dw = data[0]
+                vp, vw = v.group(1), m.group(1)
+                return [
+                    "line %d: %s is driven straight from %s, an output of a "
+                    "module instance, but %s (line %d) is a register set when "
+                    "%s is high, so it reaches the port one clock edge after "
+                    "the value it describes. Unless %s holds its value for "
+                    "that extra cycle, %s has already moved on to the next "
+                    "result by then. Drive them the same way: register %s "
+                    "beside %s, or drive %s from %s directly."
+                    % (dn, dp, dw, vp, k + 1, vw, dw, dp, dp, vp, vp, vw)]
+    return []
+
+
 def code_findings(rtl, history):
     """Facts about the failing draft, found by inspecting it and the
     testbench output. Not diagnoses: each is true of the code whether or
@@ -343,6 +393,7 @@ def code_findings(rtl, history):
                     "write x <<< n, or wrap it as $signed(%s)."
                     % (n, m.group(2), m.group(2)))
                 break
+    out += handshake_findings(rtl)
     last = history[-1] if history else {}
     ends = last.get("stage") == "timing" and _ENDS.search(
         last.get("critical_path") or "")
@@ -560,10 +611,20 @@ def run_cli(cmd, prompt, cap, silence=None, cwd=None):
         p.stdin.close()
         t0 = last = time.time()
         result, text, is_error = None, [], False
+        thought = 0
         while True:
             now = time.time()
             if now - t0 > cap:
-                raise StillThinking("still thinking after %ds, no answer" % cap)
+                # A whole module already written is the answer, whatever
+                # follows it. Traced: with thinking off, Sonnet and Opus
+                # still streamed for the whole 1500 s on the head norm,
+                # and nothing said whether it was text or thinking.
+                said = "".join(text)
+                if re.search(r"\bmodule\b[\s\S]*\bendmodule\b", said):
+                    return CliResult(0, said, "")
+                raise StillThinking(
+                    "still thinking after %ds, no answer (%d chars of "
+                    "thinking, %d of text)" % (cap, thought, len(said)))
             if now - last > silence:
                 raise subprocess.TimeoutExpired(cmd, silence)
             ready, _, _ = select.select([p.stdout], [], [], 5)
@@ -581,6 +642,8 @@ def run_cli(cmd, prompt, cap, silence=None, cwd=None):
                 d = (ev.get("event") or {}).get("delta") or {}
                 if d.get("type") == "text_delta":
                     text.append(d.get("text", ""))
+                elif d.get("type") == "thinking_delta":
+                    thought += len(d.get("thinking", ""))
             elif ev.get("type") == "result":
                 result = ev.get("result")
                 is_error = bool(ev.get("is_error"))
