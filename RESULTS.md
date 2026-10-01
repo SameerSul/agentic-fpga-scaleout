@@ -91,7 +91,7 @@ times put within 10%.
 ### The full suite
 
 ```
-python3 tests.py            # 435 tests, or 433 without OpenSTA
+python3 tests.py            # 437 tests, or 435 without OpenSTA
 ```
 
 ### Spec to RTL, across the spec space
@@ -1982,6 +1982,17 @@ first version of this check, never committed, matched with the
 generator's blocks: given no blocks to run, the design had taken only
 the ROM tables from the signed-off directory. A block whose report was
 signed off for other parameters is refused.
+
+A run of the whole chain in one command, started on that code, found one
+more gap in a spec. Haiku's and Sonnet's per-column projections got
+column 0 right and every other column wrong, and every wrong one was that
+column's sum requantized with the previous column's word: each took
+c_data on the edge after loading c_addr, one edge early, and column 0
+came out right only because c_addr already held 0. The RMSNorm spec says
+a registered read behind a register address arrives two edges after the
+edge that loads it; the projection's said only "a registered read like
+the others". It now says it, and the testbench names a lane computed with
+the previous column's word.
 
 ## An attention head
 

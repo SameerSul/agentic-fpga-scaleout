@@ -4165,9 +4165,17 @@ def render_proj_testbench(spec, cases=None, colfn=None):
         if colfn:
             # Each column its own bias, scale and shift, from a small
             # memory, as a model with per-channel weight scales needs.
-            y = []
-            for c, (b, csc, csh) in enumerate(colfn(acc, seed)):
+            y, words = [], list(colfn(acc, seed))
+            for c, (b, csc, csh) in enumerate(words):
                 y.append(requant_golden(acc[c] + b, csc, csh, dw)[0])
+                # This column's sum with the previous column's word: a
+                # column word read one edge early. Traced on the end-to-end
+                # run, where Haiku and Sonnet both captured c_data the edge
+                # after loading c_addr, and column 0 came out right only
+                # because c_addr already held 0.
+                pb, psc, psh = words[c - 1] if c else (b, csc, csh)
+                body.append("    expect_p[%d] = %s;" % (c, _slit(
+                    requant_golden(acc[c] + pb, psc, psh, dw)[0], dw)))
                 word = (((b & ((1 << p["acc_width"]) - 1)) << (sw_o + mw))
                         | (csh << mw) | csc)
                 body.append("    cmem[%d] = %d'h%x;"
@@ -4397,7 +4405,10 @@ def derive_projn_spec(ms, board=None, per_column=False):
             "o_index its column. Each column exactly once, in order.")
         spec["behavior"].append(
             "Each column's bias, scale and shift are in one word at c_addr = "
-            "its column index, a registered read like the others: c_data = "
+            "its column index, a registered read like the others: c_data "
+            "carries the word for c_addr = c on the cycle after, and with "
+            "c_addr a register that is two clock edges after the edge that "
+            "loads c into it. c_data = "
             "{bias, shift, scale}, with bias the top %d bits, a signed value "
             "at the accumulator's scale, shift the next %d bits and scale the "
             "low %d bits. The bias is added to the column's sum before the "
@@ -4438,6 +4449,19 @@ def _colparams(p):
     return fn
 
 
+FAIL_LANE = (
+    '        $display("TB_FAIL test=%0s out=%0d expected_lane=%0d got_lane=%0d",\n'
+    '                 testname, o_index, expect_y[o_index], o_data);')
+FAIL_LANE_PREV = (
+    '        if (o_data === expect_p[o_index] && expect_p[o_index] !== expect_y[o_index])\n'
+    '          $display("TB_FAIL test=%0s out=%0d expected_lane=%0d got_lane=%0d '
+    'got_lane_is_this_columns_sum_with_the_previous_columns_word=1",\n'
+    '                   testname, o_index, expect_y[o_index], o_data);\n'
+    '        else\n'
+    '          $display("TB_FAIL test=%0s out=%0d expected_lane=%0d got_lane=%0d",\n'
+    '                   testname, o_index, expect_y[o_index], o_data);')
+
+
 def render_projn_testbench(spec, cases=None):
     """The projection's cases and golden, with a wide weight word: lane j
     of word g*depth + r is column g*lanes + j's weight at row r."""
@@ -4449,6 +4473,7 @@ def render_projn_testbench(spec, cases=None):
                  (dwide, cwide, 5))
     pc = p.get("per_column")
     tb = render_proj_testbench(spec, cases, _colparams(p) if pc else None)
+    maxc = max(c for _, c, _ in cases)
     N, dw = p["lanes"], p["data_width"]
     rep = [
         ("module tb_proj;", "module tb_projn;"),
@@ -4478,6 +4503,10 @@ def render_projn_testbench(spec, cases=None):
                 max(c for _, c, _ in (cases or ((1, 260, 0),))) - 1
                 if cases else (1 << p["col_width"]) - 1, cw - 1)),
             (".w_data(w_data),", ".w_data(w_data), .c_addr(c_addr), .c_data(c_data),"),
+            ("  reg [%d-1:0] seen_bits;" % maxc,
+             "  reg [%d-1:0] seen_bits;\n  reg signed [%d:0] expect_p [0:%d];"
+             % (maxc, dw - 1, maxc - 1)),
+            (FAIL_LANE, FAIL_LANE_PREV),
         ]
     for a_, b_ in rep:
         assert a_ in tb, a_

@@ -3391,8 +3391,14 @@ def test_per_column_projection():
         good = RuleBasedAgent().render_projn(spec, {agent_mod.FIX_LANE})
         nobias = good.replace('shadow[dselb] + $signed(', 'shadow[dselb] + 0 * $signed(')
         assert nobias != good
+        # The column word taken one edge after loading c_addr, with each
+        # column's own sum: that column's sum with the previous word.
+        early = good.replace('if (dvb) begin\n        rq_acc <= shadow[dselb] +',
+                             'if (dva) begin\n        rq_acc <= shadow[dsel] +'
+                             ).replace('rq_idx <= didxb;', 'rq_idx <= didx;')
+        assert early.count('shadow[dsel] +') == 1
         out = {}
-        for label, src in (('good', good), ('nobias', nobias)):
+        for label, src in (('good', good), ('nobias', nobias), ('early', early)):
             with open(os.path.join(work, 'p.v'), 'w') as f:
                 f.write(src)
             r = subprocess.run(['iverilog', '-g2005', '-o', 's.out', 'tb.v',
@@ -3406,6 +3412,12 @@ def test_per_column_projection():
               'TB_RESULT: PASS' in out['good'])
         check('a projection that drops the bias is caught',
               'TB_RESULT: PASS' not in out['nobias'])
+        check('a column word read one edge early is caught and named',
+              'TB_RESULT: PASS' not in out['early']
+              and 'got_lane_is_this_columns_sum_with_the_previous_columns_word=1'
+              in out['early'])
+        check('the spec says when a column word arrives with c_addr a register',
+              'two clock edges after the edge that loads c' in ' '.join(spec['behavior']))
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
