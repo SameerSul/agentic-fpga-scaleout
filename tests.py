@@ -2354,6 +2354,41 @@ def test_llm_blocks_decode():
         shutil.rmtree(out, ignore_errors=True)
 
 
+def test_resume_keeps_what_a_run_signed_off():
+    """A run that loses one block resumes at that block: the blocks its
+    gates already hold signed off, under the same agent kind and
+    parameters, are kept, and the chain runs only for the rest. Four
+    end-to-end runs each restarted from the first block, about ten hours
+    apiece."""
+    import spec2rtl, qwen_synth
+    import chiplet_flow as cf
+    gates = os.path.join(ROOT, 'build_resumetest')
+    shutil.rmtree(gates, ignore_errors=True)
+    shutil.copytree(os.path.join(ROOT, 'llm_blocks', 'tiny_qwen3'), gates)
+    ran = []
+
+    def chain(kind):
+        def make():
+            ran.append(1)
+            return RuleBasedAgent()
+        return [('rules (fallback)', make, 5)]
+    saved_chain, build = spec2rtl.agent_chain, cf.BUILD
+    try:
+        spec2rtl.agent_chain = chain
+        im, _ = qwen_synth.model('qwen3', nl=1)
+        rows, _ = spec2rtl.sign_off(im, gates, 'llm', lambda *a: None, resume=True)
+        all_kept = len(rows) == 15 and all(r.get('resumed') for r in rows) and not ran
+        os.remove(os.path.join(gates, 'report_b_resadd.json'))
+        rows2, _ = spec2rtl.sign_off(im, gates, 'llm', lambda *a: None, resume=True)
+        redone = [r['file'] for r in rows2 if not r.get('resumed')]
+        check('resuming keeps the blocks a run signed off and runs only the rest',
+              all_kept and redone == ['b_resadd.v'] and len(ran) == 1
+              and rows2[-1]['converged'])
+    finally:
+        spec2rtl.agent_chain, cf.BUILD = saved_chain, build
+        shutil.rmtree(gates, ignore_errors=True)
+
+
 def test_composites_give_their_parts_ports():
     """A composite that instantiates supplied modules has to give their
     ports: told only "the supplied mac module", two models guessed port
@@ -4640,6 +4675,7 @@ if __name__ == '__main__':
     test_failed_attempts_are_kept()
     test_a_draft_that_never_passed_is_not_handed_on()
     test_composites_give_their_parts_ports()
+    test_resume_keeps_what_a_run_signed_off()
     test_llm_blocks_decode()
     test_attention_scores_cannot_overflow()
     test_spec_to_verified_rtl()

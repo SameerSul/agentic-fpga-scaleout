@@ -273,32 +273,56 @@ def load_signed_off(im, gates, src, log):
             rows.append({"file": fn, "block": what, "converged": False,
                          "agent": "none", "iterations": 0, "fixes": []})
             continue
-        last = r["history"][-1] if r["history"] else {}
-        fixes = [x for h in r["history"] for x in h["fixes_applied"]]
-        who = fixes[-1].split("#")[0] if fixes and fixes[-1].startswith("llm:") \
-            else "rules"
-        tim, fp = last.get("timing") or {}, last.get("fpga") or {}
-        per = tim.get("clock_period_ns")
-        slack = tim.get("worst_slack_ns")
-        fmax = round(1000.0 / (per - slack), 1) if per and slack is not None \
-            and per > slack else None
-        rows.append({"file": fn, "block": what, "converged": r["converged"],
-                     "agent": who, "attempts": [[who, len(r["history"]),
-                                                 r["converged"]]],
-                     "iterations": len(r["history"]),
-                     "fixes": sorted(set(fixes)),
-                     "checks": r["final_metrics"].get("sim_checks"),
-                     "cells": r["final_metrics"].get("cell_count"),
-                     "timing": tim.get("method"), "fmax": fmax,
-                     "target": spec["parameters"].get("target_clock_mhz"),
-                     "luts": fp.get("luts"), "dsps": fp.get("dsps"),
-                     "seconds": 0})
+        rows.append(_row_from_report(fn, what, spec, r))
         log("  %-26s signed off before by %s, %d iterations, %s checks"
-            % (what, who, len(r["history"]), rows[-1]["checks"]))
+            % (what, rows[-1]["agent"], rows[-1]["iterations"],
+               rows[-1]["checks"]))
     return rows, [fn for fn, *_ in plan] + sorted(tables)
 
 
-def sign_off(im, gates, agent_kind, log, dv=False):
+def _row_from_report(fn, what, spec, r):
+    """A block's row from its report, as sign_off would have written it."""
+    last = r["history"][-1] if r["history"] else {}
+    fixes = [x for h in r["history"] for x in h["fixes_applied"]]
+    who = fixes[-1].split("#")[0] if fixes and fixes[-1].startswith("llm:") \
+        else "rules"
+    tim, fp = last.get("timing") or {}, last.get("fpga") or {}
+    per = tim.get("clock_period_ns")
+    slack = tim.get("worst_slack_ns")
+    fmax = round(1000.0 / (per - slack), 1) if per and slack is not None \
+        and per > slack else None
+    return {"file": fn, "block": what, "converged": r["converged"],
+            "agent": who, "attempts": [[who, len(r["history"]), r["converged"]]],
+            "iterations": len(r["history"]), "fixes": sorted(set(fixes)),
+            "checks": r["final_metrics"].get("sim_checks"),
+            "cells": r["final_metrics"].get("cell_count"),
+            "timing": tim.get("method"), "fmax": fmax,
+            "target": spec["parameters"].get("target_clock_mhz"),
+            "luts": fp.get("luts"), "dsps": fp.get("dsps"), "seconds": 0}
+
+
+def _kept(gates, fn, spec, agent_kind):
+    """A block this run's gates already hold signed off, for --resume: its
+    report converged, under the same agent kind (an LLM's, for an LLM run)
+    and the same parameters, and its design file is there. None otherwise.
+    Traced: four end-to-end runs each restarted from the first block after
+    one block failed and was fixed, about ten hours each."""
+    tag = fn[:-2]
+    try:
+        r = json.load(open(os.path.join(gates, "report_%s.json" % tag)))
+    except (OSError, ValueError):
+        return None
+    if not r.get("converged") or not os.path.exists(os.path.join(gates, fn)):
+        return None
+    if r.get("spec", {}).get("parameters") != spec.get("parameters"):
+        return None
+    fixes = [x for h in r["history"] for x in h["fixes_applied"]]
+    if agent_kind == "llm" and not (fixes and fixes[-1].startswith("llm:")):
+        return None
+    return r
+
+
+def sign_off(im, gates, agent_kind, log, dv=False, resume=False):
     """Each block through the signoff loop, into gates/: its signed-off
     RTL under its design name. Returns one row per block. The flow's
     scratch directory is gates/ meanwhile, and the caller's afterwards: a
@@ -306,12 +330,12 @@ def sign_off(im, gates, agent_kind, log, dv=False):
     to a directory since removed."""
     old = cf.BUILD
     try:
-        return _sign_off(im, gates, agent_kind, log, dv)
+        return _sign_off(im, gates, agent_kind, log, dv, resume)
     finally:
         cf.BUILD = old
 
 
-def _sign_off(im, gates, agent_kind, log, dv=False):
+def _sign_off(im, gates, agent_kind, log, dv=False, resume=False):
     plan, tables = block_plan(im)
     os.makedirs(gates, exist_ok=True)
     for fn, src in tables.items():
@@ -321,6 +345,12 @@ def _sign_off(im, gates, agent_kind, log, dv=False):
     rows = []
     for fn, what, spec, tbf, deps in plan:
         tag = fn[:-2]
+        kept = _kept(gates, fn, spec, agent_kind) if resume else None
+        if kept:
+            rows.append(dict(_row_from_report(fn, what, spec, kept), resumed=True))
+            log("  %-26s signed off earlier in this run by %s, kept"
+                % (what, rows[-1]["agent"]))
+            continue
         job = {"spec_file": os.path.join(gates, "spec_%s.json" % tag),
                "tb_file": os.path.join(gates, "tb_%s.v" % tag),
                "rtl_file": "rtl_%s.v" % tag,
@@ -468,7 +498,7 @@ def run(spec=None, board="zybo_z7_20", out=None, weights=None, lanes=None,
         sim_layers=None, gen=2, agent="rules", package=False, bridge=False,
         dv=False, prompt="The capital of France is", seed=5, log=print,
         cluster=None, mode="balanced", split="layers", sim="fast",
-        blocks=None):
+        blocks=None, resume=False):
     """One board, or with cluster (a list of boards, any mix) the whole
     heterogeneous pipeline: see run_cluster. sim: the simulator (vsim.py);
     "fast", the default, is Verilator where it is installed, and then a
@@ -564,7 +594,7 @@ def run(spec=None, board="zybo_z7_20", out=None, weights=None, lanes=None,
         rows, files = load_signed_off(im, gates, blocks, log)
     else:
         log("2. blocks, through the signoff gates (%s agent)" % agent)
-        rows, files = sign_off(im, gates, agent, log, dv)
+        rows, files = sign_off(im, gates, agent, log, dv, resume)
     ok_blocks = all(r["converged"] for r in rows) and \
         len(rows) == len(block_plan(im)[0])
     rep["stages"]["blocks"] = {"ok": ok_blocks, "rows": rows}
@@ -1276,6 +1306,10 @@ def main():
                     help="simulate through the board's registers and DDR bridge")
     ap.add_argument("--prompt", default="The capital of France is")
     ap.add_argument("--out", default=None)
+    ap.add_argument("--resume", action="store_true",
+                    help="keep the blocks --out already holds signed off "
+                         "(same agent kind and parameters) and run the chain "
+                         "only for the rest")
     ap.add_argument("--blocks", default=None,
                     help="use blocks signed off before, from this directory, "
                          "instead of running an agent (llm_blocks/tiny_qwen3)")
@@ -1285,7 +1319,8 @@ def main():
     spec = json.load(open(a.spec)) if a.spec else None
     rep = run(spec, a.board, a.out, a.weights, a.lanes, a.sim_layers, a.gen,
               a.agent, a.package, a.bridge, a.dv, a.prompt, cluster=a.boards,
-              mode=a.mode, split=a.split, sim=a.sim, blocks=a.blocks)
+              mode=a.mode, split=a.split, sim=a.sim, blocks=a.blocks,
+              resume=a.resume)
     sys.exit(0 if rep["ok"] else 1)
 
 

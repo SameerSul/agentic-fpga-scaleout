@@ -478,6 +478,7 @@ checked against another model. Read that list before quoting any number here.
 ```bash
 python3 spec2rtl.py examples/tiny_qwen3.json                      # any shape, random weights, minutes
 python3 spec2rtl.py examples/tiny_qwen3.json --blocks llm_blocks/tiny_qwen3   # the 15 blocks the LLMs signed off
+python3 spec2rtl.py examples/tiny_qwen3.json --agent llm --out run1 --resume  # pick a run up where it stopped
 python3 spec2rtl.py --weights qwen_weights --package --bridge     # Qwen2.5-0.5B for the Zybo
 FPGAI_QWEN=qwen3 python3 spec2rtl.py --weights qwen_weights/qwen3-0.6b --board zc706 --package
 ```
