@@ -25,8 +25,9 @@ Below, `board_<name>/` is whichever package matches the board.
 |---|---|
 | Qwen2.5-0.5B on the generated blocks' integer arithmetic | 14/16 teacher-forced against float |
 | the generated sequencer, 24 layers + head, in iverilog | chooses " Paris", the integer model's token |
-| the Zybo top level (`board_zybo/rtl/fpgai_zybo.v`) driven only through its AXI-Lite registers, DDR model with random stalls | all 24 layers + head: " Paris", same core cycles, 1.18 bus cycles per core cycle (rerun on the corrected streamer under way, the same bus cycles so far) |
-| the ZC706 top level at 32 lanes, the same way | one layer of each model: the direct run's token and core cycles, 1.70 bus cycles per core cycle; all 24 layers of Qwen2.5 under way, 1.69 so far |
+| the Zybo top level (`board_zybo/rtl/fpgai_zybo.v`) driven only through its AXI-Lite registers, DDR model with random stalls | all 24 layers + head: " Paris", same core cycles, 1.19 bus cycles per core cycle |
+| the ZC706 top level at 32 lanes, the same way | one layer of each model: the direct run's token and core cycles, 1.70 bus cycles per core cycle |
+| each package's own ARM program (`sw/main.c`, unchanged) on its own RTL in Verilator, its own SD card files, every port stalling (`cosim.py`) | Zybo and ZC706: "The capital of France is Paris. Paris is the capital of France. Paris is the capital of France."; ZC706 Qwen3: "The capital of France is Paris. The capital of the United States is Washington, D.C. The capital"; all 16 tokens of each, every logit the integer model's |
 | the weight streamer under 1500 jumps and a stalling bus, every word checked | passes; it failed on every seed before a slot was limited to one burst in flight |
 | fits the part (Yosys, nextpnr-xilinx) | Zybo: 28% of LUT sites, 132 of 220 DSPs, 49 BRAMs; ZC706 at 32 lanes: 9%, 196 of 900 DSPs |
 | places and routes in the open flow (nextpnr-xilinx), XC7Z020 and XC7Z045 | all three builds close 50 MHz on both clocks, and every bitstream round-trips frame for frame |
