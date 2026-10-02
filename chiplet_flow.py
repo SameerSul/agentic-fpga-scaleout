@@ -643,9 +643,41 @@ def stage_fpga(job, spec, rtl_path, family=FPGA_FAMILY):
     return dict(res, stage="fpga", status="pass")
 
 
+def stage_contract(job, spec, rtl_path):
+    """The block's handshake contract (contracts.py), proved on its ports
+    for every input: a gate after simulation, synthesis and timing pass.
+
+    Traced on the fifth end-to-end run: Sonnet's RMSNorm never gave
+    index 0 and gave index 63 twice, passed all 268 checks, and the decode
+    step built from it came out wrong. The proof finds that in 48 s, with
+    the cycles it happens on."""
+    import contracts
+    res = contracts.check(spec, rtl_path,
+                          [os.path.join(BUILD, f) for f in job.get("extra_sources", ())],
+                          os.path.join(BUILD, "contract_" + os.path.splitext(
+                              os.path.basename(rtl_path))[0]))
+    line = contracts.describe(res)
+    if res["status"] == "failed":
+        errs = ["formal contract: " + line]
+        if res.get("trace"):
+            errs.append("counterexample, the handshake signals by cycle: " +
+                        " | ".join(res["trace"][-10:]))
+        return {"stage": "contract", "status": "fail", "phase": res.get("property"),
+                "errors": errs, "contract": {k: v for k, v in res.items() if k != "trace"}}
+    if res["status"] == "error":
+        return {"stage": "contract", "status": "fail", "phase": "elaborate",
+                "errors": ["formal contract could not be built: %s" % res.get("detail", "")]}
+    # Proved, bounded, out of time, or no contract for this block: a proof
+    # that ran out of time is not a counterexample.
+    return {"stage": "contract", "status": "pass", "summary": line,
+            "contract": {k: v for k, v in res.items() if k != "trace"}}
+
+
 def summarize(res):
     if res is None:
         return "-"
+    if res["stage"] == "contract":
+        return res["status"] if res["status"] == "fail" else res["contract"]["status"]
     if res["stage"] == "sim":
         if res["status"] == "pass":
             return "pass ({} checks)".format(res["checks"])
@@ -968,7 +1000,8 @@ def run_flow(job=None, verbose=True, agent=None, max_iters=None):
         " ({}@{})".format(agent.model, agent.backend)
         if hasattr(agent, "backend") else ""))
     history, iterations = [], []
-    rows = [("iter", "fixes applied", "sim", "synth", "timing", "fpga")]
+    rows = [("iter", "fixes applied", "sim", "synth", "timing", "fpga")
+            + (("contract",) if job.get("contract") else ())]
     converged = False
 
     for it in range(1, max_iters + 1):
@@ -996,7 +1029,7 @@ def run_flow(job=None, verbose=True, agent=None, max_iters=None):
             f.write(rtl)
 
         sim = stage_sim(job, rtl_path)
-        synth = tim = fpg = None
+        synth = tim = fpg = con = None
         if sim["status"] == "pass" and tools["yosys"]:
             synth = stage_synth(job, spec, rtl_path)
             if synth["status"] == "pass":
@@ -1005,18 +1038,27 @@ def run_flow(job=None, verbose=True, agent=None, max_iters=None):
         elif sim["status"] == "pass":
             synth = {"stage": "synth", "status": "skipped", "note": "yosys missing"}
 
+        ok = lambda r: r is not None and r["status"] in ("pass", "skipped")
+        gates_ok = ok(sim) and ok(synth) and (tim is None and synth["status"] == "skipped"
+                                              or (ok(tim) and ok(fpg)))
+        # The contract last: it is the slowest gate, and only a draft that
+        # passes the rest is worth proving.
+        if gates_ok and job.get("contract"):
+            con = stage_contract(job, spec, rtl_path)
+
         record = {"iteration": it, "fixes_applied": fixes,
                   "sim": sim, "synth": synth, "timing": tim, "fpga": fpg}
+        if con is not None:
+            record["contract"] = con
         iterations.append(record)
-        for r in (sim, synth, tim, fpg):
+        for r in (sim, synth, tim, fpg, con):
             if r and r["status"] == "fail":
                 history.append(dict(r, iteration=it))
         rows.append((str(it), ",".join(fixes) or "none", summarize(sim),
-                     summarize(synth), summarize(tim), summarize(fpg)))
+                     summarize(synth), summarize(tim), summarize(fpg))
+                    + ((summarize(con),) if job.get("contract") else ()))
 
-        ok = lambda r: r is not None and r["status"] in ("pass", "skipped")
-        if ok(sim) and ok(synth) and (tim is None and synth["status"] == "skipped"
-                                      or (ok(tim) and ok(fpg))):
+        if gates_ok and (con is None or ok(con)):
             converged = True
             break
 
@@ -1038,6 +1080,7 @@ def run_flow(job=None, verbose=True, agent=None, max_iters=None):
             "cell_count": (final["synth"] or {}).get("cell_count"),
             "area": (final["synth"] or {}).get("area"),
             "timing": final["timing"],
+            "contract": (final.get("contract") or {}).get("contract"),
         },
     }
     rpath = os.path.join(ROOT, job["report_file"])

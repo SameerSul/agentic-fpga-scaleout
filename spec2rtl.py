@@ -301,15 +301,18 @@ def _row_from_report(fn, what, spec, r):
             "luts": fp.get("luts"), "dsps": fp.get("dsps"), "seconds": 0}
 
 
+# Every block's formal handshake contract (contracts.py) as a gate after
+# simulation, synthesis and timing: --contracts, which run() sets here so
+# a cluster's sign-offs take it too.
+CONTRACTS = False
+
 # The design files whose module was renamed for its second use, and back.
 _RENAMED = {"b_rmsnorm_hd.v": ("rmsnorm_hd", "rmsnorm"), "smac_dep.v": ("mac_s", "mac")}
 
 
-def _still_passes(gates, fn, job):
-    """A kept block against the testbench as it is now: a testbench made
-    stronger since the block was signed off sends it back to the chain.
-    Traced on the fifth end-to-end run: Sonnet's RMSNorm passed all 268
-    checks without ever giving index 0, and resuming would have kept it."""
+def _kept_source(gates, fn):
+    """The design a kept block was signed off with, under the module name
+    its testbench instances."""
     tag = fn[:-2]
     src = os.path.join(gates, "rtl_%s.v" % tag)
     if not os.path.exists(src):
@@ -319,7 +322,20 @@ def _still_passes(gates, fn, job):
         src = os.path.join(gates, "resume_%s.v" % tag)
         with open(src, "w") as f:
             f.write(text)
-    return cf.stage_sim(job, src)["status"] == "pass"
+    return src
+
+
+def _still_passes(gates, fn, job):
+    """A kept block against the testbench as it is now: a testbench made
+    stronger since the block was signed off sends it back to the chain.
+    Traced on the fifth end-to-end run: Sonnet's RMSNorm passed all 268
+    checks without ever giving index 0, and resuming would have kept it.
+    With contracts on, the block has to pass its contract as well."""
+    src = _kept_source(gates, fn)
+    if cf.stage_sim(job, src)["status"] != "pass":
+        return False
+    return not job.get("contract") or cf.stage_contract(
+        job, json.load(open(job["spec_file"])), src)["status"] == "pass"
 
 
 def _kept(gates, fn, spec, agent_kind):
@@ -343,7 +359,7 @@ def _kept(gates, fn, spec, agent_kind):
     return r
 
 
-def sign_off(im, gates, agent_kind, log, dv=False, resume=False):
+def sign_off(im, gates, agent_kind, log, dv=False, resume=False, contract=None):
     """Each block through the signoff loop, into gates/: its signed-off
     RTL under its design name. Returns one row per block. The flow's
     scratch directory is gates/ meanwhile, and the caller's afterwards: a
@@ -351,12 +367,13 @@ def sign_off(im, gates, agent_kind, log, dv=False, resume=False):
     to a directory since removed."""
     old = cf.BUILD
     try:
-        return _sign_off(im, gates, agent_kind, log, dv, resume)
+        return _sign_off(im, gates, agent_kind, log, dv, resume,
+                         CONTRACTS if contract is None else contract)
     finally:
         cf.BUILD = old
 
 
-def _sign_off(im, gates, agent_kind, log, dv=False, resume=False):
+def _sign_off(im, gates, agent_kind, log, dv=False, resume=False, contract=False):
     plan, tables = block_plan(im)
     os.makedirs(gates, exist_ok=True)
     for fn, src in tables.items():
@@ -371,7 +388,7 @@ def _sign_off(im, gates, agent_kind, log, dv=False, resume=False):
                "rtl_file": "rtl_%s.v" % tag,
                "profile_file": os.path.join(gates, "profile_%s.json" % tag),
                "report_file": os.path.join(gates, "report_%s.json" % tag),
-               "extra_sources": tuple(deps)}
+               "extra_sources": tuple(deps), "contract": contract}
         with open(job["spec_file"], "w") as f:
             json.dump(spec, f, indent=2)
         with open(job["tb_file"], "w") as f:
@@ -443,6 +460,9 @@ def _sign_off(im, gates, agent_kind, log, dv=False, resume=False):
                "luts": ((profile or {}).get("fpga") or fpga).get("luts"),
                "dsps": ((profile or {}).get("fpga") or fpga).get("dsps"),
                "seconds": round(time.time() - t0, 1)}
+        if contract and last.get("contract"):
+            row["contract"] = last["contract"].get("summary") or \
+                "; ".join(last["contract"].get("errors", []))[:300]
         if report["converged"]:
             src = open(os.path.join(gates, job["rtl_file"])).read()
             if fn == "b_rmsnorm_hd.v":
@@ -465,6 +485,8 @@ def _sign_off(im, gates, agent_kind, log, dv=False, resume=False):
             row["checks"], ("%s %.0f MHz" % (row["timing"], row["fmax"]))
             if row["fmax"] else "no timing", ("; dv " + row["dv"]) if dv and
             "dv" in row else "", row["seconds"]))
+        if row.get("contract"):
+            log("  %-26s %s" % ("", row["contract"]))
         if not report["converged"]:
             break                     # the blocks above it depend on it
     return rows, [fn for fn, *_ in plan] + sorted(tables)
@@ -522,14 +544,15 @@ def run(spec=None, board="zybo_z7_20", out=None, weights=None, lanes=None,
         sim_layers=None, gen=2, agent="rules", package=False, bridge=False,
         dv=False, prompt="The capital of France is", seed=5, log=print,
         cluster=None, mode="balanced", split="layers", sim="fast",
-        blocks=None, resume=False):
+        blocks=None, resume=False, contracts=False):
     """One board, or with cluster (a list of boards, any mix) the whole
     heterogeneous pipeline: see run_cluster. sim: the simulator (vsim.py);
     "fast", the default, is Verilator where it is installed, and then a
     real model is simulated at every layer, not one."""
     import vsim
-    global SIM
+    global SIM, CONTRACTS
     SIM = vsim.pick(sim)
+    CONTRACTS = contracts
     out = os.path.abspath(out or os.path.join(ROOT, "build_spec2rtl"))
     os.makedirs(out, exist_ok=True)
     rep = {"board": board, "agent": agent, "stages": {}, "simulator": SIM}
@@ -1325,6 +1348,9 @@ def main():
                     "a real model in minutes), else Icarus")
     ap.add_argument("--agent", default="rules", choices=("rules", "llm", "swarm"))
     ap.add_argument("--dv", action="store_true", help="mutation-test every testbench")
+    ap.add_argument("--contracts", action="store_true",
+                    help="prove every block's handshake contract (contracts.py) as a "
+                         "gate after simulation, synthesis and timing")
     ap.add_argument("--package", action="store_true", help="write the board package")
     ap.add_argument("--bridge", action="store_true",
                     help="simulate through the board's registers and DDR bridge")
@@ -1344,7 +1370,7 @@ def main():
     rep = run(spec, a.board, a.out, a.weights, a.lanes, a.sim_layers, a.gen,
               a.agent, a.package, a.bridge, a.dv, a.prompt, cluster=a.boards,
               mode=a.mode, split=a.split, sim=a.sim, blocks=a.blocks,
-              resume=a.resume)
+              resume=a.resume, contracts=a.contracts)
     sys.exit(0 if rep["ok"] else 1)
 
 

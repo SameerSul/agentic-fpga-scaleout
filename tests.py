@@ -2425,6 +2425,74 @@ def test_resume_keeps_what_a_run_signed_off():
         shutil.rmtree(gates, ignore_errors=True)
 
 
+def test_contracts_catch_what_the_testbench_missed():
+    """The formal handshake contract (contracts.py), proved with ABC on
+    the ports alone. Sonnet's RMSNorm from the fifth end-to-end run never
+    gave index 0 and gave 63 twice, and passed all 268 checks of its
+    testbench as it was: the contract has to fail it, and say so. An LLM's
+    matvec has to be proved for every reachable state, and the same
+    matvec made to give a column twice has to fail."""
+    import contracts, spec2rtl, qwen_synth
+    if not contracts.available():
+        check('the contracts (no yosys-abc: skipped)', True)
+        return
+    work = os.path.join(ROOT, 'build_contracttest')
+    shutil.rmtree(work, ignore_errors=True)
+    os.makedirs(work)
+    try:
+        im, _ = qwen_synth.model('qwen3', nl=1)
+        plan, tables = spec2rtl.block_plan(im)
+        for fn, src in tables.items():
+            with open(os.path.join(work, fn), 'w') as f:
+                f.write(src)
+        for fn in ('rs_dep.v', 'rq_dep.v', 'mv_dep.v'):
+            shutil.copyfile(os.path.join(ROOT, 'llm_blocks', 'tiny_qwen3', fn),
+                            os.path.join(work, fn))
+        spec = {fn: sp for fn, _, sp, _, _ in plan}
+        bad = os.path.join(ROOT, 'llm_blocks', 'caught', 'b_rmsnorm_run5.v')
+        res = contracts.check(spec['b_rmsnorm.v'], bad, contracts.supplied(work, bad),
+                              os.path.join(work, 'rmsnorm'))
+        check('the run-5 RMSNorm fails its contract: index 0 never given, 63 twice',
+              res['status'] == 'failed' and res['property'] == 'p_all'
+              and 'index 0 never given' in res['story']
+              and 'more than once: index 63' in res['story'])
+        mv = os.path.join(work, 'mv_dep.v')
+        res = contracts.check(spec['mv_dep.v'], mv, (), os.path.join(work, 'matvec'))
+        check('an LLM matvec\'s contract is proved for every reachable state',
+              res['status'] == 'proved' and res['safety'] == 'proved'
+              and res['ends'] == 'bounded')
+        src = open(mv).read()
+        a = 'col_count <= col_count + 1;'
+        assert src.count(a) == 1
+        mut = os.path.join(work, 'mv_twice.v')
+        with open(mut, 'w') as f:
+            f.write(src.replace(a, 'col_count <= col_count + (col_count != cols - 2);'))
+        res = contracts.check(spec['mv_dep.v'], mut, (), os.path.join(work, 'matvec_twice'))
+        check('a matvec that gives a column twice fails its contract',
+              res['status'] == 'failed' and res['property'] in ('p_once', 'p_ends'))
+        # As a gate: the rules agent's matvec through sign_off with
+        # contracts on, the contract proved on the draft that passes the
+        # other gates.
+        import chiplet_flow as cf
+        saved_plan, build = spec2rtl.block_plan, cf.BUILD
+        os.makedirs(os.path.join(work, 'gates'))
+        shutil.copyfile(os.path.join(ROOT, 'llm_blocks', 'tiny_qwen3', 'mac_dep.v'),
+                        os.path.join(work, 'gates', 'mac_dep.v'))     # its testbench's MAC
+        try:
+            spec2rtl.block_plan = lambda im: (
+                [b for b in saved_plan(im)[0] if b[0] == 'mv_dep.v'], saved_plan(im)[1])
+            rows, _ = spec2rtl.sign_off(im, os.path.join(work, 'gates'), 'rules',
+                                        lambda *a: None, contract=True)
+        finally:
+            spec2rtl.block_plan, cf.BUILD = saved_plan, build
+        rep = json.load(open(os.path.join(work, 'gates', 'report_mv_dep.json')))
+        check('with --contracts, sign_off proves each block\'s contract as a gate',
+              rows[0]['converged'] and 'proved' in rows[0].get('contract', '')
+              and rep['final_metrics']['contract']['status'] == 'proved')
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
 def test_composites_give_their_parts_ports():
     """A composite that instantiates supplied modules has to give their
     ports: told only "the supplied mac module", two models guessed port
@@ -4732,6 +4800,7 @@ if __name__ == '__main__':
     test_a_draft_that_never_passed_is_not_handed_on()
     test_composites_give_their_parts_ports()
     test_resume_keeps_what_a_run_signed_off()
+    test_contracts_catch_what_the_testbench_missed()
     test_llm_blocks_decode()
     test_attention_scores_cannot_overflow()
     test_spec_to_verified_rtl()
