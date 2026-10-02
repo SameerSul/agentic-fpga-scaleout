@@ -1196,8 +1196,13 @@ def test_rmsnorm():
         uns = fixed.replace("sqr <= x_data * x_data;",
                             "sqr <= $unsigned(x_data) * $unsigned(x_data);")
         assert uns != fixed
+        # Index 0 never given and index 1 given twice: the count is right.
+        twice = fixed.replace("o_index <= idx_pipe[8];",
+                              "o_index <= (idx_pipe[8] == 0) ? 1 : idx_pipe[8];")
+        assert twice != fixed
         for label, src in (('first', rr.render_rmsnorm(spec, set())),
-                           ('fixed', fixed), ('early', early), ('uns', uns)):
+                           ('fixed', fixed), ('early', early), ('uns', uns),
+                           ('twice', twice)):
             with open(os.path.join(work, 'rms.v'), 'w') as f:
                 f.write(src)
             r = subprocess.run(['iverilog', '-g2005', '-o', 's.out', 'tb.v',
@@ -1221,6 +1226,10 @@ def test_rmsnorm():
               'outputs named as their neighbours\' expected values',
               'TB_RESULT: PASS' not in res['early']
               and 'got_norm_is_the_expected_value_for_out=' in res['early'])
+        check('a norm that gives one index twice and another never is caught, '
+              'though its count is right',
+              'TB_RESULT: PASS' not in res['twice']
+              and 'got_index_twice=1' in res['twice'])
         check('a sum of squares that reads x as unsigned is caught and named',
               'TB_RESULT: PASS' not in res['uns']
               and 'got_ssq_is_the_sum_with_x_read_as_unsigned=1' in res['uns'])
@@ -2372,20 +2381,35 @@ def test_resume_keeps_what_a_run_signed_off():
             ran.append(1)
             return RuleBasedAgent()
         return [('rules (fallback)', make, 5)]
-    saved_chain, build = spec2rtl.agent_chain, cf.BUILD
+    saved_chain, saved_plan, build = spec2rtl.agent_chain, spec2rtl.block_plan, cf.BUILD
+    keep = ('mac_dep.v', 'rq_dep.v', 'b_resadd.v')
     try:
         spec2rtl.agent_chain = chain
+        spec2rtl.block_plan = lambda im: (
+            [b for b in saved_plan(im)[0] if b[0] in keep], saved_plan(im)[1])
         im, _ = qwen_synth.model('qwen3', nl=1)
         rows, _ = spec2rtl.sign_off(im, gates, 'llm', lambda *a: None, resume=True)
-        all_kept = len(rows) == 15 and all(r.get('resumed') for r in rows) and not ran
+        all_kept = len(rows) == 3 and all(r.get('resumed') for r in rows) and not ran
         os.remove(os.path.join(gates, 'report_b_resadd.json'))
         rows2, _ = spec2rtl.sign_off(im, gates, 'llm', lambda *a: None, resume=True)
         redone = [r['file'] for r in rows2 if not r.get('resumed')]
         check('resuming keeps the blocks a run signed off and runs only the rest',
               all_kept and redone == ['b_resadd.v'] and len(ran) == 1
               and rows2[-1]['converged'])
+        # A kept block that no longer passes its testbench goes back.
+        p = os.path.join(gates, 'rtl_rq_dep.v')
+        src = open(p).read() if os.path.exists(p) else open(
+            os.path.join(gates, 'rq_dep.v')).read()
+        open(p, 'w').write(src.replace('endmodule', '  // broken\nendmodule', 1)
+                           .replace('module requant', 'module requant_gone', 1))
+        # As a rules run, which keeps any block that converged: the residual
+        # add was re-signed by the stand-in rules agent above.
+        rows3, _ = spec2rtl.sign_off(im, gates, 'rules', lambda *a: None, resume=True)
+        check('a kept block that fails its testbench now is signed off again',
+              [r['file'] for r in rows3 if not r.get('resumed')] == ['rq_dep.v']
+              and len(ran) == 2)
     finally:
-        spec2rtl.agent_chain, cf.BUILD = saved_chain, build
+        spec2rtl.agent_chain, spec2rtl.block_plan, cf.BUILD = saved_chain, saved_plan, build
         shutil.rmtree(gates, ignore_errors=True)
 
 
@@ -3923,6 +3947,14 @@ def test_llm_transport_is_retried():
               and ag.best_of([]) is None)
     finally:
         llm_agent.call_claude_cli, llm_agent.pick_backend = real_cli, real_pick
+
+    # A comment that mentions the word module, ahead of the declaration,
+    # is not where the module starts.
+    got = llm_agent.extract_verilog(
+        "```verilog\n// Attention head module: scores, softmax, sum\n"
+        "module attnn(input clk);\nendmodule\n```")
+    check('the module is taken from its declaration, not from a comment that '
+          'mentions the word', got.startswith('module attnn(input clk);'))
 
     # The stream itself: a stand-in CLI that writes events, then the answer.
     work = os.path.join(ROOT, 'build_clitest')

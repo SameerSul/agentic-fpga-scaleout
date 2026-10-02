@@ -564,7 +564,12 @@ def extract_verilog(text):
     m = re.search(r"```[a-zA-Z]*\s*\n(.*?)```", text, re.S)
     if m:
         text = m.group(1)
-    start = re.search(r"\bmodule\b", text)
+    # From the first line that declares a module, not the first time the
+    # word appears: a header comment like "// attention head module" put
+    # the cut inside the comment, and the draft failed with a syntax error
+    # on line 1, twice on the attention head in two end-to-end runs.
+    start = re.search(r"^[ \t]*module\s+[A-Za-z_]\w*", text, re.M) or \
+        re.search(r"\bmodule\b", text)
     end = text.rfind("endmodule")
     if start and end != -1:
         text = text[start.start():end + len("endmodule")]

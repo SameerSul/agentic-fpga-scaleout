@@ -1729,6 +1729,7 @@ module tb_softmax;
   // The weight every index gets when a row's scores are all equal.
   reg        [{wwm}:0] flat_w = 0;
   reg signed [{swm}:0] s_data;
+  reg [{cap}-1:0] idx_once = 0;
   integer checks = 0, seen = 0, i, j, other, best, dist, own;
   reg [255:0] testname;
   // Cycles measured, not computed: the profile's cycles_per_unit and
@@ -1758,6 +1759,17 @@ module tb_softmax;
         $display("TB_RESULT: FAIL");
         $finish;
       end
+      // Each index exactly once. Traced on the fifth end-to-end run:
+      // Sonnet's RMSNorm left out index 0 and gave index 63 twice, so
+      // the count was right and every value it did give was too; it
+      // passed all 268 checks and the decode step came out wrong.
+      if (idx_once[w_index]) begin
+        $display("TB_FAIL test=%0s idx=%0d expected=each_index_once got_index_twice=1 got=%0d",
+                 testname, w_index, w_data);
+        $display("TB_RESULT: FAIL");
+        $finish;
+      end
+      idx_once[w_index] = 1'b1;
       if (w_data !== expect_w[w_index]) begin
         // A right value under the wrong index is a pipeline alignment
         // fault, not an arithmetic one. Traced, two different models
@@ -1803,7 +1815,7 @@ module tb_softmax;
 
   task run_row(input [{nw}-1:0] cnt);
     begin
-      seen = 0;
+      seen = 0; idx_once = 0;
       n = cnt;
       @(negedge clk); start = 1;
       t0 = cyc; first_out = -1;
@@ -2178,6 +2190,7 @@ module tb_attn;
   reg        [{wwm}:0] expect_p [0:{cap}-1];
   reg signed [{dwm}:0] expect_o [0:{hd}-1];
   reg signed [{dwm}:0] k_data, v_data;
+  reg [{hd}-1:0] out_once = 0;
   integer checks = 0, seen = 0, i, bad, nbad;
   reg [255:0] testname;
   reg [15:0] bad_idx [0:7];
@@ -2212,6 +2225,17 @@ module tb_attn;
         $display("TB_RESULT: FAIL");
         $finish;
       end
+      // Each index exactly once. Traced on the fifth end-to-end run:
+      // Sonnet's RMSNorm left out index 0 and gave index 63 twice, so
+      // the count was right and every value it did give was too; it
+      // passed all 268 checks and the decode step came out wrong.
+      if (out_once[o_index]) begin
+        $display("TB_FAIL test=%0s out=%0d expected=each_index_once got_index_twice=1 got=%0d",
+                 testname, o_index, o_data);
+        $display("TB_RESULT: FAIL");
+        $finish;
+      end
+      out_once[o_index] = 1'b1;
       if (o_data !== expect_o[o_index]) begin
         // Held: a wrong score or weight makes every output wrong, and the
         // checks after the run name the upstream cause first.
@@ -2227,7 +2251,7 @@ module tb_attn;
   task run_head(input integer cnt, input integer sh, input integer sc,
                 input integer so);
     begin
-      seen = 0; nbad = 0; bad = 0;
+      seen = 0; out_once = 0; nbad = 0; bad = 0;
       for (i = 0; i < {hd}; i = i + 1) begin
         @(negedge clk); load_data = qvec[i]; load_valid = 1;
       end
@@ -2699,6 +2723,7 @@ module tb_rmsnorm;
   reg signed [{dwm}:0] gmem [0:{D}-1];
   reg signed [{dwm}:0] expect_o [0:{D}-1];
   reg signed [{dwm}:0] x_data, g_data;
+  reg [{D}-1:0] out_once = 0;
   integer checks = 0, seen = 0, i, bad, nbad;
   reg [255:0] testname;
   reg [15:0] bad_idx [0:7];
@@ -2758,6 +2783,17 @@ module tb_rmsnorm;
         $display("TB_RESULT: FAIL");
         $finish;
       end
+      // Each index exactly once. Traced on the fifth end-to-end run:
+      // Sonnet's RMSNorm left out index 0 and gave index 63 twice, so
+      // the count was right and every value it did give was too; it
+      // passed all 268 checks and the decode step came out wrong.
+      if (out_once[o_index]) begin
+        $display("TB_FAIL test=%0s out=%0d expected=each_index_once got_index_twice=1 got=%0d",
+                 testname, o_index, o_data);
+        $display("TB_RESULT: FAIL");
+        $finish;
+      end
+      out_once[o_index] = 1'b1;
       if (o_data !== expect_o[o_index]) begin
         if (nbad < 8) begin
           bad_idx[nbad] = o_index; bad_exp[nbad] = expect_o[o_index];
@@ -2773,7 +2809,7 @@ module tb_rmsnorm;
                input [{ewm}:0] want_e, input [{iwm}:0] ssq_first_twice,
                input [{iwm}:0] ssq_last_twice, input [{iwm}:0] ssq_unsigned);
     begin
-      seen = 0; nbad = 0; bad = 0;
+      seen = 0; out_once = 0; nbad = 0; bad = 0;
       eps = ep; scale_o = sc; shift_o = so;
       @(negedge clk); start = 1; trk = 0;
       t0 = cyc; first_out = -1;

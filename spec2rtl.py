@@ -301,6 +301,27 @@ def _row_from_report(fn, what, spec, r):
             "luts": fp.get("luts"), "dsps": fp.get("dsps"), "seconds": 0}
 
 
+# The design files whose module was renamed for its second use, and back.
+_RENAMED = {"b_rmsnorm_hd.v": ("rmsnorm_hd", "rmsnorm"), "smac_dep.v": ("mac_s", "mac")}
+
+
+def _still_passes(gates, fn, job):
+    """A kept block against the testbench as it is now: a testbench made
+    stronger since the block was signed off sends it back to the chain.
+    Traced on the fifth end-to-end run: Sonnet's RMSNorm passed all 268
+    checks without ever giving index 0, and resuming would have kept it."""
+    tag = fn[:-2]
+    src = os.path.join(gates, "rtl_%s.v" % tag)
+    if not os.path.exists(src):
+        text = open(os.path.join(gates, fn)).read()
+        if fn in _RENAMED:
+            text = rename_module(text, *_RENAMED[fn])
+        src = os.path.join(gates, "resume_%s.v" % tag)
+        with open(src, "w") as f:
+            f.write(text)
+    return cf.stage_sim(job, src)["status"] == "pass"
+
+
 def _kept(gates, fn, spec, agent_kind):
     """A block this run's gates already hold signed off, for --resume: its
     report converged, under the same agent kind (an LLM's, for an LLM run)
@@ -345,12 +366,6 @@ def _sign_off(im, gates, agent_kind, log, dv=False, resume=False):
     rows = []
     for fn, what, spec, tbf, deps in plan:
         tag = fn[:-2]
-        kept = _kept(gates, fn, spec, agent_kind) if resume else None
-        if kept:
-            rows.append(dict(_row_from_report(fn, what, spec, kept), resumed=True))
-            log("  %-26s signed off earlier in this run by %s, kept"
-                % (what, rows[-1]["agent"]))
-            continue
         job = {"spec_file": os.path.join(gates, "spec_%s.json" % tag),
                "tb_file": os.path.join(gates, "tb_%s.v" % tag),
                "rtl_file": "rtl_%s.v" % tag,
@@ -361,6 +376,15 @@ def _sign_off(im, gates, agent_kind, log, dv=False, resume=False):
             json.dump(spec, f, indent=2)
         with open(job["tb_file"], "w") as f:
             f.write(tbf(spec))
+        kept = _kept(gates, fn, spec, agent_kind) if resume else None
+        if kept and _still_passes(gates, fn, job):
+            rows.append(dict(_row_from_report(fn, what, spec, kept), resumed=True))
+            log("  %-26s signed off earlier in this run by %s, kept"
+                % (what, rows[-1]["agent"]))
+            continue
+        if kept:
+            log("  %-26s no longer passes its testbench; the chain takes it again"
+                % what)
         t0 = time.time()
         attempts, prev, report, err = [], None, None, None
         prev_iters = []

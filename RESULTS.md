@@ -91,7 +91,7 @@ times put within 10%.
 ### The full suite
 
 ```
-python3 tests.py            # 448 tests, or 445 without OpenSTA
+python3 tests.py            # 451 tests, or 448 without OpenSTA
 ```
 
 ### Spec to RTL, across the spec space
@@ -2026,6 +2026,20 @@ spec gave the score dot product 32 bits where the scores need 37, and the
 testbenches now name a projection sum without its last row, a score with
 the key read one element off, a score MAC that multiplies a concatenation,
 and an exponential at or above one for a negative input.
+
+The fifth run signed off all fifteen blocks with the models, none by the
+rules agent, and its decode step still differed from the integer model:
+tokens 49 and 49, logits 12806 and 12904 for 14065 and 14504. Swapping
+each of its blocks into the fifteen in llm_blocks named one, Sonnet's
+RMSNorm, and running it beside the known-good one showed how it passed
+268 checks: it never gave index 0, gave index 63 twice and dropped busy a
+cycle early, and every value it did give was right. The testbench counted
+outputs and checked values, so the count was 64 and nothing differed.
+RMSNorm's, the attention head's and softmax's testbenches now fail an
+index given twice, and a resumed run keeps a block only if it still
+passes its testbench, so the stronger check sends that RMSNorm back to
+the chain. The decode step against the integer model is what caught it,
+which is the reason it runs after every block has signed off.
 
 ## An attention head
 
