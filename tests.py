@@ -2493,6 +2493,85 @@ def test_contracts_catch_what_the_testbench_missed():
         shutil.rmtree(work, ignore_errors=True)
 
 
+def test_port_coverage_and_every_input():
+    """Port coverage (coverage.py) of an LLM's blocks under their own
+    testbenches, and the blocks small enough to check on every input
+    (exhaustive.py). The matvec testbench ran one size once and reached
+    68% of its bins; with three sizes, the last started on the cycle after
+    the one before it ends, it reaches every bin. A testbench that never
+    gives two samples back to back misses that bin. The LLM's exponential
+    and SiLU equal the golden model on all 4097 and 8192 inputs, and the
+    same exponential fails when the golden model is off by one on one. The
+    LLM's exponential is proved equal to the reference design for every
+    input sequence (contracts.equivalent)."""
+    import coverage, exhaustive, spec2rtl, qwen_synth
+    work = os.path.join(ROOT, 'build_covtest')
+    shutil.rmtree(work, ignore_errors=True)
+    os.makedirs(work)
+    saved = specgen_mod.exp_golden
+    try:
+        im, _ = qwen_synth.model('qwen3', nl=1)
+        plan, tables = spec2rtl.block_plan(im)
+        for fn, src in tables.items():
+            with open(os.path.join(work, fn), 'w') as f:
+                f.write(src)
+        for fn in ('mac_dep.v', 'rq_dep.v', 'mv_dep.v', 'expu_dep.v', 'recip_dep.v', 'b_silu.v'):
+            shutil.copyfile(os.path.join(ROOT, 'llm_blocks', 'tiny_qwen3', fn),
+                            os.path.join(work, fn))
+        got = {}
+        for fn, _, spec, tbf, deps in plan:
+            if fn not in ('mv_dep.v', 'rq_dep.v'):
+                continue
+            tb = os.path.join(work, 'tb_%s.v' % fn[:-2])
+            with open(tb, 'w') as f:
+                f.write(tbf(spec))
+            got[fn] = coverage.measure(spec, tb, os.path.join(work, fn),
+                                       [os.path.join(work, d) for d in deps],
+                                       os.path.join(work, 'cov_' + fn[:-2]))
+        check('an LLM matvec and requantizer reach every port bin of their testbenches',
+              got['mv_dep.v'].get('percent') == 100.0 and got['rq_dep.v'].get('percent') == 100.0)
+        spec = {fn: sp for fn, _, sp, _, _ in plan}
+        one_at_a_time = {'valid_in': [1, 0, 0, 0, 1, 0, 0, 0], 'valid_out': [0] * 8}
+        _, _, missed = coverage.bins(spec['expu_dep.v'], one_at_a_time)
+        check('samples never back to back are a coverage hole',
+              'valid_in on consecutive cycles' in missed)
+        res = {fn: exhaustive.check(spec[fn], os.path.join(work, fn),
+                                    [os.path.join(work, d) for d in
+                                     next(b[4] for b in plan if b[0] == fn)],
+                                    os.path.join(work, 'ex_' + fn[:-2]))
+               for fn in ('expu_dep.v', 'b_silu.v')}
+        check('the LLM exponential and SiLU equal the golden model on every input',
+              res['expu_dep.v']['status'] == 'pass' and res['expu_dep.v']['inputs'] == 4097
+              and res['b_silu.v']['status'] == 'pass' and res['b_silu.v']['inputs'] == 8192)
+        specgen_mod.exp_golden = lambda x, p: saved(x, p) + (x == -1000)
+        bad = exhaustive.check(spec['expu_dep.v'], os.path.join(work, 'expu_dep.v'),
+                               [os.path.join(work, 'exp_rom.v')], os.path.join(work, 'ex_bad'))
+        check('a golden model off by one on one input of 4097 fails it',
+              bad['status'] == 'fail')
+        # Equivalence, LLM against reference: the same samples on every
+        # cycle, the same outputs, for every input sequence.
+        import contracts
+        if contracts.available():
+            ref = RuleBasedAgent().render_exp(spec['expu_dep.v'], {agent_mod.FIX_LUT})
+            refp = os.path.join(work, 'ref_expu.v')
+            with open(refp, 'w') as f:
+                f.write(ref)
+            rom = [os.path.join(work, 'exp_rom.v')]
+            same = contracts.equivalent(spec['expu_dep.v'], os.path.join(work, 'expu_dep.v'),
+                                        refp, rom, os.path.join(work, 'eq'))
+            noshift = ref.replace('y         <= m >> sh;', 'y         <= m;')
+            assert noshift != ref
+            with open(refp, 'w') as f:
+                f.write(noshift)
+            diff = contracts.equivalent(spec['expu_dep.v'], os.path.join(work, 'expu_dep.v'),
+                                        refp, rom, os.path.join(work, 'eq_bad'))
+            check('the LLM exponential is proved equal to the reference; one without its shift is not',
+                  same['status'] == 'proved' and diff['status'] == 'failed')
+    finally:
+        specgen_mod.exp_golden = saved
+        shutil.rmtree(work, ignore_errors=True)
+
+
 def test_composites_give_their_parts_ports():
     """A composite that instantiates supplied modules has to give their
     ports: told only "the supplied mac module", two models guessed port
@@ -4801,6 +4880,7 @@ if __name__ == '__main__':
     test_composites_give_their_parts_ports()
     test_resume_keeps_what_a_run_signed_off()
     test_contracts_catch_what_the_testbench_missed()
+    test_port_coverage_and_every_input()
     test_llm_blocks_decode()
     test_attention_scores_cannot_overflow()
     test_spec_to_verified_rtl()

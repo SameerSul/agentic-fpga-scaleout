@@ -116,8 +116,26 @@ def check_profile(spec, profile, unit, timing=None):
         per, unit, fmax, profile["cell_count"])
 
 
-def run_dv(rtl_path, tb_path, extra=()):
-    """Mutation-test the generated testbench. Returns (ok, detail)."""
+def _every_input(spec, mutant, deps):
+    """"equivalent" when the mutant equals the golden model on every input
+    of a block small enough to try them all, else None."""
+    import exhaustive
+    if exhaustive.inputs(spec)[0] is None:
+        return None
+    p = os.path.join(dv.DVDIR, "exhaustive_mutant.v")
+    with open(p, "w") as f:
+        f.write(mutant)
+    r = exhaustive.check(spec, p, deps, os.path.join(dv.DVDIR, "exhaustive"))
+    return "equivalent" if r["status"] == "pass" else None
+
+
+def run_dv(rtl_path, tb_path, extra=(), spec=None):
+    """Mutation-test the generated testbench. Returns (ok, detail).
+
+    With spec, a block small enough to check on every input
+    (exhaustive.py) settles a survivor yosys cannot: a mutant that equals
+    the golden model on every input is equivalent, not a hole. SiLU's
+    product off by one and its unreset data register were two."""
     src = open(rtl_path).read()
     mods = re.findall(r"^\s*module\s+([A-Za-z_]\w*)", src, re.M)
     if not mods:
@@ -141,6 +159,8 @@ def run_dv(rtl_path, tb_path, extra=()):
                 killed += 1
             elif v == "SURVIVED":
                 verdict = dv.survivor_verdict(src, mutant, top, deps)
+                if verdict != "equivalent" and spec is not None:
+                    verdict = _every_input(spec, mutant, deps) or verdict
                 if verdict == "equivalent":
                     skipped += 1
                 elif verdict == "unproven":

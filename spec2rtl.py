@@ -471,11 +471,20 @@ def _sign_off(im, gates, agent_kind, log, dv=False, resume=False, contract=False
                 src = rename_module(src, "mac", "mac_s")
             with open(os.path.join(gates, fn), "w") as f:
                 f.write(src)
+            # How much of the block's interface its testbench exercised
+            # (coverage.py): one more run of it, with the ports dumped.
+            import coverage
+            cov = coverage.measure(spec, job["tb_file"], os.path.join(gates, job["rtl_file"]),
+                                   [os.path.join(gates, d) for d in deps],
+                                   os.path.join(gates, "coverage_" + tag))
+            if "percent" in cov:
+                row["coverage"] = {"percent": cov["percent"], "bins": cov["total"],
+                                   "missed": coverage.summary(cov["missed"])}
             if dv:
                 import sweep
                 sweep.BUILD = gates
                 ok, detail = sweep.run_dv(os.path.join(gates, job["rtl_file"]),
-                                          job["tb_file"], deps)
+                                          job["tb_file"], deps, spec)
                 row["dv"] = detail if ok else "FAIL: " + detail
         rows.append(row)
         log("  %-26s %s%s in %d iteration%s, %s checks, %s%s  (%.0f s)" % (
@@ -485,6 +494,9 @@ def _sign_off(im, gates, agent_kind, log, dv=False, resume=False, contract=False
             row["checks"], ("%s %.0f MHz" % (row["timing"], row["fmax"]))
             if row["fmax"] else "no timing", ("; dv " + row["dv"]) if dv and
             "dv" in row else "", row["seconds"]))
+        if row.get("coverage"):
+            log("  %-26s port coverage %.1f%% of %d bins" % (
+                "", row["coverage"]["percent"], row["coverage"]["bins"]))
         if row.get("contract"):
             log("  %-26s %s" % ("", row["contract"]))
         if not report["converged"]:
@@ -1201,6 +1213,21 @@ def render_report(rep):
                 r["luts"] if r["luts"] is not None else "-",
                 r["dsps"] if r["dsps"] is not None else "-"))
         L.append("")
+        if any(r.get("coverage") or r.get("contract") for r in rows):
+            L += ["## Beyond the testbench", "",
+                  "Port coverage (`coverage.py`): of the bins on each block's ports "
+                  "(every data bit at 0 and 1, data values at zero, the signs and the "
+                  "extremes, settings at two values and their limits, every output "
+                  "index, back-to-back samples and runs), how many its testbench hit. "
+                  "Formal contract (`contracts.py`, with --contracts): the handshake "
+                  "the spec promises, proved with ABC on the ports.", "",
+                  "| file | port coverage | not hit | formal contract |", "|---|---|---|---|"]
+            for r in rows:
+                c = r.get("coverage") or {}
+                L.append("| `%s` | %s | %s | %s |" % (
+                    r["file"], "%.1f%% of %d" % (c["percent"], c["bins"]) if c else "-",
+                    c.get("missed") or "-", r.get("contract") or "-"))
+            L.append("")
     d = st.get("design")
     if d and d.get("boards") and "error" in d:
         L += ["## The pipeline", "", "Did not run:", "", "```", d["error"], "```", ""]

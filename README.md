@@ -155,6 +155,7 @@ One convenient alignment: Ethernet's frame check sequence is CRC-32 with polynom
 |---|---|---|
 | `model_spec.json` + `sizing.py` | per-token MACs, weight bytes (batch-1 identity: one byte moved per MAC at int8), KV cache traffic, and all-reduce bytes from the transformer shapes; per block, compute overlaps memory (max of the two), then the ring term is added, per candidate board count | capacity planning for LLM serving on a scaleout fabric, including the memory wall and SRAM residency |
 | `sweep.py` + `dv.py` + `inference.py` | the verification layer: every spec through every gate, mutation testing of the generated testbenches, and co-simulation proving the generated RTL computes the model's arithmetic. See RESULTS.md | signoff: proving the flow works for specs nobody tuned it for, and that the DV can actually fail |
+| `contracts.py` + `coverage.py` + `exhaustive.py` | each block's handshake contract proved with ABC (PDR, BMC) on its ports for every input; the port coverage its testbench reaches; the blocks small enough checked on every input | the formal and coverage half of a UVM signoff: properties proved rather than sampled, and a measured coverage number |
 | `specgen.py` | derives the chiplet spec and its testbench from the model: datapath width from the quantization, accumulator width from the longest reduction | the architecture step: choosing the datapath the model actually needs before any RTL is written |
 | `chiplet_flow.py` + `agent.py` / `llm_agent.py` | agent proposes RTL, tools verify, parsed failures feed back until signoff; the same loop runs both the derived chiplet and the fabric endpoint, with a deterministic rule-based agent by default and a real LLM behind the same interface (`--agent llm`) | the LLM-driven RTL generation loop on production verification and synthesis flows |
 | generated `tb_mac.v` / `tb_crc.v` | golden-model checking plus a throughput burst that measures cycles per unit, at whatever widths the derivation chose | a full UVM environment plus performance characterization on the real testbench |
@@ -202,6 +203,8 @@ python3 gals.py                    # boards on their own clocks over fabric UART
 python3 fetch_qwen.py --model qwen3  # Qwen3-0.6B, ~1.5 GB; FPGAI_QWEN=qwen3 selects it everywhere
 python3 bitstream.py --block mac   # place, route and pack a real iCE40 bitstream (needs nextpnr-ice40)
 python3 dv.py --rtl build/mac.v --tb tb_mac.v   # mutation-test a generated testbench
+python3 contracts.py llm_blocks/tiny_qwen3  # prove every block's handshake contract (ABC); a failure comes with its trace
+python3 coverage.py <gates>        # the port coverage each block's testbench reaches, and the bins it misses
 python3 inference.py               # real quantized transformer dot products through the generated RTL
 python3 bench.py --agent swarm --runs 5         # convergence rate, iterations, model calls by role
 CHIPLET_LINK_GBPS=25 python3 chiplet_flow.py   # derive the endpoint for a different link rate
@@ -479,6 +482,7 @@ checked against another model. Read that list before quoting any number here.
 python3 spec2rtl.py examples/tiny_qwen3.json                      # any shape, random weights, minutes
 python3 spec2rtl.py examples/tiny_qwen3.json --blocks llm_blocks/tiny_qwen3   # the 15 blocks the LLMs signed off
 python3 spec2rtl.py examples/tiny_qwen3.json --agent llm --out run1 --resume  # pick a run up where it stopped
+python3 spec2rtl.py examples/tiny_qwen3.json --agent llm --contracts         # the formal contract as a gate too
 python3 spec2rtl.py --weights qwen_weights --package --bridge     # Qwen2.5-0.5B for the Zybo
 FPGAI_QWEN=qwen3 python3 spec2rtl.py --weights qwen_weights/qwen3-0.6b --board zc706 --package
 ```
@@ -545,9 +549,13 @@ the gathers over UDP.
    tool output alone.
 3. **Signoff gates**, per block: Icarus simulation bit-exact against the
    golden model, Yosys lint, OpenSTA timing at the target clock, and
-   `synth_xilinx` for resources. `dv.py` then mutation-tests the
-   testbench itself, and `formal.py` proves the MAC's accumulator never
-   overflows. What passes is written out as a measured profile.
+   `synth_xilinx` for resources. With `--contracts`, the block's
+   handshake contract is proved on its ports (`contracts.py`): busy,
+   the valids, every index exactly once, the latency, no state leaking
+   between samples. `coverage.py` measures the port coverage the
+   testbench reached, `dv.py` mutation-tests the testbench itself, and
+   `formal.py` proves the MAC's accumulator never overflows. What passes
+   is written out as a measured profile.
 4. **The integer model** (`qwen_int.py`). The checkpoint quantized the
    way the hardware runs it: int8 weights per channel, 16-bit
    activations with static scales calibrated on a float run

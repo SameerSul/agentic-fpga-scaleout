@@ -19,6 +19,7 @@ import json
 import math
 import os
 import random
+import re
 import zlib
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -377,13 +378,76 @@ def derive_exp_spec(ms):
     }
 
 
-def render_exp_testbench(spec):
+def with_burst(text, ins, outs, latency, n=48):
+    """A streaming testbench with a back-to-back phase: n of its own
+    drive() vectors go in on consecutive cycles, then again with a gap
+    after every third, and each valid_out is compared, in order, with the
+    expected values the vector carries. ins and outs name the ports the
+    drive() arguments set and expect, in order.
+
+    coverage.py found no testbench of the exponential, the reciprocal, the
+    inverse square root or the requantizer giving two samples on
+    consecutive cycles: each drive() waits the pipeline out. A design that
+    shares a stage register between samples passed all of them."""
+    calls = re.findall(r"^\s*drive\((.*)\);", text, re.M)
+    step = max(1, len(calls) // n)
+    vecs = [[a.strip() for a in c.split(",")] for c in calls[::step][:n]]
+    k = len(ins)
+    cases = "\n".join("      %d: bq_bad = %s;" % (i, " || ".join(
+        "%s !== %s" % (o, v[k + j]) for j, o in enumerate(outs))) for i, v in enumerate(vecs))
+    decl = """
+  // Back to back: see with_burst in specgen.py.
+  integer bq_o = 0;
+  reg bq_on = 0, bq_bad = 0;
+  always @(posedge clk) if (bq_on && rst_n && valid_out) begin
+    checks = checks + 1;
+    case (bq_o %% %d)
+%s
+      default: bq_bad = 1;
+    endcase
+    if (bq_bad) begin
+      $display("TB_FAIL test=burst sample=%%0d expected_back_to_back_like_one_at_a_time=1 got_%s=%%0d",
+               bq_o %% %d, %s);
+      $display("TB_RESULT: FAIL");
+      $finish;
+    end
+    bq_o = bq_o + 1;
+  end
+""" % (len(vecs), cases, outs[0], len(vecs), outs[0])
+    # The last single sample's output is still on valid_out: let it go.
+    run = ['    testname = "burst";', "    repeat (%d) @(negedge clk);" % (latency + 2),
+           "    bq_on = 1;"]
+    for gaps in (False, True):
+        for i, v in enumerate(vecs):
+            run.append("    @(negedge clk); %s valid_in = 1;" % " ".join(
+                "%s = %s;" % (p, v[j]) for j, p in enumerate(ins)))
+            if gaps and i % 3 == 2:
+                run.append("    @(negedge clk); valid_in = 0;")
+    run += ["    @(negedge clk); valid_in = 0;",
+            "    repeat (%d) @(negedge clk);" % (latency + 4),
+            "    bq_on = 0;",
+            "    checks = checks + 1;",
+            "    if (bq_o != %d) begin" % (2 * len(vecs)),
+            '      $display("TB_FAIL test=burst expected_outputs=%d got_outputs=%%0d", bq_o);'
+            % (2 * len(vecs)),
+            '      $display("TB_RESULT: FAIL");',
+            "      $finish;",
+            "    end"]
+    at = text.rindex("\n  initial begin")
+    text = text[:at] + decl + text[at:]
+    # After the last single sample, which leaves the pipeline empty.
+    last = list(re.finditer(r"^\s*drive\(.*\);\n", text, re.M))[-1].end()
+    return text[:last] + "\n".join(run) + "\n" + text[last:]
+
+
+def render_exp_testbench(spec, xs=None):
     """Golden outputs come from exp_golden here, and the accuracy of the
     scheme itself is checked against math.exp separately, so a design that
     reproduces its own approximation cannot pass on that alone."""
     p = spec["parameters"]
     iw, fi, fo = p["in_width"], p["in_frac"], p["out_frac"]
     rnd = random.Random(23)
+    given = xs
     # Everything is clamped to what the port can represent. The input
     # width is derived from the useful exponent range, so a vector past
     # the underflow point is not a harder test, it is an unrepresentable
@@ -403,14 +467,16 @@ def render_exp_testbench(spec):
     edge = [x for x in range(-1, lo, -1)
             if ((x * LOG2E_Q16) & 0xFFFF) in (0xFFFF, 0, 1)]
     xs += edge[:40]
+    xs = xs if given is None else given
     body = []
     for x in xs:
         body.append("    drive(%s, %d'd%d);"
                     % (_slit(x, iw), p["out_width"], exp_golden(x, p)))
-    return EXP_TB.format(iwm=iw - 1, owm=p["out_width"] - 1,
-                         one=1 << p["out_frac"],
-                         settle=p["pipeline_stages"] - 1,
-                         cases="\n".join(body), n=len(xs))
+    return with_burst(EXP_TB.format(iwm=iw - 1, owm=p["out_width"] - 1,
+                                    one=1 << p["out_frac"],
+                                    settle=p["pipeline_stages"] - 1,
+                                    cases="\n".join(body), n=len(xs)),
+                      ["x"], ["y"], p["pipeline_stages"])
 
 
 EXP_TB = """`timescale 1ns/1ps
@@ -468,11 +534,29 @@ module tb_expu;
 
   initial begin
     testname = "reset_init";
+    // A sample offered during reset is not one: valid_in is high through
+    // the reset, and no valid_out may follow it. Mutation testing on the
+    // LLM blocks of the fifth run: five pipelines whose first stage
+    // ignored reset passed this testbench while it held valid_in low, and
+    // the formal contract showed such a stage passing a reset-time sample
+    // on nine cycles later.
+    valid_in = 1;
     repeat (3) @(negedge clk);
     expect_quiet;
+    valid_in = 0;
     rst_n = 1;
     @(negedge clk);
     expect_quiet;
+    repeat (16) begin
+      @(negedge clk);
+      checks = checks + 1;
+      if (valid_out !== 1'b0) begin
+        $display("TB_FAIL test=reset_init expected_vout=0 got_vout=%b got_a_sample_offered_during_reset=1",
+                 valid_out);
+        $display("TB_RESULT: FAIL");
+        $finish;
+      end
+    end
     testname = "exp";
 {cases}
 
@@ -643,9 +727,10 @@ def render_recip_testbench(spec):
                       % ((iw, x, p["out_width"]) + recip_golden(x, p)[:1]
                          + (kw, recip_golden(x, p)[1]))
                       for x in xs)
-    return RECIP_TB.format(iwm=iw - 1, owm=p["out_width"] - 1,
-                           kwm=kw - 1, settle=p["pipeline_stages"] - 1,
-                           cases=body, n=len(xs))
+    return with_burst(RECIP_TB.format(iwm=iw - 1, owm=p["out_width"] - 1,
+                                      kwm=kw - 1, settle=p["pipeline_stages"] - 1,
+                                      cases=body, n=len(xs)),
+                      ["x"], ["y", "k"], p["pipeline_stages"])
 
 
 RECIP_TB = """`timescale 1ns/1ps
@@ -696,11 +781,29 @@ module tb_recip;
 
   initial begin
     testname = "reset_init";
+    // A sample offered during reset is not one: valid_in is high through
+    // the reset, and no valid_out may follow it. Mutation testing on the
+    // LLM blocks of the fifth run: five pipelines whose first stage
+    // ignored reset passed this testbench while it held valid_in low, and
+    // the formal contract showed such a stage passing a reset-time sample
+    // on nine cycles later.
+    valid_in = 1;
     repeat (3) @(negedge clk);
     expect_quiet;
+    valid_in = 0;
     rst_n = 1;
     @(negedge clk);
     expect_quiet;
+    repeat (16) begin
+      @(negedge clk);
+      checks = checks + 1;
+      if (valid_out !== 1'b0) begin
+        $display("TB_FAIL test=reset_init expected_vout=0 got_vout=%b got_a_sample_offered_during_reset=1",
+                 valid_out);
+        $display("TB_RESULT: FAIL");
+        $finish;
+      end
+    end
     testname = "recip";
 {cases}
 
@@ -873,9 +976,10 @@ def render_rsqrt_testbench(spec):
         % ((iw, x, p["out_width"]) + (rsqrt_golden(x, p)[0],)
            + (ew, rsqrt_golden(x, p)[1]))
         for x in xs)
-    return RSQRT_TB.format(iwm=iw - 1, owm=p["out_width"] - 1, ewm=ew - 1,
-                           settle=p["pipeline_stages"] - 1,
-                           cases=body, n=len(xs))
+    return with_burst(RSQRT_TB.format(iwm=iw - 1, owm=p["out_width"] - 1, ewm=ew - 1,
+                                      settle=p["pipeline_stages"] - 1,
+                                      cases=body, n=len(xs)),
+                      ["x"], ["y", "e"], p["pipeline_stages"])
 
 
 RSQRT_TB = """`timescale 1ns/1ps
@@ -926,11 +1030,29 @@ module tb_rsqrt;
 
   initial begin
     testname = "reset_init";
+    // A sample offered during reset is not one: valid_in is high through
+    // the reset, and no valid_out may follow it. Mutation testing on the
+    // LLM blocks of the fifth run: five pipelines whose first stage
+    // ignored reset passed this testbench while it held valid_in low, and
+    // the formal contract showed such a stage passing a reset-time sample
+    // on nine cycles later.
+    valid_in = 1;
     repeat (3) @(negedge clk);
     expect_idle;
+    valid_in = 0;
     rst_n = 1;
     @(negedge clk);
     expect_idle;
+    repeat (16) begin
+      @(negedge clk);
+      checks = checks + 1;
+      if (valid_out !== 1'b0) begin
+        $display("TB_FAIL test=reset_init expected_vout=0 got_vout=%b got_a_sample_offered_during_reset=1",
+                 valid_out);
+        $display("TB_RESULT: FAIL");
+        $finish;
+      end
+    end
     testname = "rsqrt";
 {cases}
 
@@ -1081,14 +1203,33 @@ def render_matvec_testbench(spec):
     def wt(i):
         return (i * 7919 + 13) % m - half
 
-    golden = [sum(act(r) * wt(c * depth + r) for r in range(depth))
-              for c in range(cols)]
-    init = "\n".join("    expect_col[%d] = %s;" % (i, _slit(v, aw))
-                      for i, v in enumerate(golden))
+    # Three runs: the one above; one row of one column; the spec's
+    # largest depth, started on the cycle after the run before it ends.
+    # coverage.py found one size and one run, so a sequencer that kept
+    # state from one run into the next, or mishandled depth 1, passed.
+    runs = [(depth, cols, False), (1, 1, False), (p["max_depth"], 2, True)]
+    amax = max(d for d, _, _ in runs)
+    body = []
+    for k, (d, c, b2b) in enumerate(runs):
+        golden = [sum(act(r) * wt(ci * d + r) for r in range(d)) for ci in range(c)]
+        body.append('    testname = "matvec_%dx%d";' % (d, c))
+        body += ["    expect_col[%d] = %s;" % (i, _slit(v, aw)) for i, v in enumerate(golden)]
+        body += ["    depth = %d;" % d, "    cols = %d;" % c, "    seen = 0;"]
+        if not b2b:
+            body.append("    @(negedge clk);")
+        body += ["    start = 1;", "    t0 = cyc;", "    @(negedge clk);", "    start = 0;",
+                 "    while (busy) @(negedge clk);",
+                 "    checks = checks + 1;",
+                 "    if (seen !== %d) begin" % c,
+                 '      $display("TB_FAIL test=%%0s expected_acc=%%0d got_acc=%%0d", '
+                 '"column_count", %d, seen);' % c,
+                 '      $display("TB_RESULT: FAIL");', "      $finish;", "    end"]
+        if k == 0:
+            body.append("    span0 = last_col - t0; lat0 = first_col - t0;")
     return MATVEC_TB.format(
         dwm=dw - 1, awm=aw - 1, depwm=dep_w - 1, colwm=col_w - 1,
-        addrwm=addr_w - 1, depth=depth, cols=cols, init=init,
-        nmem=depth * cols, m=m, half=half)
+        addrwm=addr_w - 1, depth=depth, cols=cols, amax=amax, runs="\n".join(body),
+        nmem=max(d * c for d, c, _ in runs), m=m, half=half)
 
 
 MATVEC_TB = """`timescale 1ns/1ps
@@ -1106,7 +1247,7 @@ module tb_matvec;
   wire mac_valid, mac_clear, col_valid, busy;
   wire [{colwm}:0] col_index;
 
-  reg signed [{dwm}:0] amem [0:{depth}-1];
+  reg signed [{dwm}:0] amem [0:{amax}-1];
   reg signed [{dwm}:0] wmem [0:{nmem}-1];
   reg signed [{awm}:0] expect_col [0:{cols}-1];
 
@@ -1122,7 +1263,7 @@ module tb_matvec;
   wire signed [{awm}:0] acc;
   wire mac_vout;
   integer checks = 0, seen = 0, i;
-  integer cyc = 0, t0 = 0, load0 = 0, first_col = -1, last_col = 0;
+  integer cyc = 0, t0 = 0, load0 = 0, first_col = -1, last_col = 0, span0 = 0, lat0 = 0;
   reg [255:0] testname;
   always @(posedge clk) cyc = cyc + 1;
 
@@ -1155,31 +1296,14 @@ module tb_matvec;
 
   initial begin
     // Filled by formula, matching the Python golden exactly.
-    for (i = 0; i < {depth}; i = i + 1)
+    for (i = 0; i < {amax}; i = i + 1)
       amem[i] = (i * 104729 + 7) % {m} - {half};
     for (i = 0; i < {nmem}; i = i + 1)
       wmem[i] = (i * 7919 + 13) % {m} - {half};
-{init}
-    testname = "matvec";
     repeat (3) @(negedge clk);
     rst_n = 1;
-    depth = {depth};
-    cols = {cols};
-    @(negedge clk);
-    start = 1;
-    t0 = cyc;
-    @(negedge clk);
-    start = 0;
-    // Generous bound: depth+drain per column, plus slack.
-    for (i = 0; i < {cols} * ({depth} + 10) + 60; i = i + 1)
-      @(negedge clk);
-    checks = checks + 1;
-    if (seen !== {cols}) begin
-      $display("TB_FAIL test=%0s expected_acc=%0d got_acc=%0d",
-               "column_count", {cols}, seen);
-      $display("TB_RESULT: FAIL");
-      $finish;
-    end
+{runs}
+    repeat (8) @(negedge clk);
     checks = checks + 1;
     if (busy !== 1'b0) begin
       $display("TB_FAIL test=%0s expected_acc=0 got_acc=1",
@@ -1189,7 +1313,7 @@ module tb_matvec;
     end
     // Measured: start to the last flagged column, and to the first.
     $display("TB_PROFILE columns=%0d span_cycles=%0d latency_cycles=%0d",
-             {cols}, last_col - t0, first_col - t0);
+             {cols}, span0, lat0);
     $display("TB_PASS checks=%0d", checks);
     $display("TB_RESULT: PASS");
     $finish;
@@ -1685,6 +1809,12 @@ def render_softmax_testbench(spec):
         # roughly one in a hundred thousand. The testbench is generated,
         # so it can go and find one.
         rows.append(disc)
+    # A full row, with both extremes of the score input in it, then a
+    # short row started on the cycle the full one ends.
+    lo_in, hi_in = -(1 << (swi - 1)), (1 << (swi - 1)) - 1
+    full = [hi_in, lo_in] + [rnd.randrange(lo_in, hi_in + 1) for _ in range(p["capacity"] - 2)]
+    rows += [full, [rnd.randrange(hi // 4, hi // 2) for _ in range(3)]]
+    how = ["run_row"] * (len(rows) - 2) + ["run_row_tight", "run_row_next"]
     body = []
     for ri, sc in enumerate(rows):
         w, _, _ = softmax_golden(sc, p)
@@ -1703,7 +1833,7 @@ def render_softmax_testbench(spec):
         for i, v in enumerate(w):
             body.append("    expect_w[%d] = %d'd%d;" % (i, ww, v))
             body.append("    expect_n[%d] = %d'd%d;" % (i, ww, narrow[i]))
-        body.append("    run_row(%d'd%d);" % (nw + 1, len(sc)))
+        body.append("    %s(%d'd%d);" % (how[ri], nw + 1, len(sc)))
     return SOFTMAX_TB.format(
         swm=swi - 1, wwm=ww - 1, nwm=nw - 1, nw=nw + 1, cap=p["capacity"],
         rows="\n".join(body), nrows=len(rows), drop=swi - sw)
@@ -1818,6 +1948,48 @@ module tb_softmax;
       seen = 0; idx_once = 0;
       n = cnt;
       @(negedge clk); start = 1;
+      t0 = cyc; first_out = -1;
+      @(negedge clk); start = 0;
+      while (busy) @(negedge clk);
+      span = span + (cyc - t0);
+      repeat (4) @(negedge clk);
+      checks = checks + 1;
+      if (seen !== cnt) begin
+        $display("TB_FAIL test=%0s idx=0 expected_w=%0d got_w=%0d",
+                 "weight_count", cnt, seen);
+        $display("TB_RESULT: FAIL");
+        $finish;
+      end
+    end
+  endtask
+
+  // The same, ending as busy falls (tight) and starting on that same
+  // cycle (next): a row started the cycle after one ended, which
+  // coverage.py found no row doing.
+  task run_row_tight(input [{nw}-1:0] cnt);
+    begin
+      seen = 0; idx_once = 0;
+      n = cnt;
+      @(negedge clk); start = 1;
+      t0 = cyc; first_out = -1;
+      @(negedge clk); start = 0;
+      while (busy) @(negedge clk);
+      span = span + (cyc - t0);
+      checks = checks + 1;
+      if (seen !== cnt) begin
+        $display("TB_FAIL test=%0s idx=0 expected_w=%0d got_w=%0d",
+                 "weight_count", cnt, seen);
+        $display("TB_RESULT: FAIL");
+        $finish;
+      end
+    end
+  endtask
+
+  task run_row_next(input [{nw}-1:0] cnt);
+    begin
+      seen = 0; idx_once = 0;
+      n = cnt;
+      start = 1;
       t0 = cyc; first_out = -1;
       @(negedge clk); start = 0;
       while (busy) @(negedge clk);
@@ -2992,7 +3164,7 @@ def silu_golden(x, p):
     return (x * sig) >> wf
 
 
-def render_silu_testbench(spec):
+def render_silu_testbench(spec, xs=None):
     """Inputs across the whole range, streamed back to back with gaps, and
     checked in order off valid_out."""
     p = spec["parameters"]
@@ -3000,9 +3172,10 @@ def render_silu_testbench(spec):
     iw, fi = p["width"], p["frac"]
     lo, hi = -(1 << (iw - 1)), (1 << (iw - 1)) - 1
     rnd = random.Random(97)
+    given = xs
     xs = [0, 1, -1, 1 << fi, -(1 << fi), 2 << fi, -(2 << fi), 5 << fi,
           -(5 << fi), lo, hi, lo + 1, -(1 << (fi - 1)), 1 << (fi - 1)]
-    xs += [rnd.randrange(lo, hi + 1) for _ in range(300)]
+    xs = given if given is not None else xs + [rnd.randrange(lo, hi + 1) for _ in range(300)]
     body = []
     for i, x in enumerate(xs):
         body.append("    xs[%d] = %s; ys[%d] = %s;"
@@ -3059,6 +3232,13 @@ module tb_silu;
     // valid_out must be low from the first cycle of reset, not merely
     // after enough idle cycles to flush the pipeline: checked only after
     // three, a shallow design with no reset at all passed.
+    // A sample offered during reset is not one: valid_in is high through
+    // the reset, and no valid_out may follow it. Mutation testing on the
+    // LLM blocks of the fifth run: five pipelines whose first stage
+    // ignored reset passed this testbench while it held valid_in low, and
+    // the formal contract showed such a stage passing a reset-time sample
+    // on nine cycles later.
+    valid_in = 1;
     for (i = 0; i < 3; i = i + 1) begin
       @(negedge clk);
       checks = checks + 1;
@@ -3069,6 +3249,7 @@ module tb_silu;
         $finish;
       end
     end
+    valid_in = 0;
     rst_n = 1;
     t0 = cyc + 1;
     for (i = 0; i < {n}; i = i + 1) begin
@@ -3210,10 +3391,17 @@ def derive_rope_spec(ms):
     }
 
 
+_SIN_TABLES = {}
+
+
 def rope_sin_table(p):
+    """The sine table, built once per shape: the golden model looks it up
+    for every pair, thousands of them in the testbench."""
     lb, cf = p["lut_bits"], p["coef_frac"]
-    return [int(round(math.sin(2 * math.pi * k / (1 << lb)) * (1 << cf)))
-            for k in range(1 << lb)]
+    if (lb, cf) not in _SIN_TABLES:
+        _SIN_TABLES[(lb, cf)] = [int(round(math.sin(2 * math.pi * k / (1 << lb)) * (1 << cf)))
+                                 for k in range(1 << lb)]
+    return _SIN_TABLES[(lb, cf)]
 
 
 def rope_golden(x1, x2, i, pos, p, freqs, dphase=0):
@@ -3300,11 +3488,46 @@ def _rope_cases(p, freqs, rnd):
     return cases
 
 
+def _rope_boundary_cases(p, freqs, rnd, n=16, tries=300000, extra=4000):
+    """Pairs whose rotated sum, after its rounding term, lands nearest a
+    shift boundary, n for y1 and n for y2, from tries random ones; then
+    extra random pairs. An error of 2**m anywhere in the sum, a partial
+    product one count off included, changes the output only within 2**m
+    of a boundary, and with a 22-bit shift that is rare: mutation testing
+    on an LLM's RoPE found a partial product off by one surviving all
+    1004 checks, differing on about one random pair in a thousand."""
+    lb, ph, cf, dw = p["lut_bits"], p["phase_bits"], p["coef_frac"], p["data_width"]
+    tab = rope_sin_table(p)
+    lo, hi = -(1 << (dw - 1)), (1 << (dw - 1)) - 1
+    best = ([], [])
+    for _ in range(tries):
+        a, b = rnd.randrange(lo, hi + 1), rnd.randrange(lo, hi + 1)
+        i, pos = rnd.randrange(p["pairs"]), rnd.randrange(1 << p["pos_width"])
+        phase = (pos * freqs[i]) & ((1 << ph) - 1)
+        k = ((phase + (1 << (ph - lb - 1))) >> (ph - lb)) & ((1 << lb) - 1)
+        sn, cs = tab[k], tab[(k + (1 << (lb - 2))) & ((1 << lb) - 1)]
+        for which, v in ((0, a * cs - b * sn), (1, b * cs + a * sn)):
+            q = (v + (1 << (cf - 1))) >> cf
+            if not lo < q < hi:
+                continue
+            r = (v + (1 << (cf - 1))) & ((1 << cf) - 1)
+            dist = min(r + 1, (1 << cf) - r)
+            if len(best[which]) < n or dist < best[which][-1][0]:
+                best[which].append((dist, (a, b, i, pos)))
+                best[which].sort()
+                del best[which][n:]
+    out = [c for side in best for _, c in side]
+    out += [(rnd.randrange(lo, hi + 1), rnd.randrange(lo, hi + 1),
+             rnd.randrange(p["pairs"]), rnd.randrange(1 << p["pos_width"])) for _ in range(extra)]
+    return out
+
+
 def render_rope_testbench(spec):
     p = spec["parameters"]
     freqs = spec["derivation"]["freqs"]
     dw = p["data_width"]
     cases = _rope_cases(p, freqs, random.Random(131))
+    cases += _rope_boundary_cases(p, freqs, random.Random(137))
     body = []
     for n_, (a, b, i, pos) in enumerate(cases):
         y1, y2 = rope_golden(a, b, i, pos, p, freqs)
@@ -3369,6 +3592,13 @@ module tb_rope;
 
   initial begin
 {cases}
+    // A sample offered during reset is not one: valid_in is high through
+    // the reset, and no valid_out may follow it. Mutation testing on the
+    // LLM blocks of the fifth run: five pipelines whose first stage
+    // ignored reset passed this testbench while it held valid_in low, and
+    // the formal contract showed such a stage passing a reset-time sample
+    // on nine cycles later.
+    valid_in = 1;
     for (i = 0; i < 3; i = i + 1) begin
       @(negedge clk);
       checks = checks + 1;
@@ -3379,6 +3609,7 @@ module tb_rope;
         $finish;
       end
     end
+    valid_in = 0;
     rst_n = 1;
     t0 = cyc + 1;
     for (i = 0; i < {n}; i = i + 1) begin
@@ -4030,6 +4261,13 @@ module tb_resadd;
     // valid_out must be low from the first cycle of reset, not merely
     // after enough idle cycles to flush the pipeline: checked only after
     // three, a shallow design with no reset at all passed.
+    // A sample offered during reset is not one: valid_in is high through
+    // the reset, and no valid_out may follow it. Mutation testing on the
+    // LLM blocks of the fifth run: five pipelines whose first stage
+    // ignored reset passed this testbench while it held valid_in low, and
+    // the formal contract showed such a stage passing a reset-time sample
+    // on nine cycles later.
+    valid_in = 1;
     for (i = 0; i < 3; i = i + 1) begin
       @(negedge clk);
       checks = checks + 1;
@@ -4040,6 +4278,7 @@ module tb_resadd;
         $finish;
       end
     end
+    valid_in = 0;
     rst_n = 1;
     t0 = cyc + 1;
     for (i = 0; i < {n1}; i = i + 1) begin
@@ -5158,7 +5397,11 @@ def render_requant_testbench(spec):
                 (hi + 1, unit, sh), (lo - 1, unit, sh),
                 ((1 << (aw - 2)), unit, sh), (-(1 << (aw - 2)), unit, sh),
                 (3, unit // 2, sh), (-3, unit // 2, sh),
-                (1, unit // 2, sh), (-1, unit // 2, sh)]
+                (1, unit // 2, sh), (-1, unit // 2, sh),
+                # The accumulator's own extremes, which coverage.py found
+                # no vector reaching: the widest product either sign.
+                ((1 << (aw - 1)) - 1, unit, sh), (-(1 << (aw - 1)), unit, sh),
+                ((1 << (aw - 1)) - 1, 1, 0), (-(1 << (aw - 1)), 1, 0)]
     for acc, sc, s_ in directed:
         cases.append(("directed", acc, sc, s_))
 
@@ -5216,10 +5459,11 @@ def render_requant_testbench(spec):
         body.append("    drive(%s, %d'd%d, %d'd%d, %s, 1'b%d);"
                     % (_slit(acc, aw), mw, sc, p["shift_width"], s_,
                        _slit(want, dw), wsat))
-    return REQUANT_TB.format(
+    return with_burst(REQUANT_TB.format(
         awm=aw - 1, dwm=dw - 1, mwm=mw - 1, swm=p["shift_width"] - 1,
         cases="\n".join(body), n=len(cases),
-        settle=p["pipeline_stages"] - 1)
+        settle=p["pipeline_stages"] - 1),
+        ["acc_in", "scale", "shift"], ["q_out", "sat"], p["pipeline_stages"])
 
 
 def _slit(v, w):
@@ -5287,11 +5531,29 @@ module tb_requant;
 
   initial begin
     testname = "reset_init";
+    // A sample offered during reset is not one: valid_in is high through
+    // the reset, and no valid_out may follow it. Mutation testing on the
+    // LLM blocks of the fifth run: five pipelines whose first stage
+    // ignored reset passed this testbench while it held valid_in low, and
+    // the formal contract showed such a stage passing a reset-time sample
+    // on nine cycles later.
+    valid_in = 1;
     repeat (3) @(negedge clk);
     expect_quiet;
+    valid_in = 0;
     rst_n = 1;
     @(negedge clk);
     expect_quiet;
+    repeat (16) begin
+      @(negedge clk);
+      checks = checks + 1;
+      if (valid_out !== 1'b0) begin
+        $display("TB_FAIL test=reset_init expected_vout=0 got_vout=%b got_a_sample_offered_during_reset=1",
+                 valid_out);
+        $display("TB_RESULT: FAIL");
+        $finish;
+      end
+    end
 {cases}
 
     $display("TB_PROFILE activations=%0d span_cycles=%0d latency_cycles=%0d",
@@ -5392,7 +5654,15 @@ module tb_mac;
 
   initial begin
     testname = "reset";
+    // A sample offered during reset is not one: valid_in is high through
+    // the reset, and no valid_out may follow it. Mutation testing on the
+    // LLM blocks of the fifth run: five pipelines whose first stage
+    // ignored reset passed this testbench while it held valid_in low, and
+    // the formal contract showed such a stage passing a reset-time sample
+    // on nine cycles later.
+    valid_in = 1; a = 3; b = 5;
     repeat (3) @(negedge clk);
+    valid_in = 0; a = 0; b = 0;
     rst_n = 1;
     idle(2);
 

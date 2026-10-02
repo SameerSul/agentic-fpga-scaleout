@@ -20,7 +20,12 @@ the same way, bit-exact on every logit. An LLM has written
 and signed off ten of the nineteen blocks through the same gates, the rotary embedding the newest of them, and a
 decode step whose fifteen blocks the agents wrote, ten of them the models' own, matches the integer model; the
 multiply-accumulate unit's accumulator is formally proved
-never to overflow, for any input sequence, on the int8 targets. A trained
+never to overflow, for any input sequence, on the int8 targets. Every
+block's handshake contract is proved on its ports with ABC, every
+reachable state for 14 of the 15 LLM blocks; the testbenches reach 99.1%
+of their port-coverage bins; exp and SiLU are checked on every input; and
+the LLMs' table-based blocks are proved equal to the reference
+("Beyond the testbench"). A trained
 language model decodes through the blocks' exact arithmetic and emits
 text, and a generated RTL sequencer decodes the real Qwen2.5-0.5B, all
 24 layers on its own weights, completing "The capital of France is" with
@@ -78,7 +83,7 @@ as of this file:
 | model | Qwen3-0.6B | Qwen3-0.6B and Qwen2.5-0.5B |
 | hardware | one AMD Versal VPK180, \$17,995 | any mix of Zynq boards, the Zybo Z7-20 (\$300) and the ZC706 today; other FPGAs over the fabric UART |
 | across chips | none | the layers split or the weights split over 1 to 8 boards, each board's share sized by its speed, bit-exact to one board |
-| verification | UVM, over 95% functional coverage | each block bit-exact to its golden model with its testbench mutation-tested; the whole decode at every layer of both real models; each package's own ARM program on its own RTL, 16 tokens with every logit, alone, split by layers and split by weights |
+| verification | UVM, over 95% functional coverage, formal properties | each block bit-exact to its golden model, its testbench mutation-tested and at 99.1% port coverage (3428 bins, every block at 97.4% or more); its handshake contract proved with ABC for every reachable state (14 of 15 LLM blocks, the 15th bounded); exp and SiLU checked on every input, and the LLM's exp, reciprocal and inverse square root proved equal to the reference; the whole decode at every layer of both real models; each package's own ARM program on its own RTL, 16 tokens with every logit, alone, split by layers and split by weights |
 | on a board | yes, 12.1 tokens/s | not yet: the bitstreams route and round-trip in the open flow, and `HANDOFF.md` is the bring-up |
 | tokens/s per dollar | 12.1 / \$17,995 | estimated: one 32-lane Zybo 1.47 / \$300, about 7 times; two split by weights 2.55 / \$600, about 6 times |
 
@@ -91,7 +96,7 @@ times put within 10%.
 ### The full suite
 
 ```
-python3 tests.py            # 458 tests, or 455 without OpenSTA
+python3 tests.py            # 463 tests, or 460 without OpenSTA
 ```
 
 ### Spec to RTL, across the spec space
@@ -2391,6 +2396,189 @@ It found three things.
   flop once per step whichever edge it is written on. The testbench's
   edge-discipline check covers that one.
 
+## Beyond the testbench: contracts, coverage, every input
+
+Redwood's agent wrote a UVM environment, with over 95% functional
+coverage, and formal properties. Until this section a block here rested
+on its testbench, bit-exact against the golden model and mutation-tested,
+and one formal proof, of the MAC's accumulator. The fifth end-to-end run
+showed what that leaves open: Sonnet's RMSNorm never gave index 0 and
+gave index 63 twice, so its count of outputs was right and every value it
+gave was too, and it passed all 268 checks. Four tools close that
+distance, each stated only on the ports the spec defines, so each applies
+to whoever wrote the RTL.
+
+```
+python3 contracts.py llm_blocks/tiny_qwen3     # every block's handshake contract
+python3 coverage.py <gates>                     # each testbench's port coverage
+python3 spec2rtl.py ... --contracts             # the contract as a signoff gate
+```
+
+### Formal contracts
+
+`contracts.py` states what each spec promises at its interface and proves
+it with ABC: PDR (IC3) for every reachable state, BMC where a property
+needs a bound. Every flop of the design starts at an arbitrary value, so
+a reset that does not reset is visible.
+
+- **Sequenced blocks** (RMSNorm, softmax, the attention head, the
+  projection, matvec): busy and the valid are low after reset; busy reads
+  1 the cycle after a start; an output only inside a run, while busy is
+  high or on the cycle it falls; every index below the row's length; none
+  twice in a run; every one by the time busy falls; the projection's in
+  order. The environment starts a run only while busy is low, holds the
+  sizes and settings for the trace, and gives every memory read arbitrary
+  data on every cycle. Proved for every size up to 16, and up to 40
+  columns for the projection (three groups, the last partial). That every
+  run ends is BMC, over two runs back to back at small sizes, each within
+  four times its measured length.
+- **Streaming blocks** (the MACs, the requantizer, exp, reciprocal,
+  inverse square root, RoPE, SiLU, the residual add): valid_out is 0 after
+  reset; each valid_in gives exactly one valid_out, in order, at one fixed
+  latency, the spec's or the one the block shows on a single pulse;
+  valid_out is 0 after a MAC's clear. For the blocks that are a function
+  of one sample, a second copy given the same sample on any cycle, and
+  arbitrary samples around it, has to give the same output: no state
+  leaks from one sample into the next.
+
+A failure comes back with the property, the cycle, the handshake signals
+replayed from the counterexample, and an account of it. For the run-5
+RMSNorm, kept in `llm_blocks/caught/`, in 48 s: *"when busy falls, every
+index has been given exactly once, at cycle 151. outputs: index 1 to 63
+on cycles 89 to 151; index 63 on cycle 152. given more than once: index
+63. index 0 never given."* That is what goes back to the agent with
+`--contracts`.
+
+| block set | handshake and latency, every reachable state | one sample, one output |
+|---|---|---|
+| the assembled LLM set (`llm_blocks/tiny_qwen3`) | 14 of 15; the projection holds over 148 cycles from reset | proved for exp, the reciprocal and the inverse square root; out of time for the four with wide multipliers |
+| run 5, one end-to-end LLM run | 14 of 15; matvec holds over 70 cycles | the same |
+| the reference (rules agent) | 12 of 15; the projection and the 64-wide RMSNorm hold over 98 and 322 cycles from reset; the attention head is undecided | the same |
+
+No block an LLM signed off after the testbench gained its each-index-once
+check fails its contract. Two engine facts decided the design: z3 through
+yosys-smtbmc managed about one cycle a second on matvec, where ABC's PDR
+proves the whole contract in 4 s and `bmc3` covers 300 cycles in 4 s; and
+with sizes up to 256 PDR had not decided matvec after a minute, nor had
+interpolation or `dprove`, hence the caps. The reference blocks are harder
+for PDR than the LLMs': the reference attention head is undecided where
+both LLM heads were proved in three to six minutes (PDR ran out of time
+at n up to 16 and, given 25 minutes, at n up to 4), and the reference
+RMSNorm needed the bounded fallback where both LLM RMSNorms were proved.
+
+### Mutation testing on the LLM blocks
+
+`dv.py` had only been run on the reference blocks. On run 5's, five
+pipelines (the MAC, the requantizer, the exponential, the reciprocal and
+the inverse square root) survived `reset_dead`: with their first stage's
+reset removed they still passed, because the testbench held valid_in low
+through reset, so that stage only ever loaded zeros. The reference blocks
+kill it; they reset differently. The contract had caught it already: a
+sample offered during reset came out of the requantizer at cycle 10.
+Every streaming testbench now holds valid_in high through reset and
+requires valid_out to stay 0 for 16 cycles after, all 45 blocks of the
+three sets still pass, and mutation testing kills every applicable
+operator on the reference blocks. On the LLM blocks every survivor is
+accounted for:
+
+- SiLU's product off by one and its unreset data register equal the
+  golden model on every one of its 8192 inputs, so they are equivalent:
+  `run_dv` now asks `exhaustive.py` before calling a survivor a hole.
+- Run 5's RMSNorm and both softmaxes, their reset removed, still pass
+  their testbenches and fail their contracts at cycle 1: busy or the
+  valid is not 0 after reset.
+- RoPE's partial product off by one survived all 1004 checks. Run against
+  the original on random pairs it differed on the 995th: an error of
+  2^m in the sum shows only within 2^m of a 22-bit rounding boundary.
+  The testbench now takes, from 300,000 random pairs, the sixteen for
+  each output that land nearest a boundary, and 4000 more at random
+  (9068 checks); it kills the mutant.
+- Two stay open: a product one count off in run 5's softmax and in its
+  attention head, which the testbench does not kill and yosys does not
+  prove equivalent. Those products are shifted right by about twenty
+  bits, and the testbench's boundary-finding row was built for the
+  reference's product, not theirs.
+
+### Port coverage
+
+`coverage.py` runs a block's own testbench with its ports dumped and
+counts bins, sampled on every clock edge after reset: every data bit seen
+at 0 and at 1; every data input at zero, above zero and at its largest, a
+signed one below zero and at its most negative, within the spec's stated
+domain (exp's input is non-positive, the reciprocal's non-zero); every
+data output at zero, above it and below it; each setting held for a row
+or a stream (eps, a scale, a shift, a size) at two values or more, a shift
+at 0 and above it, a size at 1 and at the spec's largest; every output
+index of a fixed-length row; samples back to back and with gaps; two runs,
+the second started on the cycle after the first ended; the requantizer's
+two rails. It measures the stimulus, not the checking, which is what
+mutation testing measures. It is a port-level measure, not a UVM
+covergroup model, and the bins are in the file.
+
+The first measurement found real holes, and the testbenches were extended
+until each was closed or explained:
+
+- **No streaming testbench gave two samples on consecutive cycles**: each
+  `drive()` waited the pipeline out. The exponential, reciprocal, inverse
+  square root and requantizer testbenches now add 48 of their own
+  vectors back to back, then with a gap after every third, every output
+  compared in order (97 checks more each).
+- **matvec ran one size once** (67.6%): now 68 by 9, 1 by 1, and 256 by
+  2 started on the cycle after the run before ends.
+- **softmax never ran a full row** (93.5%): now a 256-score row with both
+  21-bit extremes in it, then a row started on the cycle it ends.
+- **The requantizer never saw its accumulator's extremes**, plus and minus
+  2^31.
+
+| block | port coverage | bins | not hit |
+|---|---|---|---|
+| multiply-accumulate | 100.0% | 149 | - |
+| requantizer | 100.0% | 118 | - |
+| exponential | 100.0% | 69 | - |
+| reciprocal | 100.0% | 104 | - |
+| inverse square root | 99.3% | 139 | e[bits] |
+| matrix-vector sequencer | 100.0% | 16 | - |
+| softmax | 98.9% | 92 | w_data[bits] |
+| score multiply-accumulate | 100.0% | 159 | - |
+| projection, per column | 98.1% | 722 | depth at 1, depth at its largest, 256, cols at 1, cols at its largest, 256, a_data largest, a_data most negative, ... |
+| attention head | 99.3% | 1154 | load_data largest, load_data most negative, n at its largest, 256, k_data zero, k_data largest, v_data zero, ... |
+| RMSNorm | 97.8% | 186 | x_data largest, g_data zero, g_data largest, a start on the cycle after a run ended |
+| RMSNorm over a head | 97.4% | 154 | x_data largest, g_data zero, g_data largest, a start on the cycle after a run ended |
+| rotary embedding | 100.0% | 180 | - |
+| SiLU | 100.0% | 66 | - |
+| residual add | 100.0% | 120 | - |
+
+99.1% of the 3428 bins, the same for the reference and both LLM sets: the
+bins measure the testbench, which is the same. What is left is data
+extremes the norm and attention testbenches do not drive and the
+projection's sizes 1 and 256.
+
+### Every input, and the LLM's block against the reference
+
+`exhaustive.py` runs the blocks whose input space is small enough on all
+of it: the exponential on all 4097 non-positive inputs and SiLU on all
+8192. The reference and both LLM sets equal the golden model on every
+one, so there the check is complete.
+
+`contracts.equivalent` puts an LLM's streaming block and the reference
+side by side, the same samples into both on every cycle, the faster's
+outputs delayed to meet the slower's, and proves with PDR that the outputs
+agree whenever they are valid, for every input sequence. The exponential,
+the reciprocal and the inverse square root are proved equal to the
+reference for both LLM sets, each in under a second, and run 5's residual
+add in 21 s, at its latency of 5 against the reference's 3. The MACs, the
+requantizer, RoPE, SiLU and the other residual add run out of time at
+five minutes: two different multipliers are the case SAT handles worst,
+and their values rest on the testbenches, the back-to-back phases,
+SiLU's exhaustive run and mutation testing.
+
+It found one difference, outside a spec's domain. The reciprocal's input
+is required to be non-zero, and its spec also says what x = 0 gives: an
+all-ones mantissa and a shift of zero. Run 5's LLM reciprocal does that;
+the reference gives a shift of 24. No caller passes 0, since a softmax
+denominator always holds exp(0) = 1, so the reference is left as it is,
+and the board packages with it, and the proof is over the spec's domain.
+
 ## Not verified, and not claimed
 
 These are the distance between this repo and a local LLM host.
@@ -2451,11 +2639,18 @@ These are the distance between this repo and a local LLM host.
    clock. The fabric-level tokens/s of the sizing model remains a model
    checked against a fabric simulation.
 
-5. **Formal coverage is one property of one block.** The accumulator
-   proof holds for the int8 targets; with 16-bit operands the MAC splits
-   its multiplier, the proof becomes multiplier equivalence, and z3 runs
-   out of time. Those variants rest on the closed-form bound, the
-   testbenches and mutation testing. No other block has a formal proof.
+5. **Formal coverage is the handshake, not the arithmetic, wherever a
+   block multiplies wide.** Every block's handshake contract is proved
+   or bounded (above), and the table-based blocks (exp, reciprocal,
+   inverse square root) are proved equal to the reference for every
+   input. Where the datapath is a wide multiplier, the requantizer, the
+   MACs, RoPE, SiLU and the residual add, the two-copy and equivalence
+   proofs run out of time, and the values rest on the testbenches, their
+   back-to-back phases, SiLU's exhaustive run and mutation testing. The
+   accumulator proof holds for the int8 targets; with 16-bit operands z3
+   runs out of time on it. The reference attention head's contract is
+   undecided. Port coverage is a port-level measure, not UVM's
+   covergroups.
 
 6. **The scale-out's links stop at simulation.** The layer split's
    links are fabric UARTs in simulation (6.25 Mbaud) and, between Zynq

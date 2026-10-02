@@ -100,6 +100,7 @@ PROPS = {
     "p_ends": "every run ends",
     "p_clear": "valid_out is 0 the cycle after a clear",
     "p_latency": "each valid_in gives exactly one valid_out, in order, at the fixed latency",
+    "p_equal": "the two designs give the same outputs, at their own latencies",
     "p_same": "the output depends only on its own sample: a second copy given the same "
               "sample, and other samples around it, gives the same output",
 }
@@ -688,6 +689,106 @@ def check(spec, rtl_path, deps=(), work=None, timeout=PDR_TIMEOUT):
     return res
 
 
+EQUIV_PROPS = """
+  // ha[i], hb[i]: each copy's outputs i+1 cycles ago, to line the faster
+  // one up with the slower.
+{delays}
+  always @(*) if (te >= {start}) begin
+    p_equal: assert({valid_a} == {valid_b} && (!{valid_a} || ({same})));
+  end
+endmodule
+"""
+
+
+def _latency_of(spec, srcs, work, timeout):
+    lat = _spec_latency(spec)
+    if lat is not None:
+        return lat
+    out, err = _simulate(work, srcs, STREAM_TB.format(**_tb(spec, "streaming")), timeout)
+    m = re.search(r"LATENCY (\d+)", out or "")
+    return int(m.group(1)) if m else None
+
+
+def equivalent(spec, rtl_a, rtl_b, deps=(), work=None, timeout=PDR_TIMEOUT):
+    """A streaming block's two designs (an LLM's and the reference) given
+    the same samples on every cycle: proved to give the same outputs, at
+    their own latencies, for every input sequence and every reachable
+    state. Returns status "proved", "failed" (with the cycle and trace),
+    "timeout" or "n/a" (not a streaming block)."""
+    import spec2rtl
+    if family(spec) != "streaming":
+        return {"status": "n/a"}
+    top = _top(spec)
+    work = work or os.path.join(ROOT, "build_contract", "equiv_" + top)
+    shutil.rmtree(work, ignore_errors=True)
+    os.makedirs(work)
+    lats = []
+    for i, r in enumerate((rtl_a, rtl_b)):
+        sub = os.path.join(work, "lat%d" % i)
+        os.makedirs(sub)
+        lats.append(_latency_of(spec, _sources(sub, r, deps), sub, timeout))
+    if None in lats:
+        return {"status": "error", "detail": "no latency for one of the two"}
+    srcs = _sources(work, rtl_a, deps)
+    b = os.path.join(work, "b_" + os.path.basename(rtl_b))
+    with open(b, "w") as f:
+        f.write(spec2rtl.rename_module(open(rtl_b).read(), top, top + "_b"))
+    srcs.append(os.path.basename(b))
+    w, ca, cb, outs = _Wrap(), [], [], []
+    for p in _ports(spec):
+        n = p["name"]
+        if p["dir"] == "output":
+            w.out(p, "_a")
+            w.out(p, "_b")
+            ca.append(".%s(%s_a)" % (n, n))
+            cb.append(".%s(%s_b)" % (n, n))
+            outs.append(p)
+            continue
+        (w.held if n in STREAM_CONFIG.get(top, ()) else w.free)(p)
+        ca.append(".%s(%s)" % (n, n))
+        cb.append(".%s(%s)" % (n, n))
+    text = w.header(top, "equivalence")
+    # The spec's input domain. Outside it, at x = 0, which the reciprocal's
+    # spec also defines (all-ones mantissa, shift 0), run 5's LLM
+    # reciprocal follows the spec and the reference gives shift 24; no
+    # caller passes 0, since a softmax denominator holds exp(0) = 1.
+    dom = []
+    for p in _ports(spec):
+        desc = p.get("desc", "")
+        if p["dir"] == "input" and "non-zero" in desc:
+            dom.append("%s != 0" % p["name"])
+        if p["dir"] == "input" and "non-positive" in desc:
+            dom.append("%s <= 0" % p["name"])
+    if dom:
+        text += "  always @(*) assume(!valid_in || (%s));\n" % " && ".join(dom)
+    text += "  %s dut_a (.clk(clk), .rst_n(rst_n)%s);\n" % (top, "".join(", " + c for c in ca))
+    text += "  %s_b dut_b (.clk(clk), .rst_n(rst_n)%s);\n" % (top, "".join(", " + c for c in cb))
+    # The faster copy's outputs go through k registers to meet the
+    # slower's; compared once the delayed sample is from after reset.
+    d = lats[1] - lats[0]
+    side, k = ("a", d) if d > 0 else ("b", -d)
+    names, delays = {}, []
+    for p in outs:
+        n = p["name"]
+        names[(n, "a")], names[(n, "b")] = n + "_a", n + "_b"
+        if k:
+            ty = _Wrap._typ(p)
+            chain = ["%s_%s" % (n, side)] + ["%s_%s_d%d" % (n, side, i) for i in range(1, k + 1)]
+            delays.append("  reg %s%s;" % (ty, ", ".join(c + " = 0" for c in chain[1:])))
+            delays.append("  always @(posedge clk) begin %s end" % " ".join(
+                "%s <= %s;" % (chain[i + 1], chain[i]) for i in range(k)))
+            names[(n, side)] = chain[-1]
+    delays.append("  reg [5:0] te = 0;\n  always @(posedge clk) if (te != 6'd63) te <= te + 1;")
+    data = [p["name"] for p in outs if p["name"] != "valid_out"]
+    text += EQUIV_PROPS.format(
+        delays="\n".join(delays), valid_a=names[("valid_out", "a")],
+        valid_b=names[("valid_out", "b")], start=k + 3,
+        same=" && ".join("%s == %s" % (names[(o, "a")], names[(o, "b")]) for o in data))
+    res = _abc(work, srcs, text, "pdr", timeout)
+    res["latencies"] = lats
+    return res
+
+
 def describe(res):
     """One line for a report, and for the agent's next prompt."""
     st = res["status"]
@@ -704,18 +805,37 @@ def describe(res):
         same = {"proved": "; one sample, one output: proved",
                 "timeout": "; one sample, one output: out of time"}.get(res.get("same"), "")
         return "contract proved for every reachable state, latency %d%s" % (res["latency"], same)
-    if st in ("proved", "bounded") and "safety" in res:
-        s = ("handshake proved for every reachable state and size" if res["safety"] == "proved"
-             else "handshake holds for every input over %d cycles" % res["frames"])
+    if "safety" in res:
+        s = {"proved": "handshake proved for every reachable state and size",
+             "bounded": "handshake holds for every input over %d cycles" % res["frames"]}.get(
+            res["safety"], "handshake: out of time, neither proved nor refuted")
         e = {"bounded": "every run ends (two runs, %d cycles, small sizes)" % res["frames"],
              "timeout": "run ends: out of time"}.get(res["ends"], "run ends: %s" % res["ends"])
         return "%s; %s; a run takes %d cycles" % (s, e, res["run_cycles"])
     return "contract %s%s" % (st, (": " + res["detail"]) if res.get("detail") else "")
 
 
+def _tables(gates, out):
+    """The generated ROM tables a saved block set leaves out, remade from
+    the specs in its reports: each is a function of its block's spec."""
+    import specgen
+    os.makedirs(out, exist_ok=True)
+    make = {"expu_dep": ("exp_rom.v", specgen.exp_rom),
+            "recip_dep": ("recip_rom.v", specgen.recip_rom),
+            "rs_dep": ("rsqrt_rom.v", specgen.rsqrt_rom),
+            "b_rope": ("rope_rom.v", specgen.rope_roms)}
+    for tag, (fn, f) in make.items():
+        rep = os.path.join(gates, "report_%s.json" % tag)
+        if os.path.exists(rep) and not os.path.exists(os.path.join(gates, fn)):
+            with open(os.path.join(out, fn), "w") as g:
+                g.write(f(json.load(open(rep))["spec"]))
+    return out
+
+
 def check_gates(gates, log=print, timeout=PDR_TIMEOUT):
     """Every block in a gates directory, by its report's spec."""
     import spec2rtl
+    tables = _tables(gates, os.path.join(ROOT, "build_contract", "_tables"))
     rows = []
     for rep in sorted(f for f in os.listdir(gates) if re.match(r"report_[^.]+\.json$", f)):
         r = json.load(open(os.path.join(gates, rep)))
@@ -730,7 +850,7 @@ def check_gates(gates, log=print, timeout=PDR_TIMEOUT):
             src = os.path.join(gates, "contract_%s" % fn)
             with open(src, "w") as f:
                 f.write(text)
-        deps = supplied(gates, src, skip=fn)
+        deps = supplied(gates, src, skip=fn, fallback=(tables,))
         res = check(spec, src, deps, os.path.join(ROOT, "build_contract", tag), timeout)
         log("  %-16s %s" % (fn, describe(res)))
         rows.append((fn, res))
