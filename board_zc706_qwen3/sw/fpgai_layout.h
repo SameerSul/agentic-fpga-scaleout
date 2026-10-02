@@ -29,4 +29,7 @@
 #define N_GEN           16
 #define CORE_MHZ        50
 #define FPGAI_BOARD     "ZC706"
+#define JTAG_MARK       0x2E952000U  /* the JTAG loader's marker and sizes */
+#define JTAG_PROMPT     0x2E952040U  /* prompt.bin, loaded over JTAG */
+#define JTAG_MAGIC      0xF96A10ADU
 #endif

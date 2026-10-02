@@ -49,7 +49,10 @@ void cosim_idle(void);
 }
 #endif
 """,
-    "xil_cache.h": "static inline void Xil_DCacheFlush(void) {}\n",
+    # With JTAG set, a flush by range is where the debugger's writes land:
+    # the first one does what sw/load_jtag.tcl does.
+    "xil_cache.h": "#include <stdint.h>\nstatic inline void Xil_DCacheFlush(void) {}\n"
+                   "void Xil_DCacheFlushRange(uintptr_t a, unsigned n);\n",
     # The timer is the PL's: simulated nanoseconds, the bus clock's cycles,
     # so a program's timeouts mean what they mean on the board, and the
     # step times it prints are the board's, less the ARM's own work.
@@ -148,7 +151,23 @@ int xemacif_input(struct netif *n) { (void)n; unsigned char b[2048];
   if (k <= 0) { cosim_idle(); return 0; }   /* the PL runs while the ARM waits */
   struct pbuf *p = pbuf_alloc(PBUF_TRANSPORT, (uint16_t)k, PBUF_RAM); memcpy(p->payload, b, k);
   ip_addr_t a = {0}; cb(0, cbpcb, p, &a, 0); return 1; }
-FRESULT f_mount(FATFS *fs, const char *p, int o) { (void)fs; (void)p; (void)o; return FR_OK; }
+FRESULT f_mount(FATFS *fs, const char *p, int o) { (void)fs; (void)p; (void)o;
+  return getenv("JTAG") ? FR_NO_FILE : FR_OK; }
+/* JTAG: lines "address file" and "=address word...", as load_jtag.tcl. */
+void Xil_DCacheFlushRange(uintptr_t a, unsigned n) { (void)a; (void)n;
+  static int done = 0; char line[1200], name[1024]; unsigned long at, w;
+  if (done || !getenv("JTAG")) return;
+  done = 1; FILE *plan = fopen(getenv("JTAG"), "r");
+  while (plan && fgets(line, sizeof line, plan)) {
+    if (line[0] == '=') { char *q = line + 1, *e; at = strtoul(q, &q, 0);
+      for (;;) { w = strtoul(q, &e, 0); if (e == q) break;
+        *(uint32_t *)cosim_bus(at) = (uint32_t)w; at += 4; q = e; }
+      continue; }
+    if (sscanf(line, "%lx %1023[^\\n]", &at, name) != 2) continue;
+    FILE *f = fopen(name, "rb"); size_t k;
+    while (f && (k = fread(cosim_bus(at), 1, 1 << 20, f)) > 0) at += k;
+    if (f) fclose(f); }
+  if (plan) fclose(plan); }
 FRESULT f_open(FIL *f, const char *n, int m) { (void)m; char path[1024];
   snprintf(path, sizeof path, "%s/%s", getenv("SD"), n); f->f = fopen(path, "rb");
   if (!f->f) return FR_NO_FILE; fseek(f->f, 0, SEEK_END); f->size = ftell(f->f); fseek(f->f, 0, SEEK_SET); return FR_OK; }
@@ -361,7 +380,7 @@ def build(pkg, work, lat=30, log=print, defines=None):
     # not loaded by address only: point them into DDR's host array, at the
     # same offsets.
     h = h.replace("#define FPGAI_LAYOUT_H\n", "#define FPGAI_LAYOUT_H\n#include \"cosim.h\"\n", 1)
-    for name in ("VOCAB_BASE", "GBUF"):
+    for name in ("VOCAB_BASE", "GBUF", "JTAG_MARK", "JTAG_PROMPT"):
         if re.search(r"#define %s\s" % name, h):
             h = re.sub(r"#define %s\s+\S+" % name, "#define %-15s ((UINTPTR)cosim_bus(0x%08XU))"
                        % (name, _header_value(h, name)), h)
@@ -399,10 +418,32 @@ def build(pkg, work, lat=30, log=print, defines=None):
     return exe
 
 
-def run(exe, sd, env=None, timeout=3600, wait=True):
-    """Run a built program with its SD card; its UART is stdout."""
+def jtag_plan(pkg, sd, path):
+    """sw/load_jtag.tcl's writes, as the shim reads them: each file at its
+    address, then the sizes and the marker. Taken from the script itself,
+    so what it would write on a board is what the program sees here."""
+    t = open(os.path.join(pkg, "sw", "load_jtag.tcl")).read()
+    files = re.search(r"foreach \{name addr\} \{([^}]*)\}", t).group(1).split()
+    size_at, mark, magic = re.findall(r"^mwr (0x[0-9A-F]+) ", t, re.M) + \
+        re.findall(r"^mwr 0x[0-9A-F]+ (0x[0-9A-F]+)$", t, re.M)
+    with open(path, "w") as f:
+        for name, addr in zip(files[::2], files[1::2]):
+            f.write("%s %s\n" % (addr, os.path.join(os.path.abspath(sd), name)))
+        f.write("=%s %d %d\n" % (size_at, os.path.getsize(os.path.join(sd, "weights8.bin")),
+                                  os.path.getsize(os.path.join(sd, "cparams.bin"))))
+        f.write("=%s %s\n" % (mark, magic))
+    return path
+
+
+def run(exe, sd, env=None, timeout=3600, wait=True, jtag=None):
+    """Run a built program with its SD card; its UART is stdout. jtag: the
+    package, to run without a card, the files coming as its
+    sw/load_jtag.tcl would write them."""
     e = dict(os.environ, SD=os.path.abspath(sd), PORT0=str(47000 + os.getpid() % 1000))
     e.update(env or {})
+    if jtag:
+        e["JTAG"] = jtag_plan(jtag, sd, os.path.join(os.path.dirname(os.path.dirname(exe)),
+                                                     "jtag_plan.txt"))
     p = subprocess.Popen([exe], cwd=os.path.dirname(os.path.dirname(exe)), env=e,
                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     if not wait:
@@ -457,12 +498,15 @@ def main():
     ap.add_argument("--work", default=os.path.join(ROOT, "build_cosim"))
     ap.add_argument("--jitter", action="store_true",
                     help="every AXI port stalls and gaps its beats at random")
+    ap.add_argument("--jtag", action="store_true",
+                    help="no SD card: the files as sw/load_jtag.tcl writes them over JTAG")
     a = ap.parse_args()
     env = {"JITTER": "1" if a.jitter else "0"}
     runs = [(build(p, os.path.join(a.work, "%d_%s" % (i, os.path.basename(os.path.abspath(p))))),
              os.path.join(p, "sd"), env) for i, p in enumerate(a.packages)]
     outs = run_group(runs, timeout=24 * 3600) if len(runs) > 1 else \
-        [run(runs[0][0], runs[0][1], env, timeout=24 * 3600)]
+        [run(runs[0][0], runs[0][1], env, timeout=24 * 3600,
+             jtag=a.packages[0] if a.jtag else None)]
     for p, o in zip(a.packages, outs):
         print("==== %s" % p)
         print(uart(o).rstrip())

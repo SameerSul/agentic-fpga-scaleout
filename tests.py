@@ -3348,6 +3348,18 @@ def test_arm_programs_on_their_rtl():
         out = cosim.run(exe, os.path.join(one, 'sd'), {'JITTER': '1'}, timeout=900)
         check('the single board\'s program on its RTL, every AXI port stalling: '
               'the integer model\'s tokens and logits', text in cosim.uart(out) and cosim.heads(out) == best)
+        # No SD card: the files as sw/load_jtag.tcl writes them over JTAG.
+        out = cosim.run(exe, os.path.join(one, 'sd'), {'JITTER': '0'}, timeout=900, jtag=one)
+        check('without an SD card, the files over JTAG: the same tokens and logits',
+              'files loaded over JTAG' in out and text in cosim.uart(out)
+              and cosim.heads(out) == best)
+        bad = os.path.join(work, 'one_badsd')
+        shutil.copytree(os.path.join(one, 'sd'), bad)
+        with open(os.path.join(bad, 'cparams.bin'), 'ab') as f:
+            f.write(bytes(8))
+        out = cosim.run(exe, bad, {'JITTER': '0'}, timeout=300, jtag=one)
+        check('files over JTAG of the wrong size are refused before the PL runs',
+              'this bitstream wants' in out and not cosim.heads(out))
         # Its weight image in the old byte order: lane j at byte N - 1 - j.
         w8 = os.path.join(one, 'sd', 'weights8.bin')
         img = bytearray(open(w8, 'rb').read())

@@ -29,4 +29,7 @@
 #define N_GEN           16
 #define CORE_MHZ        50
 #define FPGAI_BOARD     "Zybo Z7-20"
+#define JTAG_MARK       0x26EB8000U  /* the JTAG loader's marker and sizes */
+#define JTAG_PROMPT     0x26EB8040U  /* prompt.bin, loaded over JTAG */
+#define JTAG_MAGIC      0xF96A10ADU
 #endif

@@ -28,6 +28,7 @@ Below, `board_<name>/` is whichever package matches the board.
 | the Zybo top level (`board_zybo/rtl/fpgai_zybo.v`) driven only through its AXI-Lite registers, DDR model with random stalls | all 24 layers + head: " Paris", same core cycles, 1.19 bus cycles per core cycle |
 | the ZC706 top level at 32 lanes, the same way | one layer of each model: the direct run's token and core cycles, 1.70 bus cycles per core cycle |
 | each package's own ARM program (`sw/main.c`, unchanged) on its own RTL in Verilator, its own SD card files, every port stalling (`cosim.py`) | Zybo and ZC706: "The capital of France is Paris. Paris is the capital of France. Paris is the capital of France."; ZC706 Qwen3: "The capital of France is Paris. The capital of the United States is Washington, D.C. The capital"; all 16 tokens of each, every logit the integer model's |
+| the same, with no SD card: the files written into DDR as `sw/load_jtag.tcl` writes them over JTAG (`cosim.py --jtag`) | Zybo, ZC706 and ZC706 Qwen3: the same 16 tokens as from the card |
 | the weight streamer under 1500 jumps and a stalling bus, every word checked | passes; it failed on every seed before a slot was limited to one burst in flight |
 | fits the part (Yosys, nextpnr-xilinx) | Zybo: 28% of LUT sites, 132 of 220 DSPs, 49 BRAMs; ZC706 at 32 lanes: 9%, 196 of 900 DSPs |
 | places and routes in the open flow (nextpnr-xilinx), XC7Z020 and XC7Z045 | all three builds close 50 MHz on both clocks, and every bitstream round-trips frame for frame |
@@ -44,15 +45,17 @@ Below, `board_<name>/` is whichever package matches the board.
   <https://github.com/Digilent/vivado-boards>, copied into
   `<Vivado>/data/boards/board_files/`. The ZC706's preset ships with
   Vivado.
-- The board, its USB cable, a microSD card of 1 GB or more formatted
-  FAT32.
+- The board and its USB cable. A microSD card (1 GB or more, FAT32) is
+  optional: without one the ARM program takes the same files over JTAG
+  (step 4), slower to load but nothing else changes.
 - Python 3 (standard library only), `iverilog` only if you want to rerun
   the simulations.
 
-## 1. Make the SD card files
+## 1. Make the model files
 
 The RTL in `board_zybo/rtl/` is committed; the model files are not
-(500 MB). Make them from the same commit, since the ARM program checks
+(500 MB). They land in the package's `sd/` folder on this machine, and
+reach the board either over JTAG or on an SD card. Make them from the same commit, since the ARM program checks
 that the bitstream's layout registers match its header before it runs.
 
 ```bash
@@ -168,13 +171,30 @@ fine: the program sits below 0x08000000, where the weights start.
 
 ## 4. Run it
 
-1. Copy `board_zybo/sd/*` to the root of the SD card and insert it.
-2. Set the boot jumper (JP5) to JTAG, connect USB, power on.
-3. From Vitis, program the FPGA and run the application.
-4. Open the USB-UART at 115200 8N1.
+1. Set the boot mode to JTAG (JP5 on the Zybo, SW11 on the ZC706),
+   connect USB, power on, and open the USB-UART at 115200 8N1.
+2. From Vitis, program the FPGA and run the application.
+3. Without an SD card, the program prints `no SD card: waiting for the
+   files over JTAG`. In Vitis's XSCT console (Window > XSCT Console),
+   with forward slashes on Windows:
 
-Expected on the UART: the four files load (the weights take about a
-minute), then the prompt and its continuation:
+   ```
+   cd <path to the repo>/board_zybo
+   source sw/load_jtag.tcl
+   ```
+
+   It halts the core, writes `sd/weights8.bin`, `cparams.bin`,
+   `vocab.bin` and `prompt.bin` into DDR at the addresses in
+   `fpgai_layout.h`, then their sizes and a marker, and resumes the
+   core; the program checks the sizes against the bitstream's and goes
+   on. JTAG takes minutes for the weights.
+
+   With an SD card instead: copy `board_zybo/sd/*` to its root before
+   step 1; the program finds the card and loads from it (the weights
+   take about a minute).
+
+Expected on the UART: the files load, then the prompt and its
+continuation:
 
 ```
 The capital of France is Paris. Paris is the capital of France. Paris is the capital of France.
@@ -200,6 +220,8 @@ last line prints the core and bus cycles of the last step.
 |---|---|
 | `the bitstream's layout is not this program's` | SD files, header and bitstream are from different commits: redo steps 1 to 3 from one commit |
 | `missing weights8.bin` or a size mismatch | the SD card is not FAT32, or the files are not at its root |
+| waits at `waiting for the files over JTAG` | `sw/load_jtag.tcl` has not run, or XSCT is on another target: `targets` in the console should list `ARM Cortex-A9 MPCore #0` |
+| `weights8.bin is ... bytes ... this bitstream wants` after JTAG | the `sd/` files are from another build: redo step 1 from this commit |
 | hangs after loading, LD0 lit | the core is waiting on memory: an AXI connection in the block design is wrong (check the address map: every master must see DDR at 0x00000000) |
 | hangs, LD0 dark | the start never reached the core: check the GP0 connection and the register base 0x43C00000 |
 | different tokens | send the log: the position where it first differs says which block |

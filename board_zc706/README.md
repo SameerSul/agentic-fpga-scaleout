@@ -14,6 +14,9 @@ from the SD card and drives it a position at a time.
    `sw/main.c` and `sw/fpgai_layout.h`.
 3. Copy `sd/*` to a FAT32 SD card, set the boot-mode switch (SW11) to JTAG, per UG954 (or make a BOOT.bin with
    the FSBL), and open the USB-UART port (J21) at 115200.
+   Without a card: run the application, which waits, then
+   `source sw/load_jtag.tcl` in Vitis's XSCT console writes the
+   same files into DDR over JTAG (minutes for the weights).
 
 ## Memory map (DDR, 1 GB)
 
