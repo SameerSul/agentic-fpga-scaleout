@@ -1,0 +1,202 @@
+{
+  "spec": {
+    "name": "matvec_qwen2_5_0p5b_a16",
+    "description": "Weight-streaming sequencer for the MAC chiplet: walks a matrix column by column, drives the MAC, drains its 3-stage pipeline and flags each finished column",
+    "top_module": "matvec",
+    "unit": "column",
+    "parameters": {
+      "data_width": 16,
+      "acc_width": 32,
+      "depth_width": 9,
+      "col_width": 9,
+      "addr_width": 18,
+      "mac_stages": 3,
+      "max_depth": 256,
+      "mem_latency": 1,
+      "signed": true,
+      "pipeline_stages": 1,
+      "target_clock_mhz": 100
+    },
+    "derivation": {
+      "model": "qwen2_5_0p5b_a16",
+      "reduction_depth": 256,
+      "mac_pipeline_stages": 3,
+      "rule": "address widths from the longest reduction; the drain count is the MAC's own pipeline depth, so a change there changes this block"
+    },
+    "ports": [
+      {
+        "name": "clk",
+        "dir": "input",
+        "width": 1,
+        "desc": "clock, rising edge"
+      },
+      {
+        "name": "rst_n",
+        "dir": "input",
+        "width": 1,
+        "desc": "active-low synchronous reset"
+      },
+      {
+        "name": "start",
+        "dir": "input",
+        "width": 1,
+        "desc": "begin a matrix-vector product"
+      },
+      {
+        "name": "depth",
+        "dir": "input",
+        "width": 9,
+        "desc": "reduction length, elements per column"
+      },
+      {
+        "name": "cols",
+        "dir": "input",
+        "width": 9,
+        "desc": "number of output columns"
+      },
+      {
+        "name": "a_addr",
+        "dir": "output",
+        "width": 9,
+        "desc": "activation index being read"
+      },
+      {
+        "name": "w_addr",
+        "dir": "output",
+        "width": 18,
+        "desc": "weight index, column major: col*depth + row"
+      },
+      {
+        "name": "mac_valid",
+        "dir": "output",
+        "width": 1,
+        "desc": "drive the MAC this cycle"
+      },
+      {
+        "name": "mac_clear",
+        "dir": "output",
+        "width": 1,
+        "desc": "clear the MAC accumulator before the next column"
+      },
+      {
+        "name": "col_valid",
+        "dir": "output",
+        "width": 1,
+        "desc": "the MAC accumulator holds a finished column"
+      },
+      {
+        "name": "col_index",
+        "dir": "output",
+        "width": 9,
+        "desc": "which column col_valid refers to"
+      },
+      {
+        "name": "busy",
+        "dir": "output",
+        "width": 1,
+        "desc": "a product is in progress"
+      }
+    ],
+    "behavior": [
+      "start begins a product of cols columns, each a reduction of depth elements.",
+      "For each column the sequencer issues depth consecutive addresses with mac_valid high, a_addr walking 0..depth-1 and w_addr walking col*depth..col*depth+depth-1.",
+      "mac_valid follows the address by one cycle, because the memory registers its read. Driving it in the same cycle as the address multiplies whatever the memory held before.",
+      "It then holds mac_valid low for 4 cycles, the read latency plus the MAC's pipeline depth, before asserting col_valid for one cycle with col_index set.",
+      "mac_clear is asserted after col_valid so the next column starts from zero. Without it every column accumulates into the one before it.",
+      "busy is high from start until the last column is flagged.",
+      "Memory reads are synchronous: data arrives one cycle after the address, as block RAM provides."
+    ]
+  },
+  "tools": {
+    "iverilog": "iverilog",
+    "vvp": "vvp",
+    "yosys": "yosys",
+    "sta": "sta"
+  },
+  "agent": "LLMAgent",
+  "converged": true,
+  "iterations_used": 2,
+  "history": [
+    {
+      "iteration": 1,
+      "fixes_applied": [
+        "llm:haiku@claude-cli#1"
+      ],
+      "sim": {
+        "stage": "sim",
+        "status": "fail",
+        "checks": null,
+        "mismatches": [
+          {
+            "test": "column_count",
+            "expected_acc": "9",
+            "got_acc": "10"
+          }
+        ]
+      },
+      "synth": null,
+      "timing": null,
+      "fpga": null
+    },
+    {
+      "iteration": 2,
+      "fixes_applied": [
+        "llm:haiku@claude-cli#2"
+      ],
+      "sim": {
+        "stage": "sim",
+        "status": "pass",
+        "checks": 11,
+        "mismatches": [],
+        "throughput": {
+          "columns": 9,
+          "span_cycles": 666,
+          "latency_cycles": 74,
+          "units": 9,
+          "cycles_per_unit": 74.0
+        }
+      },
+      "synth": {
+        "stage": "synth",
+        "status": "pass",
+        "cell_count": 1694,
+        "area": 3271.0
+      },
+      "timing": {
+        "stage": "timing",
+        "status": "pass",
+        "method": "opensta",
+        "clock_period_ns": 10.0,
+        "worst_slack_ns": 4.1
+      },
+      "fpga": {
+        "luts": 146,
+        "ffs": 39,
+        "dsps": 1,
+        "brams": 0,
+        "urams": 0,
+        "carry": 22,
+        "muxf": 18,
+        "lutram": 0,
+        "status": "pass",
+        "family": "xcup",
+        "top": "matvec",
+        "lint": [],
+        "stage": "fpga"
+      }
+    }
+  ],
+  "final_metrics": {
+    "sim_pass": true,
+    "sim_checks": 11,
+    "cell_count": 1694,
+    "area": 3271.0,
+    "timing": {
+      "stage": "timing",
+      "status": "pass",
+      "method": "opensta",
+      "clock_period_ns": 10.0,
+      "worst_slack_ns": 4.1
+    }
+  }
+}

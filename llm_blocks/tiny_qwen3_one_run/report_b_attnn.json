@@ -1,0 +1,370 @@
+{
+  "spec": {
+    "name": "attnn16_qwen2_5_0p5b_a16",
+    "description": "Multi-lane attention head, 16 lanes: scores for 16 cached positions at once, the weighted sum for 16 dimensions at once",
+    "top_module": "attnn",
+    "unit": "head",
+    "parameters": {
+      "data_width": 16,
+      "acc_width": 32,
+      "head_dim": 32,
+      "head_dim_width": 5,
+      "capacity": 256,
+      "n_width": 9,
+      "addr_width": 13,
+      "score_width": 21,
+      "score_max": 1048575,
+      "weight_width": 16,
+      "weight_frac": 15,
+      "wsum_width": 32,
+      "shift_s_width": 5,
+      "score_guard": 4,
+      "scale_width": 18,
+      "shift_width": 7,
+      "requant_stages": 9,
+      "mv_depth_width": 9,
+      "mv_col_width": 9,
+      "mv_addr_width": 18,
+      "sm_index_width": 8,
+      "signed": true,
+      "pipeline_stages": 1,
+      "target_clock_mhz": 100,
+      "lanes": 16,
+      "word_width": 256,
+      "k_addr_width": 9,
+      "v_addr_width": 9,
+      "mac_stages": 3,
+      "score_acc_width": 37
+    },
+    "derivation": {
+      "model": "qwen2_5_0p5b_a16",
+      "softmax": {
+        "capacity": 256,
+        "index_width": 8,
+        "score_width": 13,
+        "score_in_width": 21,
+        "score_frac": 8,
+        "weight_width": 16,
+        "weight_frac": 15,
+        "exp_stages": 3,
+        "recip_stages": 3,
+        "recip_in_width": 24,
+        "recip_out_width": 17,
+        "shift_bias": 40,
+        "signed": true,
+        "pipeline_stages": 1,
+        "target_clock_mhz": 100
+      },
+      "rule": "head_dim from the model; capacity and the score and weight formats from the softmax block; the output requantizer and accumulator widths from the MAC and requantizer blocks"
+    },
+    "ports": [
+      {
+        "name": "clk",
+        "dir": "input",
+        "width": 1,
+        "desc": "clock, rising edge"
+      },
+      {
+        "name": "rst_n",
+        "dir": "input",
+        "width": 1,
+        "desc": "active-low synchronous reset"
+      },
+      {
+        "name": "load_valid",
+        "dir": "input",
+        "width": 1,
+        "desc": "write the next query element"
+      },
+      {
+        "name": "load_data",
+        "dir": "input",
+        "width": 16,
+        "signed": true,
+        "desc": "query element, int8"
+      },
+      {
+        "name": "start",
+        "dir": "input",
+        "width": 1,
+        "desc": "run the head over n cached positions"
+      },
+      {
+        "name": "n",
+        "dir": "input",
+        "width": 9,
+        "desc": "number of cached positions, 1..256"
+      },
+      {
+        "name": "shift_s",
+        "dir": "input",
+        "width": 5,
+        "desc": "score shift: q.k to the softmax score format"
+      },
+      {
+        "name": "scale_o",
+        "dir": "input",
+        "width": 18,
+        "desc": "output requantizer scale"
+      },
+      {
+        "name": "shift_o",
+        "dir": "input",
+        "width": 7,
+        "desc": "output requantizer shift"
+      },
+      {
+        "name": "k_addr",
+        "dir": "output",
+        "width": 9,
+        "desc": "key word: element d of positions g*16.. at g*32 + d"
+      },
+      {
+        "name": "k_data",
+        "dir": "input",
+        "width": 256,
+        "signed": false,
+        "desc": "lane l in bits [16*l+15:16*l], registered read"
+      },
+      {
+        "name": "v_addr",
+        "dir": "output",
+        "width": 9,
+        "desc": "value word: row j, elements dg*16.. at j*2 + dg"
+      },
+      {
+        "name": "v_data",
+        "dir": "input",
+        "width": 256,
+        "signed": false,
+        "desc": "lane l in bits [16*l+15:16*l], registered read"
+      },
+      {
+        "name": "o_valid",
+        "dir": "output",
+        "width": 1,
+        "desc": "an output element is on o_data"
+      },
+      {
+        "name": "o_index",
+        "dir": "output",
+        "width": 5,
+        "desc": "which element of the head's output"
+      },
+      {
+        "name": "o_data",
+        "dir": "output",
+        "width": 16,
+        "signed": true,
+        "desc": "output element, int8"
+      },
+      {
+        "name": "busy",
+        "dir": "output",
+        "width": 1,
+        "desc": "a head is being computed"
+      }
+    ],
+    "behavior": [
+      "Each cycle with load_valid high writes load_data into the query buffer at the next index, starting from 0 after reset and after every run, so q[0..31] are loaded in order before start.",
+      "start is a one-cycle pulse, with n, shift_s, scale_o and shift_o held stable for the whole run. busy must be high on the clock edge that samples start, so it already reads 1 one cycle later, and it stays high until the last output has been emitted.",
+      "The key and value caches are read a word at a time, 16 lanes of 16 bits. Key words: word g*32 + d holds element d of positions g*16 + l in lane l, so one word gives dimension d of 16 consecutive positions. Value words: word j*2 + dg holds V[j][dg*16 + l] in lane l, so one word gives 16 dimensions of position j. k_data and v_data are registered reads: each carries the word at address a on the cycle after k_addr or v_addr = a. If the address is itself a register, that is two clock edges after the edge that loads a into it.",
+      "Scores: for j in 0..n-1, t_j = sum over d of q[d] * K[j][d], a signed 37-bit dot product. With u_j = t_j << 4, s_j = (u_j + 2**(shift_s-1)) >>> shift_s when shift_s > 0, else u_j, then clamped to [-1048576, 1048575], the 21-bit signed score the softmax reads. The softmax clamps each score minus the row maximum to its exponential's range itself.",
+      "Weights: w = softmax(s) over the n scores, exactly as the supplied softmax block computes it: 16-bit unsigned Q0.15, where 32768 is 1.0.",
+      "Output: for d in 0..31, a_d = sum over j of w_j * V[j][d], with w_j unsigned and V signed, then o_d = requant(a_d, scale_o, shift_o): multiply by scale_o, add 2**(shift_o-1) when shift_o > 0, arithmetic shift right by shift_o, saturate to [-32768, 32767]. The weights sum to under 2.0, so |a_d| stays under 2**31: a 32-bit signed sum, sign-extended into the requantizer's 32-bit input.",
+      "Emit each o_d with o_index = d and o_valid high for exactly that one cycle. Outputs may come in any order, but each index exactly once, and o_valid must be low at every other time.",
+      "The scores and weights are held in memories named sbuf and pbuf, declared reg signed [20:0] sbuf [0:255] and reg [15:0] pbuf [0:255], with position j at index j. The testbench reads them directly to check the scores and the softmax, so these names and layouts are part of the interface.",
+      "mac, softmax and requant are separate modules supplied as source files, not something to write, and matvec is supplied too, for the score pass if you want it. Instantiate the ones you use with exactly these ports, connected by name: matvec (input clk, input rst_n, input start, input [8:0] depth, input [8:0] cols, output [8:0] a_addr, output [17:0] w_addr, output mac_valid, output mac_clear, output col_valid, output [8:0] col_index, output busy); mac (input clk, input rst_n, input clear, input signed [15:0] a, input signed [15:0] b, input valid_in, output signed [31:0] acc, output valid_out); softmax (input clk, input rst_n, input start, input [8:0] n, output [7:0] s_addr, input signed [20:0] s_data, output w_valid, output [7:0] w_index, output [15:0] w_data, output busy); requant (input clk, input rst_n, input signed [31:0] acc_in, input [17:0] scale, input [6:0] shift, input valid_in, output signed [15:0] q_out, output sat, output valid_out).",
+      "matvec walks a_addr 0..depth-1 and w_addr col*depth onward for each of cols columns, drives mac_valid one cycle behind the address, pulses mac_clear between columns, and pulses col_valid with col_index when a column's sum is on the MAC's acc. If it runs the score pass, it does so with depth = 32 and cols = ceil(n / 16), the number of 16-position groups: its w_addr is then exactly the key word address g*32 + d, col_index is the group g, and mac_valid and mac_clear go to every score lane. At col_valid, score lane l holds t_j for j = g*16 + l. In the last group, lanes with j >= n are not scores: write only j < n into sbuf. softmax reads scores through s_addr and a registered s_data and emits w_valid, w_index and w_data. requant has a latency of exactly 9 cycles.",
+      "The weighted sum multiplies a 16-bit unsigned weight by an 16-bit signed value, which the 16-bit MAC cannot do, so it is its own multiply-accumulate.",
+      "All state resets to zero: busy and o_valid are 0 during reset.",
+      "Each score lane is an instance of mac_s (smac_dep.v), the MAC derived for q times k over head_dim, whose acc output is 37 bits: the model's mac, at 32, can overflow on a score. The score path runs at 37 bits up to the score quantizer. Its ports, connected by name: mac_s (input clk, input rst_n, input clear, input signed [15:0] a, input signed [15:0] b, input valid_in, output signed [36:0] acc, output valid_out)."
+    ]
+  },
+  "tools": {
+    "iverilog": "iverilog",
+    "vvp": "vvp",
+    "yosys": "yosys",
+    "sta": "sta"
+  },
+  "agent": "LLMAgent",
+  "converged": true,
+  "iterations_used": 3,
+  "history": [
+    {
+      "iteration": 1,
+      "fixes_applied": [
+        "llm:opus@claude-cli#1"
+      ],
+      "sim": {
+        "stage": "sim",
+        "status": "fail",
+        "checks": null,
+        "mismatches": [
+          {
+            "test": "attention",
+            "out": "0",
+            "expected_o": "21777",
+            "got_o": "-16347"
+          },
+          {
+            "test": "attention",
+            "out": "1",
+            "expected_o": "-25859",
+            "got_o": "-9905"
+          },
+          {
+            "test": "attention",
+            "out": "2",
+            "expected_o": "-28206",
+            "got_o": "32683"
+          },
+          {
+            "test": "attention",
+            "out": "3",
+            "expected_o": "5154",
+            "got_o": "5531"
+          },
+          {
+            "test": "attention",
+            "out": "4",
+            "expected_o": "-29532",
+            "got_o": "-27085"
+          },
+          {
+            "test": "attention",
+            "out": "5",
+            "expected_o": "2498",
+            "got_o": "4460"
+          },
+          {
+            "test": "attention",
+            "out": "6",
+            "expected_o": "27283",
+            "got_o": "-3450"
+          },
+          {
+            "test": "attention",
+            "out": "7",
+            "expected_o": "16088",
+            "got_o": "7014"
+          }
+        ]
+      },
+      "synth": null,
+      "timing": null,
+      "fpga": null
+    },
+    {
+      "iteration": 2,
+      "fixes_applied": [
+        "llm:opus@claude-cli#2"
+      ],
+      "sim": {
+        "stage": "sim",
+        "status": "pass",
+        "checks": 236,
+        "mismatches": [],
+        "throughput": {
+          "heads": 4,
+          "span_cycles": 748,
+          "latency_cycles": 303,
+          "units": 4,
+          "cycles_per_unit": 187.0
+        }
+      },
+      "synth": {
+        "stage": "synth",
+        "status": "pass",
+        "cell_count": 275486,
+        "area": 593375.0
+      },
+      "timing": {
+        "stage": "timing",
+        "status": "fail",
+        "method": "opensta",
+        "clock_period_ns": 10.0,
+        "worst_slack_ns": -1.06,
+        "critical_path": "from register shift_s_r to register sbuf. This path takes longer than one clock period: add a pipeline register on it or split the logic between them."
+      },
+      "fpga": {
+        "luts": 13117,
+        "ffs": 9138,
+        "dsps": 59,
+        "brams": 2,
+        "urams": 0,
+        "carry": 778,
+        "muxf": 2307,
+        "lutram": 16,
+        "status": "pass",
+        "family": "xcup",
+        "top": "attnn",
+        "lint": [],
+        "unmapped_cells": {
+          "SRL16E": 5
+        },
+        "stage": "fpga"
+      }
+    },
+    {
+      "iteration": 3,
+      "fixes_applied": [
+        "llm:opus@claude-cli#3"
+      ],
+      "sim": {
+        "stage": "sim",
+        "status": "pass",
+        "checks": 236,
+        "mismatches": [],
+        "throughput": {
+          "heads": 4,
+          "span_cycles": 756,
+          "latency_cycles": 305,
+          "units": 4,
+          "cycles_per_unit": 189.0
+        }
+      },
+      "synth": {
+        "stage": "synth",
+        "status": "pass",
+        "cell_count": 276796,
+        "area": 597987.0
+      },
+      "timing": {
+        "stage": "timing",
+        "status": "pass",
+        "method": "opensta",
+        "clock_period_ns": 10.0,
+        "worst_slack_ns": 0.06
+      },
+      "fpga": {
+        "luts": 12064,
+        "ffs": 9756,
+        "dsps": 59,
+        "brams": 2,
+        "urams": 0,
+        "carry": 778,
+        "muxf": 1729,
+        "lutram": 16,
+        "status": "pass",
+        "family": "xcup",
+        "top": "attnn",
+        "lint": [],
+        "stage": "fpga"
+      }
+    }
+  ],
+  "final_metrics": {
+    "sim_pass": true,
+    "sim_checks": 236,
+    "cell_count": 276796,
+    "area": 597987.0,
+    "timing": {
+      "stage": "timing",
+      "status": "pass",
+      "method": "opensta",
+      "clock_period_ns": 10.0,
+      "worst_slack_ns": 0.06
+    }
+  }
+}

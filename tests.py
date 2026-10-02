@@ -2347,6 +2347,18 @@ def test_llm_blocks_decode():
               rep['ok'] and len(rows) == 15 and used
               and all(r['converged'] and r['agent'].startswith('llm:') for r in rows)
               and [m.split('@')[0] for m in models].count('llm:haiku') == 9)
+        # The fifteen one end-to-end run signed off, its RMSNorm redone on
+        # resume under the each-index-once check: the same decode step.
+        one = os.path.join(ROOT, 'llm_blocks', 'tiny_qwen3_one_run')
+        out1 = os.path.join(out, 'one_run')
+        rep1 = spec2rtl.run(spec, out=out1, blocks=one, log=lambda *a: None)
+        rows1 = rep1['stages']['blocks']['rows']
+        check('the fifteen blocks of one end-to-end LLM run decode as the '
+              'integer model does too',
+              rep1['ok'] and len(rows1) == 15
+              and all(r['converged'] and r['agent'].startswith('llm:') for r in rows1)
+              and all(open(os.path.join(out1, 'design', r['file'])).read()
+                      == open(os.path.join(one, r['file'])).read() for r in rows1))
         # A block signed off for other parameters is not this design's.
         alt = os.path.join(out, 'alt')
         shutil.copytree(src, alt)

@@ -1,0 +1,256 @@
+{
+  "spec": {
+    "name": "rmsnorm_qwen2_5_0p5b_a16",
+    "description": "RMSNorm over a row of 32 activations: sum of squares, one inverse square root, and a scaled product per element, requantized to int8",
+    "top_module": "rmsnorm",
+    "unit": "norm",
+    "parameters": {
+      "data_width": 16,
+      "acc_width": 32,
+      "d_model": 32,
+      "addr_width": 5,
+      "rsqrt_in_width": 40,
+      "rsqrt_out_width": 17,
+      "rsqrt_e_width": 6,
+      "norm_shift": 2,
+      "scale_width": 18,
+      "shift_width": 7,
+      "requant_stages": 9,
+      "rsqrt_stages": 3,
+      "signed": true,
+      "pipeline_stages": 1,
+      "target_clock_mhz": 100
+    },
+    "derivation": {
+      "model": "qwen2_5_0p5b_a16",
+      "rsqrt": {
+        "in_width": 40,
+        "out_width": 17,
+        "lut_bits": 8,
+        "signed": false,
+        "pipeline_stages": 3,
+        "target_clock_mhz": 100
+      },
+      "rule": "row length from d_model; the rsqrt input and shift widths from that block's ports; the extra shift k from the bound |t| < 2**(data_width+ow-k) against the requantizer input"
+    },
+    "ports": [
+      {
+        "name": "clk",
+        "dir": "input",
+        "width": 1,
+        "desc": "clock, rising edge"
+      },
+      {
+        "name": "rst_n",
+        "dir": "input",
+        "width": 1,
+        "desc": "active-low synchronous reset"
+      },
+      {
+        "name": "start",
+        "dir": "input",
+        "width": 1,
+        "desc": "normalise the row"
+      },
+      {
+        "name": "eps",
+        "dir": "input",
+        "width": 40,
+        "desc": "epsilon, in units of the sum of squares"
+      },
+      {
+        "name": "scale_o",
+        "dir": "input",
+        "width": 18,
+        "desc": "output requantizer scale"
+      },
+      {
+        "name": "shift_o",
+        "dir": "input",
+        "width": 7,
+        "desc": "output requantizer shift"
+      },
+      {
+        "name": "x_addr",
+        "dir": "output",
+        "width": 5,
+        "desc": "activation address"
+      },
+      {
+        "name": "x_data",
+        "dir": "input",
+        "width": 16,
+        "signed": true,
+        "desc": "activation, registered read"
+      },
+      {
+        "name": "g_addr",
+        "dir": "output",
+        "width": 5,
+        "desc": "gain (gamma) address"
+      },
+      {
+        "name": "g_data",
+        "dir": "input",
+        "width": 16,
+        "signed": true,
+        "desc": "gain, registered read"
+      },
+      {
+        "name": "o_valid",
+        "dir": "output",
+        "width": 1,
+        "desc": "a normalised element is on o_data"
+      },
+      {
+        "name": "o_index",
+        "dir": "output",
+        "width": 5,
+        "desc": "which element"
+      },
+      {
+        "name": "o_data",
+        "dir": "output",
+        "width": 16,
+        "signed": true,
+        "desc": "normalised element, int8"
+      },
+      {
+        "name": "busy",
+        "dir": "output",
+        "width": 1,
+        "desc": "a row is being normalised"
+      }
+    ],
+    "behavior": [
+      "start is a one-cycle pulse, with eps, scale_o and shift_o held stable for the whole row. busy must be high on the clock edge that samples start, so it already reads 1 one cycle later, and it stays high until the last output is emitted.",
+      "x_data and g_data are registered reads: each carries the element at address a on the cycle after x_addr or g_addr = a. If the address is itself a register, that is two clock edges after the edge that loads a into it.",
+      "Pass 1: ssq = eps + sum over i in 0..31 of x_i * x_i, an unsigned 40-bit value held in a register named ssq. Start the sum from eps, not from zero.",
+      "Then (m, e) = rsqrt(ssq) from the supplied rsqrt block, held in registers named rs_m ([16:0]) and rs_e ([5:0]).",
+      "Pass 2: for i in 0..31, t_i = (x_i * g_i * m) >>> (e + 2), an arithmetic shift of the signed product, which floors. Then o_i = requant(t_i, scale_o, shift_o): multiply by scale_o, add 2**(shift_o-1) when shift_o > 0, arithmetic shift right by shift_o, saturate to [-32768, 32767]. |t_i| stays under 2**31, so it fits the requantizer's 32-bit input.",
+      "Emit each o_i with o_index = i and o_valid high for exactly that one cycle. Outputs may come in any order, but each index exactly once, and o_valid must be low at every other time.",
+      "The testbench reads ssq, rs_m and rs_e directly to check pass 1 and the inverse square root, so those names and widths are part of the interface.",
+      "rsqrt and requant are separate modules supplied as source files, not something to write. Instantiate them with exactly these ports, connected by name: rsqrt (input clk, input rst_n, input [39:0] x, input valid_in, output [16:0] y, output [5:0] e, output valid_out); requant (input clk, input rst_n, input signed [31:0] acc_in, input [17:0] scale, input [6:0] shift, input valid_in, output signed [15:0] q_out, output sat, output valid_out). rsqrt has a latency of 3 cycles and requant of exactly 9.",
+      "All state resets to zero: busy and o_valid are 0 during reset."
+    ]
+  },
+  "tools": {
+    "iverilog": "iverilog",
+    "vvp": "vvp",
+    "yosys": "yosys",
+    "sta": "sta"
+  },
+  "agent": "LLMAgent",
+  "converged": true,
+  "iterations_used": 2,
+  "history": [
+    {
+      "iteration": 1,
+      "fixes_applied": [
+        "llm:opus@claude-cli#1"
+      ],
+      "sim": {
+        "stage": "sim",
+        "status": "pass",
+        "checks": 140,
+        "mismatches": [],
+        "throughput": {
+          "rows": 4,
+          "span_cycles": 348,
+          "latency_cycles": 57,
+          "units": 4,
+          "cycles_per_unit": 87.0
+        }
+      },
+      "synth": {
+        "stage": "synth",
+        "status": "pass",
+        "cell_count": 30970,
+        "area": 62491.0
+      },
+      "timing": {
+        "stage": "timing",
+        "status": "fail",
+        "method": "opensta",
+        "clock_period_ns": 10.0,
+        "worst_slack_ns": -0.88,
+        "critical_path": "from register xg_reg_d to register pp_lo. This path takes longer than one clock period: add a pipeline register on it or split the logic between them."
+      },
+      "fpga": {
+        "luts": 2422,
+        "ffs": 1240,
+        "dsps": 14,
+        "brams": 0,
+        "urams": 0,
+        "carry": 121,
+        "muxf": 576,
+        "lutram": 0,
+        "status": "pass",
+        "family": "xcup",
+        "top": "rmsnorm",
+        "lint": [],
+        "stage": "fpga"
+      }
+    },
+    {
+      "iteration": 2,
+      "fixes_applied": [
+        "llm:opus@claude-cli#2"
+      ],
+      "sim": {
+        "stage": "sim",
+        "status": "pass",
+        "checks": 140,
+        "mismatches": [],
+        "throughput": {
+          "rows": 4,
+          "span_cycles": 352,
+          "latency_cycles": 58,
+          "units": 4,
+          "cycles_per_unit": 88.0
+        }
+      },
+      "synth": {
+        "stage": "synth",
+        "status": "pass",
+        "cell_count": 32003,
+        "area": 64868.0
+      },
+      "timing": {
+        "stage": "timing",
+        "status": "pass",
+        "method": "opensta",
+        "clock_period_ns": 10.0,
+        "worst_slack_ns": 0.48
+      },
+      "fpga": {
+        "luts": 2685,
+        "ffs": 1395,
+        "dsps": 18,
+        "brams": 0,
+        "urams": 0,
+        "carry": 149,
+        "muxf": 577,
+        "lutram": 0,
+        "status": "pass",
+        "family": "xcup",
+        "top": "rmsnorm",
+        "lint": [],
+        "stage": "fpga"
+      }
+    }
+  ],
+  "final_metrics": {
+    "sim_pass": true,
+    "sim_checks": 140,
+    "cell_count": 32003,
+    "area": 64868.0,
+    "timing": {
+      "stage": "timing",
+      "status": "pass",
+      "method": "opensta",
+      "clock_period_ns": 10.0,
+      "worst_slack_ns": 0.48
+    }
+  }
+}

@@ -91,7 +91,7 @@ times put within 10%.
 ### The full suite
 
 ```
-python3 tests.py            # 451 tests, or 448 without OpenSTA
+python3 tests.py            # 452 tests, or 449 without OpenSTA
 ```
 
 ### Spec to RTL, across the spec space
@@ -2040,6 +2040,44 @@ index given twice, and a resumed run keeps a block only if it still
 passes its testbench, so the stronger check sends that RMSNorm back to
 the chain. The decode step against the integer model is what caught it,
 which is the reason it runs after every block has signed off.
+
+### One run, end to end
+
+With those fixes the fifth run, resumed once, is the whole chain in one
+`spec2rtl.py examples/tiny_qwen3.json --agent llm`: every block written
+and signed off by a model, none by the rules agent, and the decode step
+matching the integer model at 2 of 2 layers, tokens 49 and 49, logits
+14065 and 14504. The resume came after the RMSNorm testbench was made to
+check each index once: the fourteen blocks the run had already signed off
+were simulated again against their current testbenches and kept, and
+RMSNorm went back through the chain, where Opus signed it off in one draft
+from Sonnet's best.
+
+| block | signed off by | drafts | checks | Fmax |
+|---|---|---|---|---|
+| multiply-accumulate | Sonnet | 2 | 613 | 139 MHz |
+| requantizer | Sonnet | 1 | 220 | 105 MHz |
+| exponential | Haiku | 2 | 153 | 171 MHz |
+| reciprocal | Haiku | 1 | 200 | 226 MHz |
+| inverse square root | Haiku | 2 | 248 | 249 MHz |
+| matrix-vector sequencer | Haiku | 2 | 11 | 170 MHz |
+| softmax | Opus | 3 | 132 | 120 MHz |
+| score multiply-accumulate | Haiku | 3 | 613 | 116 MHz |
+| projection, per column | Haiku | 6 | 252 | 109 MHz |
+| attention head | Opus | 3 | 236 | 101 MHz |
+| RMSNorm | Opus | 1 | 268 | 102 MHz |
+| RMSNorm over a head | Opus | 2 | 140 | 105 MHz |
+| rotary embedding | Sonnet | 3 | 1004 | 116 MHz |
+| SiLU | Haiku | 6 | 318 | 124 MHz |
+| residual add | Sonnet | 1 | 305 | 107 MHz |
+
+Haiku seven, Sonnet four, Opus four. The files are in
+`llm_blocks/tiny_qwen3_one_run`, and `test_llm_blocks_decode` builds the
+design from them as it does from `llm_blocks/tiny_qwen3`. One difference
+between the two sets is speed, not correctness: this run's projection,
+Haiku's, takes about 73,000 cycles a decode step where the other set's
+takes 21,000, because nothing in its signoff asks for more than the
+100 MHz clock. Its testbench measures the cycles; no gate bounds them yet.
 
 ## An attention head
 

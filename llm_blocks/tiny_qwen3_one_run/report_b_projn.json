@@ -1,0 +1,434 @@
+{
+  "spec": {
+    "name": "projn16c_qwen2_5_0p5b_a16",
+    "description": "Multi-lane projection y = requant(W x): 16 columns at once, each lane taking its own byte of a 256-bit weight word, sized to consume zybo_z7_20's sustained DDR bandwidth",
+    "top_module": "projn",
+    "unit": "projection",
+    "parameters": {
+      "data_width": 16,
+      "acc_width": 32,
+      "depth_width": 9,
+      "col_width": 9,
+      "addr_width": 18,
+      "scale_width": 18,
+      "shift_width": 7,
+      "weight_bits": 8,
+      "requant_stages": 9,
+      "max_dim": 256,
+      "signed": true,
+      "pipeline_stages": 1,
+      "target_clock_mhz": 100,
+      "per_column": true,
+      "col_word_width": 57,
+      "lanes": 16,
+      "word_width": 256,
+      "word_addr_width": 12,
+      "mac_stages": 3
+    },
+    "derivation": {
+      "model": "qwen2_5_0p5b_a16",
+      "rule": "depth, column and address widths from the matmul sequencer, which is sized from the model's largest dimension; the requantizer from that block",
+      "board": "zybo_z7_20",
+      "mem_gbytes_per_s": 2.0,
+      "lanes_rule": "smallest power of two with lanes * clock * data bytes >= sustained DDR bandwidth"
+    },
+    "ports": [
+      {
+        "name": "clk",
+        "dir": "input",
+        "width": 1,
+        "desc": "clock, rising edge"
+      },
+      {
+        "name": "rst_n",
+        "dir": "input",
+        "width": 1,
+        "desc": "active-low synchronous reset"
+      },
+      {
+        "name": "start",
+        "dir": "input",
+        "width": 1,
+        "desc": "run one projection"
+      },
+      {
+        "name": "depth",
+        "dir": "input",
+        "width": 9,
+        "desc": "input length, the reduction depth"
+      },
+      {
+        "name": "cols",
+        "dir": "input",
+        "width": 9,
+        "desc": "outputs"
+      },
+      {
+        "name": "scale",
+        "dir": "input",
+        "width": 18,
+        "desc": "requantizer scale"
+      },
+      {
+        "name": "shift",
+        "dir": "input",
+        "width": 7,
+        "desc": "requantizer shift"
+      },
+      {
+        "name": "a_addr",
+        "dir": "output",
+        "width": 9,
+        "desc": "activation address"
+      },
+      {
+        "name": "a_data",
+        "dir": "input",
+        "width": 16,
+        "signed": true,
+        "desc": "activation, registered read"
+      },
+      {
+        "name": "w_addr",
+        "dir": "output",
+        "width": 12,
+        "desc": "weight word address: group g, row r at g * depth + r"
+      },
+      {
+        "name": "w_data",
+        "dir": "input",
+        "width": 256,
+        "signed": false,
+        "desc": "lane j's weight in bits [16*j+15:16*j], registered read"
+      },
+      {
+        "name": "c_addr",
+        "dir": "output",
+        "width": 9,
+        "desc": "column parameter address"
+      },
+      {
+        "name": "c_data",
+        "dir": "input",
+        "width": 57,
+        "desc": "{bias, shift, scale} for column c_addr, registered read"
+      },
+      {
+        "name": "o_valid",
+        "dir": "output",
+        "width": 1,
+        "desc": "an output is on o_data"
+      },
+      {
+        "name": "o_index",
+        "dir": "output",
+        "width": 9,
+        "desc": "which output"
+      },
+      {
+        "name": "o_data",
+        "dir": "output",
+        "width": 16,
+        "signed": true,
+        "desc": "output activation"
+      },
+      {
+        "name": "busy",
+        "dir": "output",
+        "width": 1,
+        "desc": "a projection is in progress"
+      }
+    ],
+    "behavior": [
+      "Columns are processed in groups of 16. Group g covers columns g*16 .. g*16+15; in the last group, lanes past cols produce nothing.",
+      "For each group, rows r = 0..depth-1 are read: a_addr = r and w_addr = g*depth + r, both registered reads whose data arrives the cycle after the address; with the address a register, that is two clock edges after the edge that loads r into it. Every row r = 0..depth-1 is summed exactly once. Lane j of the word is the weight of column g*16 + j at row r.",
+      "Each lane accumulates a[r] * w_j over the rows in its own MAC, the supplied mac module, one instance per lane, cleared between groups.",
+      "Each column's sum acc is requantized by the supplied requant module, as requant(acc + bias) with that column's own scale and shift, and emitted with o_valid high for one cycle and o_index its column. Each column exactly once, in order.",
+      "busy is high from start until the last output has been emitted.",
+      "All state resets to zero.",
+      "Each column's bias, scale and shift are in one word at c_addr = its column index, a registered read like the others: c_data carries the word for c_addr = c on the cycle after, and with c_addr a register that is two clock edges after the edge that loads c into it. c_data = {bias, shift, scale}, with bias the top 32 bits, a signed value at the accumulator's scale, shift the next 7 bits and scale the low 18 bits. The bias is added to the column's sum before the requantizer, and the requantizer's scale and shift inputs take that column's scale and shift from the word. This block's own scale and shift ports are not used; tied to 0, the requantizer's would make every output 0.",
+      "mac and requant are separate modules supplied as source files, not something to write. Instantiate them with exactly these ports, connected by name: mac (input clk, input rst_n, input clear, input signed [15:0] a, input signed [15:0] b, input valid_in, output signed [31:0] acc, output valid_out); requant (input clk, input rst_n, input signed [31:0] acc_in, input [17:0] scale, input [6:0] shift, input valid_in, output signed [15:0] q_out, output sat, output valid_out). mac's valid_out follows its valid_in by 3 cycles, with acc then holding the running sum, and clear zeroes it; requant has a latency of exactly 9 cycles."
+    ]
+  },
+  "tools": {
+    "iverilog": "iverilog",
+    "vvp": "vvp",
+    "yosys": "yosys",
+    "sta": "sta"
+  },
+  "agent": "LLMAgent",
+  "converged": true,
+  "iterations_used": 6,
+  "history": [
+    {
+      "iteration": 1,
+      "fixes_applied": [
+        "llm:haiku@claude-cli#1"
+      ],
+      "sim": {
+        "stage": "sim",
+        "status": "fail",
+        "checks": null,
+        "mismatches": [
+          {
+            "test": "projection",
+            "out": "0",
+            "expected_count": "8",
+            "got_count": "0"
+          }
+        ]
+      },
+      "synth": null,
+      "timing": null,
+      "fpga": null
+    },
+    {
+      "iteration": 2,
+      "fixes_applied": [
+        "llm:haiku@claude-cli#2"
+      ],
+      "sim": {
+        "stage": "sim",
+        "status": "fail",
+        "checks": null,
+        "mismatches": [
+          {
+            "test": "projection",
+            "out": "16",
+            "expected_lane": "9219",
+            "got_lane": "x"
+          },
+          {
+            "test": "projection",
+            "out": "17",
+            "expected_lane": "-3094",
+            "got_lane": "x"
+          },
+          {
+            "test": "projection",
+            "out": "18",
+            "expected_lane": "1624",
+            "got_lane": "x"
+          },
+          {
+            "test": "projection",
+            "out": "19",
+            "expected_lane": "3151",
+            "got_lane": "x"
+          },
+          {
+            "test": "projection",
+            "out": "16",
+            "cols": "40",
+            "expected": "each_index_once",
+            "got_lane": "9219"
+          }
+        ]
+      },
+      "synth": null,
+      "timing": null,
+      "fpga": null
+    },
+    {
+      "iteration": 3,
+      "fixes_applied": [
+        "llm:haiku@claude-cli#3"
+      ],
+      "sim": {
+        "stage": "sim",
+        "status": "fail",
+        "checks": null,
+        "mismatches": [
+          {
+            "test": "projection",
+            "out": "16",
+            "expected_lane": "9219",
+            "got_lane": "x"
+          },
+          {
+            "test": "projection",
+            "out": "17",
+            "expected_lane": "-3094",
+            "got_lane": "x"
+          },
+          {
+            "test": "projection",
+            "out": "18",
+            "expected_lane": "1624",
+            "got_lane": "x"
+          },
+          {
+            "test": "projection",
+            "out": "19",
+            "expected_lane": "3151",
+            "got_lane": "x"
+          },
+          {
+            "test": "projection",
+            "out": "16",
+            "cols": "40",
+            "expected": "each_index_once",
+            "got_lane": "9219"
+          }
+        ]
+      },
+      "synth": null,
+      "timing": null,
+      "fpga": null
+    },
+    {
+      "iteration": 4,
+      "fixes_applied": [
+        "llm:haiku@claude-cli#4"
+      ],
+      "sim": {
+        "stage": "sim",
+        "status": "fail",
+        "checks": null,
+        "mismatches": [
+          {
+            "test": "projection",
+            "out": "16",
+            "expected_lane": "9219",
+            "got_lane": "x"
+          },
+          {
+            "test": "projection",
+            "out": "17",
+            "expected_lane": "-3094",
+            "got_lane": "x"
+          },
+          {
+            "test": "projection",
+            "out": "18",
+            "expected_lane": "1624",
+            "got_lane": "x"
+          },
+          {
+            "test": "projection",
+            "out": "19",
+            "expected_lane": "3151",
+            "got_lane": "x"
+          },
+          {
+            "test": "projection",
+            "out": "16",
+            "cols": "40",
+            "expected": "each_index_once",
+            "got_lane": "9219"
+          }
+        ]
+      },
+      "synth": null,
+      "timing": null,
+      "fpga": null
+    },
+    {
+      "iteration": 5,
+      "fixes_applied": [
+        "llm:haiku@claude-cli#5"
+      ],
+      "sim": {
+        "stage": "sim",
+        "status": "fail",
+        "checks": null,
+        "mismatches": [
+          {
+            "test": "projection",
+            "out": "16",
+            "expected_lane": "9219",
+            "got_lane": "x"
+          },
+          {
+            "test": "projection",
+            "out": "17",
+            "expected_lane": "-3094",
+            "got_lane": "x"
+          },
+          {
+            "test": "projection",
+            "out": "18",
+            "expected_lane": "1624",
+            "got_lane": "x"
+          },
+          {
+            "test": "projection",
+            "out": "19",
+            "expected_lane": "3151",
+            "got_lane": "x"
+          },
+          {
+            "test": "projection",
+            "out": "16",
+            "cols": "40",
+            "expected": "each_index_once",
+            "got_lane": "9219"
+          }
+        ]
+      },
+      "synth": null,
+      "timing": null,
+      "fpga": null
+    },
+    {
+      "iteration": 6,
+      "fixes_applied": [
+        "llm:haiku@claude-cli#6"
+      ],
+      "sim": {
+        "stage": "sim",
+        "status": "pass",
+        "checks": 252,
+        "mismatches": [],
+        "throughput": {
+          "projections": 5,
+          "span_cycles": 5056,
+          "latency_cycles": 400,
+          "units": 5,
+          "cycles_per_unit": 1011.2
+        }
+      },
+      "synth": {
+        "stage": "synth",
+        "status": "pass",
+        "cell_count": 79495,
+        "area": 157087.0
+      },
+      "timing": {
+        "stage": "timing",
+        "status": "pass",
+        "method": "opensta",
+        "clock_period_ns": 10.0,
+        "worst_slack_ns": 0.84
+      },
+      "fpga": {
+        "luts": 3766,
+        "ffs": 2703,
+        "dsps": 41,
+        "brams": 0,
+        "urams": 0,
+        "carry": 329,
+        "muxf": 101,
+        "lutram": 0,
+        "status": "pass",
+        "family": "xcup",
+        "top": "projn",
+        "lint": [],
+        "stage": "fpga"
+      }
+    }
+  ],
+  "final_metrics": {
+    "sim_pass": true,
+    "sim_checks": 252,
+    "cell_count": 79495,
+    "area": 157087.0,
+    "timing": {
+      "stage": "timing",
+      "status": "pass",
+      "method": "opensta",
+      "clock_period_ns": 10.0,
+      "worst_slack_ns": 0.84
+    }
+  }
+}

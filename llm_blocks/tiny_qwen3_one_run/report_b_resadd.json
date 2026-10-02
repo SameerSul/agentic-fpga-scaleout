@@ -1,0 +1,164 @@
+{
+  "spec": {
+    "name": "resadd_qwen2_5_0p5b_a16",
+    "description": "Streaming residual add of two 16-bit tensors at different scales, rounded and saturated",
+    "top_module": "resadd",
+    "unit": "element",
+    "parameters": {
+      "data_width": 16,
+      "scale_width": 18,
+      "shift_width": 7,
+      "sum_width": 36,
+      "signed": true,
+      "pipeline_stages": 1,
+      "target_clock_mhz": 100
+    },
+    "derivation": {
+      "model": "qwen2_5_0p5b_a16",
+      "rule": "operand width from the MAC; scale and shift widths from the requantizer; the sum is two scaled operands, dw+mw+1 bits each, plus a carry"
+    },
+    "ports": [
+      {
+        "name": "clk",
+        "dir": "input",
+        "width": 1,
+        "desc": "clock, rising edge"
+      },
+      {
+        "name": "rst_n",
+        "dir": "input",
+        "width": 1,
+        "desc": "active-low synchronous reset"
+      },
+      {
+        "name": "a",
+        "dir": "input",
+        "width": 16,
+        "signed": true,
+        "desc": "residual stream element"
+      },
+      {
+        "name": "b",
+        "dir": "input",
+        "width": 16,
+        "signed": true,
+        "desc": "block output element"
+      },
+      {
+        "name": "scale_a",
+        "dir": "input",
+        "width": 18,
+        "desc": "scale for a"
+      },
+      {
+        "name": "scale_b",
+        "dir": "input",
+        "width": 18,
+        "desc": "scale for b"
+      },
+      {
+        "name": "shift",
+        "dir": "input",
+        "width": 7,
+        "desc": "shift after the scaled sum"
+      },
+      {
+        "name": "valid_in",
+        "dir": "input",
+        "width": 1,
+        "desc": "a and b valid"
+      },
+      {
+        "name": "y",
+        "dir": "output",
+        "width": 16,
+        "signed": true,
+        "desc": "sum, saturated"
+      },
+      {
+        "name": "valid_out",
+        "dir": "output",
+        "width": 1,
+        "desc": "y valid"
+      }
+    ],
+    "behavior": [
+      "Fully pipelined: a new pair may arrive on every cycle, and each valid_in produces exactly one valid_out, in the same order. The latency is fixed but is the design's choice. scale_a, scale_b and shift are held stable while a stream runs.",
+      "v = a * scale_a + b * scale_b. scale_a and scale_b are unsigned magnitudes: every one of their 18 bits, the top one included, is magnitude, so they run up to 262143. Each product has the sign of its operand, and v is a signed 36-bit value.",
+      "If shift > 0, r = (v + 2**(shift-1)) >>> shift, an arithmetic shift, which rounds to nearest with ties toward plus infinity. If shift is 0, r = v with no rounding term.",
+      "y = r clamped to [-32768, 32767].",
+      "All state resets to zero: valid_out is 0 during reset."
+    ]
+  },
+  "tools": {
+    "iverilog": "iverilog",
+    "vvp": "vvp",
+    "yosys": "yosys",
+    "sta": "sta"
+  },
+  "agent": "LLMAgent",
+  "converged": true,
+  "iterations_used": 1,
+  "history": [
+    {
+      "iteration": 1,
+      "fixes_applied": [
+        "llm:sonnet@claude-cli#1"
+      ],
+      "sim": {
+        "stage": "sim",
+        "status": "pass",
+        "checks": 305,
+        "mismatches": [],
+        "throughput": {
+          "elements": 214,
+          "span_cycles": 227,
+          "latency_cycles": 6,
+          "units": 214,
+          "cycles_per_unit": 1.060747663551402
+        }
+      },
+      "synth": {
+        "stage": "synth",
+        "status": "pass",
+        "cell_count": 9559,
+        "area": 18567.0
+      },
+      "timing": {
+        "stage": "timing",
+        "status": "pass",
+        "method": "opensta",
+        "clock_period_ns": 10.0,
+        "worst_slack_ns": 0.66
+      },
+      "fpga": {
+        "luts": 451,
+        "ffs": 220,
+        "dsps": 2,
+        "brams": 0,
+        "urams": 0,
+        "carry": 24,
+        "muxf": 31,
+        "lutram": 0,
+        "status": "pass",
+        "family": "xcup",
+        "top": "resadd",
+        "lint": [],
+        "stage": "fpga"
+      }
+    }
+  ],
+  "final_metrics": {
+    "sim_pass": true,
+    "sim_checks": 305,
+    "cell_count": 9559,
+    "area": 18567.0,
+    "timing": {
+      "stage": "timing",
+      "status": "pass",
+      "method": "opensta",
+      "clock_period_ns": 10.0,
+      "worst_slack_ns": 0.66
+    }
+  }
+}
