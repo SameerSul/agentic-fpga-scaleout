@@ -2126,6 +2126,19 @@ def render_attn_testbench(spec, rows=((1, False), (3, False), (8, True),
             body.append("    expect_s[%d] = %s; expect_p[%d] = %d'd%d;"
                         % (j, _slit(s[j], p["score_width"]), j,
                            p["weight_width"], w[j]))
+            # Traced on the fourth end-to-end run: Sonnet's score for
+            # -914 was -996, the sum with d = 0 left out and the last
+            # element counted twice, the key read one element off.
+            smax = p["score_max"]
+            alt = lambda v: max(-smax - 1, min(smax, _round_shift(
+                v << p.get("score_guard", 0), sh)))
+            tj = sum(q[d] * K[j][d] for d in range(hd))
+            first, last = q[0] * K[j][0], q[-1] * K[j][-1]
+            body.append("    expect_sa[%d] = %s; expect_sb[%d] = %s; "
+                        "expect_sl[%d] = %s;"
+                        % (j, _slit(alt(tj - first + last), p["score_width"]),
+                           j, _slit(alt(tj + first - last), p["score_width"]),
+                           j, _slit(alt(tj - last), p["score_width"])))
         for d in range(hd):
             body.append("    expect_o[%d] = %s;" % (d, _slit(o[d], dw)))
         body.append("    run_head(%d, %d, %d, %d);" % (n, sh, sc, so))
@@ -2161,6 +2174,7 @@ module tb_attn;
   reg signed [{dwm}:0] kmem [0:{mem}-1];
   reg signed [{dwm}:0] vmem [0:{mem}-1];
   reg signed [{swm}:0] expect_s [0:{cap}-1];
+  reg signed [{swm}:0] expect_sa [0:{cap}-1], expect_sb [0:{cap}-1], expect_sl [0:{cap}-1];
   reg        [{wwm}:0] expect_p [0:{cap}-1];
   reg signed [{dwm}:0] expect_o [0:{hd}-1];
   reg signed [{dwm}:0] k_data, v_data;
@@ -2228,8 +2242,18 @@ module tb_attn;
       for (i = 0; i < cnt; i = i + 1) begin
         checks = checks + 1;
         if (dut.sbuf[i] !== expect_s[i]) begin
-          $display("TB_FAIL test=%0s score_index=%0d expected_s=%0d got_s=%0d",
-                   testname, i, expect_s[i], dut.sbuf[i]);
+          if (dut.sbuf[i] === expect_sa[i] && expect_sa[i] !== expect_s[i])
+            $display("TB_FAIL test=%0s score_index=%0d expected_s=%0d got_s=%0d got_s_is_the_sum_without_d0_and_with_the_last_element_twice=1",
+                     testname, i, expect_s[i], dut.sbuf[i]);
+          else if (dut.sbuf[i] === expect_sb[i] && expect_sb[i] !== expect_s[i])
+            $display("TB_FAIL test=%0s score_index=%0d expected_s=%0d got_s=%0d got_s_is_the_sum_with_d0_twice_and_without_the_last_element=1",
+                     testname, i, expect_s[i], dut.sbuf[i]);
+          else if (dut.sbuf[i] === expect_sl[i] && expect_sl[i] !== expect_s[i])
+            $display("TB_FAIL test=%0s score_index=%0d expected_s=%0d got_s=%0d got_s_is_the_sum_without_the_last_element=1",
+                     testname, i, expect_s[i], dut.sbuf[i]);
+          else
+            $display("TB_FAIL test=%0s score_index=%0d expected_s=%0d got_s=%0d",
+                     testname, i, expect_s[i], dut.sbuf[i]);
           bad = bad + 1;
         end
       end
@@ -2382,6 +2406,13 @@ def derive_attnn_spec(ms, board=None):
         beh.append(b_)
     spec["behavior"] = beh
     if p["score_acc_width"] != p["acc_width"]:
+        # The scores bullet said "a signed 32-bit dot product" while the
+        # first test's t is -3833640547, which needs 37: traced on the
+        # fourth end-to-end run.
+        old = "a signed %d-bit dot product" % p["acc_width"]
+        spec["behavior"] = [
+            b_.replace(old, "a signed %d-bit dot product" % p["score_acc_width"])
+            if b_.startswith("Scores:") else b_ for b_ in spec["behavior"]]
         spec["behavior"].append(
             "Each score lane is an instance of mac_s (smac_dep.v), the MAC "
             "derived for q times k over head_dim, whose acc output is %d "

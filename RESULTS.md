@@ -91,7 +91,7 @@ times put within 10%.
 ### The full suite
 
 ```
-python3 tests.py            # 445 tests, or 443 without OpenSTA
+python3 tests.py            # 447 tests, or 444 without OpenSTA
 ```
 
 ### Spec to RTL, across the spec space
@@ -2006,6 +2006,26 @@ never passed simulation kept its bug: Sonnet's and Opus's projections gave
 Haiku's wrong -20614 in five of their thirteen drafts, so the next model
 now starts from the spec unless a draft passed simulation and synthesis.
 Opus, last before the rules agent, gets eight drafts like the others.
+
+Runs three and four each lost one block and each loss was traced. In the
+third, Opus's projection gave 0 on every lane for eight drafts: the spec
+said "the scale and shift inputs are not used", meaning the block's own
+ports, and Opus tied the requantizer's to 0. The spec now says where the
+requantizer's scale and shift come from, and in run four Opus signed the
+projection off in one draft. In the fourth, the attention head failed for
+Opus and for the rules agent alike, and neither could have passed: the
+failing path was inside the softmax, which Sonnet had signed off at
+exactly 100 MHz and which missed by 0.68 ns inside the head. A composite's
+timing gate now leaves paths that start and end inside a supplied block
+to that block's own signoff and checks its own logic and every path into
+and out of it; Opus's head then had 0.74 ns to spare. The whole design is
+still placed and routed at the end. Smaller findings from the same runs:
+Yosys's front end crashes on $signed(x) of an unsigned whole signal in a
+port connection (the agent now names it and the signed-wire fix), the
+spec gave the score dot product 32 bits where the scores need 37, and the
+testbenches now name a projection sum without its last row, a score with
+the key read one element off, a score MAC that multiplies a concatenation,
+and an exponential at or above one for a negative input.
 
 ## An attention head
 

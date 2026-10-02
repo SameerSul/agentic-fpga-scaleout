@@ -1241,6 +1241,53 @@ def test_rmsnorm():
         shutil.rmtree(work, ignore_errors=True)
 
 
+def test_timing_leaves_subblock_internals_to_their_signoff():
+    """A supplied sub-block signed off with no margin missed by 0.68 ns on
+    a path wholly inside it when the attention head instantiated it, and
+    nothing the head's agent wrote could change that. The composite's gate
+    checks its own logic and its paths into and out of the sub-block."""
+    if not chiplet_flow.tool('sta'):
+        return
+    work = os.path.join(ROOT, 'build_hiersta')
+    shutil.rmtree(work, ignore_errors=True)
+    os.makedirs(work)
+    saved = chiplet_flow.BUILD
+    try:
+        chiplet_flow.BUILD = work
+        shutil.copy(chiplet_flow.LIB, work)
+        open(os.path.join(work, 'sub.v'), 'w').write(
+            "module sub(input clk, input [31:0] a, output reg [31:0] y);\n"
+            "  reg [31:0] r;\n"
+            "  always @(posedge clk) begin r <= a; y <= r * r * r + r; end\n"
+            "endmodule\n")
+        tops = {
+            'quick': "module top(input clk, input [31:0] a, output [31:0] y);\n"
+                     "  reg [31:0] ar;\n  always @(posedge clk) ar <= a;\n"
+                     "  sub s (.clk(clk), .a(ar), .y(y));\nendmodule\n",
+            'slow': "module top(input clk, input [31:0] a, output [31:0] y);\n"
+                    "  reg [31:0] ar, br;\n"
+                    "  always @(posedge clk) begin ar <= a; br <= ar * ar * ar + ar; end\n"
+                    "  sub s (.clk(clk), .a(br), .y(y));\nendmodule\n"}
+        spec = {'top_module': 'top', 'parameters': {'target_clock_mhz': 100},
+                'ports': [{'name': 'clk', 'dir': 'input'},
+                          {'name': 'a', 'dir': 'input'}]}
+        res = {}
+        for label, src in tops.items():
+            open(os.path.join(work, 'top.v'), 'w').write(src)
+            job = {'extra_sources': ('sub.v',), 'rtl_file': 'top.v'}
+            chiplet_flow.stage_synth(job, spec, os.path.join(work, 'top.v'))
+            res[label] = chiplet_flow.stage_timing(job, spec)
+            res[label + '_flat'] = chiplet_flow.stage_timing({}, spec)
+        check('a composite\'s timing leaves a supplied sub-block\'s own paths '
+              'to its signoff, and still fails its own slow path',
+              res['quick']['status'] == 'pass'
+              and res['quick_flat']['status'] == 'fail'
+              and res['slow']['status'] == 'fail')
+    finally:
+        chiplet_flow.BUILD = saved
+        shutil.rmtree(work, ignore_errors=True)
+
+
 def test_composite_cell_count():
     """A block that instantiates others is reported per module by yosys,
     and the flow took the first module's count: the MLP layer and RMSNorm
@@ -2345,6 +2392,14 @@ def test_composites_give_their_parts_ports():
           'the head norm\'s with the head size',
           not bad and hd['parameters']['d_model'] == im.hd
           and 'over i in 0..%d ' % (im.hd - 1) in ' '.join(hd['behavior']))
+    an = next(s for fn, _, s, _, _ in plan if fn == 'b_attnn.v')
+    tb = specgen_mod.render_attnn_testbench(an)
+    check('the attention spec gives the score dot product the score MAC\'s '
+          'width, and its testbench names a key read one element off',
+          'a signed %d-bit dot product' % an['parameters']['score_acc_width']
+          in ' '.join(an['behavior'])
+          and 'got_s_is_the_sum_without_d0_and_with_the_last_element_twice=1' in tb
+          and 'expect_sa[0] = ' in tb)
     pj = next(s for fn, _, s, _, _ in plan if fn == 'b_projn.v')
     check('the projection gives its mac and requant ports and latencies',
           'mac (input clk' in ' '.join(pj['behavior'])
@@ -4600,6 +4655,7 @@ if __name__ == '__main__':
     test_simulators_agree()
     test_arm_programs_on_their_rtl()
     test_composite_cell_count()
+    test_timing_leaves_subblock_internals_to_their_signoff()
     test_requant_golden_is_shared()
     test_table_unit_specs_are_implementable()
     test_llm_transport_is_retried()
