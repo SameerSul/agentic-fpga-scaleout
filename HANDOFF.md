@@ -126,6 +126,89 @@ python3 board_zybo.py --board zybo_z7_20_32 --work build_q25l32
 python3 cosim.py board_zybo_32 --jitter
 ```
 
+### The card made on one machine, the board on another
+
+The card holds data, not a boot image: `weights8.bin`, `cparams.bin`,
+`vocab.bin` and `prompt.bin`. The board still boots over JTAG from Vitis,
+and the program reads the four files from the card. So whoever makes the
+card and whoever builds the bitstream use **the same commit and the same
+package**. The program checks only the files' sizes against its header,
+so a card from another build of the same size loads and prints the wrong
+text; the checksums below are the real check. Making the card needs
+Python 3, 4 GB of disk and the network; no Vivado.
+
+1. Agree on the package (the board's) and the commit. The files below
+   are from `f847fad`:
+
+   ```bash
+   git clone https://github.com/SameerSul/agentic-fpga-scaleout.git
+   cd agentic-fpga-scaleout
+   git checkout f847fad
+   ```
+
+2. Make the files (14 minutes for Qwen3, after a 1.5 GB download). For
+   the ZC706 with Qwen3-0.6B:
+
+   ```bash
+   python3 fetch_qwen.py --model qwen3
+   FPGAI_QWEN=qwen3 python3 qwen_full.py --no-sim --lanes 32 --work build_q3l32
+   FPGAI_QWEN=qwen3 python3 board_zybo.py --work build_q3l32 --board zc706 --out board_zc706_qwen3
+   git status --short board_zc706_qwen3/rtl      # prints nothing
+   ```
+
+   In Windows PowerShell set the variable first, `$env:FPGAI_QWEN="qwen3"`,
+   and drop it from the start of the lines. For the other packages the
+   commands are in step 1 above.
+
+3. Check them against these (`shasum -a 256 board_zc706_qwen3/sd/*`;
+   `sha256sum` on Linux, `certutil -hashfile <file> SHA256` on Windows):
+   the files the co-simulations ran. Both ZC706 packages were made again
+   from a fresh clone of `f847fad` with these commands, byte for byte,
+   the RTL unchanged.
+
+   | package | file | bytes | sha256 |
+   |---|---|---|---|
+   | `board_zc706_qwen3` | `weights8.bin` | 595984384 | `c56727e75e530463acd13c3e6804722310c59ea8a003d9ae6cad57d55c07a612` |
+   | | `cparams.bin` | 5183488 | `b84d5259cff64b1d8c29cd504ed73c36fe1c0b00edb5bf87c787e38b1a1c39d1` |
+   | | `vocab.bin` | 1582993 | `0c22fb14bfeb81463e0d3df1c8598ba687a0ee4ee2040d32f9c534ce7ce497bf` |
+   | | `prompt.bin` | 24 | `7075edf7fef54ce678a9a478b554fe3f5cb152c2a022ee3778644663d3d99246` |
+   | `board_zc706` | `weights8.bin` | 493961216 | `0b6843b6cfb6f23b8ab95b5202b111967a00b811a1add60235e63d647f68ed7b` |
+   | | `cparams.bin` | 4864000 | `39f8e70a724e2530af5f853e25fc21e2a16a9c3678792bca9354fd647784ede2` |
+   | | `vocab.bin` | 1582931 | `5068e879c8aa997efb107ed244451a018e8da2ce3229bf1fc8b3f2d494d4b965` |
+   | | `prompt.bin` | 24 | `7075edf7fef54ce678a9a478b554fe3f5cb152c2a022ee3778644663d3d99246` |
+   | `board_zybo` | `weights8.bin` | 493961216 | `8a089f7eb8be4aa011c868f0a5fef31a724752b5d37b257d96f162a89d843554` |
+   | | `cparams.bin`, `vocab.bin`, `prompt.bin` | | as `board_zc706` |
+
+   The checkpoints themselves, as downloaded: Qwen3-0.6B
+   `model.safetensors` `f47f71177f32bcd101b7573ec9171e6a57f4f4d31148d38e382306f42996874b`,
+   Qwen2.5-0.5B `88c142557820ccad55bb59756bfcfcf891de9cc6202816bd346445188a0ed342`.
+   `fetch_qwen.py` takes Hugging Face's current revision; if the
+   checkpoint's checksum differs, so will the files, and they then need
+   `cosim.py <package> --jitter` before a board, or the files above.
+
+4. Format a microSD card of 1 GB or more as FAT32 with an MBR partition
+   table. This erases it.
+   - macOS: `diskutil list`, find the card (say `/dev/disk4`), then
+     `diskutil eraseDisk FAT32 HALO MBRFormat /dev/disk4`.
+   - Windows: File Explorer, the card, Format, FAT32 (cards up to 32 GB).
+   - Linux: `sudo mkfs.vfat -F 32 /dev/sdX1` on the card's partition.
+
+5. Copy the four files to the **root** of the card, not into a folder,
+   eject it properly (writing 600 MB takes a while; pulling it early
+   corrupts the file), and label it with the package and commit.
+
+6. Get it to the board's owner: hand it over or mail it in a card case,
+   with a message giving the package, the commit and the checksums. With
+   no card to send, share the four files instead (a zip of `sd/`); the
+   board's owner copies them to a card, or skips the card and loads them
+   over JTAG (step 4).
+
+The board's owner then checks out the same commit, builds the same
+package (steps 2 and 3), and in step 4 inserts the card with the board
+off. The boot mode stays JTAG: the card has no `BOOT.bin`, and SD boot
+would find nothing to boot. The UART shows each file loading
+(`weights8.bin: 595984384 bytes at 0x08000000` for Qwen3), then the text.
+
 ## 2. Build the bitstream and the platform
 
 ```bash
