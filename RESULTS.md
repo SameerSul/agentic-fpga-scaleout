@@ -2493,11 +2493,13 @@ accounted for:
   The testbench now takes, from 300,000 random pairs, the sixteen for
   each output that land nearest a boundary, and 4000 more at random
   (9068 checks); it kills the mutant.
-- Two stay open: a product one count off in run 5's softmax and in its
-  attention head, which the testbench does not kill and yosys does not
-  prove equivalent. Those products are shifted right by about twenty
-  bits, and the testbench's boundary-finding row was built for the
-  reference's product, not theirs.
+- The last two, which yosys could not decide, are equivalent. In run
+  5's softmax the mutant adds one to `{e, 15'b0} * m`, a product whose
+  low 15 bits are zero, before a right shift of 40 - k: the one never
+  carries out of bit 0, so every weight is the same. In its attention
+  head the mutant widens a part-select, `k_data[16*gl+15:16*gl]`, by a
+  bit that the 16-bit port drops: both synthesize to the same netlist.
+  No survivor on any LLM block is a hole.
 
 ### Port coverage
 
