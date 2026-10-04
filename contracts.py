@@ -482,7 +482,8 @@ def _abc(work, srcs, wrapper, engine, timeout, frames=0):
         return {"status": "error",
                 "detail": " ".join(l for l in out.strip().splitlines()
                                    if not l.startswith("Warning"))[-400:]}
-    cmd = ("pdr -T %d" % timeout) if engine == "pdr" else ("bmc3 -F %d -T %d" % (frames, timeout))
+    cmd = {"pdr": "pdr -T %d" % timeout, "dprove": "dprove -T %d" % timeout}.get(
+        engine, "bmc3 -F %d -T %d" % (frames, timeout))
     rc, out = formal._run(["yosys-abc", "-c", "read_aiger contract.aig; fold; strash; %s; "
                            "write_cex -a cex.aiw" % cmd], work, timeout + 60)
     if rc == 124 or re.search(r"[Tt]imeout|[Rr]esource limit|time limit", out) and \
@@ -492,7 +493,7 @@ def _abc(work, srcs, wrapper, engine, timeout, frames=0):
             if m and int(m.group(1)) >= frames:
                 return {"status": "bounded", "frames": frames}
         return {"status": "timeout", "engine": engine}
-    if "Property proved" in out:
+    if "Property proved" in out or "Networks are equivalent" in out:
         return {"status": "proved"}
     m = re.search(r"Output (\d+) .*?asserted in frame (\d+)", out)
     if m:
@@ -700,6 +701,33 @@ endmodule
 """
 
 
+def domain(spec):
+    """The inputs a spec allows, as Verilog conditions on its ports: what
+    a port's description or the behaviour says (exp's x non-positive, the
+    reciprocal's x non-zero, the requantizer's shift below 50, a MAC's
+    weight port carrying 8-bit values). Two designs may differ outside
+    it: at shift 72 an LLM's requantizer gives 1 and the reference 0, and
+    the spec says nothing about shift 72."""
+    ins = {p["name"]: p for p in _ports(spec) if p["dir"] == "input"}
+    out = []
+    for n, p in ins.items():
+        desc = p.get("desc", "")
+        if "non-zero" in desc:
+            out.append("%s != 0" % n)
+        if "non-positive" in desc:
+            out.append("%s <= 0" % n)
+    text = " ".join(spec.get("behavior", []))
+    for n in ins:
+        m = re.search(r"\b%s is always less than (\d+)" % re.escape(n), text)
+        if m:
+            out.append("%s < %s" % (n, m.group(1)))
+        m = re.search(r"\b%s carries (\d+)-bit" % re.escape(n), text)
+        if m:
+            b = int(m.group(1))
+            out.append("%s >= -%d && %s <= %d" % (n, 1 << (b - 1), n, (1 << (b - 1)) - 1))
+    return out
+
+
 def _latency_of(spec, srcs, work, timeout):
     lat = _spec_latency(spec)
     if lat is not None:
@@ -752,13 +780,7 @@ def equivalent(spec, rtl_a, rtl_b, deps=(), work=None, timeout=PDR_TIMEOUT):
     # spec also defines (all-ones mantissa, shift 0), run 5's LLM
     # reciprocal follows the spec and the reference gives shift 24; no
     # caller passes 0, since a softmax denominator holds exp(0) = 1.
-    dom = []
-    for p in _ports(spec):
-        desc = p.get("desc", "")
-        if p["dir"] == "input" and "non-zero" in desc:
-            dom.append("%s != 0" % p["name"])
-        if p["dir"] == "input" and "non-positive" in desc:
-            dom.append("%s <= 0" % p["name"])
+    dom = domain(spec)
     if dom:
         text += "  always @(*) assume(!valid_in || (%s));\n" % " && ".join(dom)
     text += "  %s dut_a (.clk(clk), .rst_n(rst_n)%s);\n" % (top, "".join(", " + c for c in ca))
@@ -784,8 +806,14 @@ def equivalent(spec, rtl_a, rtl_b, deps=(), work=None, timeout=PDR_TIMEOUT):
         delays="\n".join(delays), valid_a=names[("valid_out", "a")],
         valid_b=names[("valid_out", "b")], start=k + 3,
         same=" && ".join("%s == %s" % (names[(o, "a")], names[(o, "b")]) for o in data))
-    res = _abc(work, srcs, text, "pdr", timeout)
+    # SAT sweeping first: two pipelines that slice a multiply alike share
+    # internal points it can match, and it finds a difference at once.
+    # PDR, for what sweeping leaves undecided.
+    res = _abc(work, srcs, text, "dprove", timeout)
+    if res["status"] in ("timeout", "error"):
+        res = _abc(work, srcs, text, "pdr", timeout)
     res["latencies"] = lats
+    res["domain"] = dom
     return res
 
 

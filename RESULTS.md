@@ -2453,7 +2453,7 @@ on cycles 89 to 151; index 63 on cycle 152. given more than once: index
 |---|---|---|
 | the assembled LLM set (`llm_blocks/tiny_qwen3`) | 14 of 15; the projection holds over 148 cycles from reset | proved for exp, the reciprocal and the inverse square root; out of time for the four with wide multipliers |
 | run 5, one end-to-end LLM run | 14 of 15; matvec holds over 70 cycles | the same |
-| the reference (rules agent) | 12 of 15; the projection and the 64-wide RMSNorm hold over 98 and 322 cycles from reset; the attention head is undecided | the same |
+| the reference (rules agent) | 12 of 15; the projection, the 64-wide RMSNorm and the attention head hold for every input over 98, 322 and 242 cycles from reset | the same |
 
 No block an LLM signed off after the testbench gained its each-index-once
 check fails its contract. Two engine facts decided the design: z3 through
@@ -2461,10 +2461,11 @@ yosys-smtbmc managed about one cycle a second on matvec, where ABC's PDR
 proves the whole contract in 4 s and `bmc3` covers 300 cycles in 4 s; and
 with sizes up to 256 PDR had not decided matvec after a minute, nor had
 interpolation or `dprove`, hence the caps. The reference blocks are harder
-for PDR than the LLMs': the reference attention head is undecided where
-both LLM heads were proved in three to six minutes (PDR ran out of time
-at n up to 16 and, given 25 minutes, at n up to 4), and the reference
-RMSNorm needed the bounded fallback where both LLM RMSNorms were proved.
+for PDR than the LLMs'. PDR could not prove the reference attention head,
+at n up to 16 nor in 25 minutes at n up to 4, where both LLM heads were
+proved in three to six minutes; run alone, BMC holds its handshake for
+every input over two whole runs, 242 cycles. The reference RMSNorm needed
+the same bounded fallback where both LLM RMSNorms were proved.
 
 ### Mutation testing on the LLM blocks
 
@@ -2564,8 +2565,15 @@ one, so there the check is complete.
 
 `contracts.equivalent` puts an LLM's streaming block and the reference
 side by side, the same samples into both on every cycle, the faster's
-outputs delayed to meet the slower's, and proves with PDR that the outputs
-agree whenever they are valid, for every input sequence. The exponential,
+outputs delayed to meet the slower's, and proves that the outputs agree
+whenever they are valid, for every input sequence in the spec's domain:
+SAT sweeping (`dprove`) first, which matches internal points of two
+designs built alike and finds a difference at once, then PDR. The domain
+is what the spec states (exp's input non-positive, the reciprocal's
+non-zero, the requantizer's shift below 50, a MAC's weights 8-bit).
+Without it, sweeping found in 0.03 s that an LLM's requantizer gives 1
+at shift 72 where the reference gives 0; the spec says nothing about
+shift 72, and within the domain neither engine finds a difference. The exponential,
 the reciprocal and the inverse square root are proved equal to the
 reference for both LLM sets, each in under a second, and run 5's residual
 add in 21 s, at its latency of 5 against the reference's 3. The MACs, the
@@ -2650,9 +2658,9 @@ These are the distance between this repo and a local LLM host.
    proofs run out of time, and the values rest on the testbenches, their
    back-to-back phases, SiLU's exhaustive run and mutation testing. The
    accumulator proof holds for the int8 targets; with 16-bit operands z3
-   runs out of time on it. The reference attention head's contract is
-   undecided. Port coverage is a port-level measure, not UVM's
-   covergroups.
+   runs out of time on it. The reference attention head's and RMSNorm's
+   contracts are bounded, two whole runs, not proved for every state.
+   Port coverage is a port-level measure, not UVM's covergroups.
 
 6. **The scale-out's links stop at simulation.** The layer split's
    links are fabric UARTs in simulation (6.25 Mbaud) and, between Zynq
