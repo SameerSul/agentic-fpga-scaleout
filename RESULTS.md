@@ -2611,6 +2611,18 @@ France is" from the card's vocabulary, then 16 tokens, with QEMU's
 missing PL answered by a stand-in. The SPL's DDR initialisation and the
 bitstream on the PL are what only the board can show.
 
+The one piece of the card no simulation has run is the open flow's top
+level, `open/fpgai_ps7.v`, which wires the core to the PS7's ports (the
+co-simulation drives the core's AXI ports directly). Checked by hand
+against the PS7's AXI3 ports: the streamers tie each length's upper four
+bits low, so no burst exceeds the 16 beats AXI3 allows and the 4-bit
+slice loses nothing; every beat is 64 bits (size 3 in the 2-bit field),
+INCR, non-cacheable; GP0 reads are single beats from the CPU with its MMU
+off, so a constant RLAST is right; the HP ports stay at their 64-bit
+reset width, since neither board's `ps7_init` writes the AFI registers;
+and U-Boot builds with the L2 cache off, so the ACP and the CPU see the
+same DDR.
+
 ## Not verified, and not claimed
 
 These are the distance between this repo and a local LLM host.
