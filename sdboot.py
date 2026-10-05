@@ -18,7 +18,8 @@ The card:
   weights8.bin, cparams.bin, vocab.bin, prompt.bin   the package's sd/
 
 U-Boot's SPL and U-Boot are built from U-Boot v2026.07 with
-xilinx_zynq_virt_defconfig and DEVICE_TREE=zynq-zc706 (sdboot/uboot/).
+xilinx_zynq_virt_defconfig and the board's device tree, zynq-zc706 or
+zynq-zybo-z7 (sdboot/uboot/).
 
 Everything but the model files is committed in the package's boot/
 folder, so making a card needs Python and the package's sd/ files only:
@@ -84,6 +85,11 @@ def _layout(pkg):
         re.search(r'#define FPGAI_BOARD\s+"([^"]+)"', h).group(1)
 
 
+def _slug(board):
+    """sdboot/uboot/'s folder for a board: "Zybo Z7-20" is zybo_z7_20."""
+    return re.sub(r"[^a-z0-9]+", "_", board.lower()).strip("_")
+
+
 def _run(cmd, cwd=None):
     r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
     if r.returncode:
@@ -134,7 +140,7 @@ def build_boot(pkg, bit, uboot=None):
     bitstream, compressed (the 7Z045's 13 MB is 1.2 MB gzipped)."""
     import gzip
     _, board = _layout(pkg)
-    uboot = uboot or os.path.join(SD, "uboot", board.lower())
+    uboot = uboot or os.path.join(SD, "uboot", _slug(board))
     out = os.path.join(pkg, "boot")
     os.makedirs(out, exist_ok=True)
     for f in ("boot.bin", "u-boot.img"):
@@ -174,7 +180,7 @@ def copy_card(pkg, out):
 def card(pkg, out, bit=None, uboot=None, fake_tokens=None, fpga=True):
     """Every file the card holds, in out, built here (for --qemu)."""
     _, board = _layout(pkg)
-    uboot = uboot or os.path.join(SD, "uboot", board.lower())
+    uboot = uboot or os.path.join(SD, "uboot", _slug(board))
     bit = bit or os.path.join(pkg, "open", "fpgai.bit")
     os.makedirs(out, exist_ok=True)
     for f in ("boot.bin", "u-boot.img"):
@@ -284,7 +290,7 @@ def main():
         files = card(pkg, os.path.join(work, "files"), a.bit, a.uboot, toks, fpga=False)
         img = image(files, os.path.join(work, "sd.img"))
         _, board = _layout(pkg)
-        print(qemu(img, a.uboot or os.path.join(SD, "uboot", board.lower())))
+        print(qemu(img, a.uboot or os.path.join(SD, "uboot", _slug(board))))
         shutil.rmtree(work, ignore_errors=True)
         return
     if a.build:

@@ -2592,7 +2592,8 @@ and the board packages with it, and the proof is over the spec's domain.
 ## A card that boots by itself
 
 The board step needed Vivado and Vitis on an x86 machine. It no longer
-does: `sdboot.py` makes a card that boots the ZC706 on its own. U-Boot
+does: `sdboot.py` makes a card that boots the ZC706, or the Zybo Z7-20,
+on its own. U-Boot
 v2026.07's SPL runs the board's published `ps7_init` (DDR, MIO, and FCLK0
 at 1000 / 20 = 50 MHz, the design's clock), U-Boot programs the PL from
 the open-flow bitstream (`xc7z045ffg900-2` in its header, a payload of
@@ -2603,9 +2604,10 @@ BSP's register access, the global timer, a printf on the UART, and FatFs
 as a view of what U-Boot put in DDR, so the program's own size and
 layout checks still apply.
 
-In QEMU's Zynq the whole card boots: U-Boot reads all 617 MB off it, and
-the program loads the files, passes its checks and prints "The capital
-of France is" from the card's vocabulary, then 16 tokens, with QEMU's
+In QEMU's Zynq the whole card boots, the ZC706's with Qwen3 and the
+Zybo's with Qwen2.5: U-Boot reads every file off it (617 MB for Qwen3),
+and the program loads them, passes its checks and prints "The capital of
+France is" from the card's vocabulary, then 16 tokens, with QEMU's
 missing PL answered by a stand-in. The SPL's DDR initialisation and the
 bitstream on the PL are what only the board can show.
 

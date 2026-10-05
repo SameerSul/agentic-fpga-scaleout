@@ -126,11 +126,12 @@ python3 board_zybo.py --board zybo_z7_20_32 --work build_q25l32
 python3 cosim.py board_zybo_32 --jitter
 ```
 
-### No Vivado: a card that boots by itself (ZC706)
+### No Vivado: a card that boots by itself
 
-`board_zc706_qwen3/boot/` and `board_zc706/boot/` hold everything a card
-needs besides the model files: U-Boot's SPL (`boot.bin`, which runs the
-ZC706's own `ps7_init`: DDR, MIO, FCLK0 at 50 MHz), U-Boot
+`board_zc706_qwen3/boot/`, `board_zc706/boot/` and `board_zybo/boot/`
+hold everything a card needs besides the model files: U-Boot's SPL
+(`boot.bin`, which runs the board's own `ps7_init`: DDR, MIO, FCLK0 at
+50 MHz), U-Boot
 (`u-boot.img`), a script (`halo.scr`) that programs the PL from the
 open-flow bitstream and reads each model file into DDR, the package's
 `sw/main.c` built bare-metal (`halo.bin`, the program unchanged, built
@@ -142,8 +143,9 @@ python3 sdboot.py board_zc706_qwen3 --out /Volumes/HALO   # onto a FAT32 card (P
 python3 sdboot.py board_zc706_qwen3 --image halo_sd.img   # or a disk image to flash (mtools)
 ```
 
-Set SW11 to SD-card boot (UG954, "Boot mode"), insert the card, power on,
-and open the USB-UART at 115200 8N1. U-Boot prints its banner, then
+Set the boot mode to SD card (SW11 on the ZC706, UG954 "Boot mode"; JP5
+on the Zybo Z7), insert the card, power on, and open the USB-UART at
+115200 8N1. U-Boot prints its banner, then
 "Halo: programming the PL", each file it reads (the weights take about
 half a minute), and the program prints the same lines as a Vitis build:
 
