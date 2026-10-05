@@ -2572,6 +2572,51 @@ def test_port_coverage_and_every_input():
         shutil.rmtree(work, ignore_errors=True)
 
 
+def test_sd_card_boots_on_its_own():
+    """A package's card with no Vivado (sdboot.py): U-Boot's SPL and
+    U-Boot, a script that programs the PL and reads the model files into
+    DDR, and the package's sw/main.c, unchanged, built bare-metal. A tiny
+    package's card boots in QEMU's Zynq: every file loads, the program's
+    own size checks pass, and it prints the prompt and the tokens from its
+    own vocabulary. QEMU has no PL, so the register reads are answered by
+    sdboot's stand-in with the integer model's tokens; the PL itself is the
+    board's to show."""
+    tools = ('arm-none-eabi-gcc', 'mkimage', 'mformat', 'mcopy', 'qemu-system-arm')
+    if not all(shutil.which(t) for t in tools):
+        check('the SD card boots on its own (no ARM toolchain or QEMU: skipped)', True)
+        return
+    import board_zybo as bz, cosim, qwen_full, qwen_synth, sdboot, zybo
+    import qwen_real as qr
+    import io, contextlib
+    work = os.path.join(ROOT, 'build_sdboottest')
+    shutil.rmtree(work, ignore_errors=True)
+    try:
+        ids, n_gen = [3, 77, 12, 140], 3
+        im, _ = qwen_synth.model('qwen3', nl=2)
+        want = qr.greedy(im, ids, n_gen)
+        b = os.path.join(work, 'build')
+        im.ms['lanes'] = boards_mod.PACKAGES['zybo_z7_20']['lanes']
+        qwen_full.build_model(im, ids, n_gen, b, log=lambda *a: None, want=want)
+        pkg = os.path.join(work, 'pkg')
+        with contextlib.redirect_stdout(io.StringIO()):
+            bz.package(b, 'zybo_z7_20', pkg, '', n_gen, sd=False, model='tiny', checked='-')
+        bz.write_sd(zybo.layout(b, bz.BASE), b, os.path.join(pkg, 'sd'), ids, cosim.Tokens(im.V))
+        uboot = os.path.join(ROOT, 'sdboot', 'uboot', 'zc706')
+        bit = os.path.join(work, 'none.bit')
+        open(bit, 'wb').write(b'\0' * 64)          # QEMU skips the PL step
+        files = sdboot.card(pkg, os.path.join(work, 'files'), bit, uboot,
+                            want[len(ids):], fpga=False)
+        img = sdboot.image(files, os.path.join(work, 'sd.img'), 64)
+        out = sdboot.qemu(img, uboot, timeout=300)
+        text = ''.join('<%d>' % t for t in want)
+        check('a card boots in QEMU on its own: U-Boot loads every file, the program '
+              'prints the prompt and its tokens',
+              'Halo: reading the model files' in out and text in out
+              and 'Application terminated, rc = 0x0' in out)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
 def test_composites_give_their_parts_ports():
     """A composite that instantiates supplied modules has to give their
     ports: told only "the supplied mac module", two models guessed port
@@ -4881,6 +4926,7 @@ if __name__ == '__main__':
     test_resume_keeps_what_a_run_signed_off()
     test_contracts_catch_what_the_testbench_missed()
     test_port_coverage_and_every_input()
+    test_sd_card_boots_on_its_own()
     test_llm_blocks_decode()
     test_attention_scores_cannot_overflow()
     test_spec_to_verified_rtl()

@@ -1,0 +1,307 @@
+"""A board package as one SD card that boots by itself: no Vivado, no
+Vitis, no JTAG. Put the card in, set the boot mode to SD, power on, and
+read the UART.
+
+The card:
+
+  boot.bin      U-Boot's SPL, with the board's own ps7_init (DDR, clocks,
+                MIO; FCLK0 is 50 MHz on the ZC706, the design's clock)
+  u-boot.img    U-Boot, whose boot command runs halo.scr
+  halo.scr      programs the PL from fpgai.bit, reads each model file into
+                the address the program loads it to and records its size,
+                turns the caches off and starts the program
+  halo.bin      the package's sw/main.c, unchanged, built bare-metal with
+                sdboot/ (the BSP's register access, timer and FatFs, served
+                from what U-Boot put in DDR, and a printf on the UART)
+  fpgai.bit     the open-flow bitstream (open/build_open.sh), which has no
+                PS configuration in it: the SPL's ps7_init is that
+  weights8.bin, cparams.bin, vocab.bin, prompt.bin   the package's sd/
+
+U-Boot's SPL and U-Boot are built from U-Boot v2026.07 with
+xilinx_zynq_virt_defconfig and DEVICE_TREE=zynq-zc706 (sdboot/uboot/).
+
+Everything but the model files is committed in the package's boot/
+folder, so making a card needs Python and the package's sd/ files only:
+
+  python3 sdboot.py board_zc706_qwen3 --out /Volumes/HALO      onto the card
+  python3 sdboot.py board_zc706_qwen3 --image halo_sd.img      a FAT32 image (mtools)
+  python3 sdboot.py board_zc706_qwen3 --build --bit <fpgai.bit>   remake boot/
+  python3 sdboot.py board_zc706_qwen3 --qemu --tokens ...      boot it in QEMU
+
+--build needs arm-none-eabi-gcc and mkimage; --qemu also qemu-system-arm.
+
+--qemu boots the card's U-Boot in QEMU's xilinx-zynq-a9 machine with the
+image as its SD card. QEMU has no PL, so that build answers the program's
+register reads from a stand-in (the cosim's tokens, in order): it checks
+the boot chain, every file's load, the table, the program and its UART
+output, not the PL, which only a board can.
+"""
+import argparse
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+ROOT = os.path.dirname(os.path.abspath(__file__))
+SD = os.path.join(ROOT, "sdboot")
+TABLE = 0x07F00000
+MAGIC = 0x48414C4F
+BIT_STAGE = 0x01000000
+SCRIPT_STAGE = 0x03000000
+APP = 0x00100000
+DATA = ("weights8.bin", "cparams.bin", "vocab.bin", "prompt.bin")
+
+SCRIPT = """echo "Halo: programming the PL from fpgai.bit"
+if fatload mmc 0 {bit:#010x} fpgai.bit && fpga loadb 0 {bit:#010x} ${{filesize}}; then
+  echo "Halo: PL programmed"
+else
+  echo "Halo: could not program the PL; stopping"
+  exit
+fi
+echo "Halo: reading the model files"
+mw.l {table:#010x} 0 8
+if fatload mmc 0 {wb:#010x} weights8.bin; then mw.l {t1:#010x} ${{filesize}}; fi
+if fatload mmc 0 {cb:#010x} cparams.bin; then mw.l {t2:#010x} ${{filesize}}; fi
+if fatload mmc 0 {vb:#010x} vocab.bin; then mw.l {t3:#010x} ${{filesize}}; fi
+if fatload mmc 0 {pb:#010x} prompt.bin; then mw.l {t4:#010x} ${{filesize}}; fi
+mw.l {table:#010x} {magic:#010x}
+if fatload mmc 0 {app:#010x} halo.bin; then
+  dcache off
+  icache off
+  go {app:#010x}
+else
+  echo "Halo: no halo.bin on the card"
+fi
+"""
+
+
+def _layout(pkg):
+    h = open(os.path.join(pkg, "sw", "fpgai_layout.h")).read()
+    get = lambda n: int(re.search(r"#define %s\s+0x([0-9A-Fa-f]+)U" % n, h).group(1), 16)
+    return {n: get(n) for n in ("WBASE", "CBASE", "VOCAB_BASE")}, \
+        re.search(r'#define FPGAI_BOARD\s+"([^"]+)"', h).group(1)
+
+
+def _run(cmd, cwd=None):
+    r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+    if r.returncode:
+        raise RuntimeError("%s failed:\n%s%s" % (cmd[0], r.stdout[-2000:], r.stderr[-2000:]))
+    return r.stdout
+
+
+def build_program(pkg, out, fake_tokens=None):
+    """The package's sw/main.c, unchanged, as halo.bin."""
+    elf = os.path.join(out, "halo.elf")
+    defs = []
+    if fake_tokens:
+        defs = ["-DHALO_FAKE_PL", "-DHALO_FAKE_TOKENS=%s" % ",".join(map(str, fake_tokens))]
+    _run(["arm-none-eabi-gcc", "-mcpu=cortex-a9", "-marm", "-mfloat-abi=soft",
+          "-mno-unaligned-access", "-ffreestanding", "-fno-builtin", "-nostdlib",
+          "-nostartfiles", "-O2", "-Wall", "-Wno-unused-function",
+          "-I" + os.path.join(SD, "include"), "-I" + os.path.join(pkg, "sw")] + defs +
+         [os.path.join(SD, "start.S"), os.path.join(SD, "rt.c"),
+          os.path.join(pkg, "sw", "main.c"), "-T", os.path.join(SD, "app.ld"),
+          "-Wl,--no-warn-rwx-segments", "-lgcc", "-o", elf])
+    _run(["arm-none-eabi-objcopy", "-O", "binary", elf, os.path.join(out, "halo.bin")])
+    return os.path.join(out, "halo.bin")
+
+
+def build_script(pkg, out, fpga=True):
+    lay, _ = _layout(pkg)
+    text = SCRIPT.format(bit=BIT_STAGE, table=TABLE, magic=MAGIC, app=APP,
+                         wb=lay["WBASE"], cb=lay["CBASE"], vb=lay["VOCAB_BASE"],
+                         pb=TABLE + 0x1000, t1=TABLE + 4, t2=TABLE + 8, t3=TABLE + 12,
+                         t4=TABLE + 16)
+    if not fpga:
+        text = text.replace('if fatload mmc 0 0x01000000 fpgai.bit && fpga loadb 0 '
+                            '0x01000000 ${filesize}; then',
+                            'if fatload mmc 0 0x01000000 fpgai.bit; then')
+    cmd = os.path.join(out, "halo.cmd")
+    with open(cmd, "w") as f:
+        f.write(text)
+    _run(["mkimage", "-A", "arm", "-O", "u-boot", "-T", "script", "-C", "none",
+          "-n", "Halo", "-d", cmd, os.path.join(out, "halo.scr")])
+    return os.path.join(out, "halo.scr")
+
+
+BOOT_FILES = ("boot.bin", "u-boot.img", "halo.scr", "halo.bin", "fpgai.bit.gz")
+
+
+def build_boot(pkg, bit, uboot=None):
+    """The package's boot/ folder: U-Boot, the script, the program and the
+    bitstream, compressed (the 7Z045's 13 MB is 1.2 MB gzipped)."""
+    import gzip
+    _, board = _layout(pkg)
+    uboot = uboot or os.path.join(SD, "uboot", board.lower())
+    out = os.path.join(pkg, "boot")
+    os.makedirs(out, exist_ok=True)
+    for f in ("boot.bin", "u-boot.img"):
+        shutil.copyfile(os.path.join(uboot, f), os.path.join(out, f))
+    build_program(pkg, out)
+    build_script(pkg, out)
+    for f in ("halo.elf", "halo.cmd"):
+        os.remove(os.path.join(out, f))
+    with open(bit, "rb") as f, gzip.GzipFile(os.path.join(out, "fpgai.bit.gz"), "wb",
+                                             mtime=0) as g:
+        shutil.copyfileobj(f, g)
+    return out
+
+
+def copy_card(pkg, out):
+    """boot/ and sd/ onto the card (or a folder): Python only."""
+    import gzip
+    boot, sd = os.path.join(pkg, "boot"), os.path.join(pkg, "sd")
+    missing = [f for f in BOOT_FILES if not os.path.exists(os.path.join(boot, f))]
+    if missing:
+        raise RuntimeError("%s/boot/ lacks %s" % (os.path.basename(pkg), ", ".join(missing)))
+    missing = [f for f in DATA if not os.path.exists(os.path.join(sd, f))]
+    if missing:
+        raise RuntimeError("%s/sd/ lacks %s: make them first (HANDOFF.md step 1)"
+                           % (os.path.basename(pkg), ", ".join(missing)))
+    os.makedirs(out, exist_ok=True)
+    for f in BOOT_FILES[:-1]:
+        shutil.copyfile(os.path.join(boot, f), os.path.join(out, f))
+    with gzip.open(os.path.join(boot, "fpgai.bit.gz"), "rb") as g, \
+            open(os.path.join(out, "fpgai.bit"), "wb") as f:
+        shutil.copyfileobj(g, f)
+    for f in DATA:
+        shutil.copyfile(os.path.join(sd, f), os.path.join(out, f))
+    return out
+
+
+def card(pkg, out, bit=None, uboot=None, fake_tokens=None, fpga=True):
+    """Every file the card holds, in out, built here (for --qemu)."""
+    _, board = _layout(pkg)
+    uboot = uboot or os.path.join(SD, "uboot", board.lower())
+    bit = bit or os.path.join(pkg, "open", "fpgai.bit")
+    os.makedirs(out, exist_ok=True)
+    for f in ("boot.bin", "u-boot.img"):
+        shutil.copyfile(os.path.join(uboot, f), os.path.join(out, f))
+    if not os.path.exists(bit):
+        raise RuntimeError("no bitstream at %s: build it with %s/open/build_open.sh, "
+                           "or pass --bit" % (bit, os.path.basename(pkg)))
+    shutil.copyfile(bit, os.path.join(out, "fpgai.bit"))
+    build_program(pkg, out, fake_tokens)
+    build_script(pkg, out, fpga)
+    for f in DATA:
+        src = os.path.join(pkg, "sd", f)
+        if not os.path.exists(src):
+            raise RuntimeError("no %s: make the package's sd/ files first (HANDOFF.md step 1)" % src)
+        dst = os.path.join(out, f)
+        if os.path.exists(dst):
+            os.remove(dst)
+        try:
+            os.link(src, dst)
+        except OSError:
+            shutil.copyfile(src, dst)
+    for f in ("halo.elf", "halo.cmd"):
+        os.remove(os.path.join(out, f))
+    return out
+
+
+def image(files, path, size_mb=1024):
+    """A raw disk image: one FAT32 partition, MBR, holding files."""
+    part_off = 1 << 20
+    with open(path, "wb") as f:
+        f.truncate(size_mb << 20)
+    sectors = (size_mb << 20) // 512
+    start = part_off // 512
+    mbr = bytearray(512)
+    entry = bytes([0x00, 0, 0, 0, 0x0C, 0, 0, 0]) + start.to_bytes(4, "little") + \
+        (sectors - start).to_bytes(4, "little")
+    mbr[446:462] = entry
+    mbr[510:512] = b"\x55\xaa"
+    with open(path, "r+b") as f:
+        f.write(mbr)
+    target = "%s@@%d" % (path, part_off)
+    _run(["mformat", "-i", target, "-F", "-v", "HALO", "::"])
+    for name in sorted(os.listdir(files)):
+        _run(["mcopy", "-i", target, os.path.join(files, name), "::/" + name])
+    return path
+
+
+def qemu(img, uboot, timeout=900):
+    """Boot U-Boot in QEMU's Zynq with img as the SD card; return the UART."""
+    dtb = os.path.join(uboot, "u-boot-dtb.bin")
+    cmd = ["qemu-system-arm", "-M", "xilinx-zynq-a9", "-m", "1024", "-nographic",
+           "-serial", "null", "-serial", "stdio", "-monitor", "none",
+           "-drive", "file=%s,if=sd,format=raw,index=0" % img,
+           "-device", "loader,file=%s,addr=0x04000000" % dtb,
+           "-device", "loader,addr=0x04000000,cpu-num=0"]
+    p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                         stderr=subprocess.STDOUT)
+    # Raw reads: U-Boot prints progress without a newline, and a line read
+    # would wait on it for good.
+    import select
+    import time
+    out, t0 = b"", time.time()
+    def done():
+        i = out.find(b"Application terminated")
+        return i >= 0 and b"\n" in out[i:]
+    while time.time() - t0 < timeout and not done():
+        r, _, _ = select.select([p.stdout], [], [], 2)
+        if r:
+            chunk = os.read(p.stdout.fileno(), 65536)
+            if not chunk:
+                break
+            out += chunk
+    p.kill()
+    p.wait()
+    return out.decode("utf-8", "replace")
+
+
+def cosim_tokens(pkg):
+    """The 16 tokens the package's program printed in the cosim, for the
+    QEMU stand-in. From cosim.py's head lines if a run left them, else the
+    integer model's, as qwen_full.py recorded them."""
+    p = os.path.join(pkg, "sd", "tokens.txt")
+    if os.path.exists(p):
+        return [int(t) for t in open(p).read().split()]
+    return None
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("package", help="a board package: board_zc706_qwen3, board_zc706")
+    ap.add_argument("--out", default=None, help="write the card's files here")
+    ap.add_argument("--image", default=None, help="write a raw FAT32 disk image here")
+    ap.add_argument("--bit", default=None, help="the bitstream (default: <package>/open/fpgai.bit)")
+    ap.add_argument("--uboot", default=None, help="boot.bin and u-boot.img (default: sdboot/uboot/<board>)")
+    ap.add_argument("--build", action="store_true",
+                    help="remake <package>/boot/ (needs arm-none-eabi-gcc, mkimage and --bit)")
+    ap.add_argument("--qemu", action="store_true", help="boot the card in QEMU, PL stood in for")
+    ap.add_argument("--tokens", default=None,
+                    help="for --qemu: the tokens the stand-in PL gives, comma-separated")
+    a = ap.parse_args()
+    pkg = os.path.abspath(a.package)
+    if a.qemu:
+        toks = [int(t) for t in a.tokens.split(",")] if a.tokens else cosim_tokens(pkg)
+        if not toks:
+            ap.error("--qemu needs --tokens (the cosim's tokens, from cosim.py's head steps)")
+        work = tempfile.mkdtemp(prefix="halo_qemu_")
+        files = card(pkg, os.path.join(work, "files"), a.bit, a.uboot, toks, fpga=False)
+        img = image(files, os.path.join(work, "sd.img"))
+        _, board = _layout(pkg)
+        print(qemu(img, a.uboot or os.path.join(SD, "uboot", board.lower())))
+        shutil.rmtree(work, ignore_errors=True)
+        return
+    if a.build:
+        if not a.bit:
+            ap.error("--build needs --bit, the open-flow bitstream for this package")
+        print("boot files in", build_boot(pkg, os.path.abspath(a.bit), a.uboot))
+        return
+    if a.image:
+        work = tempfile.mkdtemp(prefix="halo_card_")
+        image(copy_card(pkg, os.path.join(work, "files")), os.path.abspath(a.image))
+        shutil.rmtree(work, ignore_errors=True)
+        print("FAT32 image in", a.image)
+        return
+    out = os.path.abspath(a.out or os.path.join(pkg, "card"))
+    copy_card(pkg, out)
+    print("card files in", out)
+
+
+if __name__ == "__main__":
+    main()

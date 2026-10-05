@@ -126,6 +126,41 @@ python3 board_zybo.py --board zybo_z7_20_32 --work build_q25l32
 python3 cosim.py board_zybo_32 --jitter
 ```
 
+### No Vivado: a card that boots by itself (ZC706)
+
+`board_zc706_qwen3/boot/` and `board_zc706/boot/` hold everything a card
+needs besides the model files: U-Boot's SPL (`boot.bin`, which runs the
+ZC706's own `ps7_init`: DDR, MIO, FCLK0 at 50 MHz), U-Boot
+(`u-boot.img`), a script (`halo.scr`) that programs the PL from the
+open-flow bitstream and reads each model file into DDR, the package's
+`sw/main.c` built bare-metal (`halo.bin`, the program unchanged, built
+with `sdboot/`), and the bitstream (`fpgai.bit.gz`, unpacked onto the
+card). With them the board needs no Vivado, no Vitis and no JTAG:
+
+```bash
+python3 sdboot.py board_zc706_qwen3 --out /Volumes/HALO   # onto a FAT32 card (Python only)
+python3 sdboot.py board_zc706_qwen3 --image halo_sd.img   # or a disk image to flash (mtools)
+```
+
+Set SW11 to SD-card boot (UG954, "Boot mode"), insert the card, power on,
+and open the USB-UART at 115200 8N1. U-Boot prints its banner, then
+"Halo: programming the PL", each file it reads (the weights take about
+half a minute), and the program prints the same lines as a Vitis build:
+
+```
+fpgai: Qwen on the ZC706 PL
+weights8.bin: 595984384 bytes at 0x08000000
+...
+The capital of France is Paris. The capital of the United States is Washington, D.C. The capital
+```
+
+If U-Boot cannot program the PL it says so and stops, rather than running
+the program without one. Checked in QEMU's Zynq (`sdboot.py --qemu`):
+U-Boot reads every file off the card, and the program loads them, passes
+its own size checks and prints the prompt and the tokens from the card's
+vocabulary, with QEMU's missing PL answered by a stand-in. The SPL's
+`ps7_init` and the open-flow bitstream on the PL are the board's to show.
+
 ### The card made on one machine, the board on another
 
 The card holds data, not a boot image: `weights8.bin`, `cparams.bin`,
