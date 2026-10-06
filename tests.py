@@ -2613,6 +2613,21 @@ def test_sd_card_boots_on_its_own():
               'prints the prompt and its tokens',
               'Halo: reading the model files' in out and text in out
               and 'Application terminated, rc = 0x0' in out)
+        # The diagnostics for a board whose answer is wrong (sdboot.py
+        # --diag): on the RTL in simulation they record the step the board
+        # is checked against, the integer model's token and every layer's
+        # K and V; on a card they run to the end.
+        d = os.path.join(work, 'diag')
+        rec = sdboot.diag_record(pkg, d, log=lambda *a: None, tok=ids[0])
+        sdboot.write_expect(rec, os.path.join(d, 'diag_expect.h'))
+        sdboot.build_program(pkg, files, want[len(ids):], main=os.path.join(ROOT, 'sdboot', 'diag.c'),
+                             include=d)
+        out = sdboot.qemu(sdboot.image(files, os.path.join(work, 'sd2.img'), 64), uboot, timeout=300)
+        check('the diagnostics record the integer model\'s token and every layer\'s K and V '
+              'on the RTL, and run to the end on a card',
+              rec['next'] == qr.greedy(im, ids[:1], 1)[-1]
+              and len(rec['w']) == 2 * 2 * im.KV * im.hd
+              and 'Halo diagnostics done' in out and 'Application terminated, rc = 0x0' in out)
     finally:
         shutil.rmtree(work, ignore_errors=True)
 

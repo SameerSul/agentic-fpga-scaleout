@@ -163,6 +163,29 @@ its own size checks and prints the prompt and the tokens from the card's
 vocabulary, with QEMU's missing PL answered by a stand-in. The SPL's
 `ps7_init` and the open-flow bitstream on the PL are the board's to show.
 
+### If the card boots and the answer is wrong
+
+The first ZC706 run did exactly this: U-Boot programmed the PL, every
+file loaded, every step took its usual time, and every token was 0
+("!"). A step's time does not depend on its data, so that is the PL
+computing on wrong data. To find where, copy
+`board_zc706_qwen3/boot/halo_diag.bin` onto the card as `halo.bin` (keep
+the old one), boot, and send back the whole UART log. In about five
+minutes it prints:
+
+- A: the clocks, resets and caches U-Boot left (FCLK0 should be 50 MHz)
+- B: every bit of TOK, POS and head_en, written over GP0 and read back
+- C: the model files in DDR, sampled, against the ones it was built with
+- D: one step (token 785, "The", at position 0): its token, logit and
+  cycles, and each layer's 1024 K and 1024 V values in the KV cache,
+  against the same RTL in simulation, twice
+- E: the card's own prompt, with each generated token's id and logit
+- F: D again at 25 and 10 MHz, and E at the first clock that matches
+
+`python3 sdboot.py <package> --diag` remakes it: it runs `sdboot/diag.c`
+on the package's RTL under `cosim.py` to record the step, then builds
+the ARM program that compares the board with that recording.
+
 ### The card made on one machine, the board on another
 
 The card holds data, not a boot image: `weights8.bin`, `cparams.bin`,

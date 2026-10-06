@@ -31,11 +31,22 @@
 #define UART_FIFO 0x30
 #define UART_TXFULL (1U << 4)
 
-static void putch(char c)
+static void putch_raw(char c)
 {
     while (Xil_In32(HALO_UART + UART_SR) & UART_TXFULL)
         ;
     Xil_Out32(HALO_UART + UART_FIFO, (u32)(unsigned char)c);
+}
+
+/* A token's text has bare newlines; a terminal wants a carriage return
+   with each, or the next line starts where the last one ended. */
+static void putch(char c)
+{
+    static char last;
+    if (c == '\n' && last != '\r')
+        putch_raw('\r');
+    putch_raw(c);
+    last = c;
 }
 
 typedef struct { int unused; } FILE;
@@ -292,6 +303,7 @@ u32 halo_fake_in(UINTPTR a)
     case FPGAI_ID: return FPGAI_ID_VALUE;
     case FPGAI_WBASE: return WBASE;
     case FPGAI_KVEND: return KVEND;
+    case FPGAI_VBASE: return KBASE + (KVEND - KBASE) / 2;
     case FPGAI_STATUS: return 2;
     case FPGAI_NEXT_TOK: return fake_next;
     default: return 0;
