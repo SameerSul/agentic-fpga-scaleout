@@ -23,7 +23,9 @@ cd "$(dirname "$0")"
 : "${NEXTPNR_XILINX:?set NEXTPNR_XILINX}" "${XRAY_DIR:?set XRAY_DIR}"
 cp ../rtl/gains.hex .
 yosys -q -l yosys.log -p "read_verilog fpgai_ps7.v $(ls ../rtl/*.v | tr '\n' ' '); \
-  synth_xilinx -flatten -abc9 -arch xc7 -top fpgai_ps7; write_json fpgai.json"
+  synth_xilinx -flatten -abc9 -arch xc7 -top fpgai_ps7 -run :map_dsp; \
+  dffunmap -srst-only; \
+  synth_xilinx -flatten -abc9 -arch xc7 -top fpgai_ps7 -run map_dsp:; write_json fpgai.json"
 "$NEXTPNR_XILINX/build/nextpnr-xilinx" --chipdb "$NEXTPNR_XILINX/xilinx/xc7z045.bin" \
   --xdc open.xdc --json fpgai.json --fasm fpgai.fasm --freq 50 \
   --report report.json --log nextpnr.log

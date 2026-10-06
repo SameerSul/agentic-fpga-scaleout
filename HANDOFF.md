@@ -31,7 +31,8 @@ Below, `board_<name>/` is whichever package matches the board.
 | the same, with no SD card: the files written into DDR as `sw/load_jtag.tcl` writes them over JTAG (`cosim.py --jtag`) | Zybo, ZC706 and ZC706 Qwen3: the same 16 tokens as from the card |
 | the weight streamer under 1500 jumps and a stalling bus, every word checked | passes; it failed on every seed before a slot was limited to one burst in flight |
 | fits the part (Yosys, nextpnr-xilinx) | Zybo: 28% of LUT sites, 132 of 220 DSPs, 49 BRAMs; ZC706 at 32 lanes: 9%, 196 of 900 DSPs |
-| places and routes in the open flow (nextpnr-xilinx), XC7Z020 and XC7Z045 | all three builds close 50 MHz on both clocks, and every bitstream round-trips frame for frame |
+| places and routes in the open flow (nextpnr-xilinx), XC7Z020 and XC7Z045 | all three builds close 50 MHz on both clocks, and every bitstream round-trips frame for frame; the card runs them at 40 MHz, since the paths from the bus clock into the core's gated clock (unconstrained in nextpnr) reach 20 ns |
+| the open flow's own netlist, Xilinx primitives simulated (`gatesim.py`) | a tiny package's program: the RTL's tokens and logits; Yosys 0.68's DSP sign bug, which made the first board run answer "!", reproduced and worked around |
 | several boards on their own clocks, each a stage of layers (`gals.py`, simulated) | two and three stages over fabric UARTs give one board's tokens and logits exactly |
 | the stage ARM program's UDP protocol, run on a host (two processes, lwIP shimmed, one datagram dropped) | resends, reassembles, prints the reference tokens |
 | Vivado block design, Vivado timing, the ARM program | **not run** |
@@ -132,8 +133,8 @@ python3 cosim.py board_zybo_32 --jitter
 hold everything a card needs besides the model files: U-Boot's SPL
 (`boot.bin`, which runs the board's own `ps7_init`: DDR, MIO, FCLK0 at
 50 MHz), U-Boot
-(`u-boot.img`), a script (`halo.scr`) that programs the PL from the
-open-flow bitstream and reads each model file into DDR, the package's
+(`u-boot.img`), a script (`halo.scr`) that sets FCLK0 to 40 MHz, programs
+the PL from the open-flow bitstream and reads each model file into DDR, the package's
 `sw/main.c` built bare-metal (`halo.bin`, the program unchanged, built
 with `sdboot/`), and the bitstream (`fpgai.bit.gz`, unpacked onto the
 card). With them the board needs no Vivado, no Vitis and no JTAG:
@@ -167,19 +168,35 @@ vocabulary, with QEMU's missing PL answered by a stand-in. The SPL's
 
 The first ZC706 run did exactly this: U-Boot programmed the PL, every
 file loaded, every step took its usual time, and every token was 0
-("!"). A step's time does not depend on its data, so that is the PL
-computing on wrong data. To find where, copy
-`board_zc706_qwen3/boot/halo_diag.bin` onto the card as `halo.bin` (keep
-the old one), boot, and send back the whole UART log. In about five
-minutes it prints:
+("!"). That was Yosys's DSP mapping dropping the sign of negative
+products (`RESULTS.md`, "The first board run, and a Yosys bug"); the
+bitstreams in `boot/` are rebuilt without it, and the card now runs the
+PL at 40 MHz. A card made before the fix needs three files replaced from
+the same package's `boot/`: `fpgai.bit` (gunzip `fpgai.bit.gz`),
+`halo.scr` and `halo.bin`. The team's prompt, "Answer each question with
+one word or number." and three questions, then answers, on the RTL:
 
-- A: the clocks, resets and caches U-Boot left (FCLK0 should be 50 MHz)
+```
+Answers:
+1. 4
+2. 14
+3. 7
+Answer:
+```
+
+If the answer is still wrong, copy `board_zc706_qwen3/boot/halo_diag.bin`
+onto the card as `halo.bin` (keep the old one), boot, and send back the
+whole UART log. In about five minutes it prints:
+
+- A: the clocks, resets and caches U-Boot left (FCLK0 should be 40 MHz)
 - B: every bit of TOK, POS and head_en, written over GP0 and read back
 - C: the model files in DDR, sampled, against the ones it was built with
 - D: one step (token 785, "The", at position 0): its token, logit and
   cycles, and each layer's 1024 K and 1024 V values in the KV cache,
   against the same RTL in simulation, twice
 - E: the card's own prompt, with each generated token's id and logit
+- G: D again with the SCU on and the HP ports at 64 bits, if U-Boot left
+  them otherwise
 - F: D again at 25 and 10 MHz, and E at the first clock that matches
 
 `python3 sdboot.py <package> --diag` remakes it: it runs `sdboot/diag.c`

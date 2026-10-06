@@ -5,9 +5,10 @@ read the UART.
 The card:
 
   boot.bin      U-Boot's SPL, with the board's own ps7_init (DDR, clocks,
-                MIO; FCLK0 is 50 MHz on the ZC706, the design's clock)
+                MIO; FCLK0 at 50 MHz, which halo.scr lowers to 40)
   u-boot.img    U-Boot, whose boot command runs halo.scr
-  halo.scr      programs the PL from fpgai.bit, reads each model file into
+  halo.scr      sets the PL's clock (PL_MHZ), programs the PL from
+                fpgai.bit, reads each model file into
                 the address the program loads it to and records its size,
                 turns the caches off and starts the program
   halo.bin      the package's sw/main.c, unchanged, built bare-metal with
@@ -54,7 +55,29 @@ SCRIPT_STAGE = 0x03000000
 APP = 0x00100000
 DATA = ("weights8.bin", "cparams.bin", "vocab.bin", "prompt.bin")
 
-SCRIPT = """echo "Halo: programming the PL from fpgai.bit"
+# The PL's clock, FCLK0, set by the script before the PL is programmed:
+# the IO PLL's 1000 MHz (ZC706 and Zybo Z7 alike) over 25. The open-flow
+# bitstream meets 50 MHz within a core's clock domain by 2%, and nextpnr
+# leaves the paths from the bus clock into the core's gated clock
+# untimed; the longest of those is 20.0 ns. At 40 MHz each has 25 ns.
+PL_MHZ = 40
+FPGA0_CLK_CTRL = 0xF8000170
+SLCR_UNLOCK, SLCR_LOCK = 0xF8000008, 0xF8000004
+
+
+def fclk_ctrl(mhz, pll_mhz=1000):
+    """FPGA0_CLK_CTRL for mhz from the IO PLL: DIVISOR1 << 20 | DIVISOR0 << 8."""
+    total = pll_mhz // mhz
+    assert total * mhz == pll_mhz
+    d1 = next(d for d in range(1, 64) if total % d == 0 and total // d < 64)
+    return (d1 << 20) | ((total // d1) << 8)
+
+
+SCRIPT = """echo "Halo: FCLK0 at {mhz} MHz"
+mw.l {unlock:#010x} 0xdf0d
+mw.l {fclk:#010x} {fclk_val:#010x}
+mw.l {lock:#010x} 0x767b
+echo "Halo: programming the PL from fpgai.bit"
 if fatload mmc 0 {bit:#010x} fpgai.bit && fpga loadb 0 {bit:#010x} ${{filesize}}; then
   echo "Halo: PL programmed"
 else
@@ -117,7 +140,7 @@ def build_program(pkg, out, fake_tokens=None, main=None, include=None, name="hal
     return os.path.join(out, name)
 
 
-def diag_record(pkg, work, log=print, tok=785):
+def diag_record(pkg, work, log=print, tok=785, sd=None, layers=None):
     """sdboot/diag.c under cosim.py, on the package's RTL and sd/ files:
     the step it makes on the board, as the RTL makes it. Returns the
     token, logit, core cycles, the sampled files' hashes and every K and
@@ -132,7 +155,7 @@ def diag_record(pkg, work, log=print, tok=785):
     shutil.copyfile(os.path.join(SD, "diag.c"), os.path.join(tmp, "sw", "main.c"))
     exe = cosim.build(tmp, os.path.join(work, "cosim"), log=log,
                       defines={"DIAG_RECORD": "1", "DX_TOK": str(tok)})
-    out = cosim.run(exe, os.path.join(pkg, "sd"), env={"JITTER": "0"})
+    out = cosim.run(exe, sd or os.path.join(pkg, "sd"), env={"JITTER": "0"})
     rec = {"w": []}
     for line in out.splitlines():
         f = line.split()
@@ -149,8 +172,10 @@ def diag_record(pkg, work, log=print, tok=785):
             rec["w"].append((int(f[2]), int(f[3])))
     if "next" not in rec or not rec["w"]:
         raise RuntimeError("the diagnostics did not run under cosim:\n" + out[-3000:])
-    rtl = open(os.path.join(pkg, "rtl", "qwen_full.v")).read()
-    rec["layers"] = int(re.search(r"lyr \+ 1 < (\d+)", rtl).group(1))
+    if layers is None:
+        rtl = open(os.path.join(pkg, "rtl", "qwen_full.v")).read()
+        layers = int(re.search(r"lyr \+ 1 < (\d+)", rtl).group(1))
+    rec["layers"] = layers
     return rec
 
 
@@ -188,7 +213,8 @@ def build_diag(pkg, work=None, log=print):
 
 def build_script(pkg, out, fpga=True):
     lay, _ = _layout(pkg)
-    text = SCRIPT.format(bit=BIT_STAGE, table=TABLE, magic=MAGIC, app=APP,
+    text = SCRIPT.format(mhz=PL_MHZ, unlock=SLCR_UNLOCK, lock=SLCR_LOCK, fclk=FPGA0_CLK_CTRL,
+                         fclk_val=fclk_ctrl(PL_MHZ), bit=BIT_STAGE, table=TABLE, magic=MAGIC, app=APP,
                          wb=lay["WBASE"], cb=lay["CBASE"], vb=lay["VOCAB_BASE"],
                          pb=TABLE + 0x1000, t1=TABLE + 4, t2=TABLE + 8, t3=TABLE + 12,
                          t4=TABLE + 16)

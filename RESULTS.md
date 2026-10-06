@@ -2623,20 +2623,82 @@ reset width, since neither board's `ps7_init` writes the AFI registers;
 and U-Boot builds with the L2 cache off, so the ACP and the CPU see the
 same DDR.
 
+## The first board run, and a Yosys bug
+
+The ZC706 booted the card. U-Boot programmed the PL from the open-flow
+bitstream, read every file (596 MB of weights in 31 s), and the program
+passed its layout and size checks, printed the team's own 42-token
+prompt and ran every step: the last in 27.1 million bus cycles, 0.54 s,
+within the simulation's range. Every token it chose was 0, "!". A step
+takes the same cycles whatever its data, so the PL was running the right
+schedule on wrong numbers.
+
+Simulation found why without the board. `gatesim.py` runs a package's
+ARM program on the netlist its bitstream is made from: the RTL through
+`open/build_open.sh`'s own Yosys commands, as Xilinx primitives, in the
+co-simulation's harness. The first such run answered token 0 too, but
+for a reason of its own: Yosys's simulation models of RAMB36E1 and
+RAMB18E1 carry timing only, their outputs driven by nothing, so every
+block RAM read 0. With behavioral models of the two (the gains RAM's
+65,536 entries then read back as written), the netlist still disagreed
+with the RTL from layer 0's first K value (1, 4, 466, 233 against 40,
+26, -23, -10). Synthesising without DSPs agreed exactly; swapping one
+synthesised module at a time into the RTL found the MAC and the
+requantizer; and the MAC's netlist had `assign p_lo[31:25] = 7'h00`.
+Three lines reproduce it:
+
+```verilog
+always @(posedge clk)
+  if (!rst_n) p <= 0;
+  else p <= a * $signed({1'b0, b});   // a signed [15:0], b [7:0], p signed [31:0]
+```
+
+Yosys 0.68's `xilinx_dsp`, folding the register into the DSP's M
+register because of its synchronous reset, ties the bits above the
+product's 25 to 0 rather than to its sign: 2,436 of 5,000 random
+products read back wrong, every negative one. Every MAC and requantizer
+in the core is written that way. The open flow now unmaps synchronous
+resets just before the DSP mapping (`board_zybo._open_synth`): the
+products stay on the 199 DSPs, their registers in the fabric, and none
+of the 5,000 is wrong. `test_open_flow_keeps_signed_products` fails on
+plain `synth_xilinx` and passes on the flow's; `test_netlist_runs_its_program`
+runs a tiny package's program on its netlist, the RTL's tokens and
+logits, and fails on plain `synth_xilinx` too.
+
+On the rebuilt ZC706 Qwen3 netlist the diagnostics' step, token 785 at
+position 0 through all 28 layers and the head, gives the RTL's token 15
+and logit 9900 in its 19,409,519 core cycles, and all 57,344 K and V
+values the RTL's.
+
+The registers outside the DSPs cost timing. The rebuilt ZC706 Qwen3
+bitstream closes its core clock at 51.1 MHz and its bus clock at 53.0
+(69.5 and 51.5 before), and its longest path from the bus clock into the
+core's gated clock, which nextpnr reports but does not constrain, is
+20.0 ns. The card's script now sets FCLK0 to 40 MHz (the IO PLL over
+25) before it programs the PL: 25 ns for each of those paths, and about
+0.68 s a step. The ZC706 Qwen2.5 bitstream closes at 52.8 and 53.2 MHz (19.6 ns), and
+the Zybo's at 53.1 and 54.4 MHz (16.6 ns).
+
+For the failed run, `sdboot/diag.c` (`sdboot.py --diag`) is a `halo.bin`
+that reads back every bit of the PL's registers over GP0, samples the
+model files in DDR against the program's own, and runs one step whose
+57,344 K and V values it compares, layer by layer, with the same step on
+the RTL; then the card's prompt with token ids and logits, and the step
+again at 25 and 10 MHz.
+
 ## Not verified, and not claimed
 
 These are the distance between this repo and a local LLM host.
 
-1. **Nothing has run on hardware.** No device has been configured and
-   clocked, so every timing number is from a timing model rather than
-   from silicon in operation. The Zynq parts are no longer out of reach:
-   the open 7-series flow (nextpnr-xilinx on Project X-Ray, with one
-   patch in `open/`) places and routes the whole design on the XC7Z020
-   and the XC7Z045 at 50 MHz and writes bitstreams that round-trip. The
-   team has a ZC706, so what remains is the board itself, `HANDOFF.md`'s
-   steps: Vivado's build or the open-flow bitstream with a ps7_init, the
-   Vitis program, the SD card, and a UART log. `board_basys3/` is the
-   same for the Basys 3, with the small Qwen-shaped decoder.
+1. **The board has run, but not to a right answer yet.** A ZC706 booted
+   the self-booting card, programmed the PL and ran every step of a
+   42-token prompt in the expected cycles, and answered "!" each time:
+   Yosys's DSP mapping had dropped the sign of every negative product
+   ("The first board run, and a Yosys bug"). The rebuilt bitstreams run
+   their programs correctly on their own netlists in simulation; on the
+   board, not yet. Every timing number is still from nextpnr's model,
+   not silicon. `board_basys3/` is the same for the Basys 3, with the
+   small Qwen-shaped decoder.
 2. **The generated blocks are the arithmetic, not the whole engine.** The
    flow generates the multiply-accumulate unit, the requantizer between
    matmuls, the exponential and the reciprocal that softmax needs, the

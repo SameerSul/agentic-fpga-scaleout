@@ -401,14 +401,14 @@ def build(pkg, work, lat=30, log=print, defines=None):
     dflags = ["-D%s=%s" % kv for kv in sorted((defines or {}).items())]
     for c in ("main.c", "shim.c"):
         r = subprocess.run([cc, "-O1", "-w", "-I."] + dflags + ["-c", c, "-o", c[:-2] + ".o"],
-                           cwd=work, capture_output=True, text=True)
+                           cwd=work, capture_output=True, text=True, errors="replace")
         if r.returncode:
             raise RuntimeError(r.stderr[-3000:])
     r = subprocess.run(["verilator", "--cc", "--exe", "--build", "-j", "8", "-DSIM",
                         "--top-module", "fpgai_zybo", "-Wno-fatal", "-Wno-lint", "-Wno-style",
                         "--x-assign", "0", "--x-initial", "0", "-O2", "-CFLAGS", "-I..",
                         "-LDFLAGS", "../main.o ../shim.o", "-o", "pl"] + srcs + ["harness.cpp"],
-                       cwd=work, capture_output=True, text=True)
+                       cwd=work, capture_output=True, text=True, errors="replace")
     if r.returncode:
         raise RuntimeError(r.stdout[-3000:] + r.stderr[-3000:])
     exe = os.path.join(work, "obj_dir", "pl")

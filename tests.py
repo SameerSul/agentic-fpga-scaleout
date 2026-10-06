@@ -2572,6 +2572,98 @@ def test_port_coverage_and_every_input():
         shutil.rmtree(work, ignore_errors=True)
 
 
+def test_open_flow_keeps_signed_products():
+    """Yosys 0.68's xilinx_dsp, folding a product's register into the DSP
+    when that register has a synchronous reset, ties the register's bits
+    above the product's width to 0 instead of its sign, and every negative
+    product reads back wrong: the first ZC706 bitstream answered token 0
+    at every step. The open flow's synthesis (board_zybo._open_synth)
+    unmaps synchronous resets before the DSP mapping; the product, still
+    on a DSP, then matches its RTL for random operands across resets."""
+    if not (shutil.which('yosys') and shutil.which('iverilog')):
+        check('the open flow keeps a signed product\'s sign (no yosys or iverilog: skipped)', True)
+        return
+    import board_zybo, gatesim
+    work = os.path.join(ROOT, 'build_signedprod')
+    shutil.rmtree(work, ignore_errors=True)
+    os.makedirs(work)
+    try:
+        open(os.path.join(work, 't.v'), 'w').write(
+            'module t (input clk, input rst_n, input signed [15:0] a, input [7:0] b,\n'
+            '          output reg signed [31:0] p);\n'
+            '  always @(posedge clk)\n'
+            '    if (!rst_n) p <= 0;\n'
+            '    else p <= a * $signed({1\'b0, b});\n'
+            'endmodule\n')
+        synth = re.sub(r'\\\n', ' ', board_zybo._open_synth({}, top='t'))
+        r = subprocess.run(['yosys', '-q', '-p', 'read_verilog t.v; %s; rename t t_net; '
+                            'write_verilog -noattr n.v' % synth], cwd=work, capture_output=True,
+                           text=True, errors='replace')
+        net = open(os.path.join(work, 'n.v')).read() if not r.returncode else ''
+        open(os.path.join(work, 'p.v'), 'w').write(gatesim.primitives(net))
+        open(os.path.join(work, 'tb.v'), 'w').write(
+            '`timescale 1ns/1ps\nmodule tb;\n'
+            '  reg clk = 0, rst_n = 0; reg signed [15:0] a = 0; reg [7:0] b = 0;\n'
+            '  wire signed [31:0] p0, p1;\n'
+            '  t r (.clk(clk), .rst_n(rst_n), .a(a), .b(b), .p(p0));\n'
+            '  t_net n (.clk(clk), .rst_n(rst_n), .a(a), .b(b), .p(p1));\n'
+            '  always #5 clk = ~clk;\n  integer i, e = 0;\n'
+            '  initial begin\n'
+            '    for (i = 0; i < 3000; i = i + 1) begin\n'
+            '      @(negedge clk); a = $random; b = $random; rst_n = (i % 50 != 7) && i > 1;\n'
+            '      @(posedge clk); #1; e = e + (p0 !== p1);\n'
+            '    end\n'
+            '    $display("WRONG %0d", e); $finish;\n  end\nendmodule\n')
+        r2 = subprocess.run(['iverilog', '-g2012', '-o', 's', 'tb.v', 't.v', 'n.v', 'p.v'],
+                            cwd=work, capture_output=True, text=True)
+        out = subprocess.run(['vvp', '-n', 's'], cwd=work, capture_output=True,
+                             text=True).stdout if not r2.returncode else ''
+        check('the open flow keeps a signed product\'s sign through a reset register on a DSP',
+              not r.returncode and 'DSP48E1' in net and 'WRONG 0' in out)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def test_netlist_runs_its_program():
+    """gatesim.py: a package's ARM program on the netlist its bitstream is
+    made from, the open flow's own synthesis of its RTL, Xilinx primitives
+    simulated (block RAMs behaviorally; Yosys's models of them carry
+    timing only). A tiny package's tokens and logits on the netlist are
+    the RTL's, which are the integer model's."""
+    if not (shutil.which('yosys') and shutil.which('verilator')):
+        check('the netlist runs its program (no yosys or Verilator: skipped)', True)
+        return
+    import board_zybo as bz, cosim, gatesim, qwen_full, qwen_synth, zybo
+    import qwen_real as qr
+    import io, contextlib
+    work = os.path.join(ROOT, 'build_gatesimtest')
+    shutil.rmtree(work, ignore_errors=True)
+    try:
+        ids, n_gen = [3, 77, 12, 140], 3
+        im, _ = qwen_synth.model('qwen3', nl=2)
+        want = qr.greedy(im, ids, n_gen)
+        b = os.path.join(work, 'build')
+        im.ms['lanes'] = boards_mod.PACKAGES['zybo_z7_20']['lanes']
+        qwen_full.build_model(im, ids, n_gen, b, log=lambda *a: None, want=want)
+        pkg = os.path.join(work, 'pkg')
+        with contextlib.redirect_stdout(io.StringIO()):
+            bz.package(b, 'zybo_z7_20', pkg, '', n_gen, sd=False, model='tiny', checked='-')
+        bz.write_sd(zybo.layout(b, bz.BASE), b, os.path.join(pkg, 'sd'), ids, cosim.Tokens(im.V))
+        rtl = cosim.heads(cosim.run(cosim.build(pkg, os.path.join(work, 'rtl'), log=lambda *a: None),
+                                    os.path.join(pkg, 'sd'), env={'JITTER': '1'}))
+        gp = gatesim.gate_package(pkg, os.path.join(work, 'gate'), log=lambda *a: None)
+        gate = cosim.heads(cosim.run(cosim.build(gp, os.path.join(work, 'gatecosim'),
+                                                 log=lambda *a: None),
+                                     os.path.join(pkg, 'sd'), env={'JITTER': '1'}))
+        net = open(os.path.join(work, 'gate', 'syn', 'netlist.v')).read()
+        check('a package\'s program on its open-flow netlist: the RTL\'s tokens and logits, '
+              'the integer model\'s tokens',
+              len(gate) == n_gen and gate == rtl and [t for t, _ in gate] == want[len(ids):]
+              and 'DSP48E1' in net and 'RAMB' in net)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
 def test_sd_card_boots_on_its_own():
     """A package's card with no Vivado (sdboot.py): U-Boot's SPL and
     U-Boot, a script that programs the PL and reads the model files into
@@ -4941,6 +5033,8 @@ if __name__ == '__main__':
     test_resume_keeps_what_a_run_signed_off()
     test_contracts_catch_what_the_testbench_missed()
     test_port_coverage_and_every_input()
+    test_open_flow_keeps_signed_products()
+    test_netlist_runs_its_program()
     test_sd_card_boots_on_its_own()
     test_llm_blocks_decode()
     test_attention_scores_cannot_overflow()

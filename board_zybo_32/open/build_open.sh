@@ -24,6 +24,7 @@ cd "$(dirname "$0")"
 cp ../rtl/gains.hex .
 yosys -q -l yosys.log -p "read_verilog fpgai_ps7.v $(ls ../rtl/*.v | tr '\n' ' '); \
   synth_xilinx -flatten -abc9 -arch xc7 -top fpgai_ps7 -run :map_dsp; \
+  dffunmap -srst-only; \
   select -set soft t:\$mul c:*slane?0?.* c:*slane?1?.* c:*slane?2?.* c:*slane?3?.* c:*slane?4?.* c:*slane?5?.* c:*slane?6?.* c:*slane?7?.* c:*slane?8?.* c:*slane?9?.* c:*slane?10?.* c:*slane?11?.* c:*slane?12?.* c:*slane?13?.* c:*slane?14?.* c:*slane?15?.* c:*slane?16?.* c:*slane?17?.* c:*slane?18?.* c:*slane?19?.* c:*slane?20?.* c:*slane?21?.* c:*slane?22?.* c:*slane?23?.* %u %u %u %u %u %u %u %u %u %u %u %u %u %u %u %u %u %u %u %u %u %u %u %i; chtype -set \$__soft_mul @soft; \
   synth_xilinx -flatten -abc9 -arch xc7 -top fpgai_ps7 -run map_dsp:; write_json fpgai.json"
 "$NEXTPNR_XILINX/build/nextpnr-xilinx" --chipdb "$NEXTPNR_XILINX/xilinx/xc7z020.bin" \

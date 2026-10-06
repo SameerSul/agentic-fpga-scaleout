@@ -550,20 +550,33 @@ write_hw_platform -fixed -include_bit -force ./fpgai.xsa
 puts "platform: ./fpgai.xsa"
 """
 
-def _open_synth(pk):
-    """Yosys's synthesis for the open flow. A core that fills the part's
-    DSPs (the Zybo's at 32 lanes, 196 of 220) leaves nextpnr-xilinx no
-    free LUT beside some DSPs to make the constants their unused inputs
-    need, and routing fails; so the first soft_score_lanes of the
-    attention head's score lanes multiply in LUTs instead, retyped before
-    the DSP mapping. Vivado's build keeps every multiplier on a DSP."""
+def _open_synth(pk, top="fpgai_ps7"):
+    """Yosys's synthesis for the open flow, split around its DSP mapping.
+
+    Yosys 0.68's xilinx_dsp pass, folding a product's register into the
+    DSP's M register when that register has a synchronous reset, ties the
+    register's bits above the product's own width to 0 rather than to its
+    sign: `if (!rst_n) p <= 0; else p <= a * $signed({1'b0, b});` reads
+    back wrong for every negative product. Every MAC and requantizer here
+    is written that way, and the first ZC706 bitstream answered token 0
+    at every step. Unmapping synchronous resets just before the DSP
+    mapping keeps those registers out of the DSPs; the resets come back
+    as the flip-flops' R pins.
+
+    A core that fills the part's DSPs (the Zybo's at 32 lanes, 196 of
+    220) leaves nextpnr-xilinx no free LUT beside some DSPs to make the
+    constants their unused inputs need, and routing fails; so the first
+    soft_score_lanes of the attention head's score lanes multiply in LUTs
+    instead, retyped before the DSP mapping. Vivado's build keeps every
+    multiplier on a DSP."""
+    synth = "synth_xilinx -flatten -abc9 -arch xc7 -top %s" % top
     n = pk.get("soft_score_lanes", 0)
-    if not n:
-        return "  synth_xilinx -flatten -abc9 -arch xc7 -top fpgai_ps7"
-    lanes = " ".join("c:*slane?%d?.*" % k for k in range(n)) + " %u" * (n - 1)
-    return ("  synth_xilinx -flatten -abc9 -arch xc7 -top fpgai_ps7 -run :map_dsp; \\\n"
-            "  select -set soft t:\\$mul %s %%i; chtype -set \\$__soft_mul @soft; \\\n"
-            "  synth_xilinx -flatten -abc9 -arch xc7 -top fpgai_ps7 -run map_dsp:" % lanes)
+    soft = ""
+    if n:
+        lanes = " ".join("c:*slane?%d?.*" % k for k in range(n)) + " %u" * (n - 1)
+        soft = "  select -set soft t:\\$mul %s %%i; chtype -set \\$__soft_mul @soft; \\\n" % lanes
+    return ("  %s -run :map_dsp; \\\n  dffunmap -srst-only; \\\n%s  %s -run map_dsp:"
+            % (synth, soft, synth))
 
 
 def render_xdc(pk, open_flow=False):

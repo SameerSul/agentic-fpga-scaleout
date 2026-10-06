@@ -595,6 +595,12 @@ the gathers over UDP.
    prints what the board's UART will, and the harness checks each step's
    logit. A real model's whole run takes minutes; several boards run as
    several processes over localhost UDP.
+9. **The programs on their netlist** (`gatesim.py`). The same harness on
+   what Yosys makes of the RTL for the bitstream, the commands of the
+   package's own `open/build_open.sh`, simulated as Xilinx primitives
+   (block RAMs behaviorally; Yosys's models of them carry timing only).
+   It is what found the Yosys DSP bug behind the first board run's
+   answer ("The first board run, and a Yosys bug" in `RESULTS.md`).
 
 ### Outputs
 

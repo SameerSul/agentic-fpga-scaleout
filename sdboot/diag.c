@@ -14,6 +14,8 @@
         record them: sdboot.py --diag)
      E  the card's own prompt, as sw/main.c runs it, with each token's id
         and logit
+     G  D again with what software can change: the SCU on, the HP ports
+        at 64 bits, if U-Boot left them otherwise
      F  D again at a slower PL clock (25 and 10 MHz), and E at the first
         clock where D matches
 
@@ -118,6 +120,8 @@ static int step(u32 tok, u32 pos, int head, u32 *next)
 #define FPGA_RST_CTRL 0xF8000240U
 #define LVL_SHFTR_EN 0xF8000900U
 #define PS_CLK_HZ 33333333U             /* ZC706 and Zybo Z7 */
+#define SCU_CTRL 0xF8F00000U
+#define AFI_RDCHAN_CTRL(i) (0xF8008000U + 0x1000U * (i))
 
 static u32 pll_hz(u32 ctrl)
 {
@@ -145,15 +149,15 @@ static void env(void)
     printf("A  CPU: MMU %s, D-cache %s, I-cache %s (SCTLR 0x%08lx); L2 0x%lx, SCU 0x%lx\r\n",
            sctlr & 1 ? "on" : "off", sctlr & 4 ? "on" : "off", sctlr & 0x1000 ? "on" : "off",
            (unsigned long)sctlr, (unsigned long)Xil_In32(0xF8F02100U),
-           (unsigned long)Xil_In32(0xF8F00000U));
+           (unsigned long)Xil_In32(SCU_CTRL));
     printf("   IO PLL %lu MHz (0x%08lx), FCLK0 %lu.%02lu MHz (FPGA0_CLK_CTRL 0x%08lx)\r\n",
            (unsigned long)(pll_hz(Xil_In32(IO_PLL_CTRL)) / 1000000),
            (unsigned long)Xil_In32(IO_PLL_CTRL), (unsigned long)(fclk0_hz() / 1000000),
            (unsigned long)(fclk0_hz() / 10000 % 100), (unsigned long)Xil_In32(FPGA0_CLK_CTRL));
     printf("   FPGA_RST_CTRL 0x%lx, LVL_SHFTR_EN 0x%lx, AFI read width 0x%lx 0x%lx 0x%lx 0x%lx\r\n",
            (unsigned long)Xil_In32(FPGA_RST_CTRL), (unsigned long)Xil_In32(LVL_SHFTR_EN),
-           (unsigned long)Xil_In32(0xF8008000U), (unsigned long)Xil_In32(0xF8009000U),
-           (unsigned long)Xil_In32(0xF800A000U), (unsigned long)Xil_In32(0xF800B000U));
+           (unsigned long)Xil_In32(AFI_RDCHAN_CTRL(0)), (unsigned long)Xil_In32(AFI_RDCHAN_CTRL(1)),
+           (unsigned long)Xil_In32(AFI_RDCHAN_CTRL(2)), (unsigned long)Xil_In32(AFI_RDCHAN_CTRL(3)));
 }
 
 /* FCLK0 at hz, the PL held in reset while it changes. */
@@ -481,6 +485,32 @@ int main(void)
     if (r1 == 0 && r2 == 0) {
         printf("Halo diagnostics done: the PL matches the simulation\r\n");
         return 0;
+    }
+    /* G: what software can change. U-Boot leaves the SCU, which the ACP
+       (the KV cache's port) goes through, as it found it; a Vitis boot
+       enables it. The AFIs reset to 64-bit reads, the width the PL uses. */
+    if (!(Xil_In32(SCU_CTRL) & 1)) {
+        Xil_Out32(SCU_CTRL, Xil_In32(SCU_CTRL) | 1);
+        printf("G  SCU enabled (0x%lx)\r\n", (unsigned long)Xil_In32(SCU_CTRL));
+        if (step_test(0, 0, &h1) == 0) {
+            run_prompt();
+            printf("Halo diagnostics done: the PL matches the simulation with the SCU on\r\n");
+            return 0;
+        }
+    }
+    u32 afi32 = 0;
+    for (u32 i = 0; i < 4; i++)
+        afi32 |= Xil_In32(AFI_RDCHAN_CTRL(i)) & 1;
+    if (afi32) {
+        Xil_Out32(SLCR_UNLOCK, 0xDF0D);
+        for (u32 i = 0; i < 4; i++)
+            Xil_Out32(AFI_RDCHAN_CTRL(i), Xil_In32(AFI_RDCHAN_CTRL(i)) & ~1U);
+        printf("G  HP read ports set to 64 bits\r\n");
+        if (step_test(0, 0, &h1) == 0) {
+            run_prompt();
+            printf("Halo diagnostics done: the PL matches the simulation with 64-bit HP ports\r\n");
+            return 0;
+        }
     }
     static const u32 slow[] = {25000000, 10000000};
     for (unsigned i = 0; i < sizeof slow / sizeof slow[0]; i++) {
