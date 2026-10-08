@@ -18,3 +18,5 @@ qwen_weights/
 board_*/sd/
 # A card's files, assembled by sdboot.py from boot/ and sd/.
 board_*/card/
+# The bitstream unpacked for XSCT by sdboot.py --jtag (boot/ has it gzipped).
+board_*/jtag/fpgai.bit

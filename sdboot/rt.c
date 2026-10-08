@@ -229,9 +229,55 @@ void XTime_GetTime(XTime *t)
     *t = ((XTime)hi << 32) | lo;
 }
 
+#ifdef HALO_JTAG
+/* Loaded over JTAG, nothing has set the UART up: ps7_init gave it its pins
+   and its reference clock (the IO PLL over UART_CLK_CTRL's divisor), and
+   115200 8N1 is set here from that clock. */
+#define UART_CR 0x00
+#define UART_MR 0x04
+#define UART_BAUDGEN 0x18
+#define UART_BAUDDIV 0x34
+#define IO_PLL_CTRL 0xF8000108U
+#define UART_CLK_CTRL 0xF8000154U
+
+static void uart_init(void)
+{
+    u32 ref = 33333333U * ((Xil_In32(IO_PLL_CTRL) >> 12) & 0x7F) /
+              ((Xil_In32(UART_CLK_CTRL) >> 8) & 0x3F);
+    u32 best_cd = 0, best_div = 4, best_err = ~0U;
+    for (u32 div = 4; div < 256; div++) {
+        u32 cd = (ref + 115200U * (div + 1) / 2) / (115200U * (div + 1));
+        if (cd < 1 || cd > 65535)
+            continue;
+        u32 baud = ref / (cd * (div + 1));
+        u32 err = baud > 115200U ? baud - 115200U : 115200U - baud;
+        if (err < best_err) {
+            best_err = err;
+            best_cd = cd;
+            best_div = div;
+        }
+    }
+    Xil_Out32(HALO_UART + UART_CR, 0x28);               /* TX and RX off */
+    Xil_Out32(HALO_UART + UART_MR, 0x20);               /* 8 bits, no parity, 1 stop */
+    Xil_Out32(HALO_UART + UART_BAUDGEN, best_cd);
+    Xil_Out32(HALO_UART + UART_BAUDDIV, best_div);
+    Xil_Out32(HALO_UART + UART_CR, 0x117);              /* reset both, then on */
+    Xil_Out32(HALO_UART + UART_CR, 0x114);
+}
+#endif
+
 void rt_init(void)
 {
+#ifdef HALO_JTAG
+    uart_init();
+#endif
     Xil_Out32(GT_CTRL, Xil_In32(GT_CTRL) | 1U);        /* timer running */
+}
+
+/* The JTAG entry's end: no U-Boot to return to. */
+void rt_exit(int rc)
+{
+    printf("\r\nHalo: the program ended, rc = %d\r\n", rc);
 }
 
 /* ---- FatFs, as a view of what U-Boot already put in DDR ------------- */

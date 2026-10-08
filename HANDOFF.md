@@ -164,6 +164,26 @@ its own size checks and prints the prompt and the tokens from the card's
 vocabulary, with QEMU's missing PL answered by a stand-in. The SPL's
 `ps7_init` and the open-flow bitstream on the PL are the board's to show.
 
+### No SD card: everything over JTAG, still no Vivado project
+
+`python3 sdboot.py <package> --jtag` unpacks the bitstream into the
+package's `jtag/`, beside `run.tcl`, the board's `ps7_init.tcl` (U-Boot's
+`ps7_init_gpl.c` as XSCT commands) and the program built for a JTAG load
+(`halo.elf`; `halo_diag.elf` for the diagnostics). With the model files
+in the package's `sd/` folder (step 1), the board's boot mode on JTAG
+(SW11 all to JTAG on the ZC706, JP5 on the Zybo), its JTAG and UART USB
+ports connected and the UART open at 115200 8N1:
+
+```
+xsct board_zc706_qwen3/jtag/run.tcl
+```
+
+It resets the board, programs the PL, runs ps7_init (DDR, clocks, MIO),
+sets FCLK0 to 40 MHz, releases the PL, downloads the program and the
+four model files (the weights take minutes) and starts the program; the
+output is the same as from the card. `xsct ... run.tcl diag` runs the
+diagnostics instead. XSCT comes with Vitis (and with Vivado from 2023.1).
+
 ### If the card boots and the answer is wrong
 
 The first ZC706 run did exactly this: U-Boot programmed the PL, every
