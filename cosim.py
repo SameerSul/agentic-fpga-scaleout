@@ -388,7 +388,7 @@ def build(pkg, work, lat=30, log=print, defines=None):
         f.write(h)
     shutil.copyfile(os.path.join(sw, "main.c"), os.path.join(work, "main.c"))
     with open(os.path.join(work, "harness.cpp"), "w") as f:
-        f.write(HARNESS % dict(base=base, size=size, regs=board_zybo.REG_BASE, lat=lat,
+        f.write(HARNESS % dict(base=base, size=size, regs=_header_value(h, "FPGAI_REGS"), lat=lat,
                                ns=1000 // board_zybo.MHZ))
     # The RTL beside the harness, named relative to it: make cannot take
     # a source path with a space in it.
