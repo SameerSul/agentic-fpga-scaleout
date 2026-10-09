@@ -22,6 +22,10 @@ Vivado, on an x86 machine (Linux or Windows) with Vivado and Vitis
    the script writes the model files into DDR over JTAG (minutes) and
    it goes on, printing the prompt and the generated tokens.
 
+On Windows, `run_all.bat` does steps 2 to 4 in order, skipping what is
+already built (`run_all.bat rebuild` remakes it; `run_all.bat COM5`
+opens PuTTY on COM5 first).
+
 The prompt in `sd/prompt.bin` decides the text; for "The capital of
 France is" the RTL prints "The capital of France is Paris. The capital
 of the United States is Washington, D.C. The capital".
