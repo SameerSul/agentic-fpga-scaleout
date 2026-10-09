@@ -8,14 +8,15 @@ is at 0, so the layout is unchanged.
 
 The open flow has no UltraScale+ database: the bitstream comes from
 Vivado, on an x86 machine (Linux or Windows) with Vivado and Vitis
-2022.1 or later and Real Digital's AUP-ZU3 board files (realdigital.org, the AUP-ZU3 page), in <Vivado>/data/boards/board_files/.
+2022.1 or later (2024.1 or 2023.2 suggested) and Real Digital's AUP-ZU3 board files (realdigital.org, the AUP-ZU3 page), in <Vivado>/data/boards/board_files/.
 
 1. The model files, in `sd/`: the same four as `board_zc706_qwen3/sd/` (copy them,
    or make them with `HANDOFF.md` step 1 for `board_zc706_qwen3`).
 2. `vivado -mode batch -source build.tcl` in this folder: `fpgai.bit`,
    `fpgai.xsa`, `psu_init.tcl`, `timing.rpt` (WNS must be positive).
-3. `xsct sw/build_app.tcl`: `sw/halo.elf`, `sw/main.c` on the A53's
-   standalone BSP with xilffs.
+3. `vitis -s sw/build_app.py` (Vitis 2024.1 and later), or
+   `xsct sw/build_app.tcl` (2023.2 and before): `sw/halo.elf`, `sw/main.c`
+   on the A53's standalone BSP with xilffs.
 4. Boot mode to JTAG, JTAG and UART USB connected, the UART at 115200
    8N1, then `xsct sw/run_jtag.tcl`. With no SD card the program waits;
    the script writes the model files into DDR over JTAG (minutes) and

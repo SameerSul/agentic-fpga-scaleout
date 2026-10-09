@@ -68,6 +68,6 @@ report_timing_summary -file timing.rpt
 report_utilization -file utilization.rpt
 write_hw_platform -fixed -include_bit -force ./fpgai.xsa
 file copy -force [glob ./vivado/fpgai.runs/impl_1/*.bit] ./fpgai.bit
-set psu [glob -nocomplain ./vivado/*/sources_1/bd/system/ip/*zynq_ultra_ps_e*/psu_init.tcl]
+set psu [glob -nocomplain ./vivado/*/sources_1/bd/system/ip/*/psu_init.tcl]
 if {[llength $psu]} { file copy -force [lindex $psu 0] ./psu_init.tcl }
 puts "platform: ./fpgai.xsa, bitstream: ./fpgai.bit, PS init: ./psu_init.tcl"
